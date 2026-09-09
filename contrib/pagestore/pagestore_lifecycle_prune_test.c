@@ -779,7 +779,8 @@ begin_delete(uint32_t timeline)
 /* The daemon's answer for single-page redo: the newest retained position at
  * or below a horizon at which the block was outside its relation. */
 static uint64_t
-block_death_asof(uint32_t timeline, uint32_t block, uint64_t lsn)
+block_death_asof_seq(uint32_t timeline, uint32_t block, uint64_t lsn,
+					 uint64_t *seq_out)
 {
 	PsChannel	ch;
 
@@ -795,7 +796,15 @@ block_death_asof(uint32_t timeline, uint32_t block, uint64_t lsn)
 	(void) ps_handle_meta(&ch);
 	ps_unlock_shard(ps_shard_of(&rel_key));
 	ps_lifecycle_read_unlock();
+	if (seq_out != NULL)
+		*seq_out = ch.status == PS_STATUS_OK ? ch.req_seq : 0;
 	return ch.status == PS_STATUS_OK ? ch.req_lsn : UINT64_MAX;
+}
+
+static uint64_t
+block_death_asof(uint32_t timeline, uint32_t block, uint64_t lsn)
+{
+	return block_death_asof_seq(timeline, block, lsn, NULL);
 }
 
 /* Creation, truncates at or below the block, and unlink are deaths; growth
@@ -820,6 +829,12 @@ test_block_death_asof(void)
 		  "creation is the newest death before the truncate");
 	check(block_death_asof(0, 1, 2050) == 2000,
 		  "the truncate is the death at its own horizon");
+	{
+		uint64_t	seq = 0;
+
+		check(block_death_asof_seq(0, 1, 2050, &seq) == 2000 && seq != 0,
+			  "the death carries its admission sequence");
+	}
 	check(block_death_asof(0, 1, 2500) == 2000,
 		  "regrowth does not hide the death the chain was retired against");
 	check(block_death_asof(0, 0, 2500) == 1000,

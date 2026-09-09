@@ -121,6 +121,7 @@ typedef struct Bounds
 	uint64_t	retention;
 	uint64_t	timelines;
 	uint64_t	other;
+	uint64_t	files;			/* regular files in the store, inodes included */
 } Bounds;
 
 static const Bounds during_bound = {
@@ -132,6 +133,7 @@ static const Bounds during_bound = {
 	.retention = 256u * 1024u,
 	.timelines = 64u * 1024u,
 	.other = 256u * 1024u,
+	.files = 96,
 };
 
 static const Bounds quiescent_bound = {
@@ -143,6 +145,7 @@ static const Bounds quiescent_bound = {
 	.retention = 128u * 1024u,
 	.timelines = 64u * 1024u,
 	.other = 256u * 1024u,
+	.files = 64,
 };
 
 /* Declared catch-up interval after ingestion stops. */
@@ -669,8 +672,20 @@ typedef struct Physical
 	uint64_t	timelines;
 	uint64_t	other;
 	uint64_t	total;
-	unsigned int files;
+	uint64_t	files;
 } Physical;
+
+/* Space a file occupies: the larger of its logical length and the blocks the
+ * filesystem allocated to it, so neither sparse files nor slack from many
+ * small files hides behind the other measure. */
+static uint64_t
+file_bytes(const struct stat *st)
+{
+	uint64_t	logical = (uint64_t) st->st_size;
+	uint64_t	allocated = (uint64_t) st->st_blocks * 512u;
+
+	return allocated > logical ? allocated : logical;
+}
 
 typedef struct FileSize
 {
@@ -738,9 +753,9 @@ dir_bytes(const char *path, Physical *p)
 			total += dir_bytes(child, p);
 		else if (S_ISREG(st.st_mode))
 		{
-			total += (uint64_t) st.st_size;
+			total += file_bytes(&st);
 			p->files++;
-			note_file(child, (uint64_t) st.st_size);
+			note_file(child, file_bytes(&st));
 		}
 	}
 	closedir(dir);
@@ -774,7 +789,7 @@ measure(Physical *p)
 			bytes = dir_bytes(child, p);
 		else if (S_ISREG(st.st_mode))
 		{
-			bytes = (uint64_t) st.st_size;
+			bytes = file_bytes(&st);
 			p->files++;
 			note_file(child, bytes);
 		}
@@ -851,6 +866,7 @@ physical_within(const Physical *p, const Bounds *b, const char *phase,
 	BOUNDF(retention);
 	BOUNDF(timelines);
 	BOUNDF(other);
+	BOUNDF(files);
 #undef BOUNDF
 	return ok;
 }
@@ -859,12 +875,12 @@ static void
 dump_physical(FILE *out, const char *label, const Physical *p)
 {
 	fprintf(out, "  %s: total=%llu page=%llu layers=%llu wal=%llu walidx=%llu"
-			" forkmeta=%llu retention=%llu timelines=%llu other=%llu files=%u\n",
+			" forkmeta=%llu retention=%llu timelines=%llu other=%llu files=%llu\n",
 			label, (unsigned long long) p->total, (unsigned long long) p->page,
 			(unsigned long long) p->layers, (unsigned long long) p->wal,
 			(unsigned long long) p->walidx, (unsigned long long) p->forkmeta,
 			(unsigned long long) p->retention, (unsigned long long) p->timelines,
-			(unsigned long long) p->other, p->files);
+			(unsigned long long) p->other, (unsigned long long) p->files);
 }
 
 /* ===================== IPC primitives ================================= */
@@ -1886,16 +1902,16 @@ write_report(FILE *out, int rounds, uint64_t seed, const Physical *max,
 			"\"physical_written_approx\":%llu,\"write_amplification\":%.2f,"
 			"\"physical_max\":{\"total\":%llu,\"page\":%llu,\"layers\":%llu,"
 			"\"wal\":%llu,\"walidx\":%llu,\"forkmeta\":%llu,\"retention\":%llu,"
-			"\"timelines\":%llu,\"other\":%llu,\"files\":%u},"
+			"\"timelines\":%llu,\"other\":%llu,\"files\":%llu},"
 			"\"physical_quiescent\":{\"total\":%llu,\"page\":%llu,\"layers\":%llu,"
 			"\"wal\":%llu,\"walidx\":%llu,\"forkmeta\":%llu,\"retention\":%llu,"
-			"\"timelines\":%llu,\"other\":%llu,\"files\":%u},"
+			"\"timelines\":%llu,\"other\":%llu,\"files\":%llu},"
 			"\"bounds_during\":{\"page\":%llu,\"layers\":%llu,\"wal\":%llu,"
 			"\"walidx\":%llu,\"forkmeta\":%llu,\"retention\":%llu,"
-			"\"timelines\":%llu,\"other\":%llu},"
+			"\"timelines\":%llu,\"other\":%llu,\"files\":%llu},"
 			"\"bounds_quiescent\":{\"page\":%llu,\"layers\":%llu,\"wal\":%llu,"
 			"\"walidx\":%llu,\"forkmeta\":%llu,\"retention\":%llu,"
-			"\"timelines\":%llu,\"other\":%llu},"
+			"\"timelines\":%llu,\"other\":%llu,\"files\":%llu},"
 			"\"reclaimers\":{"
 			"\"page\":{\"high_water\":%u,\"catch_up\":%u,\"throttle_enters\":%llu,\"wait_ms\":%llu,\"final_lag\":%llu},"
 			"\"wal\":{\"high_water\":%u,\"catch_up\":%u,\"throttle_enters\":%llu,\"wait_ms\":%llu,\"final_lag\":%llu},"
@@ -1921,20 +1937,22 @@ write_report(FILE *out, int rounds, uint64_t seed, const Physical *max,
 			(unsigned long long) max->layers, (unsigned long long) max->wal,
 			(unsigned long long) max->walidx, (unsigned long long) max->forkmeta,
 			(unsigned long long) max->retention, (unsigned long long) max->timelines,
-			(unsigned long long) max->other, max->files,
+			(unsigned long long) max->other, (unsigned long long) max->files,
 			(unsigned long long) quiescent->total, (unsigned long long) quiescent->page,
 			(unsigned long long) quiescent->layers, (unsigned long long) quiescent->wal,
 			(unsigned long long) quiescent->walidx,
 			(unsigned long long) quiescent->forkmeta,
 			(unsigned long long) quiescent->retention,
 			(unsigned long long) quiescent->timelines,
-			(unsigned long long) quiescent->other, quiescent->files,
+			(unsigned long long) quiescent->other,
+			(unsigned long long) quiescent->files,
 			(unsigned long long) during_bound.page, (unsigned long long) during_bound.layers,
 			(unsigned long long) during_bound.wal, (unsigned long long) during_bound.walidx,
 			(unsigned long long) during_bound.forkmeta,
 			(unsigned long long) during_bound.retention,
 			(unsigned long long) during_bound.timelines,
 			(unsigned long long) during_bound.other,
+			(unsigned long long) during_bound.files,
 			(unsigned long long) quiescent_bound.page,
 			(unsigned long long) quiescent_bound.layers,
 			(unsigned long long) quiescent_bound.wal,
@@ -1943,6 +1961,7 @@ write_report(FILE *out, int rounds, uint64_t seed, const Physical *max,
 			(unsigned long long) quiescent_bound.retention,
 			(unsigned long long) quiescent_bound.timelines,
 			(unsigned long long) quiescent_bound.other,
+			(unsigned long long) quiescent_bound.files,
 			PAGE_HIGH_WATER, PAGE_CATCH_UP,
 			(unsigned long long) m->page.throttle_enters,
 			(unsigned long long) (m->page.foreground_wait_ns / 1000000),

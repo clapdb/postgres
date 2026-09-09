@@ -161,7 +161,8 @@ extern void pagestore_localsvc_read_at(const PageStoreRelKey *key,
 									   BlockNumber blocknum, uint64 lsn, void *out);
 extern bool pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 											 BlockNumber blocknum, uint64 lsn,
-											 void *out, uint64 *version_out);
+											 void *out, uint64 *version_out,
+											 uint64 *version_seq_out);
 extern void pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
 										   uint64 branch_lsn,
 										   uint64 target_incarnation,
@@ -218,7 +219,7 @@ extern uint64 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key,
 											  uint64 lsn);
 extern uint64 pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
 												  BlockNumber blocknum,
-												  uint64 lsn);
+												  uint64 lsn, uint64 *seq_out);
 extern int	pagestore_localsvc_exists_asof(const PageStoreRelKey *key,
 										   uint64 lsn);
 extern uint64 pagestore_localsvc_read_lsn(void);

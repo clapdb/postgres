@@ -394,9 +394,14 @@ at every horizon (each definitive event that is the newest death of some
 block, not only the latest and the smallest), and the as-of size, existence,
 and death queries are admissible at WAL-index horizons below the page
 frontier like the WAL-index reads retained for that owner are
-(`pagestore_forkmeta_prune_test`, `pagestore_lifecycle_prune_test`).  With
-that, 8000-round soaks keep every category, forkmeta included, within
-bound.  Still required for the gate:
+(`pagestore_forkmeta_prune_test`, `pagestore_lifecycle_prune_test`).  Those
+identities are compared as (LSN, admission sequence) tuples end to end, the
+order `fork_page_invalidated()` already applies, so a page clamped to the
+LSN of the truncate it was written after keeps its bytes; an admitted
+artifact registers its fence under the same lock as the check that admitted
+it; and the soak measures allocated blocks rather than logical length and
+bounds the file count.  With that, 8000-round soaks keep every category,
+forkmeta included, within bound.  Still required for the gate:
 
 - no owner establishes the durable operational cutoff that controllers
   respect: the real materializer pins WAL and the WAL index but not page

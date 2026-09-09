@@ -857,14 +857,36 @@ pagestore_read_at(PG_FUNCTION_ARGS)
  * truncated or dropped and regrown, and every earlier record was retired
  * behind that absence).  Returns false when the block does not exist at lsn.
  */
+/*
+ * Does a fork death at (death, death_seq) come after a base at (base_end,
+ * base_seq)?  The same order fork_page_invalidated() applies to a stored
+ * version: a same-LSN tie is broken by the admission sequence, so a page
+ * clamped to the LSN of the truncate it was written after keeps its bytes.
+ * A full-page image or a zero page carries no sequence (zero), so a death at
+ * its LSN, admitted later, supersedes it.
+ */
+static bool
+ps_death_supersedes(uint64 death, uint64 death_seq, XLogRecPtr base_end,
+					uint64 base_seq)
+{
+	if (death == 0)
+		return false;
+	if (death != (uint64) base_end)
+		return death > (uint64) base_end;
+	return death_seq > base_seq;
+}
+
 static bool
 ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
-					XLogRecPtr lsn, char *out, XLogRecPtr *base_end_lsn)
+					XLogRecPtr lsn, char *out, XLogRecPtr *base_end_lsn,
+					uint64 *base_seq)
 {
 	uint64		version = 0;
+	uint64		version_seq = 0;
 
+	*base_seq = 0;
 	if (pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out,
-										 &version))
+										 &version, &version_seq))
 	{
 		/*
 		 * The base position is the store's version identity, not the pd_lsn
@@ -875,6 +897,8 @@ ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
 		 */
 		*base_end_lsn = (XLogRecPtr) version > PageGetLSN((Page) out) ?
 			(XLogRecPtr) version : PageGetLSN((Page) out);
+		if ((XLogRecPtr) version >= PageGetLSN((Page) out))
+			*base_seq = version_seq;
 		return true;
 	}
 	if (pagestore_localsvc_nblocks_asof(key, (uint64) lsn) > (uint64) blocknum)
@@ -2147,13 +2171,14 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	if (n == 0)
 	{
 		XLogRecPtr	base_end;
+		uint64		base_seq = 0;
 
 		/* WAL-index compaction leaves no record at all for a page whose
 		 * durable stored version (or proven absence) covers every visible
 		 * record; that stored version is then the base. */
 		page = palloc(BLCKSZ);
 		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
-								&base_end))
+								&base_end, &base_seq))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -2233,10 +2258,11 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	 */
 	{
 		XLogRecPtr	base_end = fpi_end;
+		uint64		base_seq = 0;
 
 		if (result == NULL &&
 			ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
-								&base_end))
+								&base_end, &base_seq))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -2251,10 +2277,11 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		 */
 		if (result != NULL)
 		{
+			uint64		death_seq = 0;
 			uint64		death = pagestore_localsvc_block_death_asof(
-				&key, (BlockNumber) blocknum, (uint64) lsn);
+				&key, (BlockNumber) blocknum, (uint64) lsn, &death_seq);
 
-			if (death != 0 && death >= (uint64) base_end)
+			if (ps_death_supersedes(death, death_seq, base_end, base_seq))
 			{
 				if (pagestore_localsvc_nblocks_asof(&key, (uint64) lsn) >
 					(uint64) blocknum)
@@ -2388,6 +2415,7 @@ Datum
 pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 {
 	bool		death_based = false;
+	uint64		base_seq = 0;
 	Oid			relid = PG_GETARG_OID(0);
 	int32		forknum = PG_GETARG_INT32(1);
 	int32		blocknum = PG_GETARG_INT32(2);
@@ -2423,13 +2451,14 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	if (n == 0)
 	{
 		XLogRecPtr	base_end;
+		uint64		base_seq = 0;
 
 		/* No record survives WAL-index compaction: the durable stored version
 		 * at or below lsn (or a zero page for a regrown block) already is the
 		 * page as of lsn; a truncated or dropped block is absent. */
 		page = palloc(BLCKSZ);
 		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
-								&base_end))
+								&base_end, &base_seq))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -2512,7 +2541,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		 * apply only the records that complete after its pd_lsn.
 		 */
 		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, base,
-								&base_end_lsn))
+								&base_end_lsn, &base_seq))
 		{
 			for (int i = 0; i < n; i++)
 				if (((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
@@ -2543,10 +2572,11 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * lsn has no page at all.
 	 */
 	{
+		uint64		death_seq = 0;
 		uint64		death = pagestore_localsvc_block_death_asof(
-			&key, (BlockNumber) blocknum, (uint64) lsn);
+			&key, (BlockNumber) blocknum, (uint64) lsn, &death_seq);
 
-		if (death != 0 && death >= (uint64) base_end_lsn)
+		if (ps_death_supersedes(death, death_seq, base_end_lsn, base_seq))
 		{
 			if (pagestore_localsvc_nblocks_asof(&key, (uint64) lsn) <=
 				(uint64) blocknum)

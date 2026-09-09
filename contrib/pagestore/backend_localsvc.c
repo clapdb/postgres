@@ -979,7 +979,7 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 bool
 pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 								 BlockNumber blocknum, uint64 lsn, void *out,
-								 uint64 *version_out)
+								 uint64 *version_out, uint64 *version_seq_out)
 {
 	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
@@ -995,6 +995,8 @@ pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 	 * clamped copy carries above the pd_lsn its bytes retain */
 	if (version_out != NULL)
 		*version_out = ch->req_lsn;
+	if (version_seq_out != NULL)
+		*version_seq_out = ch->req_seq;
 	return true;
 }
 
@@ -1502,7 +1504,8 @@ pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
  */
 uint64
 pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
-									BlockNumber blocknum, uint64 lsn)
+									BlockNumber blocknum, uint64 lsn,
+									uint64 *seq_out)
 {
 	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
@@ -1510,7 +1513,13 @@ pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
 	ch->blocknum = blocknum;
 	ch->req_lsn = lsn;
 	ls_exec(ch);
-	return ch->status == PS_STATUS_OK ? ch->req_lsn : 0;
+	if (ch->status != PS_STATUS_OK)
+	{
+		*seq_out = 0;
+		return 0;
+	}
+	*seq_out = ch->req_seq;
+	return ch->req_lsn;
 }
 
 int

@@ -5675,10 +5675,12 @@ fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
  */
 static uint64_t
 fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
-						 uint64_t read_lsn, uint64_t read_seq)
+						 uint64_t read_lsn, uint64_t read_seq,
+						 uint64_t *seq_out)
 {
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
+	*seq_out = 0;
 	do
 	{
 		ForkEnt    *e = fork_find(w.tl, key);
@@ -5697,7 +5699,10 @@ fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
 					continue;
 				if (v->kind == FEV_DEAD ||
 					(v->kind == FEV_SET && v->nblocks <= block))
+				{
+					*seq_out = v->admission_seq;
 					return v->lsn;
+				}
 			}
 		}
 	} while (tl_walk_next(&w));
@@ -13345,6 +13350,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		fenced = hdr.lsn >= frontier.lsn ||
 			ps_retention_page_fence_at(timeline, hdr.lsn) ||
 			page_frontier_structural_fence_active(timeline, timeline, hdr.lsn);
+		/* Register the artifact's fence while the fence that admitted it is
+		 * still held: control pruning plans under map-wr, so it cannot run
+		 * between this check and the registration, and once registered the
+		 * image survives the admitting pin being dropped.  A fence noted for
+		 * an append that then fails only retains until the next open rebuilds
+		 * the registry from the versions that exist. */
+		if (fenced)
+			artifact_fence_note(timeline, hdr.lsn);
 		ps_unlock_map();
 		if (!fenced)
 			return -1;
@@ -13672,6 +13685,17 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
 			 uint64_t *out_ver)
 {
+	return read_resolve_version(timeline, key, block, read_lsn, read_seq, out,
+								out_ver, NULL);
+}
+
+/* read_resolve() that also reports the resolved version's admission
+ * sequence, the second half of the identity a same-LSN comparison needs. */
+int
+read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
+					 uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
+					 uint64_t *out_ver, uint64_t *out_seq)
+{
 	Shard	   *s;				/* same shard across the ancestry walk */
 	TlWalk		walk[MAX_TIMELINES];
 	uint32_t	levels = 0;
@@ -13764,6 +13788,8 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * exact-cutoff match -- e.g. an SLRU snapshot read -- compares it. */
 			if (out_ver)
 				*out_ver = pv->lsn;
+			if (out_seq)
+				*out_seq = pv->admission_seq;
 
 			/* fast path: materialized-page cache, keyed by the resolved version */
 			if (!poisoned && ps_pgcache_lookup(tl, key, block, pv->lsn,
@@ -15879,16 +15905,24 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_BLOCK_DEATH:
-			/* req_lsn caps the horizon and returns the answer: the newest
-			 * retained death of (key, blocknum) at or below it, or zero. */
+			/* req_lsn/req_seq cap the horizon and return the answer: the
+			 * newest retained death of (key, blocknum) at or below it as
+			 * (lsn, admission sequence), or zero. */
 			if (ch->req_lsn == 0 ||
 				!fork_asof_query_allowed(tl, ch->req_lsn, ch->req_seq))
 			{
 				ch->status = PS_STATUS_ERROR;
 				break;
 			}
-			ch->req_lsn = fork_block_death_through(tl, &ch->key, ch->blocknum,
-												   ch->req_lsn, ch->req_seq);
+			{
+				uint64_t	death_seq = 0;
+
+				ch->req_lsn = fork_block_death_through(tl, &ch->key,
+													   ch->blocknum,
+													   ch->req_lsn, ch->req_seq,
+													   &death_seq);
+				ch->req_seq = death_seq;
+			}
 			break;
 
 		case PS_OP_UNLINK:

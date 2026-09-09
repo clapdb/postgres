@@ -365,6 +365,7 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 				 * found-ness (ch->result) until the page actually lands, so a failed
 				 * async read does not advertise a zero-filled page as found */
 				ch->req_lsn = v->lsn;
+				ch->req_seq = v->admission_seq;
 				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
 									  v->admission_seq,
 									  ch->data))

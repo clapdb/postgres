@@ -286,6 +286,10 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
  * page is unwritten, -1 if an authoritative stored version cannot be read, and
  * -2 when the requested capped horizon has been reclaimed.
  */
+extern int	read_resolve_version(uint32_t timeline, const PsKey *key,
+								 uint32_t block, uint64_t read_lsn,
+								 uint64_t read_seq, unsigned char *out,
+								 uint64_t *out_ver, uint64_t *out_seq);
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,
 						 unsigned char *out, uint64_t *out_ver);
