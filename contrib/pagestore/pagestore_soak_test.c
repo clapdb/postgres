@@ -279,8 +279,9 @@ remove_tree(const char *path)
 {
 	char		cmd[1024];
 
-	if (snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", path) > 0)
-		(void) system(cmd);
+	if (snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", path) > 0 &&
+		system(cmd) != 0)
+		fprintf(stderr, "warning: could not remove %s\n", path);
 }
 
 static void

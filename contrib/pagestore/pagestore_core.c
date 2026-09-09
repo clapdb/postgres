@@ -14019,6 +14019,7 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	uint32_t npins = 0;
 	PsPruneFence *fences;
 	uint32_t nfences = 0;
+	uint32_t artifact_cap = 0;
 
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
 		return -1;
@@ -14057,6 +14058,53 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 		}
 	}
 	free(pins);
+	/* SLRU seed snapshots and exact-R reader artifacts are reader-artifact
+	 * authority that no dedicated protocol reclaims yet.  Seeding replays from
+	 * such a base and resolves the control state (for example the commit-ts
+	 * era) as of that base, so the newest control image at or below every
+	 * retained artifact version must survive with it.  Until SLRU history has
+	 * its own retention protocol this bounds control retention, and the WAL
+	 * floor derived from it, by the oldest retained seed. */
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (PageEnt *e = g_shards[sh].page_idx[bucket]; e; e = e->next)
+			{
+				if (e->timeline != timeline ||
+					(e->key.klass != PS_KLASS_SLRU &&
+					 e->key.klass != PS_KLASS_READER_SNAPSHOT))
+					continue;
+				for (int i = 0; i < e->nver; i++)
+				{
+					uint64_t	lsn = e->vers[i].lsn;
+					int			seen = 0;
+
+					if (lsn == 0)
+						continue;
+					for (uint32_t f = 0; f < nfences && !seen; f++)
+						seen = fences[f].lsn == lsn &&
+							fences[f].admission_seq == UINT64_MAX;
+					if (seen)
+						continue;
+					if (nfences == npins + MAX_TIMELINES + artifact_cap)
+					{
+						PsPruneFence *grown;
+
+						artifact_cap = artifact_cap != 0 ? artifact_cap * 2 : 64;
+						grown = realloc(fences, (size_t) (npins + MAX_TIMELINES +
+														  artifact_cap) *
+										sizeof(*fences));
+						if (grown == NULL)
+						{
+							free(fences);
+							return -1;
+						}
+						fences = grown;
+					}
+					fences[nfences].lsn = lsn;
+					fences[nfences].admission_seq = UINT64_MAX;
+					nfences++;
+				}
+			}
 	*fences_out = fences;
 	*nfences_out = nfences;
 	return 0;
