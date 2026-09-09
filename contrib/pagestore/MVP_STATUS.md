@@ -171,7 +171,22 @@ recovery, which replays the intact live log and passes everything after it;
 recovery must replay either log to a sane manifest reconciled with the local
 layers, serve every page written before the rewrite, remove a crashed temp
 log on open, and register no owner; a second restart proves idempotence.
-Compute-restart combinations remain outside the harness.
+
+Compute-restart combinations are composed through a `restart` operation in
+the writer and materializer runtimes.  The writer runtime restarts the writer
+or an installed pinned reader with a fast shutdown; a pinned reader's
+shutdown checkpoint rewrites its `pg_control`, so its restart restores the
+boot control image at its immutable identity before starting, as the
+documented reader protocol requires.  The materializer runtime restarts the
+writer, the materializer worker (the supervisor replaces the cleanly stopped
+worker with a new generation), or the store, where the supervisor stops
+first, both computes shut down, the daemon restarts on the same shared
+memory name, and the writer and supervisor return.  The two scenarios
+require the pinned reader to keep its horizon and hide the in-flight
+prepared transaction across its restart and the writer's, and the
+materializer to serve each boundary after a writer restart, a worker
+restart, and a store restart with zero lag at the end.  Remaining outside
+the harness: branch-compute restarts, which the golden scenario covers.
 
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer
@@ -565,13 +580,13 @@ to compare across nights.
 ### 5. Composed crash and format-compatibility coverage -- partial
 
 The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
-reclaim, timeline deletion, and manifest replacement slices are now covered
-by the declarative harness.  The deletion slice crashes on both sides of its
-first transition: before the DELETING record is durable the request is lost
-and the branch must survive intact, and after each later boundary the cleanup
-must resume.  Its workload seeds a live sibling branch with the same kind of
-private state, so cleanup that reached past its owner would be caught.
-Compute-restart combinations remain outside them.  Before declaring the MVP
+reclaim, timeline deletion, manifest replacement, and compute-restart slices
+are now covered by the declarative harness.  The deletion slice crashes on
+both sides of its first transition: before the DELETING record is durable the
+request is lost and the branch must survive intact, and after each later
+boundary the cleanup must resume.  Its workload seeds a live sibling branch
+with the same kind of private state, so cleanup that reached past its owner
+would be caught.  Before declaring the MVP
 repeatable, add a persisted-format fixture for restart/upgrade
 compatibility.
 

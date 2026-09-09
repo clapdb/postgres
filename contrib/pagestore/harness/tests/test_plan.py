@@ -1912,6 +1912,49 @@ class PlanValidationTests(unittest.TestCase):
             MODULE.cleanup_temporary_root(root, True, False, [])
             self.assertFalse(root.exists())
 
+    def test_restart_combination_scenarios_validate(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        scenario_dir = ROOT / "scenarios"
+        for name, runtime in (
+            ("materializer_restart_combinations.jsonl", "materializer_smoke"),
+            ("writer_reader_restart.jsonl", "writer_smoke"),
+        ):
+            with self.subTest(scenario=name):
+                plan = MODULE.read_plan(scenario_dir / name)
+                MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+                MODULE.validate_runtime_plan(plan, capabilities, runtime)
+
+    def test_writer_restart_requires_an_installed_compute(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-restart-target", "seed": 1,
+                "contracts": ["write_read"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "restart", "id": "restart", "target": "reader-R"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "not an available compute"):
+            MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
+
+    def test_materializer_restart_rejects_reader_targets(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-materializer-restart", "seed": 1,
+                "contracts": ["lifecycle"],
+                "case": {"storage": "posix", "shards": 1,
+                         "compute": ["writer", "materializer"]},
+            },
+            {"op": "restart", "id": "restart", "target": "reader-R"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaises(MODULE.PlanError):
+            MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
+
     def test_materializer_fault_validates_scenario_identity(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         header = self.header()

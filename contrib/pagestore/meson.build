@@ -630,6 +630,8 @@ test('pagestore_harness_materializer_lifecycle_plan',
 foreach materializer_fault_scenario : [
   'materializer_restartpoint_after_relation_sync_before_marker',
   'materializer_restartpoint_after_marker_sync',
+  'materializer_restart_combinations',
+  'writer_reader_restart',
 ]
   test('pagestore_harness_' + materializer_fault_scenario + '_plan',
     pagestore_harness_python,

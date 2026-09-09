@@ -1,0 +1,18 @@
+{"schema":1,"scenario":"materializer-restart-combinations","seed":4123105,"contracts":["lifecycle","wal_materialization","durability","restart_idempotence"],"case":{"storage":"posix","shards":1,"compute":["writer","materializer"]}}
+{"op":"sql","id":"first-write","target":"writer","sql":"CREATE TABLE restart_t(id int primary key, v text); INSERT INTO restart_t VALUES (1, 'before-restarts')"}
+{"op":"checkpoint","id":"first-boundary","target":"writer","name":"R1"}
+{"op":"assert","id":"first-materialized","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"before-restarts"}
+{"op":"restart","id":"writer-restart","target":"writer"}
+{"op":"assert","id":"writer-recovered","target":"writer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"before-restarts"}
+{"op":"sql","id":"second-write","target":"writer","sql":"UPDATE restart_t SET v='after-writer-restart' WHERE id=1"}
+{"op":"restart","id":"materializer-restart","target":"materializer"}
+{"op":"assert","id":"replacement-in-recovery","target":"materializer","oracle":"sql_scalar","sql":"SELECT pg_is_in_recovery() AND current_setting('pagestore.materializer')::boolean","expect":"t"}
+{"op":"checkpoint","id":"second-boundary","target":"writer","name":"R2"}
+{"op":"assert","id":"second-materialized","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"after-writer-restart"}
+{"op":"restart","id":"store-restart","target":"store"}
+{"op":"assert","id":"writer-after-store-restart","target":"writer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"after-writer-restart"}
+{"op":"assert","id":"materializer-after-store-restart","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"after-writer-restart"}
+{"op":"sql","id":"third-write","target":"writer","sql":"UPDATE restart_t SET v='after-store-restart' WHERE id=1"}
+{"op":"checkpoint","id":"third-boundary","target":"writer","name":"R3"}
+{"op":"assert","id":"third-materialized","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"after-store-restart"}
+{"op":"assert","id":"writer-sees-zero-lag","target":"writer","oracle":"sql_scalar","sql":"SELECT lag_bytes = 0 FROM pagestore_materializer_status()","expect":"t"}

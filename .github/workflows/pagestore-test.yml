@@ -272,6 +272,15 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
 
+      - name: Run H1 writer and pinned-reader restart combinations
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --writer-smoke contrib/pagestore/harness/scenarios/writer_reader_restart.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
+
       - name: Run pagestore harness managed materializer smoke
         if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
         run: |
@@ -316,6 +325,25 @@ jobs:
             --capabilities contrib/pagestore/harness/capabilities.json \
             --materializer-smoke \
               contrib/pagestore/harness/scenarios/materializer_restartpoint_after_marker_sync.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Run H1 store, writer, and materializer restart combinations
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke \
+              contrib/pagestore/harness/scenarios/materializer_restart_combinations.jsonl \
             --build-dir "$(pwd)/build" \
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \

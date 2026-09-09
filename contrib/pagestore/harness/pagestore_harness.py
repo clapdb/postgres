@@ -653,10 +653,11 @@ RUNTIME_OPERATIONS = {
     "daemon_fault_smoke": {"crash", "set_fault", "release_fault", "layer_seed", "gc_seed"},
     "writer_smoke": {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
-        "install_reader", "assert", "capture",
+        "install_reader", "assert", "capture", "restart",
     },
     "materializer_smoke": {
-        "sql", "checkpoint", "materializer_fault", "inspect_relation", "crash", "assert",
+        "sql", "checkpoint", "materializer_fault", "inspect_relation", "crash",
+        "assert", "restart",
     },
 }
 
@@ -684,6 +685,7 @@ RUNTIME_CONSTRAINTS = {
         "install_reader": {"forbidden_values": {"target": ["writer"]}},
         "assert": {"oracle": ["sql_scalar"]},
         "capture": {"target": ["writer"], "kind": ["reader_datadir"]},
+        "restart": {},
     },
     "materializer_smoke": {
         "sql": {
@@ -700,6 +702,7 @@ RUNTIME_CONSTRAINTS = {
         },
         "materializer_fault": {"target": ["materializer"], "action": ["pause"]},
         "inspect_relation": {"target": ["materializer"]},
+        "restart": {"target": ["store", "writer", "materializer"]},
     },
 }
 
@@ -809,7 +812,7 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         writer_mutated_since_checkpoint = True
         bootstrapped = False
         for action in plan.actions:
-            if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
+            if action["op"] in ("sql", "assert", "restart") and action["target"] not in available_clients:
                 raise PlanError(
                     f"runtime {runtime!r} operation {action['op']!r} target "
                     f"{action['target']!r} is not an available compute"
@@ -4250,6 +4253,7 @@ def run_writer_smoke(
         reader_seeds: dict[str, Path] = {}
         reader_clients: dict[str, tuple[Path, int]] = {}
         reader_data_dirs: dict[str, Path] = {}
+        reader_lsns: dict[str, str] = {}
         reader_owner_ids: dict[str, int] = {}
         for action in plan.actions:
             if action["op"] == "sql":
@@ -4348,7 +4352,35 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(reader_data), "-l", str(trace / "reader.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 reader_clients[action["target"]] = (reader_socket, reader_port)
                 reader_data_dirs[action["target"]] = reader_data
+                reader_lsns[action["target"]] = lsn
                 events.emit("install_reader", id=action["id"], target=action["target"], lsn=lsn, data=str(reader_data), port=reader_port)
+                continue
+            elif action["op"] == "restart":
+                # A clean compute restart: the writer or an installed pinned
+                # reader stops with a fast shutdown and starts from its own
+                # data directory against the unchanged store.  A pinned
+                # reader's shutdown checkpoint rewrites its pg_control, so its
+                # restart follows the documented protocol and restores the
+                # boot control image at its immutable identity first.
+                restored_control = False
+                if action["target"] == "writer":
+                    restart_data, restart_log = data, trace / "writer.log"
+                elif action["target"] in reader_data_dirs:
+                    restart_data, restart_log = reader_data_dirs[action["target"]], trace / "reader.log"
+                else:
+                    raise PlanError(f"restart {action['id']} targets unavailable compute {action['target']!r}")
+                subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(restart_data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                if action["target"] in reader_data_dirs:
+                    assert control_restore is not None
+                    subprocess.run(
+                        pagestore_control_restore_command(
+                            control_restore, shm, 0, 1, reader_lsns[action["target"]], restart_data,
+                        ),
+                        check=True, capture_output=True, encoding="utf-8", env=env,
+                    )
+                    restored_control = True
+                subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(restart_data), "-l", str(restart_log), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                events.emit("restart", id=action["id"], target=action["target"], mode="fast", data=str(restart_data), restored_control=restored_control)
                 continue
             elif action["op"] == "capture":
                 ref = action["horizon"]
@@ -4791,33 +4823,41 @@ def run_materializer_smoke(
             "run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
             shm=shm, postgres_major=postgres_major,
         )
-        with (trace / "daemon.log").open("w", encoding="utf-8") as log:
-            dproc = subprocess.Popen(
-                [
-                    str(daemon), "--shm", shm, "--store", str(store),
-                    "--page-size", str(profile["page_size"]),
-                    "--nshards", str(plan.header["case"]["shards"]),
-                    "--storage", plan.header["case"]["storage"],
-                ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
-            )
-        deadline = time.monotonic() + 10
-        while True:
-            if dproc.poll() is not None:
-                raise PlanError(
-                    f"daemon exited before readiness with status {dproc.returncode}"
+        daemon_command = [
+            str(daemon), "--shm", shm, "--store", str(store),
+            "--page-size", str(profile["page_size"]),
+            "--nshards", str(plan.header["case"]["shards"]),
+            "--storage", plan.header["case"]["storage"],
+        ]
+
+        def start_store(reason: str) -> dict[str, Any]:
+            nonlocal dproc
+            with (trace / "daemon.log").open("a", encoding="utf-8") as log:
+                dproc = subprocess.Popen(
+                    daemon_command,
+                    stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
                 )
-            try:
-                health = inspect_store(inspector, shm, "health", schema)
-                break
-            except PlanError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(.05)
-        validate_runtime_health(
-            plan, capabilities, "materializer_smoke", health, schema
-        )
-        probe_runtime_inspection(inspector, shm, capabilities, schema)
+            deadline = time.monotonic() + 10
+            while True:
+                if dproc.poll() is not None:
+                    raise PlanError(
+                        f"daemon exited before readiness with status {dproc.returncode}"
+                    )
+                try:
+                    health = inspect_store(inspector, shm, "health", schema)
+                    break
+                except PlanError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.05)
+            validate_runtime_health(
+                plan, capabilities, "materializer_smoke", health, schema
+            )
+            probe_runtime_inspection(inspector, shm, capabilities, schema)
+            events.emit("process_start", target="store", pid=dproc.pid, reason=reason)
+            return health
+
+        health = start_store("provision")
         subprocess.run(
             [
                 str(pg_bin / "initdb"), "-D", str(writer_data),
@@ -4845,14 +4885,64 @@ def run_materializer_smoke(
                 f"unix_socket_directories = {postgresql_conf_string(writer_socket)}\n"
                 f"port = {writer_port}\n"
             )
-        subprocess.run(
-            [
-                str(pg_bin / "pg_ctl"), "-D", str(writer_data), "-l",
-                str(trace / "writer.log"), "-w", "start",
-            ],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
+        def start_writer(reason: str) -> None:
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(writer_data), "-l",
+                    str(trace / "writer.log"), "-w", "start",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            wait_scalar(
+                writer_socket, writer_port, "SELECT 1", "1",
+                f"writer did not accept connections after {reason}",
+            )
+            events.emit("process_start", target="writer", reason=reason)
+
+        def stop_writer(reason: str) -> None:
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(writer_data),
+                    "-m", "fast", "-w", "stop",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            events.emit("process_stop", target="writer", mode="fast", reason=reason)
+
+        def stop_materializer_worker(reason: str) -> None:
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
+                    "-m", "fast", "-w", "stop",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            events.emit(
+                "process_stop", target="materializer",
+                generation=materializer_generation, mode="fast", reason=reason,
+            )
+
+        def stop_supervisor(reason: str) -> None:
+            nonlocal supervisor_proc
+            if supervisor_proc is None:
+                return
+            supervisor_proc.terminate()
+            supervisor_proc.wait(timeout=5)
+            if supervisor_proc.returncode != 0:
+                raise PlanError(
+                    f"materializer supervisor did not stop cleanly for {reason}: "
+                    f"status {supervisor_proc.returncode}"
+                )
+            events.emit(
+                "process_stop", target="materializer-supervisor",
+                pid=supervisor_proc.pid, reason=reason,
+            )
+            supervisor_proc = None
+
+        start_writer("provision")
         events.emit("ready", target="writer", health=health, port=writer_port)
 
         subprocess.run(
@@ -4936,16 +5026,29 @@ def run_materializer_smoke(
                     ),
                 }
             )
-        with (trace / "materializer-supervisor.log").open(
-            "w", encoding="utf-8"
-        ) as log:
-            supervisor_proc = subprocess.Popen(
-                [
-                    sys.executable, str(supervisor),
-                    "--config", str(supervisor_config),
-                ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
+        supervisor_starts = 0
+
+        def start_supervisor(log_name: str) -> None:
+            nonlocal supervisor_proc, supervisor_starts
+            supervisor_starts += 1
+            with (trace / log_name).open("w", encoding="utf-8") as log:
+                supervisor_proc = subprocess.Popen(
+                    [
+                        sys.executable, str(supervisor),
+                        "--config", str(supervisor_config),
+                    ],
+                    stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
+                )
+
+        def wait_materializer_role(context: str) -> None:
+            wait_scalar(
+                materializer_socket, materializer_port,
+                "SELECT pg_is_in_recovery() AND "
+                "current_setting('pagestore.materializer')::boolean",
+                "t", context,
             )
+
+        start_supervisor("materializer-supervisor.log")
         supervisor_status = wait_supervisor_status(
             lambda status: (
                 status.get("owner_pid") == supervisor_proc.pid
@@ -4955,12 +5058,7 @@ def run_materializer_smoke(
             "materializer supervisor did not start its worker",
         )
         sync_materializer_generation(supervisor_status)
-        wait_scalar(
-            materializer_socket, materializer_port,
-            "SELECT pg_is_in_recovery() AND "
-            "current_setting('pagestore.materializer')::boolean",
-            "t", "materializer did not enter its declared recovery role",
-        )
+        wait_materializer_role("materializer did not enter its declared recovery role")
         events.emit(
             "process_start", target="materializer",
             generation=materializer_generation, reason="supervisor provisioned",
@@ -4984,16 +5082,7 @@ def run_materializer_smoke(
                 "materializer supervisor did not stop cleanly for handoff: "
                 f"status {supervisor_proc.returncode}"
             )
-        with (trace / "materializer-supervisor-replacement.log").open(
-            "w", encoding="utf-8"
-        ) as log:
-            supervisor_proc = subprocess.Popen(
-                [
-                    sys.executable, str(supervisor),
-                    "--config", str(supervisor_config),
-                ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
-            )
+        start_supervisor("materializer-supervisor-replacement.log")
         supervisor_status = wait_supervisor_status(
             lambda status: (
                 status.get("owner_pid") == supervisor_proc.pid
@@ -5428,6 +5517,76 @@ def run_materializer_smoke(
                     "replacement", id=action["id"], target="materializer",
                     crashed_generation=crashed_generation,
                     generation=materializer_generation,
+                )
+            elif action["op"] == "restart":
+                restarted_generation = materializer_generation
+                restarted_retention_generation = materializer_retention_generation
+                if action["target"] == "writer":
+                    stop_writer(action["id"])
+                    start_writer(action["id"])
+                elif action["target"] == "materializer":
+                    # The supervisor keeps running and treats a cleanly stopped
+                    # worker exactly like a crashed one: a new worker and a new
+                    # retention generation, adopted through the same status.
+                    stop_materializer_worker(action["id"])
+                    supervisor_status = wait_supervisor_status(
+                        lambda status: (
+                            isinstance(status.get("worker_generation"), int)
+                            and status["worker_generation"] > restarted_generation
+                            and isinstance(status.get("retention_generation"), int)
+                            and status["retention_generation"]
+                                > restarted_retention_generation
+                            and status.get("state")
+                            in {"running", "waiting_for_progress_api"}
+                        ),
+                        f"supervisor did not replace the stopped worker after {action['id']}",
+                    )
+                    sync_materializer_generation(supervisor_status)
+                    wait_materializer_role(
+                        f"restarted materializer did not become healthy after {action['id']}"
+                    )
+                else:
+                    # Every attached compute must be down while the daemon
+                    # reinitializes its shared memory; the supervisor stops
+                    # first so it cannot replace the worker mid-restart.
+                    stop_supervisor(action["id"])
+                    stop_materializer_worker(action["id"])
+                    stop_writer(action["id"])
+                    assert dproc is not None
+                    dproc.terminate()
+                    dproc.wait(timeout=30)
+                    if dproc.returncode != 0:
+                        raise UnexpectedExit(
+                            f"daemon did not stop cleanly for {action['id']}: "
+                            f"status {dproc.returncode}"
+                        )
+                    events.emit(
+                        "process_stop", target="store", pid=dproc.pid,
+                        returncode=dproc.returncode, reason=action["id"],
+                    )
+                    remove_shm(shm)
+                    health = start_store(action["id"])
+                    start_writer(action["id"])
+                    start_supervisor(f"materializer-supervisor-restart-{supervisor_starts}.log")
+                    supervisor_status = wait_supervisor_status(
+                        lambda status: (
+                            status.get("owner_pid") == supervisor_proc.pid
+                            and isinstance(status.get("worker_generation"), int)
+                            and status["worker_generation"] > restarted_generation
+                            and status.get("state")
+                            in {"running", "waiting_for_progress_api"}
+                        ),
+                        f"supervisor did not restart the worker after {action['id']}",
+                    )
+                    sync_materializer_generation(supervisor_status)
+                    wait_materializer_role(
+                        f"materializer did not recover after {action['id']}"
+                    )
+                events.emit(
+                    "restart", id=action["id"], target=action["target"],
+                    previous_generation=restarted_generation,
+                    generation=materializer_generation,
+                    health=health if action["target"] == "store" else None,
                 )
             elif action["op"] == "assert":
                 if action["target"] == "writer":

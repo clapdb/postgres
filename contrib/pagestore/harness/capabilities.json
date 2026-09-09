@@ -26,7 +26,7 @@
       "io_unit": 262144
     },
     "writer_smoke": {
-      "operations": ["sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap", "install_reader", "assert", "capture"],
+      "operations": ["sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap", "install_reader", "assert", "capture", "restart"],
       "constraints": {
         "checkpoint": {"target": ["writer"]},
         "prepare_reader": {"target": ["writer"]},
@@ -34,21 +34,23 @@
         "bootstrap": {"target": ["writer"]},
         "install_reader": {"forbidden_values": {"target": ["writer"]}},
         "assert": {"oracle": ["sql_scalar"]},
-        "capture": {"target": ["writer"], "kind": ["reader_datadir"]}
+        "capture": {"target": ["writer"], "kind": ["reader_datadir"]},
+        "restart": {}
       },
       "protocol_version": 46,
       "page_size": 8192,
       "io_unit": 262144
     },
     "materializer_smoke": {
-      "operations": ["sql", "checkpoint", "materializer_fault", "inspect_relation", "crash", "assert"],
+      "operations": ["sql", "checkpoint", "materializer_fault", "inspect_relation", "crash", "assert", "restart"],
       "constraints": {
         "sql": {"target": ["writer"], "forbidden_fields": ["expect_error", "expect_sqlstate"]},
         "checkpoint": {"target": ["writer"]},
         "crash": {"target": ["materializer"], "model": ["compute"], "forbidden_fields": ["fault"]},
         "assert": {"target": ["writer", "materializer"], "oracle": ["sql_scalar"]},
         "materializer_fault": {"target": ["materializer"], "action": ["pause"]},
-        "inspect_relation": {"target": ["materializer"]}
+        "inspect_relation": {"target": ["materializer"]},
+        "restart": {"target": ["store", "writer", "materializer"]}
       },
       "protocol_version": 46,
       "page_size": 8192,
