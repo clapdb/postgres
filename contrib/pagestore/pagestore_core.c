@@ -2605,8 +2605,46 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		if (order[first].key.klass != PS_KLASS_RELATION &&
 			order[first].key.klass != PS_KLASS_CONTROL)
 		{
+			uint32_t	klass = order[first].key.klass;
+
+			if (floor != 0 &&
+				(klass == PS_KLASS_SLRU || klass == PS_KLASS_READER_SNAPSHOT ||
+				 klass == PS_KLASS_SLRU_LIVE || klass == PS_KLASS_SLRU_TOMB ||
+				 klass == PS_KLASS_SLRU_WM))
+			{
+				/* SLRU-class objects and reader artifacts are consumed as-of
+				 * a horizon their consumer pinned first (a reader, a branch
+				 * being prepared) or that is a branch's fork point.  A seed
+				 * is a replay base: a horizon R is served by the newest seed
+				 * at or below R plus the WAL after it, so the newest seed
+				 * below every retained horizon must survive.  A reader
+				 * snapshot is read at exactly its reader's horizon, which is
+				 * that reader's pin, and the live mirror, tombstones, and
+				 * watermark resolve to the newest version at or below the
+				 * horizon.  All of them therefore follow the relation plan:
+				 * the newest version at or below the floor and every fence,
+				 * everything above the floor; a retried copy of a retained
+				 * version collapses to the newest tuple like any other. */
+				for (uint32_t i = first; i < end; i++)
+					versions[i - first] = order[i].version;
+				if (ps_page_prune_plan(versions, end - first,
+									   (PsPruneFence) {floor, UINT64_MAX},
+									   fences, nfences, keep) < 0)
+					memset(keep, 1, end - first);
+				/* zero-version (WAL-less) state is latest-only and stays */
+				for (uint32_t i = first; i < end; i++)
+					if (order[i].version.lsn == 0)
+						keep[i - first] = 1;
+			}
+			else
+				memset(keep, 1, end - first);
 			for (uint32_t i = first; i < end; i++)
-				selected[out++] = recs[order[i].source];
+			{
+				if (keep[i - first])
+					selected[out++] = recs[order[i].source];
+				else
+					dropped[ndropped++] = recs[order[i].source];
+			}
 			first = end;
 			continue;
 		}
@@ -3238,6 +3276,7 @@ static void artifact_fence_reset(void);
 static void artifact_fence_note(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_reserve(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_release(uint32_t timeline, uint64_t lsn);
+static void artifact_fence_forget_version(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_forget(uint32_t timeline);
 
 static void
@@ -4372,6 +4411,9 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 				remove = 1;
 			if (!remove)
 				e->vers[out++] = *v;
+			else if (e->key.klass == PS_KLASS_SLRU ||
+					 e->key.klass == PS_KLASS_READER_SNAPSHOT)
+				artifact_fence_forget_version(timeline, v->lsn);
 		}
 		e->nver = out;
 		r = end;
@@ -14674,7 +14716,7 @@ typedef struct ArtifactFence
 	uint32_t	timeline;
 	uint64_t	lsn;
 	uint32_t	pending;		/* appends admitted at this cutoff, in flight */
-	unsigned char durable;		/* an artifact version exists at this cutoff */
+	uint32_t	versions;		/* artifact versions that exist at this cutoff */
 } ArtifactFence;
 
 static ArtifactFence *artifact_fences;
@@ -14718,7 +14760,8 @@ artifact_fence_entry(uint32_t timeline, uint64_t lsn)
 	return &artifact_fences[nartifact_fences++];
 }
 
-/* An artifact version exists at this cutoff (append, or recovery replay). */
+/* One more artifact version exists at this cutoff (append, or recovery
+ * replay).  The fence lives as long as any version does. */
 static void
 artifact_fence_note(uint32_t timeline, uint64_t lsn)
 {
@@ -14728,8 +14771,32 @@ artifact_fence_note(uint32_t timeline, uint64_t lsn)
 		return;
 	pthread_mutex_lock(&artifact_fence_lock);
 	entry = artifact_fence_entry(timeline, lsn);
-	if (entry != NULL)
-		entry->durable = 1;
+	if (entry != NULL && entry->versions != UINT32_MAX)
+		entry->versions++;
+	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+/* One artifact version at this cutoff was retired by compaction.  The last
+ * one releases the fence, so the control era it named can be retired too. */
+static void
+artifact_fence_forget_version(uint32_t timeline, uint64_t lsn)
+{
+	if (lsn == 0)
+		return;
+	pthread_mutex_lock(&artifact_fence_lock);
+	if (nartifact_fences != UINT32_MAX)
+		for (uint32_t i = 0; i < nartifact_fences; i++)
+			if (artifact_fences[i].timeline == timeline &&
+				artifact_fences[i].lsn == lsn)
+			{
+				if (artifact_fences[i].versions != 0 &&
+					artifact_fences[i].versions != UINT32_MAX)
+					artifact_fences[i].versions--;
+				if (artifact_fences[i].versions == 0 &&
+					artifact_fences[i].pending == 0)
+					artifact_fences[i] = artifact_fences[--nartifact_fences];
+				break;
+			}
 	pthread_mutex_unlock(&artifact_fence_lock);
 }
 
@@ -14771,7 +14838,7 @@ artifact_fence_release(uint32_t timeline, uint64_t lsn)
 				if (artifact_fences[i].pending != 0)
 					artifact_fences[i].pending--;
 				if (artifact_fences[i].pending == 0 &&
-					!artifact_fences[i].durable)
+					artifact_fences[i].versions == 0)
 					artifact_fences[i] = artifact_fences[--nartifact_fences];
 				break;
 			}

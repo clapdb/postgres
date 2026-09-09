@@ -427,7 +427,14 @@ gate:
   pin shipped WAL until the horizon advances; treating the derived cutoff as
   that owner's page fence needs the owner to advance its pin before its
   marker, so a standing horizon can never lose its base;
-- SLRU-class object versions are still retained without a dedicated protocol.
+SLRU-class and reader-artifact versions now have their retention protocol:
+they are consumed as-of a horizon their consumer pinned first or a branch
+forked at, and a seed is a replay base (a horizon is served by the newest
+seed at or below it plus the WAL after it), so all of them follow the
+relation plan: the newest version at or below the floor and every
+page-history fence, everything above the floor, retried copies collapsing to
+one.  A retired artifact releases the control era it fenced
+(`pagestore_control_prune_test`).
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):

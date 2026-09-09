@@ -591,6 +591,11 @@ test_slru_seed_keeps_its_control_image(void)
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
 		  write_relation(0, 0, 2900) && write_control(0, 3000, 2800),
 		  "write three checkpoints before the seed");
+	/* The consumer that captures a seed pins its cutoff first; the seed
+	 * itself is retained by that pin and fences the control image. */
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 7, 1,
+					  PS_RETENTION_RESOURCE_ALL, 2000),
+		  "the seed's consumer pins the second checkpoint");
 	memset(page, 0x77, sizeof(page));
 	ps_lock_shard_wr(ps_shard_of(&seed));
 	check(append_page(0, &seed, 0, page, 2000, NULL) == 0,
@@ -831,6 +836,175 @@ test_checkpoint_note_is_the_page_cutoff(void)
 	remove_tree(store);
 }
 
+/* An object of any class, written as the backend's obj_write would. */
+static int
+write_object(uint32_t timeline, uint32_t klass, uint32_t object,
+			 uint32_t block, uint64_t version, unsigned char tag)
+{
+	PsKey key = {0, 0, object, 0, klass};
+	unsigned char page[8192];
+	int rc;
+
+	memset(page, tag, sizeof(page));
+	memcpy(page, &version, sizeof(version));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(timeline, &key, block, page, version, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
+/* Resolved version of an object at or below lsn, or 0 when none is left. */
+static uint64_t
+object_version_at(uint32_t timeline, uint32_t klass, uint32_t object,
+				  uint32_t block, uint64_t lsn)
+{
+	PsKey key = {0, 0, object, 0, klass};
+	unsigned char page[8192];
+	uint64_t version = 0;
+	int rc;
+
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	rc = read_resolve(timeline, &key, block, lsn, 0, page, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	if (rc != 1)
+		return 0;
+	memcpy(&version, page, sizeof(version));
+	return version;
+}
+
+/* SLRU seeds are replay bases and reader snapshots exact-horizon artifacts,
+ * consumed as-of a horizon their consumer pinned or a branch forked at.  Below
+ * the floor they survive as the newest version at or below such a fence; a
+ * retired artifact also releases the control era it fenced, and a dropped pin
+ * retires the artifacts only it protected. */
+static void
+test_stale_artifacts_are_retired(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-artifact-XXXXXX";
+	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsKey seed7 = {0, 0, 7, 0, PS_KLASS_SLRU};
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the artifact retention test");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 500),
+		  "a materializer owns the timeline");
+	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
+		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
+		  write_relation(0, 0, 2900) && write_checkpoint(0, 2800, 3000),
+		  "three checkpoints for the artifact retention test");
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 9, 1,
+					  PS_RETENTION_RESOURCE_ALL, 1500),
+		  "a reader pins the cutoff it captures its artifacts at");
+	check(write_object(0, PS_KLASS_SLRU, 7, 0, 1500, 0x71) &&
+		  write_object(0, PS_KLASS_SLRU, 7, 1, 1500, 0x72) &&
+		  write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500, 0x73) &&
+		  write_object(0, PS_KLASS_SLRU, 7, 0, 2500, 0x74) &&
+		  write_object(0, PS_KLASS_SLRU, 7, 0, 2500, 0x75) &&
+		  write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500, 0x76),
+		  "artifacts at the reader's cutoff and at a branch base (with a retry)");
+	check(create_branch(1, 0, 2500), "a branch forks at the second cutoff");
+	check(ps_test_artifact_fence_count(0) == 2,
+		  "both artifact cutoffs fence control images before compaction");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 3400),
+		  "the materializer moves its restart redo above every artifact");
+	run_maintenance(64);
+	/* The reader's pin is the floor, so everything at or above it stays,
+	 * retried copies included. */
+	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 1500 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500) == 1500 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
+		  ps_test_page_version_count(0, &seed7, 0) == 3 &&
+		  ps_test_artifact_fence_count(0) == 2,
+		  "artifacts at and above the reader's pin survive");
+	check(drop_pin(0, PS_RETENTION_OWNER_READER, 9, 1),
+		  "the reader releases its pin");
+	run_maintenance(64);
+	/* Only the branch's fork point remains below the floor: the seed page
+	 * that has a newer version at the fork point and the reader snapshot are
+	 * retired at 1500, while the seed page whose newest base at or below the
+	 * fork point is still the 1500 one survives as that base. */
+	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500) == 0,
+		  "a dropped pin retires the artifacts it protected below the floor");
+	check(object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 1500,
+		  "a seed page stays as the newest base below the branch's fork point");
+	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500) == 2500 &&
+		  ps_test_page_version_count(0, &seed7, 0) == 1,
+		  "artifacts at a live branch's fork point survive, one copy per cutoff");
+	check(ps_test_artifact_fence_count(0) == 2,
+		  "each cutoff with a surviving artifact still fences control images");
+	check(ps_test_page_version_count(0, &rel, 0) == 2,
+		  "relation history keeps the branch's base and the newest version");
+	close_store();
+	configure_core(1);
+	check(ps_core_open(store) == 0, "reopen the store after artifact pruning");
+	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 1500 &&
+		  ps_test_artifact_fence_count(0) == 2,
+		  "retired artifacts stay retired and the surviving bases persist across restart");
+	close_store();
+	remove_tree(store);
+}
+
+/* The live SLRU mirror, its truncation tombstones, and the visibility
+ * watermark are read as-of a horizon like relation pages, so they keep the
+ * newest version at or below every fence and the floor, and everything above
+ * the floor. */
+static void
+test_live_slru_mirror_follows_page_history(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-slrulive-XXXXXX";
+	PsKey live = {0, 0, 7, 0, PS_KLASS_SLRU_LIVE};
+	PsKey tomb = {0, 0, 7, 0, PS_KLASS_SLRU_TOMB};
+	PsKey wm = {0, 0, 0, 0, PS_KLASS_SLRU_WM};
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the live SLRU retention test");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 500),
+		  "a materializer owns the live-mirror timeline");
+	check(write_object(0, PS_KLASS_SLRU_LIVE, 7, 0, 1000, 0x11) &&
+		  write_object(0, PS_KLASS_SLRU_WM, 0, 0, 1100, 0x12) &&
+		  write_object(0, PS_KLASS_SLRU_TOMB, 7, 0, 1200, 0x13) &&
+		  write_object(0, PS_KLASS_SLRU_LIVE, 7, 0, 2000, 0x14) &&
+		  write_object(0, PS_KLASS_SLRU_WM, 0, 0, 2100, 0x15) &&
+		  write_object(0, PS_KLASS_SLRU_TOMB, 7, 0, 2200, 0x16) &&
+		  write_object(0, PS_KLASS_SLRU_LIVE, 7, 0, 3000, 0x17) &&
+		  write_object(0, PS_KLASS_SLRU_WM, 0, 0, 3100, 0x18),
+		  "three generations of live mirror, tombstone, and watermark");
+	check(create_branch(1, 0, 1500), "a branch forks inside the history");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 3500),
+		  "the materializer's restart redo passes the whole history");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &live, 0) == 2 &&
+		  object_version_at(0, PS_KLASS_SLRU_LIVE, 7, 0, 1500) == 1000 &&
+		  object_version_at(0, PS_KLASS_SLRU_LIVE, 7, 0, 3500) == 3000,
+		  "the live mirror keeps the branch's version and the newest one");
+	check(ps_test_page_version_count(0, &tomb, 0) == 2 &&
+		  object_version_at(0, PS_KLASS_SLRU_TOMB, 7, 0, 1500) == 1200 &&
+		  object_version_at(0, PS_KLASS_SLRU_TOMB, 7, 0, 3500) == 2200,
+		  "tombstones keep the branch's version and the newest one");
+	check(ps_test_page_version_count(0, &wm, 0) == 2 &&
+		  object_version_at(0, PS_KLASS_SLRU_WM, 0, 0, 1500) == 1100 &&
+		  object_version_at(0, PS_KLASS_SLRU_WM, 0, 0, 3500) == 3100,
+		  "the watermark keeps the branch's version and the newest one");
+	close_store();
+	remove_tree(store);
+}
+
 /* Independently versioned control blocks (materializer marker, checkpoints)
  * keep their own newest visible version, whether or not their LSNs coincide
  * with image versions the pair plan drops. */
@@ -893,6 +1067,8 @@ main(void)
 	test_failed_artifact_append_releases_its_fence();
 	test_materializer_pin_is_the_page_cutoff();
 	test_checkpoint_note_is_the_page_cutoff();
+	test_stale_artifacts_are_retired();
+	test_live_slru_mirror_follows_page_history();
 	test_independent_blocks_keep_their_newest();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
