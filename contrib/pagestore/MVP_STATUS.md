@@ -609,7 +609,7 @@ revision is reported in each job summary.  A
 run that cannot write its JSON report fails rather than passing with nothing
 to compare across nights.
 
-### 5. Composed crash and format-compatibility coverage -- partial
+### 5. Composed crash and format-compatibility coverage -- crash coverage composed; format fixtures started
 
 The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
 reclaim, timeline deletion, manifest replacement, fork-metadata publication,
@@ -618,9 +618,37 @@ deletion slice crashes on both sides of its first transition: before the
 DELETING record is durable the request is lost and the branch must survive
 intact, and after each later boundary the cleanup must resume.  Its workload
 seeds a live sibling branch with the same kind of private state, so cleanup
-that reached past its owner would be caught.  Before declaring the MVP
-repeatable, add a persisted-format fixture for restart/upgrade
-compatibility.
+that reached past its owner would be caught.
+
+The first persisted-format fixture slice is in place under the recommended
+D5 policy (fixtures for every format shipped after the MVP baseline;
+explicit migration for supported older versions; fail closed otherwise),
+which is still an open decision and is flagged as an assumption.  Every
+daemon-side format reports its compiled magic and version through
+`pagestore_format_versions`; `fixtures/posix-mvp-baseline` holds a captured
+store carrying page history and its cutoff, fork-size events on both sides of
+the cutoff plus a post-cutover source tail, a sealed shipped-WAL segment
+with a control note inside it, a compacted WAL-index interval with a fixed
+reader, a live branch, and a deleted branch.  `harness/pagestore_fixture.py
+--check` fails when the compiled identities differ from the fixture (a
+format change without a fixture update), reopens the fixture and runs its
+oracle across a restart, and applies thirty-six mutations (unknown newer
+version, checksum corruption, truncation) across the WAL store identity,
+sealed WAL segments, retention state and records, page and WAL-index
+frontiers, forkmeta and WAL-index snapshot manifests and payloads, the
+timelines log, the forkmeta source epoch, the layer manifest, and image
+layers.  Each is rejected at open except the documented torn-tail repairs of
+the timelines and layer manifest logs.  Two findings were fixed on the way:
+a store reopened at a new path was refused because layer locations recorded
+their absolute parent directory (a missing parent now rebases onto the
+store's own leaf; a foreign existing parent is still rejected), and a
+damaged forkmeta snapshot marker silently discarded acknowledged
+post-cutover events (a source epoch that conflicts with the selected
+snapshot now refuses to open).  One gap remains documented in the check:
+forkmeta source records carry no checksum, so corruption inside a record is
+caught only by the oracle.  Backend-side artifacts (reader manifests, branch
+bootstrap, materializer markers, the writer checkpoint block) and older
+format migrations remain for the next fixture slice.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it

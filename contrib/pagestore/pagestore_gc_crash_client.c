@@ -111,6 +111,17 @@
 #define FORKMETA_TRICKLE_REL 7000u
 #define FORKMETA_TRICKLE_RELS 400u
 
+/* fixture workload: every persisted family on one store, then a clean exit.
+ * The shipped WAL keeps one sealed segment because the control note's redo
+ * sits inside it, so the WAL segment format is part of the fixture. */
+#define FIXTURE_WAL_END (RECLAIM_SEGMENT + 64u * 1024u)
+#define FIXTURE_WAL_REDO (RECLAIM_SEGMENT / 2)
+#define FIXTURE_BRANCH 1u
+#define FIXTURE_DELETED_BRANCH 2u
+#define FIXTURE_FORK_LSN UINT64_C(65536)
+#define FIXTURE_TAIL_REL 8000u
+#define FIXTURE_TAIL_LSN UINT64_C(9000)
+
 static void *shm_base;
 static int shm_fd = -1;
 static int channel = -1;
@@ -392,18 +403,14 @@ forkmeta_create_grow(uint32_t rel, uint64_t lsn, uint32_t nblocks)
 		die("fork zero-extend failed");
 }
 
+/* Persisted fork-size events the segment log cannot re-derive: a create and
+ * an allocation-only growth below the page cutoff for every relation, then
+ * a truncate below the cutoff (even) or above it (odd). */
 static void
-forkmeta_seed(void)
+forkmeta_events_seed(void)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
-	unsigned char *page = malloc(page_size);
 
-	if (page == NULL)
-		die("out of memory");
-	page_history_seed(page);
-	/* Persisted fork-size events the segment log cannot re-derive: a create
-	 * and an allocation-only growth below the page cutoff for every
-	 * relation, then a truncate below the cutoff (even) or above it (odd). */
 	for (uint32_t i = 0; i < FORKMETA_RELS; i++)
 	{
 		forkmeta_create_grow(FORKMETA_FIRST_REL + i, 1000 + i, 4);
@@ -414,6 +421,17 @@ forkmeta_seed(void)
 		if (execute()->status != PS_STATUS_OK)
 			die("fork truncate failed");
 	}
+}
+
+static void
+forkmeta_seed(void)
+{
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	page_history_seed(page);
+	forkmeta_events_seed();
 	free(page);
 	arm_fault();
 	page_cutoff_pin();
@@ -434,11 +452,10 @@ forkmeta_seed(void)
 }
 
 static void
-forkmeta_verify(void)
+forkmeta_check(void)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
 
-	verify();
 	for (uint32_t i = 0; i < FORKMETA_RELS; i++)
 	{
 		set_forkmeta_relation(ch, i);
@@ -469,10 +486,19 @@ forkmeta_verify(void)
 	}
 }
 
+static void
+forkmeta_verify(void)
+{
+	verify();
+	forkmeta_check();
+}
+
 /* ---- wal_index workload ------------------------------------------------ */
 
+/* The WAL-index chains sit at base + {10, 30, 50, 70, 90, 110}; the fixed
+ * reader at base + 40 keeps the first chain exact. */
 static void
-walidx_pin_reader(void)
+walidx_pin_reader(uint64_t base)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
 
@@ -482,13 +508,13 @@ walidx_pin_reader(void)
 	ch->parent_timeline = PS_RETENTION_RESOURCE_WAL_INDEX;
 	ch->old_nblocks = 1;
 	ch->req_seq = WALIDX_READER;
-	ch->req_lsn = WALIDX_READER_LSN;
+	ch->req_lsn = base + WALIDX_READER_LSN;
 	if (execute()->status != PS_STATUS_OK)
 		die("fixed WAL-index reader registration failed");
 }
 
 static void
-walidx_seed(void)
+walidx_batch_add(uint64_t base)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
 	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
@@ -503,38 +529,61 @@ walidx_seed(void)
 	};
 
 	set_relation(ch);
-	ch->opcode = PS_OP_WAL_APPEND;
-	ch->req_lsn = 0;
-	ch->datalen = WALIDX_WAL_BYTES;
-	memset(ch->data, 0, WALIDX_WAL_BYTES);
-	if (execute()->status != PS_STATUS_OK)
-		die("WAL append failed");
-	walidx_pin_reader();
-	set_relation(ch);
 	for (uint32_t i = 0; i < 6; i++)
 	{
 		entries[i].key = ch->key;
 		entries[i].block = WALIDX_BLOCK;
 		entries[i].flags = flags[i];
-		entries[i].lsn = lsns[i];
-		entries[i].end_lsn = lsns[i] + 1;
+		entries[i].lsn = base + lsns[i];
+		entries[i].end_lsn = base + lsns[i] + 1;
 	}
 	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
 	ch->nblocks = 6;
 	ch->datalen = 6 * sizeof(*entries);
 	if (execute()->status != PS_STATUS_OK)
 		die("WAL-index batch add failed");
-	/* Arm before the commit that makes the interval a snapshot candidate:
-	 * nothing is published before progress moves, so this is the only
-	 * publication the daemon can reach. */
-	arm_fault();
+}
+
+static void
+walidx_commit(uint64_t end_lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
 	set_relation(ch);
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
 	ch->req_lsn = 0;
-	ch->req_seq = WALIDX_WAL_BYTES;
+	ch->req_seq = end_lsn;
 	if (execute()->status != PS_STATUS_OK)
 		die("WAL-index progress commit failed");
+}
+
+static void
+walidx_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = 0;
+	ch->datalen = WALIDX_WAL_BYTES;
+	memset(ch->data, 0, WALIDX_WAL_BYTES);
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL append failed");
+	walidx_pin_reader(0);
+	/* Arm before the commit that makes the interval a snapshot candidate:
+	 * nothing is published before progress moves, so this is the only
+	 * publication the daemon can reach. */
+	walidx_batch_add(0);
+	arm_fault();
+	walidx_commit(WALIDX_WAL_BYTES);
 	wait_forever();
+}
+
+static void
+walidx_batch_and_commit(uint64_t base, uint64_t end_lsn)
+{
+	walidx_batch_add(base);
+	walidx_commit(end_lsn);
 }
 
 /* ---- manifest_compact workload ----------------------------------------- */
@@ -1015,6 +1064,145 @@ delete_verify(void)
 	free(page);
 }
 
+/* ---- fixture workload -------------------------------------------------- */
+
+static void walidx_pin_reader(uint64_t base);
+static void walidx_batch_and_commit(uint64_t base, uint64_t end_lsn);
+static void walidx_check(uint64_t base, uint64_t end);
+static void write_control(uint32_t block, uint64_t version, uint64_t redo);
+static int wal_read_status(uint64_t lsn);
+
+static uint64_t
+fixture_create_branch(uint32_t timeline)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	parent_incarnation = 0;
+
+	if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE)
+		die("timeline 0 is not live");
+	set_relation(ch);
+	set_timeline(ch, timeline, 0);
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->parent_timeline = 0;
+	ch->req_lsn = FIXTURE_FORK_LSN;
+	ch->req_seq = parent_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch create failed");
+	return ch->incarnation;
+}
+
+static void
+fixture_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	lsn = 0;
+	uint64_t	incarnation;
+
+	if (page == NULL)
+		die("out of memory");
+	/* page history and persisted fork-size events, then the cutoff: every
+	 * event below the cutoff must land before its frontier is published,
+	 * because history below a durable frontier is refused */
+	page_history_seed(page);
+	forkmeta_events_seed();
+	page_cutoff_pin();
+	/* shipped WAL with one sealed segment that stays retained, a WAL-index
+	 * interval with a fixed reader, and the control note that derives the
+	 * WAL floor inside that segment */
+	while (lsn < FIXTURE_WAL_END)
+	{
+		set_relation(ch);
+		ch->opcode = PS_OP_WAL_APPEND;
+		ch->req_lsn = lsn;
+		ch->datalen = RECLAIM_CHUNK;
+		memset(ch->data, (int) (1 + lsn / RECLAIM_SEGMENT), RECLAIM_CHUNK);
+		if (execute()->status != PS_STATUS_OK)
+			die("WAL append failed");
+		lsn += RECLAIM_CHUNK;
+	}
+	/* the index interval lives above the WAL floor the note derives */
+	walidx_pin_reader(FIXTURE_WAL_REDO);
+	write_control(0, FIXTURE_WAL_END, FIXTURE_WAL_REDO);
+	write_control(1, FIXTURE_WAL_END, FIXTURE_WAL_REDO);
+	walidx_batch_and_commit(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
+	/* a live branch with its own page version, and a deleted branch */
+	incarnation = fixture_create_branch(FIXTURE_BRANCH);
+	delete_write_block(page, FIXTURE_BRANCH, incarnation, 0, 70000, 0x77);
+	incarnation = fixture_create_branch(FIXTURE_DELETED_BRANCH);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_DELETED_BRANCH, incarnation);
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->req_seq = incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("BEGIN_DELETE failed");
+	free(page);
+}
+
+/* Fork-size events appended after the snapshot cutover live in the source
+ * epoch's tail rather than in the checkpoint, so the fixture carries both. */
+static void
+fixture_extend(void)
+{
+	forkmeta_create_grow(FIXTURE_TAIL_REL, FIXTURE_TAIL_LSN, 2);
+}
+
+static void
+fixture_verify(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	verify();
+	forkmeta_check();
+	set_relation(ch);
+	ch->key.relNumber = FIXTURE_TAIL_REL;
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != 2)
+		die("fixture lost the fork-size events appended after the snapshot cutover");
+	walidx_check(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_END)
+		die("fixture WAL end changed");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_REDO)
+		die("fixture WAL retain floor changed");
+	if (wal_read_status(0) != PS_STATUS_OK ||
+		wal_read_status(RECLAIM_SEGMENT) != PS_STATUS_OK)
+		die("fixture shipped WAL is not readable");
+	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation == 0)
+		die("fixture branch is not live");
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x77))
+		die_page("fixture branch lost its own page version", 0, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 1;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch inherited read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 1))
+		die_page("fixture branch lost its inherited page", 1, page);
+	if (timeline_state(FIXTURE_DELETED_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
+		die("fixture deleted branch is not DELETED");
+	free(page);
+}
+
 /* ---- wal_reclaim workload ---------------------------------------------- */
 
 static void
@@ -1155,8 +1343,10 @@ walidx_get(uint64_t lsn_max, PsWalRec *out, uint32_t max_out, int *count)
 	return ch->status;
 }
 
+/* Reads at the durable frontier (end) see the compacted chains; a read at
+ * the reader's exact pin sees its chain; unrepresented points are refused. */
 static void
-walidx_verify(void)
+walidx_check(uint64_t base, uint64_t end)
 {
 	PsWalRec	out[8];
 	struct timespec pause_interval = {0, 20000000};
@@ -1168,8 +1358,7 @@ walidx_verify(void)
 	 * wait. */
 	for (int i = 0; i < 500; i++)
 	{
-		if (walidx_get(WALIDX_WAL_BYTES, out, 8, &count) == PS_STATUS_OK &&
-			count == 4)
+		if (walidx_get(end, out, 8, &count) == PS_STATUS_OK && count == 4)
 		{
 			compacted = 1;
 			break;
@@ -1185,6 +1374,8 @@ walidx_verify(void)
 	/* The seeded tuples, not only their positions: a recovery that keeps the
 	 * LSNs but drops an end position, a flag or the source timeline no longer
 	 * describes chains WAL replay can follow. */
+	if (out[0].lsn != base + 10 || out[1].lsn != base + 30 ||
+		out[2].lsn != base + 90 || out[3].lsn != base + 110)
 	{
 		const uint64_t expect_lsn[] = {10, 30, 90, 110};
 		const uint32_t expect_flags[] = {
@@ -1213,8 +1404,10 @@ walidx_verify(void)
 		out[0].flags != (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) ||
 		out[1].flags != PS_WAL_INDEX_FLAG_KNOWN ||
 		out[0].timeline != 0 || out[1].timeline != 0)
+	if (walidx_get(base + WALIDX_READER_LSN, out, 8, &count) != PS_STATUS_OK ||
+		count != 2 || out[0].lsn != base + 10 || out[1].lsn != base + 30)
 		die("recovery lost the fixed reader's retained WAL-index chain");
-	if (walidx_get(WALIDX_DROPPED_LSN, out, 8, &count) == PS_STATUS_OK)
+	if (walidx_get(base + WALIDX_DROPPED_LSN, out, 8, &count) == PS_STATUS_OK)
 		die("recovery resurrected a WAL-index point below the durable frontier");
 	/* The retained pin must still be the seeded reader itself.  A pin that
 	 * kept the horizon but lost its owner identity leaves the real owner
@@ -1235,6 +1428,12 @@ walidx_verify(void)
 			ch->req_lsn != WALIDX_READER_LSN)
 			die("recovery changed the seeded WAL-index reader's identity");
 	}
+}
+
+static void
+walidx_verify(void)
+{
+	walidx_check(0, WALIDX_WAL_BYTES);
 }
 
 static uint64_t
@@ -1349,24 +1548,35 @@ main(int argc, char **argv)
 		else
 			die("usage: --shm NAME --mode seed|verify "
 				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
-				"timeline_delete_abort|manifest_compact|forkmeta] "
+				"timeline_delete_abort|manifest_compact|forkmeta|fixture] "
 				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
-		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0) ||
+		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0 &&
+		 (strcmp(mode, "extend") != 0 || strcmp(workload, "fixture") != 0)) ||
 		(strcmp(workload, "page_prune") != 0 &&
 		 strcmp(workload, "wal_index") != 0 &&
 		 strcmp(workload, "wal_reclaim") != 0 &&
 		 strcmp(workload, "timeline_delete") != 0 &&
 		 strcmp(workload, "timeline_delete_abort") != 0 &&
 		 strcmp(workload, "manifest_compact") != 0 &&
-		 strcmp(workload, "forkmeta") != 0))
+		 strcmp(workload, "forkmeta") != 0 &&
+		 strcmp(workload, "fixture") != 0))
 		die("usage: --shm NAME --mode seed|verify "
 			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
-			"timeline_delete_abort|manifest_compact|forkmeta] "
+			"timeline_delete_abort|manifest_compact|forkmeta|fixture] "
 			"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
-	if (strcmp(workload, "forkmeta") == 0)
+	if (strcmp(workload, "fixture") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			fixture_seed();
+		else if (strcmp(mode, "extend") == 0)
+			fixture_extend();
+		else
+			fixture_verify();
+	}
+	else if (strcmp(workload, "forkmeta") == 0)
 	{
 		if (strcmp(mode, "seed") == 0)
 			forkmeta_seed();

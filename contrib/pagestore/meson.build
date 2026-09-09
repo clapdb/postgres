@@ -93,6 +93,18 @@ contrib_targets += pagestore_layer_crash_client
 # harness slice: history below a configured cutoff is compacted, and the
 # scenarios crash at the replacement publication, the source mark-delete, and
 # the durable frontier advance.
+pagestore_format_versions = executable('pagestore_format_versions',
+  files('pagestore_format_versions.c', 'pagestore_core.c', 'pagestore_fault.c',
+        'storage_posix.c', 'pagestore_layer.c', 'pagestore_store_owner.c',
+        'pagestore_layer_store.c', 'pagestore_manifest.c', 'pagestore_memtable.c',
+        'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_retention.c',
+        'pagestore_wal_store.c', 'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+
 pagestore_gc_crash_client = executable('pagestore_gc_crash_client',
   files('pagestore_gc_crash_client.c'),
   kwargs: default_bin_args,
@@ -707,6 +719,22 @@ foreach layer_fault_scenario : [
     timeout: 60,
   )
 endforeach
+# Persisted-format fixture: the compiled identities must match the committed
+# fixture, the fixture must reopen with its oracle intact, and every declared
+# mutation must be rejected as documented.
+test('pagestore_persisted_format_fixture',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_fixture.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline',
+         '--daemon-binary', pagestore_daemon,
+         '--client-binary', pagestore_gc_crash_client,
+         '--inspect-binary', pagestore_inspect,
+         '--format-tool', pagestore_format_versions],
+  depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect,
+            pagestore_format_versions],
+  suite: ['pagestore'],
+  timeout: 300,
+)
 foreach prune_fault_scenario : [
   'page_prune_after_frontier',
   'page_compaction_after_publish',

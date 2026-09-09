@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_format.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
 #include "pagestore_memtable.h"
@@ -7256,6 +7257,61 @@ fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
 	}
 }
 
+/* A source epoch that does not start with the selected generation's marker
+ * is only legitimate when it is the pre-cutover log the snapshot already
+ * captured: the publication froze appends at the snapshot's freeze sequence,
+ * so such a log holds no event admitted after it and no marker of the
+ * selected or a later generation.  Anything else means the marker was damaged
+ * after acknowledged post-cutover events were appended; discarding the epoch
+ * would silently lose them, so refuse to open instead. */
+static int
+fork_meta_source_conflicts_with_snapshot(void)
+{
+	uint64_t	off = 0;
+
+	for (;;)
+	{
+		ForkMetaRecV2 rec;
+		int			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+
+		if (nread == 0)
+			return 0;
+		if (nread < 0)
+			return 1;
+		if (nread != (int) sizeof(rec))
+			return 0;			/* a torn tail is the unacknowledged crash tail */
+		if (rec.magic != FORK_META_V2_MAGIC || rec.rec_len != sizeof(rec))
+		{
+			fprintf(stderr, "pagestore: forkmeta source epoch record at %llu is not "
+					"a V2 record while snapshot generation %llu is selected\n",
+					(unsigned long long) off,
+					(unsigned long long) fork_meta_snapshot_generation);
+			return 1;
+		}
+		if (rec.kind == FEV_SNAPSHOT_BASE &&
+			rec.order_id >= fork_meta_snapshot_generation)
+		{
+			fprintf(stderr, "pagestore: forkmeta source epoch carries a damaged or "
+					"newer snapshot marker (generation %llu, selected %llu)\n",
+					(unsigned long long) rec.order_id,
+					(unsigned long long) fork_meta_snapshot_generation);
+			return 1;
+		}
+		if (rec.kind != FEV_SNAPSHOT_BASE &&
+			rec.admission_seq > fork_meta_snapshot_freeze_seq)
+		{
+			fprintf(stderr, "pagestore: forkmeta source epoch holds an event admitted "
+					"after snapshot generation %llu froze (%llu > %llu) but no "
+					"matching marker; refusing to discard it\n",
+					(unsigned long long) fork_meta_snapshot_generation,
+					(unsigned long long) rec.admission_seq,
+					(unsigned long long) fork_meta_snapshot_freeze_seq);
+			return 1;
+		}
+		off += sizeof(rec);
+	}
+}
+
 /* The selected snapshot owns the entire old epoch, including its captured
  * future tail.  Preserve a matching new epoch byte-for-byte; otherwise replace
  * the whole source with a marker-only epoch. */
@@ -7305,6 +7361,8 @@ fork_meta_snapshot_reconcile_source(void)
 		free(rewritten.data);
 		return 0;
 	}
+	if (fork_meta_source_conflicts_with_snapshot())
+		goto fail;
 	if (rewritten.len > UINT32_MAX || ps_storage->fork_meta_rewrite == NULL ||
 		ps_storage->fork_meta_rewrite(rewritten.data, (uint32_t) rewritten.len) != 0)
 		goto fail;
@@ -19170,4 +19228,24 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	__atomic_store_n(&core_opened, 1, __ATOMIC_RELEASE);
 
 	return 0;
+}
+
+size_t
+ps_core_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"page_frontier", "page-prune.frontiers", PS_PAGE_FRONTIER_MAGIC,
+		 PS_PAGE_FRONTIER_VERSION},
+		{"walidx_frontier", "walidx-prune.frontiers", PS_WALIDX_FRONTIER_MAGIC,
+		 PS_WALIDX_FRONTIER_VERSION},
+		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 2},
+		{"forkmeta", "forkmeta record", FORK_META_V2_MAGIC, 2},
+		{"forkmeta_snapshot", "forkmeta checkpoint/tail payload",
+		 FORK_META_SNAPSHOT_PAYLOAD_MAGIC, FORK_META_SNAPSHOT_PAYLOAD_VERSION},
+		{"walidx_snapshot", "walidx snapshot shard payload",
+		 WALIDX_SNAPSHOT_PAYLOAD_MAGIC, WALIDX_SNAPSHOT_PAYLOAD_VERSION},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
 }

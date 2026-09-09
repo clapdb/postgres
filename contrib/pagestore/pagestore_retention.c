@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "pagestore_retention.h"
+#include "pagestore_format.h"
 
 #define PS_RETENTION_MAGIC		0x4e544552	/* "RETN" */
 #define PS_RETENTION_VERSION	2
@@ -1646,4 +1647,16 @@ ps_retention_generation_stale(uint32_t timeline, uint32_t owner_kind,
 		rc = 1;
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
+}
+
+size_t
+ps_retention_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"retention", "retention.state", PS_RETENTION_STATE_MAGIC, PS_RETENTION_VERSION},
+		{"retention", "retention.meta record", PS_RETENTION_MAGIC, PS_RETENTION_VERSION},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
 }

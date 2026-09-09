@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "pagestore_manifest.h"
+#include "pagestore_format.h"
 #include "pagestore_fault.h"
 #include "pagestore_store_owner.h"
 
@@ -1214,6 +1215,17 @@ ps_manifest_should_compact(void)
  * compacted log; both replay to the same layer map.  Caller must hold the state
  * stable (no concurrent map mutation) across this.
  */
+size_t
+ps_manifest_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"manifest", "layers.manifest record", PS_MANIFEST_MAGIC, PS_MANIFEST_VERSION},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
+}
+
 int
 ps_manifest_compact(void)
 {

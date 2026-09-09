@@ -12,6 +12,7 @@
 
 #include "pagestore_fault.h"
 #include "pagestore_wal_store.h"
+#include "pagestore_format.h"
 
 static int segment_name(const PsWalStore *store, uint64_t segment_no,
 						char *name, size_t name_len);
@@ -1952,4 +1953,16 @@ ps_wal_store_close(PsWalStore *store)
 	}
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
+}
+
+size_t
+ps_wal_store_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"wal_store", "wal_store_identity_v1", PS_WAL_STORE_METADATA_MAGIC,
+		 PS_WAL_STORE_METADATA_VERSION},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
 }

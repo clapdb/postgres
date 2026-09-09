@@ -80,6 +80,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_store_test pagestore_layer_store_test.c pagestore_layer_store.c pagestore_layer.c pagestore_fault.c pagestore_store_owner.c -lrt -pthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_crash_client pagestore_layer_crash_client.c -lrt -pthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_gc_crash_client pagestore_gc_crash_client.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_format_versions pagestore_format_versions.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_tiering_test pagestore_tiering_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_cutover_test pagestore_forkmeta_cutover_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_crash_matrix_test pagestore_forkmeta_crash_matrix_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
@@ -171,6 +172,16 @@ jobs:
               --gc-client-binary ./pagestore_gc_crash_client \
               --inspect-binary ./pagestore_inspect
           done
+
+      - name: Check persisted-format fixtures
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_fixture.py \
+            --check fixtures/posix-mvp-baseline \
+            --daemon-binary ./pagestore_daemon \
+            --client-binary ./pagestore_gc_crash_client \
+            --inspect-binary ./pagestore_inspect \
+            --format-tool ./pagestore_format_versions
 
       - name: Run image-layer unit test
         working-directory: contrib/pagestore
