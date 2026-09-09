@@ -26,6 +26,7 @@
 
 #include "pagestore_core.h"
 #include "pagestore_forkmeta_snapshot.h"
+#include "pagestore_manifest.h"
 
 #define TEST_SNAPSHOT_MAGIC 0x31534d46U
 
@@ -652,12 +653,66 @@ test_frontier_less_branch_caps_cutoff(void)
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
+static uint32_t
+live_image_layers(uint32_t timeline)
+{
+	uint32_t	n = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline &&
+			ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting)
+			n++;
+	return n;
+}
+
+/* A dropped relation whose layers hold nothing else: compaction must retire
+ * those layers and its versions even though nothing survives to publish. */
+static void
+test_dropped_relation_retires_its_layers(void)
+{
+	char		store[] = "/tmp/pagestore-lifecycle-drop-XXXXXX";
+	unsigned char tag = 0;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the drop test");
+	check(fork_op(PS_OP_CREATE, 1000, 0, 0) &&
+		  fork_op(PS_OP_ZEROEXTEND, 1010, 3, 0) &&
+		  write_page(0, 1020, 0xE0) && write_page(1, 1030, 0xE1) &&
+		  write_page(2, 1040, 0xE2),
+		  "write a relation into its own layers");
+	check(live_image_layers(0) > 0, "the relation's layers are live");
+	check(fork_op(PS_OP_UNLINK, 2000, 0, 0), "drop the relation");
+	check(reserve_pin(PS_RETENTION_OWNER_MATERIALIZER, 1, 1, 2500),
+		  "materializer cutoff above the drop");
+	for (int i = 0; i < 64 && (live_image_layers(0) != 0 ||
+							   ps_test_page_version_count(0, &rel_key, 0) != 0); i++)
+		(void) ps_core_maintenance();
+	check(ps_test_page_version_count(0, &rel_key, 0) == 0 &&
+		  ps_test_page_version_count(0, &rel_key, 1) == 0 &&
+		  ps_test_page_version_count(0, &rel_key, 2) == 0,
+		  "every version of the dropped relation leaves the index");
+	check(live_image_layers(0) == 0,
+		  "layers that held only the dropped relation are retired");
+	check(read_tag_at(0, 2500, &tag) == 0,
+		  "the dropped relation still reads as absent");
+	close_store();
+	configure_core();
+	check(ps_core_open(store) == 0 && live_image_layers(0) == 0 &&
+		  read_tag_at(0, 2500, &tag) == 0,
+		  "recovery keeps the retired layers gone and the relation absent");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
 	test_truncate_churn_is_bounded();
 	test_reader_pin_keeps_invalidated_history();
 	test_frontier_less_branch_caps_cutoff();
+	test_dropped_relation_retires_its_layers();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

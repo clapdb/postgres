@@ -453,6 +453,105 @@ test_wal_only_pin_release_reschedules(void)
 	remove_tree(store);
 }
 
+/* An SLRU seed shipped at an older cutoff keeps the control image it
+ * resolves its era from, across compaction and restart, while newer
+ * unreferenced checkpoints are still retired. */
+static void
+test_slru_seed_keeps_its_control_image(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-seed-XXXXXX";
+	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
+	unsigned char page[8192];
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the SLRU seed test");
+	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
+		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
+		  write_relation(0, 0, 2900) && write_control(0, 3000, 2800),
+		  "write three checkpoints before the seed");
+	memset(page, 0x77, sizeof(page));
+	ps_lock_shard_wr(ps_shard_of(&seed));
+	check(append_page(0, &seed, 0, page, 2000, NULL) == 0,
+		  "ship an SLRU seed snapshot at the second checkpoint");
+	ps_unlock_shard(ps_shard_of(&seed));
+	check(ps_storage->sync() == 0, "sync the seed");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 3500),
+		  "materializer cutoff above every checkpoint");
+	run_maintenance(64);
+	{
+		uint64_t version = 0;
+
+		check(read_control_at(0, 0, 2000, &version) && version == 2000,
+			  "the seed's control image survives compaction");
+		check(wal_floor(0) == 1800,
+			  "the WAL floor is bounded by the seed's checkpoint, not older ones");
+	}
+	close_store();
+	configure_core(1);
+	check(ps_core_open(store) == 0, "reopen the seeded store");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 3600),
+		  "advance the cutoff after restart");
+	run_maintenance(64);
+	{
+		uint64_t version = 0;
+
+		check(read_control_at(0, 0, 2000, &version) && version == 2000,
+			  "recovery rebuilds the seed fence before pruning again");
+	}
+	close_store();
+	remove_tree(store);
+}
+
+/* Independently versioned control blocks (materializer marker, checkpoints)
+ * keep their own newest visible version, whether or not their LSNs coincide
+ * with image versions the pair plan drops. */
+static void
+test_independent_blocks_keep_their_newest(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-marker-XXXXXX";
+	PsKey key = control_key();
+	unsigned char page[8192];
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the marker test");
+	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
+		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
+		  write_relation(0, 0, 2900) && write_control(0, 3000, 2800),
+		  "write three checkpoints for the marker test");
+	ps_lock_shard_wr(ps_shard_of(&key));
+	for (uint64_t version = 1000; version <= 3000; version += 500)
+	{
+		memset(page, 0, sizeof(page));
+		memcpy(page, &version, sizeof(version));
+		check(append_page(0, &key, 3, page, version, NULL) == 0,
+			  "write a materializer marker version");
+	}
+	ps_unlock_shard(ps_shard_of(&key));
+	check(ps_storage->sync() == 0, "sync the markers");
+	check(ps_test_page_version_count(0, &key, 3) == 5,
+		  "five marker versions before compaction");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 3500),
+		  "materializer cutoff above every marker");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &key, 3) == 1,
+		  "only the newest marker survives the cutoff");
+	{
+		uint64_t version = 0;
+
+		check(read_control_at(0, 3, 3500, &version) && version == 3000,
+			  "the newest marker is the one retained");
+		check(read_control_at(0, 0, 3500, &version) && version == 3000,
+			  "the image plan is unaffected by the marker block");
+	}
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -462,6 +561,8 @@ main(void)
 	test_split_pair_is_never_unnoted();
 	test_retry_copies_collapse();
 	test_wal_only_pin_release_reschedules();
+	test_slru_seed_keeps_its_control_image();
+	test_independent_blocks_keep_their_newest();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

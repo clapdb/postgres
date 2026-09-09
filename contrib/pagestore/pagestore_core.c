@@ -401,9 +401,12 @@ static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
 static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								uint32_t *nfences_out);
-/* Retention plan for one control object, computed over the image block's
- * complete version chain and applied to every block of the pair. */
+/* Retention plan for one control block chain.  Blocks 0-2 (image, redo-floor
+ * note, admission fence) are written as a same-version group and follow the
+ * image block's plan; higher blocks (materializer marker, release and writer
+ * checkpoints) are versioned independently and plan their own chain. */
 #define PS_CONTROL_IMAGE_BLOCK 0u
+#define PS_CONTROL_PAIRED_BLOCKS 3u
 typedef struct PsControlChainPlan
 {
 	PsPruneVersion *chain;
@@ -414,8 +417,9 @@ typedef struct PsControlChainPlan
 } PsControlChainPlan;
 
 static int control_chain_plan(uint32_t timeline, const PsKey *key,
-							  uint64_t floor, const PsPruneFence *fences,
-							  uint32_t nfences, PsControlChainPlan *plan);
+							  uint32_t block, uint64_t floor,
+							  const PsPruneFence *fences, uint32_t nfences,
+							  PsControlChainPlan *plan);
 struct PageEnt;
 static int control_chain_keeps(const PsControlChainPlan *plan,
 							   const struct PageEnt *entry, uint32_t block,
@@ -2556,8 +2560,11 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		{
 			PsControlChainPlan plan;
 
-			if (control_chain_plan(timeline, &order[first].key, floor,
-								   control_fences, ncontrol_fences, &plan) != 0)
+			if (control_chain_plan(timeline, &order[first].key,
+								   order[first].block < PS_CONTROL_PAIRED_BLOCKS ?
+								   PS_CONTROL_IMAGE_BLOCK : order[first].block,
+								   floor, control_fences, ncontrol_fences,
+								   &plan) != 0)
 			{
 				free(order);
 				free(versions);
@@ -2768,13 +2775,22 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		goto cleanup;
 	scanned = nrec;
 	if (prune_compaction_records(timeline, recs, &nrec, page_floor,
-								 &dropped, &ndropped) != 0 || nrec == 0)
+								 &dropped, &ndropped) != 0)
+		goto cleanup;
+	/* Every source version can be invalidated (a dropped relation whose
+	 * layers hold nothing else).  That is a complete result, not a failure:
+	 * there is no replacement to publish, but the frontier still advances,
+	 * the versions leave the index, and the sources are retired; otherwise
+	 * drop/recreate churn would keep every such layer alive forever. */
+	if (nrec == 0 && ndropped == 0)
 		goto cleanup;
 	frontier_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (frontier_seq != 0)
 		frontier_seq--;
 
 	/* install the new merged layer durably, THEN delete the old ones */
+	if (nrec != 0)
+	{
 	nid = alloc_layer_id(&g_shards[shard]);
 	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size,
 							 &newdesc) != 0)
@@ -2817,18 +2833,20 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			newdesc.remote_uploaded_lsn = newdesc.lsn_end;
 			break;
 		}
+	}
 	/* Reject later pins/branches below this cutoff before the pruned layer can
 	 * become durable and visible.  Advancing conservatively when publication
 	 * later fails is safe; admitting already-reclaimed history is not. */
 	if (ndropped != 0 &&
 		page_frontier_advance(timeline, page_floor, frontier_seq) != 0)
 	{
-		(void) ps_layer_store->delete_local_layer(&newdesc);
+		if (nrec != 0)
+			(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
 	}
 	if (ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) != 0)
 		goto cleanup;
-	if (record_layer(NULL, &newdesc) != 0)
+	if (nrec != 0 && record_layer(NULL, &newdesc) != 0)
 	{
 		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
@@ -3157,9 +3175,13 @@ typedef struct ForkEnt
 	int			has_wal_less;	/* at least one page version has lsn 0 */
 } ForkEnt;
 
+static void artifact_fence_reset(void);
+static void artifact_fence_note(uint32_t timeline, uint64_t lsn);
+
 static void
 free_page_fork_indexes(void)
 {
+	artifact_fence_reset();
 	for (uint32_t sh = 0; sh < MAX_SHARDS; sh++)
 	{
 		Shard *s = &g_shards[sh];
@@ -4352,6 +4374,8 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
 	e->nver++;
+	if (key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_READER_SNAPSHOT)
+		artifact_fence_note(timeline, lsn);
 	if (lsn > fork->last_page_lsn ||
 		(lsn == fork->last_page_lsn && admission_seq > fork->last_page_seq))
 	{
@@ -13898,11 +13922,11 @@ prune_version_cmp(const void *va, const void *vb)
  * the shard write lock.
  */
 static int
-control_chain_plan(uint32_t timeline, const PsKey *key, uint64_t floor,
-				   const PsPruneFence *fences, uint32_t nfences,
-				   PsControlChainPlan *plan)
+control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
+				   uint64_t floor, const PsPruneFence *fences,
+				   uint32_t nfences, PsControlChainPlan *plan)
 {
-	PageEnt    *e = page_find(timeline, key, PS_CONTROL_IMAGE_BLOCK);
+	PageEnt    *e = page_find(timeline, key, block);
 	unsigned char *keep;
 	uint32_t	n;
 
@@ -13967,12 +13991,14 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 	for (uint32_t i = 0; i < plan->nkept; i++)
 		if (plan->kept[i].lsn == v->lsn)
 		{
-			if (block == PS_CONTROL_IMAGE_BLOCK)
+			/* The image block, and every independently versioned block that
+			 * planned its own chain, keep exactly the planned tuple. */
+			if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
 				return plan->kept[i].admission_seq == v->admission_seq;
 			lsn_retained = 1;
 			break;
 		}
-	if (block == PS_CONTROL_IMAGE_BLOCK)
+	if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
 		return 0;
 	if (!lsn_retained)
 	{
@@ -14034,6 +14060,110 @@ prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
 								   horizon.admission_seq))
 			return 1;
 	}
+	return 0;
+}
+
+/*
+ * Reader-artifact versions (SLRU seed snapshots, exact-R reader snapshots)
+ * fence control images, but compaction owns only one shard's write lock
+ * while every shard's page index may be mutated by its own writer.  The
+ * writer therefore registers each artifact version under its shard lock in
+ * this leaf-locked registry, which compaction reads without touching other
+ * shards.  Artifacts are never pruned yet, so the registry only grows and is
+ * rebuilt by recovery through the same insertion path.
+ */
+typedef struct ArtifactFence
+{
+	uint32_t	timeline;
+	uint64_t	lsn;
+} ArtifactFence;
+
+static ArtifactFence *artifact_fences;
+static uint32_t nartifact_fences;
+static uint32_t artifact_fence_cap;
+static pthread_mutex_t artifact_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+artifact_fence_note(uint32_t timeline, uint64_t lsn)
+{
+	if (lsn == 0)
+		return;
+	pthread_mutex_lock(&artifact_fence_lock);
+	for (uint32_t i = 0; i < nartifact_fences; i++)
+		if (artifact_fences[i].timeline == timeline &&
+			artifact_fences[i].lsn == lsn)
+		{
+			pthread_mutex_unlock(&artifact_fence_lock);
+			return;
+		}
+	if (nartifact_fences == artifact_fence_cap)
+	{
+		uint32_t	ncap = artifact_fence_cap != 0 ? artifact_fence_cap * 2 : 64;
+		ArtifactFence *grown = realloc(artifact_fences,
+									   (size_t) ncap * sizeof(*grown));
+
+		if (grown == NULL)
+		{
+			/* Fail closed: an unrecorded artifact must not lose its control
+			 * image.  Poisoning the registry makes control pruning retain
+			 * everything until the next open rebuilds it. */
+			nartifact_fences = UINT32_MAX;
+			pthread_mutex_unlock(&artifact_fence_lock);
+			return;
+		}
+		artifact_fences = grown;
+		artifact_fence_cap = ncap;
+	}
+	if (nartifact_fences != UINT32_MAX)
+	{
+		artifact_fences[nartifact_fences].timeline = timeline;
+		artifact_fences[nartifact_fences].lsn = lsn;
+		nartifact_fences++;
+	}
+	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+static void
+artifact_fence_reset(void)
+{
+	pthread_mutex_lock(&artifact_fence_lock);
+	free(artifact_fences);
+	artifact_fences = NULL;
+	nartifact_fences = 0;
+	artifact_fence_cap = 0;
+	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+/* Copy this timeline's artifact fences.  Returns -1 when the registry is
+ * poisoned or memory is short; the caller must then retain everything. */
+static int
+artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
+						uint32_t *n_out)
+{
+	uint64_t   *lsns = NULL;
+	uint32_t	n = 0;
+
+	pthread_mutex_lock(&artifact_fence_lock);
+	if (nartifact_fences == UINT32_MAX)
+	{
+		pthread_mutex_unlock(&artifact_fence_lock);
+		return -1;
+	}
+	if (nartifact_fences != 0)
+	{
+		lsns = malloc((size_t) nartifact_fences * sizeof(*lsns));
+		if (lsns == NULL)
+		{
+			pthread_mutex_unlock(&artifact_fence_lock);
+			return -1;
+		}
+		for (uint32_t i = 0; i < nartifact_fences; i++)
+			if (artifact_fences[i].timeline == timeline)
+				lsns[n++] = artifact_fences[i].lsn;
+	}
+	pthread_mutex_unlock(&artifact_fence_lock);
+	*lsns_out = lsns;
+	*n_out = n;
 	return 0;
 }
 
@@ -14108,7 +14238,6 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	uint32_t npins = 0;
 	PsPruneFence *fences;
 	uint32_t nfences = 0;
-	uint32_t artifact_cap = 0;
 
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
 		return -1;
@@ -14154,46 +14283,37 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	 * retained artifact version must survive with it.  Until SLRU history has
 	 * its own retention protocol this bounds control retention, and the WAL
 	 * floor derived from it, by the oldest retained seed. */
-	for (uint32_t sh = 0; sh < core_shards(); sh++)
-		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
-			for (PageEnt *e = g_shards[sh].page_idx[bucket]; e; e = e->next)
+	{
+		uint64_t   *artifacts = NULL;
+		uint32_t	nartifacts = 0;
+
+		if (artifact_fence_snapshot(timeline, &artifacts, &nartifacts) != 0)
+		{
+			free(fences);
+			return -1;
+		}
+		if (nartifacts != 0)
+		{
+			PsPruneFence *grown = realloc(fences,
+										  (size_t) (npins + MAX_TIMELINES +
+													nartifacts) * sizeof(*fences));
+
+			if (grown == NULL)
 			{
-				if (e->timeline != timeline ||
-					(e->key.klass != PS_KLASS_SLRU &&
-					 e->key.klass != PS_KLASS_READER_SNAPSHOT))
-					continue;
-				for (int i = 0; i < e->nver; i++)
-				{
-					uint64_t	lsn = e->vers[i].lsn;
-					int			seen = 0;
-
-					if (lsn == 0)
-						continue;
-					for (uint32_t f = 0; f < nfences && !seen; f++)
-						seen = fences[f].lsn == lsn &&
-							fences[f].admission_seq == UINT64_MAX;
-					if (seen)
-						continue;
-					if (nfences == npins + MAX_TIMELINES + artifact_cap)
-					{
-						PsPruneFence *grown;
-
-						artifact_cap = artifact_cap != 0 ? artifact_cap * 2 : 64;
-						grown = realloc(fences, (size_t) (npins + MAX_TIMELINES +
-														  artifact_cap) *
-										sizeof(*fences));
-						if (grown == NULL)
-						{
-							free(fences);
-							return -1;
-						}
-						fences = grown;
-					}
-					fences[nfences].lsn = lsn;
-					fences[nfences].admission_seq = UINT64_MAX;
-					nfences++;
-				}
+				free(artifacts);
+				free(fences);
+				return -1;
 			}
+			fences = grown;
+			for (uint32_t i = 0; i < nartifacts; i++)
+			{
+				fences[nfences].lsn = artifacts[i];
+				fences[nfences].admission_seq = UINT64_MAX;
+				nfences++;
+			}
+		}
+		free(artifacts);
+	}
 	*fences_out = fences;
 	*nfences_out = nfences;
 	return 0;

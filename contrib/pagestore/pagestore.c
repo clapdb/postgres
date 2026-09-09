@@ -2108,7 +2108,23 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
 									  (uint64) lsn, &recs);
 	if (n == 0)
-		PG_RETURN_NULL();
+	{
+		/* WAL-index compaction leaves no record at all for a page whose
+		 * durable stored version covers every visible record; that stored
+		 * version is then the base. */
+		page = palloc(BLCKSZ);
+		if (pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
+											 (uint64) lsn, page))
+		{
+			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+			memcpy(VARDATA(result), page, BLCKSZ);
+		}
+		pfree(page);
+		if (result == NULL)
+			PG_RETURN_NULL();
+		PG_RETURN_BYTEA_P(result);
+	}
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -2336,7 +2352,23 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
 									  (uint64) lsn, &recs);
 	if (n == 0)
+	{
+		/* No record survives WAL-index compaction: the durable stored version
+		 * at or below lsn already is the page as of lsn, including a later
+		 * truncate or drop, which the store answers as "no content". */
+		page = palloc(BLCKSZ);
+		if (pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
+											 (uint64) lsn, page))
+		{
+			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+			memcpy(VARDATA(result), page, BLCKSZ);
+			pfree(page);
+			PG_RETURN_BYTEA_P(result);
+		}
+		pfree(page);
 		PG_RETURN_NULL();
+	}
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
