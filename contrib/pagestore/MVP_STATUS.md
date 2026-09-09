@@ -427,8 +427,13 @@ gate:
   pin shipped WAL until the horizon advances; treating the derived cutoff as
   that owner's page fence needs the owner to advance its pin before its
   marker, so a standing horizon can never lose its base;
-- SLRU-class object versions are still retained without a dedicated protocol;
-- a nightly long-run soak configuration.
+- SLRU-class object versions are still retained without a dedicated protocol.
+
+The long-run configuration the gate asks for is the
+`pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):
+three seeds at 8000 rounds on a daily schedule and on demand with chosen
+seeds/rounds, one job per seed, with every JSON report summarized in the job
+and kept as a 30-day artifact.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 

@@ -1,0 +1,107 @@
+# Nightly long-run bounded-space soak for contrib/pagestore.
+#
+# The pull-request lane runs the CI-sized soak (2400 rounds, one seed) on every
+# change.  This lane runs the long configuration the R6 gate asks for: several
+# seeds, 8000 rounds each, on a schedule and on demand, and keeps every JSON
+# report as an artifact so a bound drift can be compared across nights.  The
+# soak is freestanding C (daemon plus harness, libc only), so no PostgreSQL
+# build is needed.
+name: pagestore nightly soak
+
+on:
+  schedule:
+    # 03:17 UTC daily; off the hour to avoid the shared-runner rush.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "workload rounds per seed"
+        required: false
+        default: "8000"
+      seeds:
+        description: "comma-separated PRNG seeds"
+        required: false
+        default: "20260909,7,4242"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: seed matrix
+    runs-on: ubuntu-latest
+    outputs:
+      seeds: ${{ steps.matrix.outputs.seeds }}
+      rounds: ${{ steps.matrix.outputs.rounds }}
+    steps:
+      - id: matrix
+        shell: bash
+        env:
+          INPUT_SEEDS: ${{ github.event.inputs.seeds }}
+          INPUT_ROUNDS: ${{ github.event.inputs.rounds }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os
+          seeds = [s.strip() for s in (os.environ.get("INPUT_SEEDS") or "20260909,7,4242").split(",") if s.strip()]
+          rounds = (os.environ.get("INPUT_ROUNDS") or "8000").strip()
+          if not seeds or not all(s.isdigit() for s in seeds) or not rounds.isdigit() or int(rounds) <= 0:
+              raise SystemExit(f"invalid seeds {seeds!r} or rounds {rounds!r}")
+          print("seeds=" + json.dumps(seeds))
+          print("rounds=" + rounds)
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  soak:
+    name: soak seed ${{ matrix.seed }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJSON(needs.plan.outputs.seeds) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile daemon and soak harness
+        working-directory: contrib/pagestore
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
+
+      - name: Run the long bounded-space soak
+        working-directory: contrib/pagestore
+        env:
+          PAGESTORE_SOAK_ROUNDS: ${{ needs.plan.outputs.rounds }}
+          PAGESTORE_SOAK_SEED: ${{ matrix.seed }}
+          PAGESTORE_SOAK_REPORT: soak-report-${{ matrix.seed }}.json
+        run: ./pagestore_soak_test ./pagestore_daemon
+
+      - name: Summarize the report
+        if: always()
+        working-directory: contrib/pagestore
+        shell: bash
+        run: |
+          f="soak-report-${{ matrix.seed }}.json"
+          [ -f "$f" ] || { echo "no report written" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          python3 - "$f" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          res, mx, q = r["result"], r["physical_max"], r["physical_quiescent"]
+          print(f"### seed {r['seed']}: {r['rounds']} rounds, {res['checks']} checks, {res['failures']} failures")
+          print(f"- during bounds ok: {res['during_bounds_ok']}, quiescent bounds ok: {res['quiescent_bounds_ok']}")
+          print(f"- write amplification {r['write_amplification']}, files max {mx['files']}")
+          print("| category | max | quiescent | during bound | quiescent bound |")
+          print("|---|---|---|---|---|")
+          for k in ("page", "layers", "wal", "walidx", "forkmeta", "retention", "timelines", "other", "files"):
+              print(f"| {k} | {mx[k]} | {q[k]} | {r['bounds_during'][k]} | {r['bounds_quiescent'][k]} |")
+          PY
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagestore-soak-report-${{ matrix.seed }}
+          path: contrib/pagestore/soak-report-${{ matrix.seed }}.json
+          if-no-files-found: warn
+          retention-days: 30
