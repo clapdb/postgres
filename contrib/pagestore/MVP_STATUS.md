@@ -388,8 +388,15 @@ and may still list pre-death records for an older owner; and an SLRU seed or
 reader snapshot shipped at a cutoff that page compaction already passed
 without a fence is refused, since the control image it would resolve its
 era from is gone (`pagestore_lifecycle_prune_test`,
-`pagestore_control_prune_test`).  With that, 8000-round soaks keep every
-category, forkmeta included, within bound.  Still required for the gate:
+`pagestore_control_prune_test`).  For those consumers to be exact at a
+WAL-index-only owner's horizon, forkmeta compaction keeps the size envelope
+at every horizon (each definitive event that is the newest death of some
+block, not only the latest and the smallest), and the as-of size, existence,
+and death queries are admissible at WAL-index horizons below the page
+frontier like the WAL-index reads retained for that owner are
+(`pagestore_forkmeta_prune_test`, `pagestore_lifecycle_prune_test`).  With
+that, 8000-round soaks keep every category, forkmeta included, within
+bound.  Still required for the gate:
 
 - no owner establishes the durable operational cutoff that controllers
   respect: the real materializer pins WAL and the WAL index but not page

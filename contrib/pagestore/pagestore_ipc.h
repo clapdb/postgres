@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		45	/* 45: relation inspection incarnation fence;
+#define PS_SHM_VERSION		46	/* 46: block death as-of query (PS_OP_BLOCK_DEATH);
+								 * 45: relation inspection incarnation fence;
 								 * 44: isolated relation inspection request;
 							 * relation inspection uses an fd lock and
 							 * publishes directly IDLE -> REQUEST;

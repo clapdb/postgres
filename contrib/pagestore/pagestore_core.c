@@ -5326,6 +5326,33 @@ page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
 	}
 }
 
+/*
+ * Caller holds map_lock.  An as-of fork query (size, existence, death) is
+ * answered from fork metadata, which forkmeta compaction keeps exact at every
+ * page-history horizon and at every WAL-index horizon; a WAL-index-only owner
+ * whose FPI chain was retained for it therefore asks at a position below the
+ * page frontier, and must be answered there like its WAL-index reads are.
+ */
+static int walidx_frontier_exception_active(uint32_t timeline, uint64_t lsn);
+
+static int
+fork_asof_query_allowed(uint32_t reader_timeline, uint64_t read_lsn,
+						uint64_t read_seq)
+{
+	TlWalk		w;
+
+	if (page_frontier_ancestry_allows(reader_timeline, read_lsn, read_seq))
+		return 1;
+	w = tl_walk_first(reader_timeline, read_lsn);
+	for (;;)
+	{
+		if (!walidx_frontier_exception_active(w.tl, w.lsn))
+			return 0;
+		if (!tl_walk_next(&w))
+			return 1;
+	}
+}
+
 /* Caller holds map_lock. */
 static int
 walidx_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn)
@@ -15835,7 +15862,7 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_EXISTS:
 			/* req_lsn caps the horizon; 0 = newest (the writer path) */
 			if (ch->req_lsn != 0 &&
-				!page_frontier_ancestry_allows(tl, ch->req_lsn, ch->req_seq))
+				!fork_asof_query_allowed(tl, ch->req_lsn, ch->req_seq))
 			{
 				ch->status = PS_STATUS_ERROR;
 				break;
@@ -15855,7 +15882,7 @@ ps_handle_meta(PsChannel *ch)
 			/* req_lsn caps the horizon and returns the answer: the newest
 			 * retained death of (key, blocknum) at or below it, or zero. */
 			if (ch->req_lsn == 0 ||
-				!page_frontier_ancestry_allows(tl, ch->req_lsn, ch->req_seq))
+				!fork_asof_query_allowed(tl, ch->req_lsn, ch->req_seq))
 			{
 				ch->status = PS_STATUS_ERROR;
 				break;
@@ -15896,7 +15923,7 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_NBLOCKS:
 			/* req_lsn caps the horizon; 0 = newest (the writer path) */
 			if (ch->req_lsn != 0 &&
-				!page_frontier_ancestry_allows(tl, ch->req_lsn, ch->req_seq))
+				!fork_asof_query_allowed(tl, ch->req_lsn, ch->req_seq))
 			{
 				ch->status = PS_STATUS_ERROR;
 				break;

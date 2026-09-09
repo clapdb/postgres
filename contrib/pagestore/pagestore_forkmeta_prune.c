@@ -27,33 +27,41 @@ retain_horizon(const PsForkMetaEvent *events, uint32_t nitems,
 			   PsForkMetaFence horizon, unsigned char *keep)
 {
 	uint32_t latest_def = 0;
-	uint32_t min_fence = 0;
 	uint32_t largest_grow = 0;
+	uint32_t envelope = UINT32_MAX;
 	int have_def = 0;
 	int have_grow = 0;
 
-	for (uint32_t i = 0; i < nitems; i++)
+	/*
+	 * Walking newest to oldest, every visible definitive event whose size is
+	 * a new strict minimum is the newest death of the blocks at or above that
+	 * size: the latest one fixes the size at the horizon, the smallest fences
+	 * inherited blocks, and each one in between is the zero-page base that
+	 * WAL-index compaction and single-page redo use for the blocks it killed
+	 * last.  An equal size does not start a new death, so the newest of equal
+	 * sizes is the one kept and truncate churn at the same sizes adds nothing.
+	 */
+	for (uint32_t i = nitems; i > 0; i--)
 	{
 		uint32_t size;
 
-		if (!event_visible(&events[i], horizon))
+		if (!event_visible(&events[i - 1], horizon))
 			continue;
-		if (events[i].kind != PS_FORKMETA_SET &&
-			events[i].kind != PS_FORKMETA_DEAD)
+		if (events[i - 1].kind != PS_FORKMETA_SET &&
+			events[i - 1].kind != PS_FORKMETA_DEAD)
 			continue;
-		size = events[i].kind == PS_FORKMETA_DEAD ? 0 : events[i].nblocks;
-		latest_def = i;
-		/* The smallest visible definitive size fences inherited blocks; a
-		 * later event wins a tie so the fence stays with the newest history. */
-		if (!have_def || size <= (events[min_fence].kind == PS_FORKMETA_DEAD ?
-								  0 : events[min_fence].nblocks))
-			min_fence = i;
-		have_def = 1;
-	}
-	if (have_def)
-	{
-		keep[latest_def] = 1;
-		keep[min_fence] = 1;
+		size = events[i - 1].kind == PS_FORKMETA_DEAD ? 0 :
+			events[i - 1].nblocks;
+		if (!have_def)
+		{
+			latest_def = i - 1;
+			have_def = 1;
+		}
+		if (size < envelope)
+		{
+			keep[i - 1] = 1;
+			envelope = size;
+		}
 	}
 	for (uint32_t i = have_def ? latest_def + 1 : 0; i < nitems; i++)
 	{

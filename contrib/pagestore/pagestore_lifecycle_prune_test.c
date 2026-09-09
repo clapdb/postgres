@@ -162,6 +162,46 @@ reserve_pin(uint32_t kind, uint64_t owner_id, uint32_t generation,
 }
 
 static int
+reserve_pin_resources(uint32_t kind, uint64_t owner_id, uint32_t generation,
+					  uint32_t resources, uint64_t lsn)
+{
+	PsChannel	ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch.blocknum = kind;
+	ch.parent_timeline = resources;
+	ch.old_nblocks = generation;
+	ch.req_seq = owner_id;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+/* Relation size as of lsn, or UINT64_MAX when the daemon refuses the horizon. */
+static uint64_t
+nblocks_asof(uint32_t timeline, uint64_t lsn)
+{
+	PsChannel	ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_NBLOCKS;
+	ch.timeline = timeline;
+	ch.key = rel_key;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&rel_key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&rel_key));
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK ? ch.result : UINT64_MAX;
+}
+
+static int
 drop_pin(uint32_t kind, uint64_t owner_id, uint32_t generation)
 {
 	PsChannel	ch;
@@ -802,6 +842,59 @@ test_block_death_asof(void)
 	remove_tree(store);
 }
 
+/* A WAL-index-only owner between a truncate that killed a block and a later
+ * truncate that did not: forkmeta compaction keeps the killing truncate (it
+ * is the newest death of that block at the owner's horizon, though neither
+ * the latest nor the smallest definitive event), the block's size and death
+ * are answered at that horizon even though page compaction moved past it,
+ * and both survive a restart. */
+static void
+test_walidx_horizon_keeps_newest_death(void)
+{
+	char		store[] = "/tmp/pagestore-lifecycle-envelope-XXXXXX";
+	uint64_t	lsn = 5000;
+	uint64_t	generation;
+
+	configure_core();
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
+		  "arm a small forkmeta snapshot trigger for the envelope test");
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the death envelope test");
+	check(fork_op(PS_OP_CREATE, 1000, 0, 0) &&
+		  fork_op(PS_OP_ZEROEXTEND, 1100, 8, 0) &&
+		  write_page(5, 1200, 0x21) &&
+		  fork_op(PS_OP_TRUNCATE, 2000, 3, 0) &&
+		  fork_op(PS_OP_ZEROEXTEND, 2100, 5, 3) &&
+		  write_page(5, 2200, 0x22) &&
+		  fork_op(PS_OP_TRUNCATE, 3000, 6, 0),
+		  "kill block 5 by a truncate, regrow it, then truncate above it");
+	check(reserve_pin_resources(PS_RETENTION_OWNER_MATERIALIZER, 7, 1,
+								PS_RETENTION_RESOURCE_WAL |
+								PS_RETENTION_RESOURCE_WAL_INDEX, 3500),
+		  "a WAL-index-only owner between the two truncates");
+	check(block_death_asof(0, 5, 3500) == 2000 && nblocks_asof(0, 3500) == 6,
+		  "the killing truncate is block 5's newest death before compaction");
+	churn_other_relations(&lsn);
+	generation = selected_generation(store);
+	check(reserve_pin(PS_RETENTION_OWNER_READER, 8, 1, lsn += 10),
+		  "a page-history owner above everything proves the cutoff");
+	run_maintenance(8);
+	check(run_maintenance_until_generation(store, generation),
+		  "forkmeta compaction publishes above the WAL-index-only horizon");
+	check(block_death_asof(0, 5, 3500) == 2000,
+		  "the killing truncate survives as the newest death at the horizon");
+	check(nblocks_asof(0, 3500) == 6,
+		  "the size is answered at the WAL-index-only horizon below the frontier");
+	close_store();
+	configure_core();
+	check(ps_core_open(store) == 0, "reopen the compacted store");
+	check(block_death_asof(0, 5, 3500) == 2000 && nblocks_asof(0, 3500) == 6,
+		  "death and size at the WAL-index-only horizon survive restart");
+	close_store();
+	remove_tree(store);
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+}
+
 static void
 test_deleted_branch_forgets_artifact_fences(void)
 {
@@ -845,6 +938,7 @@ main(void)
 	test_dropped_relation_retires_its_layers();
 	test_deleted_branch_forgets_artifact_fences();
 	test_block_death_asof();
+	test_walidx_horizon_keeps_newest_death();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

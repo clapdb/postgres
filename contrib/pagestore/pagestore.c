@@ -861,9 +861,20 @@ static bool
 ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
 					XLogRecPtr lsn, char *out, XLogRecPtr *base_end_lsn)
 {
-	if (pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out))
+	uint64		version = 0;
+
+	if (pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out,
+										 &version))
 	{
-		*base_end_lsn = PageGetLSN((Page) out);
+		/*
+		 * The base position is the store's version identity, not the pd_lsn
+		 * the bytes carry: a page clamped above its pd_lsn (a branch copy, or
+		 * a page written below a truncate's growth floor) reflects the state
+		 * at its admission, and the records before that position were retired
+		 * behind it.
+		 */
+		*base_end_lsn = (XLogRecPtr) version > PageGetLSN((Page) out) ?
+			(XLogRecPtr) version : PageGetLSN((Page) out);
 		return true;
 	}
 	if (pagestore_localsvc_nblocks_asof(key, (uint64) lsn) > (uint64) blocknum)
@@ -2376,6 +2387,7 @@ PG_FUNCTION_INFO_V1(pagestore_redo_page_asof);
 Datum
 pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 {
+	bool		death_based = false;
 	Oid			relid = PG_GETARG_OID(0);
 	int32		forknum = PG_GETARG_INT32(1);
 	int32		blocknum = PG_GETARG_INT32(2);
@@ -2555,6 +2567,11 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 					((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) == 0 &&
 					 recs[i].lsn < death))
 					base_idx = i;
+			/* The death is the newest at or below lsn and the block exists
+			 * again there, so the block is live: the truncate scan below
+			 * would only rediscover this death from a retained pre-death
+			 * record (a block regrown by zero-extend has no newer one). */
+			death_based = true;
 		}
 	}
 
@@ -2564,6 +2581,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * materialize a stale page for it.  recs[n - 1].lsn is the block's newest record
 	 * at/below lsn.
 	 */
+	if (!death_based)
 	{
 		volatile RedoBlockLiveness liveness = REDO_BLOCK_SCAN_INCOMPLETE;
 		bool		saved_liveness_from_store = ps_redo_liveness_from_store;

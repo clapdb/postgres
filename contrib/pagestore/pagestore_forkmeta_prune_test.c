@@ -112,6 +112,49 @@ min_fence(const PsForkMetaEvent *events, uint32_t nitems,
 	return result;
 }
 
+/* The newest visible definitive event that leaves 'block' outside the fork:
+ * the zero-page base WAL-index compaction and single-page redo rely on.
+ * Compaction must answer it identically for every block. */
+static int
+newest_death(const PsForkMetaEvent *events, uint32_t nitems,
+			 const unsigned char *keep, PsForkMetaFence fence, uint32_t block)
+{
+	int result = -1;
+
+	for (uint32_t i = 0; i < nitems; i++)
+	{
+		if ((keep != NULL && !keep[i]) || !oracle_visible(&events[i], fence))
+			continue;
+		if (events[i].kind == PS_FORKMETA_DEAD ||
+			(events[i].kind == PS_FORKMETA_SET && events[i].nblocks <= block))
+			result = (int) i;
+	}
+	return result;
+}
+
+static int
+same_deaths(const PsForkMetaEvent *events, uint32_t nitems,
+			const unsigned char *keep, PsForkMetaFence fence)
+{
+	unsigned char all[32];
+
+	memset(all, 1, sizeof(all));
+	/* every definitive size is the smallest block some death applies to */
+	for (uint32_t i = 0; i < nitems; i++)
+	{
+		uint32_t block;
+
+		if (events[i].kind != PS_FORKMETA_SET &&
+			events[i].kind != PS_FORKMETA_DEAD)
+			continue;
+		block = events[i].kind == PS_FORKMETA_DEAD ? 0 : events[i].nblocks;
+		if (newest_death(events, nitems, all, fence, block) !=
+			newest_death(events, nitems, keep, fence, block))
+			return 0;
+	}
+	return 1;
+}
+
 static void
 check_model(const PsForkMetaEvent *events, uint32_t nitems,
 			PsForkMetaFence cutoff, const PsForkMetaFence *fences,
@@ -123,12 +166,14 @@ check_model(const PsForkMetaEvent *events, uint32_t nitems,
 					 fold(events, nitems, keep, cutoff)), name);
 	check(min_fence(events, nitems, all, cutoff) ==
 		  min_fence(events, nitems, keep, cutoff), name);
+	check(same_deaths(events, nitems, keep, cutoff), name);
 	for (uint32_t f = 0; f < nfences; f++)
 	{
 		check(same_value(fold(events, nitems, all, fences[f]),
 					 fold(events, nitems, keep, fences[f])), name);
 		check(min_fence(events, nitems, all, fences[f]) ==
 			  min_fence(events, nitems, keep, fences[f]), name);
+		check(same_deaths(events, nitems, keep, fences[f]), name);
 	}
 }
 
