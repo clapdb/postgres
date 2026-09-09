@@ -7460,27 +7460,58 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					}
 				if (!preserve_survivors)
 				{
-					if (page_prune_fences(e->timeline, &raw_fences,
-										  &nfences) != 0)
-						goto fail_entry;
-					fences = malloc((size_t) nfences * sizeof(*fences));
-					if (nfences != 0 && fences == NULL)
-						goto fail_entry;
-					{
-						uint32_t out = 0;
+					uint64_t   *wfences = NULL;
+					uint32_t	nwfences = 0;
+					uint32_t	out = 0;
 
-						for (uint32_t i = 0; i < nfences; i++)
-							if (raw_fences[i].lsn < cutoff.lsn ||
-								(raw_fences[i].lsn == cutoff.lsn &&
-								 raw_fences[i].admission_seq != 0 &&
-								 raw_fences[i].admission_seq <= cutoff.admission_seq))
-							{
-								fences[out].lsn = raw_fences[i].lsn;
-								fences[out].admission_seq = raw_fences[i].admission_seq;
-								out++;
-							}
-						nfences = out;
+					if (page_prune_fences(e->timeline, &raw_fences,
+										  &nfences) != 0 ||
+						walidx_prune_fences(e->timeline, &wfences,
+											&nwfences) != 0)
+					{
+						free(wfences);
+						goto fail_entry;
 					}
+					fences = malloc((size_t) (nfences + nwfences + 1) *
+									sizeof(*fences));
+					if (fences == NULL)
+					{
+						free(wfences);
+						goto fail_entry;
+					}
+					for (uint32_t i = 0; i < nfences; i++)
+						if (raw_fences[i].lsn < cutoff.lsn ||
+							(raw_fences[i].lsn == cutoff.lsn &&
+							 raw_fences[i].admission_seq != 0 &&
+							 raw_fences[i].admission_seq <= cutoff.admission_seq))
+						{
+							fences[out].lsn = raw_fences[i].lsn;
+							fences[out].admission_seq = raw_fences[i].admission_seq;
+							out++;
+						}
+					/* Every WAL-index horizon (owner pins carrying the WAL
+					 * index, branch caps, and the shipper's progress) is a
+					 * fork-history horizon too: WAL-index compaction judges a
+					 * block's life at exactly those positions when it retires
+					 * records against a fork death, and single-page redo
+					 * reads the relation size there.  A horizon that is not
+					 * also a page fence would otherwise lose the death it was
+					 * planned against, or the regrowth after it, and be left
+					 * with neither an FPI nor a base. */
+					for (uint32_t i = 0; i <= nwfences; i++)
+					{
+						uint64_t	lsn = i < nwfences ? wfences[i] :
+							walidx_progress_read(e->timeline);
+
+						if (lsn != 0 && lsn < cutoff.lsn)
+						{
+							fences[out].lsn = lsn;
+							fences[out].admission_seq = 0;
+							out++;
+						}
+					}
+					free(wfences);
+					nfences = out;
 				}
 				if (nitems != 0 && !preserve_survivors &&
 					fork_meta_entry_exempt(e))
@@ -11547,7 +11578,12 @@ walidx_plan_bases_build(uint32_t tl)
 		return -1;
 	/* Protected horizons are exactly the page-history fences: owner pins
 	 * carrying page history and live branch caps.  Only they keep the
-	 * "newest version at or below" that a stored replacement base is. */
+	 * "newest version at or below" that a stored replacement base is.  The
+	 * protection must belong to the horizon's own owner, though: a WAL-index
+	 * pin that carries no page history is not kept alive by another owner's
+	 * page fence at the same LSN, because that owner may advance or drop its
+	 * pin first and page compaction would then retire the base while the
+	 * WAL-index horizon still needs it.  Such a horizon keeps its FPI chain. */
 	walidx_plan_protected = malloc((size_t) (nfences + 1) *
 								   sizeof(*walidx_plan_protected));
 	if (walidx_plan_protected == NULL)
@@ -11557,6 +11593,31 @@ walidx_plan_bases_build(uint32_t tl)
 	}
 	for (uint32_t i = 0; i < nfences; i++)
 		walidx_plan_protected[walidx_plan_nprotected++] = fences[i].lsn;
+	{
+		PsRetentionPin *pins = NULL;
+		uint32_t	npins = 0;
+
+		if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		{
+			free(fences);
+			return -1;
+		}
+		for (uint32_t i = 0; i < npins; i++)
+		{
+			uint64_t	projected = pins[i].lsn;
+			uint32_t	out = 0;
+
+			if ((pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0 ||
+				(pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 ||
+				!retention_project_lsn(pins[i].timeline, tl, &projected))
+				continue;
+			for (uint32_t j = 0; j < walidx_plan_nprotected; j++)
+				if (walidx_plan_protected[j] != projected)
+					walidx_plan_protected[out++] = walidx_plan_protected[j];
+			walidx_plan_nprotected = out;
+		}
+		free(pins);
+	}
 	/* The horizons WAL-index compaction will plan for: a block that this
 	 * timeline's own lifecycle proves absent at a horizon has nothing to
 	 * reconstruct there, which covers every record completing before it. */

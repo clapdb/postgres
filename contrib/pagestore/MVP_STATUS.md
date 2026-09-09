@@ -372,7 +372,14 @@ drop invalidates at every horizon they serve, the planner keeps only the
 base, the inheritance fence, and the growth per horizon plus the definitive
 events a retained version or a still-indexed WAL record needs, and a
 deletion-forced generation compacts survivors whenever a cutoff is proven
-(`pagestore_lifecycle_prune_test`).  With that, 8000-round soaks keep every
+(`pagestore_lifecycle_prune_test`).  Review of those fixes tightened two
+rules that the soak's owner mix could not expose: a stored replacement base
+is trusted only at a WAL-index horizon whose own owner also holds page
+history (another owner's page fence at the same LSN can move first), and
+forkmeta compaction treats every WAL-index horizon as a fork-history horizon,
+so a WAL-index-only owner between two truncates keeps the death its chain
+was retired against and the regrowth after it
+(`pagestore_wal_reclaim_core_test`).  With that, 8000-round soaks keep every
 category, forkmeta included, within bound.  Still required for the gate:
 
 - no owner establishes the durable operational cutoff that controllers
