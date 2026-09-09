@@ -159,6 +159,9 @@ extern void pagestore_localsvc_bind_incarnation(uint32 timeline,
 extern uint64 pagestore_localsvc_expected_incarnation(void);
 extern void pagestore_localsvc_read_at(const PageStoreRelKey *key,
 									   BlockNumber blocknum, uint64 lsn, void *out);
+extern bool pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
+											 BlockNumber blocknum, uint64 lsn,
+											 void *out);
 extern void pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
 										   uint64 branch_lsn,
 										   uint64 target_incarnation,

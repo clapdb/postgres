@@ -2170,6 +2170,19 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	if (pd != NULL)
 		pfree(pd);
 	pfree(recs);
+	/*
+	 * WAL-index compaction retires a page's full-page image once a durable
+	 * stored version covers it.  That stored version is then the base: return
+	 * it exactly as the FPI would have been returned.
+	 */
+	if (result == NULL &&
+		pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
+										 (uint64) lsn, page))
+	{
+		result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+		SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+		memcpy(VARDATA(result), page, BLCKSZ);
+	}
 	pfree(page);
 
 	if (result == NULL)
@@ -2389,13 +2402,33 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 
 	if (base_idx < 0)
 	{
-		/* no base image indexed for this block; cannot materialize yet */
-		XLogReaderFree(reader);
-		pfree(pd);
-		pfree(recs);
-		pfree(base);
-		pfree(page);
-		PG_RETURN_NULL();
+		/*
+		 * No full-page image is indexed at or below lsn.  WAL-index compaction
+		 * retires an FPI once a durable stored version covers it, so the stored
+		 * version at or below lsn is the replacement base: start from it and
+		 * apply only the records that complete after its pd_lsn.
+		 */
+		if (pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
+											 (uint64) lsn, base))
+		{
+			base_end_lsn = PageGetLSN((Page) base);
+			for (int i = 0; i < n; i++)
+				if (((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+					 recs[i].end_lsn <= (uint64) base_end_lsn) ||
+					((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) == 0 &&
+					 recs[i].lsn < (uint64) base_end_lsn))
+					base_idx = i;
+		}
+		else
+		{
+			/* no base at all for this block; cannot materialize yet */
+			XLogReaderFree(reader);
+			pfree(pd);
+			pfree(recs);
+			pfree(base);
+			pfree(page);
+			PG_RETURN_NULL();
+		}
 	}
 
 	/*

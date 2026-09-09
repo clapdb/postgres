@@ -381,6 +381,78 @@ test_split_pair_is_never_unnoted(void)
 	remove_tree(store);
 }
 
+/* A mirror retry appends the same control bytes again under a new admission
+ * sequence.  Only the newest copy of a retained version survives. */
+static void
+test_retry_copies_collapse(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-retry-XXXXXX";
+	PsKey key = control_key();
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for retry test");
+	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
+		  write_control(0, 1000, 800) && write_control(0, 1000, 800) &&
+		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
+		  write_control(0, 2000, 1800),
+		  "write checkpoints with retried control appends");
+	check(ps_test_page_version_count(0, &key, 0) == 5 &&
+		  ps_test_page_version_count(0, &key, 1) == 5,
+		  "retries leave one physical copy per append before compaction");
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 9, 1,
+					  PS_RETENTION_RESOURCE_ALL, 1500) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 2500),
+		  "reader below and materializer above the second checkpoint");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &key, 0) == 2 &&
+		  ps_test_page_version_count(0, &key, 1) == 2,
+		  "compaction keeps exactly one copy per retained version");
+	check(wal_floor(0) == 800, "the reader's checkpoint keeps its floor");
+	{
+		uint64_t version = 0;
+
+		check(read_control_at(0, 0, 1500, &version) && version == 1000 &&
+			  read_control_at(0, 1, 1500, &version) && version == 800,
+			  "the reader still restores its pair after collapsing retries");
+	}
+	close_store();
+	remove_tree(store);
+}
+
+/* A WAL-only pin fences control images.  Dropping it must schedule the
+ * control layers for pruning even when no layer-count threshold is crossed. */
+static void
+test_wal_only_pin_release_reschedules(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-walpin-XXXXXX";
+
+	configure_core(1);
+	compact_layers = 1;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for WAL-only pin test");
+	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
+		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
+		  write_relation(0, 0, 2900) && write_control(0, 3000, 2800),
+		  "write three checkpoints for the WAL-only pin test");
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 11, 1,
+					  PS_RETENTION_RESOURCE_WAL, 2500) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 3500),
+		  "WAL-only reader below the third checkpoint");
+	run_maintenance(64);
+	check(wal_floor(0) == 1800,
+		  "WAL-only pin keeps the checkpoint it restores");
+	check(drop_pin(0, PS_RETENTION_OWNER_READER, 11, 1),
+		  "WAL-only reader drops its pin");
+	run_maintenance(64);
+	check(wal_floor(0) == 2800,
+		  "dropping the WAL-only pin reschedules control pruning");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -388,6 +460,8 @@ main(void)
 	test_reader_pin_retains_its_checkpoint();
 	test_branch_cap_retains_its_checkpoint();
 	test_split_pair_is_never_unnoted();
+	test_retry_copies_collapse();
+	test_wal_only_pin_release_reschedules();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

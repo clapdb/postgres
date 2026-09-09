@@ -416,8 +416,11 @@ typedef struct PsControlChainPlan
 static int control_chain_plan(uint32_t timeline, const PsKey *key,
 							  uint64_t floor, const PsPruneFence *fences,
 							  uint32_t nfences, PsControlChainPlan *plan);
-static int control_chain_keeps(const PsControlChainPlan *plan, uint32_t block,
+struct PageEnt;
+static int control_chain_keeps(const PsControlChainPlan *plan,
+							   const struct PageEnt *entry, uint32_t block,
 							   const PsPruneVersion *v);
+static struct PageEnt *page_find(uint32_t timeline, const PsKey *key, uint32_t block);
 static int prune_version_cmp(const void *va, const void *vb);
 struct ForkEnt;
 typedef struct ForkMetaWalIdxPage ForkMetaWalIdxPage;
@@ -2565,9 +2568,16 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(control_fences);
 				return -1;
 			}
-			for (uint32_t i = first; i < end; i++)
-				keep[i - first] = control_chain_keeps(&plan, order[first].block,
-													  &order[i].version);
+			{
+				const struct PageEnt *entry = page_find(timeline,
+														&order[first].key,
+														order[first].block);
+
+				for (uint32_t i = first; i < end; i++)
+					keep[i - first] = control_chain_keeps(&plan, entry,
+														  order[first].block,
+														  &order[i].version);
+			}
 			free(plan.chain);
 			free(plan.kept);
 		}
@@ -3225,15 +3235,21 @@ timeline_meta_poison(void)
 static unsigned char page_prune_due[MAX_TIMELINES][PS_MAX_CHANNELS];
 
 static void
-page_prune_mark_all_due(void)
+page_prune_mark_all_due_locked(void)
 {
 	uint32_t	ns = core_shards();
 
-	ps_lock_map_rd();
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (tl == 0 || timelines[tl].defined)
 			for (uint32_t sh = 0; sh < ns; sh++)
 				__atomic_store_n(&page_prune_due[tl][sh], 1, __ATOMIC_RELEASE);
+}
+
+static void
+page_prune_mark_all_due(void)
+{
+	ps_lock_map_rd();
+	page_prune_mark_all_due_locked();
 	ps_unlock_map();
 }
 
@@ -4365,6 +4381,19 @@ page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
 			best = v;
 	}
 	return best;
+}
+
+uint32_t
+ps_test_page_version_count(uint32_t timeline, const PsKey *key, uint32_t block)
+{
+	PageEnt    *e;
+	uint32_t	n;
+
+	ps_lock_shard_rd(ps_shard_of(key));
+	e = page_find(timeline, key, block);
+	n = e != NULL && e->nver > 0 ? (uint32_t) e->nver : 0;
+	ps_unlock_shard(ps_shard_of(key));
+	return n;
 }
 
 /* --- fork size index (keyed by timeline, key) --- */
@@ -6961,13 +6990,14 @@ fork_meta_timeline_records_present_locked(uint32_t target)
 /*
  * A branch timeline without a durable page frontier has no operational
  * cutoff of its own: nothing proves which of its fork events are still
- * required.  Snapshot compaction retains such an entry in full and does not
- * let it block the cutoff of the timelines that do have a proven frontier
- * (exempt mode).  Reclaim-debt accounting stays strict: while any owner is
- * unproven the source growth is not charged, so the controller can never
- * throttle metadata churn that no snapshot could reclaim.  The root timeline
- * is never exempt: without its frontier there is no cutoff at all.  Caller
- * holds map-rd.
+ * required.  Snapshot compaction retains such an entry in full and lets it
+ * cap the cutoff at its fork point instead of blocking every timeline
+ * (exempt mode), so the branch's own lower-LSN mutations stay admissible and
+ * recovery's partition check stays consistent.  Reclaim-debt accounting
+ * stays strict: while any owner is unproven the source growth is not charged,
+ * so the controller can never throttle metadata churn that no snapshot could
+ * reclaim.  The root timeline is never exempt: without its frontier there is
+ * no cutoff at all.  Caller holds map-rd.
  */
 static int
 fork_meta_entry_exempt(const ForkEnt *e)
@@ -7083,6 +7113,42 @@ fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out, int filter_deleting,
 					}
 				}
 			}
+	/* A live branch without a durable page frontier keeps every record in
+	 * exempt mode, but the cutoff is still the single tuple every later
+	 * mutation must exceed and recovery's partition check enforces it.  The
+	 * branch's own WAL stream starts at its fork point, so that point (any
+	 * same-LSN sequence above 1 is still future) caps the cutoff while the
+	 * branch lives, whether or not it has written fork metadata yet;
+	 * deletion releases it. */
+	if (exempt_missing)
+		for (uint32_t tl = 1; tl < MAX_TIMELINES; tl++)
+		{
+			PsPruneFence fork_point;
+			PsPruneFence frontier;
+			PsTimelineState state;
+
+			if (!timelines[tl].defined || !timeline_has_parent(tl) ||
+				!ps_timeline_state(tl, &state, NULL) ||
+				state != PS_TIMELINE_LIVE)
+				continue;
+			frontier = page_frontier_current(tl);
+			if (frontier.lsn != 0 && frontier.admission_seq != 0)
+				continue;
+			fork_point.lsn = timelines[tl].branch_lsn;
+			fork_point.admission_seq = 1;
+			if (fork_point.lsn == 0)
+			{
+				missing = 1;
+				continue;
+			}
+			if (!have || fork_point.lsn < cutoff.lsn ||
+				(fork_point.lsn == cutoff.lsn &&
+				 fork_point.admission_seq < cutoff.admission_seq))
+			{
+				cutoff = fork_point;
+				have = 1;
+			}
+		}
 	if (missing || !have)
 	{
 		if (!filter_deleting || (missing && !preserve_survivors))
@@ -10824,6 +10890,9 @@ timeline_delete_publish_one(void)
 			__atomic_store_n(&timelines[tl].state, PS_TIMELINE_DELETED,
 							 __ATOMIC_RELEASE);
 			inspection_timeline_cache_changed();
+			/* The deleted branch's cap no longer fences its ancestors' page
+			 * and control history; revisit their layers (map-wr is held). */
+			page_prune_mark_all_due_locked();
 			did = 1;
 		}
 		ps_unlock_map();
@@ -13877,26 +13946,46 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint64_t floor,
 }
 
 /*
- * The image block follows the plan exactly.  A note (or admission-fence)
- * block keeps every version the image plan keeps and, in addition, every
- * version whose image has not been written yet: the shipper writes the note
- * first, so a version present only in the note chain is a pair in flight and
- * must survive until its image arrives and the pair can be judged together.
+ * The image block follows the plan exactly, tuple by tuple.  A note (or
+ * admission-fence) block keeps one physical copy of every version LSN the
+ * image plan keeps and, in addition, of every LSN whose image has not been
+ * written yet: the shipper writes the note first, so a version present only
+ * in the note chain is a pair in flight and must survive until its image
+ * arrives and the pair can be judged together.  A mirror retry after an IPC
+ * timeout appends the same bytes again under a new admission sequence; only
+ * the newest copy of a retained LSN is kept, so retries cannot accumulate.
+ * Caller holds the shard write lock.
  */
 static int
-control_chain_keeps(const PsControlChainPlan *plan, uint32_t block,
-					const PsPruneVersion *v)
+control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
+					uint32_t block, const PsPruneVersion *v)
 {
+	int			lsn_retained = 0;
+
 	if (!plan->valid)
 		return 1;
 	for (uint32_t i = 0; i < plan->nkept; i++)
 		if (plan->kept[i].lsn == v->lsn)
-			return 1;
+		{
+			if (block == PS_CONTROL_IMAGE_BLOCK)
+				return plan->kept[i].admission_seq == v->admission_seq;
+			lsn_retained = 1;
+			break;
+		}
 	if (block == PS_CONTROL_IMAGE_BLOCK)
 		return 0;
-	for (uint32_t i = 0; i < plan->nchain; i++)
-		if (plan->chain[i].lsn == v->lsn)
-			return 0;
+	if (!lsn_retained)
+	{
+		for (uint32_t i = 0; i < plan->nchain; i++)
+			if (plan->chain[i].lsn == v->lsn)
+				return 0;
+	}
+	/* Newest copy of this LSN across the block's complete chain. */
+	if (entry != NULL)
+		for (int i = 0; i < entry->nver; i++)
+			if (entry->vers[i].lsn == v->lsn &&
+				entry->vers[i].admission_seq > v->admission_seq)
+				return 0;
 	return 1;
 }
 
@@ -15759,11 +15848,13 @@ ps_handle_meta(PsChannel *ch)
 					if (ret == PS_RETENTION_OK)
 					{
 						admission_seq_observe(pin.admission_seq);
+						/* Control-image fences follow WAL pins too. */
 						if ((old_found != 1 ||
 							 memcmp(&old_pin, &pin, sizeof(pin)) != 0) &&
 							(((old_found == 1 ? old_pin.resources : 0) |
 							  pin.resources) &
-							 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+							 (PS_RETENTION_RESOURCE_PAGE_HISTORY |
+							  PS_RETENTION_RESOURCE_WAL)) != 0)
 							page_prune_mark_all_due();
 					}
 					pthread_rwlock_unlock(&walidx_prune_lock);
@@ -15844,11 +15935,13 @@ ps_handle_meta(PsChannel *ch)
 				{
 					memcpy(ch->data, &seq, sizeof(seq));
 					ch->datalen = sizeof(seq);
+					/* Control-image fences follow WAL pins too. */
 					if ((old_found != 1 ||
 						 memcmp(&old_pin, &pin, sizeof(pin)) != 0) &&
 						(((old_found == 1 ? old_pin.resources : 0) |
 						  pin.resources) &
-						 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+						 (PS_RETENTION_RESOURCE_PAGE_HISTORY |
+						  PS_RETENTION_RESOURCE_WAL)) != 0)
 						page_prune_mark_all_due();
 				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
@@ -15886,7 +15979,8 @@ ps_handle_meta(PsChannel *ch)
 					ps_retention_drop(tl, ch->blocknum, ch->req_seq,
 									  ch->old_nblocks);
 				if (ret == PS_RETENTION_OK && old_found == 1 &&
-					(old_pin.resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+					(old_pin.resources & (PS_RETENTION_RESOURCE_PAGE_HISTORY |
+										  PS_RETENTION_RESOURCE_WAL)) != 0)
 					page_prune_mark_all_due();
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);

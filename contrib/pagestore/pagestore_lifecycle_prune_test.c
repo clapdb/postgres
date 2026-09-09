@@ -532,11 +532,132 @@ test_reader_pin_keeps_invalidated_history(void)
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
+static int
+create_branch(uint32_t timeline, uint32_t parent, uint64_t lsn)
+{
+	PsChannel	ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_CREATE_BRANCH;
+	ch.timeline = timeline;
+	ch.parent_timeline = parent;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_wr(0);
+	ps_lock_map_wr();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+branch_fork_op(uint32_t timeline, PsOpcode opcode, uint64_t lsn,
+			   uint32_t nblocks, uint32_t block)
+{
+	PsChannel	ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = opcode;
+	ch.timeline = timeline;
+	ch.key = rel_key;
+	ch.req_lsn = lsn;
+	ch.nblocks = nblocks;
+	ch.blocknum = block;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&rel_key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&rel_key));
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static uint64_t
+selected_cutoff_lsn(const char *store)
+{
+	char		directory[1024];
+	PsForkmetaSnapshot selected;
+	uint64_t	cutoff = 0;
+
+	memset(&selected, 0, sizeof(selected));
+	selected.directory_fd = selected.checkpoint_fd = selected.tail_fd = -1;
+	if (snprintf(directory, sizeof(directory), "%s/forkmeta_snapshots",
+				 store) > 0 &&
+		ps_forkmeta_snapshot_open(&selected, directory) == 0)
+	{
+		cutoff = selected.cutoff_lsn;
+		ps_forkmeta_snapshot_close(&selected);
+	}
+	return cutoff;
+}
+
+/* A branch without a page frontier keeps every record but caps the cutoff
+ * at its fork point, so its own lower-LSN mutations stay admissible while the
+ * root keeps compacting. */
+static void
+test_frontier_less_branch_caps_cutoff(void)
+{
+	char		store[] = "/tmp/pagestore-lifecycle-branch-XXXXXX";
+	uint64_t	lsn = 1000;
+	unsigned char tag = 0;
+	uint64_t	generation;
+
+	configure_core();
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
+		  "arm a small forkmeta snapshot trigger for the branch test");
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the branch cutoff test");
+	check(fork_op(PS_OP_CREATE, lsn, 0, 0) &&
+		  fork_op(PS_OP_ZEROEXTEND, lsn += 10, 2, 0) &&
+		  write_page(0, lsn += 10, 0xC0) && write_page(0, lsn += 10, 0xC1),
+		  "write the root relation before forking");
+	check(create_branch(1, 0, lsn += 10), "fork a branch at the current LSN");
+	{
+		uint64_t	fork_lsn = lsn;
+
+		/* Root churn far above the fork point, with a materializer cutoff. */
+		for (int cycle = 0; cycle < 6; cycle++)
+		{
+			generation = selected_generation(store);
+			check(write_page(0, lsn += 1000, (unsigned char) (0xD0 + cycle)),
+				  "write the root above the fork point");
+			churn_other_relations(&lsn);
+			check(reserve_pin(PS_RETENTION_OWNER_MATERIALIZER, 1, 1, lsn += 10),
+				  "advance the root cutoff above the fork point");
+			run_maintenance(8);
+			if (cycle >= 2)
+				check(run_maintenance_until_generation(store, generation),
+					  "root keeps publishing generations with a live branch");
+		}
+		check(selected_cutoff_lsn(store) != 0 &&
+			  selected_cutoff_lsn(store) <= fork_lsn,
+			  "the selected cutoff never passes the live branch's fork point");
+		/* The branch's own stream starts at its fork point. */
+		check(branch_fork_op(1, PS_OP_ZEROEXTEND, fork_lsn + 5, 3, 2),
+			  "the frontier-less branch extends at its own low LSN");
+		check(branch_fork_op(1, PS_OP_TRUNCATE, fork_lsn + 15, 1, 0),
+			  "the frontier-less branch truncates at its own low LSN");
+		check(read_tag_at(0, lsn, &tag) == 1,
+			  "root reads stay intact beside the branch");
+	}
+	close_store();
+	remove_tree(store);
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+}
+
 int
 main(void)
 {
 	test_truncate_churn_is_bounded();
 	test_reader_pin_keeps_invalidated_history();
+	test_frontier_less_branch_caps_cutoff();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

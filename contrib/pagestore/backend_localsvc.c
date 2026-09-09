@@ -971,6 +971,29 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 }
 
 /*
+ * Like pagestore_localsvc_read_at, but reports whether the store holds a
+ * version of the page at or below lsn.  Single-page redo uses it to start
+ * from the stored replacement base once WAL-index compaction has retired the
+ * page's full-page image.
+ */
+bool
+pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
+								 BlockNumber blocknum, uint64 lsn, void *out)
+{
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
+
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = blocknum;
+	ch->nblocks = 1;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	if (ch->status != PS_STATUS_OK || ch->result == 0)
+		return false;
+	memcpy(out, ch->data, BLCKSZ);
+	return true;
+}
+
+/*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.

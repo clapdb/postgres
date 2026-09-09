@@ -729,7 +729,13 @@ retained WAL boundary and planned over the complete version chain
 page versions and fork-level deaths as replacement bases
 (`ps_walidx_prune_plan_bases`, reclaim core cases); and forkmeta snapshot
 compaction exempts frontier-less branch timelines instead of failing closed
-for every timeline, while reclaim-debt accounting stays strict.  Longer runs
+for every timeline, capping the cutoff at each live branch's fork point so
+its own lower-LSN mutations stay admissible, while reclaim-debt accounting
+stays strict.  Control-image retention also fences every retained SLRU seed
+and reader artifact, keeps one physical copy per retained version across
+mirror retries, and is rescheduled whenever a WAL-resource pin or a deleted
+branch cap changes; single-page redo starts from the stored replacement base
+when the WAL index no longer carries a full-page image.  Longer runs
 then exposed unbounded fork-lifecycle history: image compaction now drops
 page versions invalidated at every horizon they serve, the forkmeta planner
 keeps only the base, inheritance fence, and growth per horizon plus the

@@ -360,7 +360,8 @@ versions were never pruned, so the WAL retention floor never advanced;
 WAL-index compaction retained an FPI-led chain per page even when a durable
 stored page version (or a fork-level death) already covered it, so cold pages
 pinned raw WAL forever; and a branch timeline without a page frontier blocked
-forkmeta compaction for every timeline.  With those fixes the CI-sized run
+forkmeta compaction for every timeline (such a branch now caps the cutoff at
+its fork point instead).  With those fixes the CI-sized run
 keeps page, layer, WAL, WAL-index, retention, and timeline storage within
 bound and reclaims shipped WAL down to the last immutable segment.  A fourth
 gap showed only in longer runs: the forkmeta planner retained every visible
