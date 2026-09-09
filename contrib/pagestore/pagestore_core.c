@@ -12079,7 +12079,12 @@ walidx_plan_bases_build(uint32_t tl)
 	 * pin that carries no page history is not kept alive by another owner's
 	 * page fence at the same LSN, because that owner may advance or drop its
 	 * pin first and page compaction would then retire the base while the
-	 * WAL-index horizon still needs it.  Such a horizon keeps its FPI chain. */
+	 * WAL-index horizon still needs it.  Such a horizon keeps its FPI chain.
+	 * The materializer's own pin is the exception: it carries no page history,
+	 * but its LSN (the redo of its last durable restartpoint) is the
+	 * operational page-history cutoff derived from it, so the newest version
+	 * at or below that horizon is retained by the very same pin and the two
+	 * can only move together. */
 	walidx_plan_protected = malloc((size_t) (nfences + 1) *
 								   sizeof(*walidx_plan_protected));
 	if (walidx_plan_protected == NULL)
@@ -12107,10 +12112,61 @@ walidx_plan_bases_build(uint32_t tl)
 				(pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 ||
 				!retention_project_lsn(pins[i].timeline, tl, &projected))
 				continue;
+			if (pins[i].timeline == tl &&
+				pins[i].owner_kind == PS_RETENTION_OWNER_MATERIALIZER)
+				continue;
 			for (uint32_t j = 0; j < walidx_plan_nprotected; j++)
 				if (walidx_plan_protected[j] != projected)
 					walidx_plan_protected[out++] = walidx_plan_protected[j];
 			walidx_plan_nprotected = out;
+		}
+		/* A materializer horizon is protected by its own derived cutoff,
+		 * unless another WAL-index-only owner shares the LSN: that owner
+		 * would keep standing there after the materializer advanced. */
+		for (uint32_t i = 0; i < npins; i++)
+		{
+			int			present = 0;
+			int			shared = 0;
+
+			if (pins[i].timeline != tl ||
+				pins[i].owner_kind != PS_RETENTION_OWNER_MATERIALIZER ||
+				(pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0 ||
+				pins[i].lsn == 0)
+				continue;
+			for (uint32_t k = 0; k < npins && !shared; k++)
+			{
+				uint64_t	projected = pins[k].lsn;
+
+				if (k != i &&
+					(pins[k].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+					(pins[k].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0 &&
+					!(pins[k].timeline == tl &&
+					  pins[k].owner_kind == PS_RETENTION_OWNER_MATERIALIZER) &&
+					retention_project_lsn(pins[k].timeline, tl, &projected) &&
+					projected == pins[i].lsn)
+					shared = 1;
+			}
+			if (shared)
+				continue;
+			for (uint32_t j = 0; j < walidx_plan_nprotected && !present; j++)
+				if (walidx_plan_protected[j] == pins[i].lsn)
+					present = 1;
+			if (present)
+				continue;
+			{
+				uint64_t   *grown = realloc(walidx_plan_protected,
+											(size_t) (walidx_plan_nprotected + 1) *
+											sizeof(*walidx_plan_protected));
+
+				if (grown == NULL)
+				{
+					free(pins);
+					free(fences);
+					return -1;
+				}
+				walidx_plan_protected = grown;
+				walidx_plan_protected[walidx_plan_nprotected++] = pins[i].lsn;
+			}
 		}
 		free(pins);
 	}

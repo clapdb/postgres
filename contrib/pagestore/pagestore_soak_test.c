@@ -127,11 +127,7 @@ typedef struct Bounds
 static const Bounds during_bound = {
 	.page = PAGE_HIGH_WATER + 2u * NSHARDS * SEGMENT_SIZE + FLUSH_PAGES * PAGE_SIZE * NSHARDS + 4u * NSHARDS * SEGMENT_SIZE,
 	.layers = (COMPACT_LAYERS + 2) * (LIVE_BYTES_MAX + INTERVAL_PAGE_BYTES * 2) * 2,
-	/* A materializer pins WAL and the WAL index but no page history, so
-	 * stored pages cannot replace the FPI-led chains at its horizon and the
-	 * raw WAL they name stays until the horizon advances: allow two more
-	 * publication intervals beyond the reclaimer's high water. */
-	.wal = WAL_HIGH_WATER + 2u * 1024u * 1024u + INTERVAL_WAL_BYTES * 4,
+	.wal = WAL_HIGH_WATER + 2u * 1024u * 1024u + INTERVAL_WAL_BYTES * 2,
 	.walidx = WALIDX_HIGH_WATER * 4,
 	.forkmeta = FORKMETA_HIGH_WATER * 4,
 	.retention = 256u * 1024u,

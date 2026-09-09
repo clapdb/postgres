@@ -770,17 +770,9 @@ page-history owner; the branch controller's base pin carries page history
 while a branch is prepared, and a kept checkpoint image retains its
 exact-redo twin.
 
-Remaining before the gate closes:
-
-- a WAL-index-only owner's horizon is not page-protected, so stored pages
-  cannot replace its FPI-led chains and cold pages pin shipped WAL until it
-  advances (bounded by the owner's publication interval, and accounted for in
-  the soak's declared WAL bound);
-SLRU-class versions are retained by their consumers' pins and branch fork
-points: seeds (replay bases), reader snapshots, the live mirror, tombstones,
-and the watermark follow the relation-page plan (newest at or below every
-retained horizon, everything above the floor), and a retired artifact releases
-its control-image fence.
+The materializer's own WAL-index horizon is page-protected by the cutoff
+derived from its pin, so stored pages replace its FPI-led chains; nothing
+remains before the gate closes beyond keeping the nightly soak green.
 
 The nightly long-run configuration is `.github/workflows/pagestore-nightly.yml`
 (three seeds, 8000 rounds each, scheduled daily and dispatchable with chosen
@@ -1108,6 +1100,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Made the materializer's WAL-index horizon page-protected by its own derived cutoff (unless another WAL-index-only owner shares the LSN), so stored pages replace its FPI-led chains and the soak's WAL bound returns to two publication intervals | Reclaim-core case (a WAL/WAL-index materializer pin authorizes the base at its horizon; a shared LSN still does not); control/lifecycle/standalone suites; integration lane; 2400/8000-round soaks within the tighter bound |
 | 2026-09-10 | Added SLRU-class and reader-artifact retention: seeds (replay bases), reader snapshots, the live SLRU mirror, tombstones, and the watermark follow the relation plan below their consumers' pins and branch fork points, and a retired artifact releases its control-image fence (the registry now counts artifact versions) | Control-prune cases for a pinned reader, a branch fork point, a dropped pin, retry collapse, fence release, and restart; lifecycle/reclaim/standalone suites; integration lane; 2400/8000-round soaks |
 | 2026-09-10 | Added the nightly long-run soak workflow: a seed matrix (default three seeds at 8000 rounds) built from the freestanding daemon and harness, scheduled daily and dispatchable with chosen seeds/rounds, with per-job report summaries and 30-day JSON artifacts | Workflow YAML validated; the same soak binary and report format as the pull-request lane |
 | 2026-09-10 | Derived the operational page-history cutoff from the writing compute (the materializer's restart-redo pin, or the newest checkpoint note's redo), kept the exact-redo twin of every retained checkpoint image, gave the branch controller's base pin page history, and modeled the real materializer mask plus progress marker in the soak | Control-prune cases for marker and note cutoffs with refusal below the frontier and restart; lifecycle/reclaim/standalone suites; integration lane with pruning active in the golden and branch-boot flows; 2400/8000-round soaks |

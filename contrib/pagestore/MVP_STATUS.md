@@ -420,13 +420,11 @@ exact-redo twin of a kept checkpoint image is retained with it, which is what
 an earlier attempt at this floor had missed
 (`pagestore_control_prune_test`; the soak now models the materializer with
 its real WAL/WAL-index mask and a progress marker).  Still required for the
-gate:
-
-- a WAL-index-only owner's horizon (the materializer's) is not page-protected,
-  so stored pages cannot replace the FPI-led chains it keeps and cold pages
-  pin shipped WAL until the horizon advances; treating the derived cutoff as
-  that owner's page fence needs the owner to advance its pin before its
-  marker, so a standing horizon can never lose its base;
+gate: none.  The materializer's own WAL-index horizon is page-protected by the
+cutoff derived from its pin (the base at that horizon and the horizon itself
+are the same pin and move together), so stored pages replace its FPI-led
+chains and cold pages no longer pin shipped WAL beyond the reclaimer's
+declared bound.
 SLRU-class and reader-artifact versions now have their retention protocol.
 Seeds and reader snapshots are exact-generation artifacts: a consumer reads
 every page of the object at exactly the generation it captured, which is
