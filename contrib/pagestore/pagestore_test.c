@@ -4266,7 +4266,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 			  "temporary mutation owner is removed");
 	}
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 4000,
+		  PS_STATUS_OK && floor == 3000,
 		  "page floor is the minimum matching explicit pin");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL, &floor) ==
 		  PS_STATUS_OK && floor == 3000,
@@ -4305,8 +4305,11 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "a released generation cannot resurrect its pin");
 
 	op_create_branch(1, 0, 1500);
+	/* The page floor is 3000, the materializer's restart redo, rather than the
+	 * configured owner's 4000: a child's fork point is a discrete fence and
+	 * does not lower it further. */
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 4000,
+		  PS_STATUS_OK && floor == 3000,
 		  "a child fork point does not lower the operational page floor");
 	{
 		char output[256];
@@ -4363,15 +4366,18 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "projected effective floor survives restart");
 	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 404, 1) == PS_STATUS_OK,
 		  "a restarted controller can release its durable pin");
+	/* The materializer pinned WAL and the WAL index at 3000 with no page
+	 * history, but it restarts from that redo and reads pages there, so its
+	 * pin is the operational page-history cutoff below the configured owner. */
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 4000,
-		  "dropping the reader restores the configured operational floor");
+		  PS_STATUS_OK && floor == 3000,
+		  "dropping the reader leaves the materializer's restart redo as the floor");
 	for (uint64_t owner = 1000; owner < 2025; owner++)
 		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, owner,
 						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 6000 + owner) ==
 			  PS_STATUS_OK, "registry admits more owners than timelines");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 4000,
+		  PS_STATUS_OK && floor == 3000,
 		  "floor snapshot covers every owner beyond MAX_TIMELINES");
 	client_detach();
 	stop_daemon(dpid);

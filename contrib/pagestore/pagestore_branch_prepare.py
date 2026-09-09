@@ -1060,8 +1060,11 @@ class BranchPreparer:
                     self.materializer_extension_schema,
                     "pagestore_retention_set(",
                 )
+                # Resources 7 = page history, WAL, and WAL index: the base
+                # must be an explicit page-history fence while the branch is
+                # prepared, because the materializer's own cutoff can pass it.
                 + f"{self.config.parent_timeline}, 3, {owner_id}, "
-                + f"{self.branch_retention_generation}, 6, "
+                + f"{self.branch_retention_generation}, 7, "
                 + sql_literal(base)
                 + "::pg_lsn)"
             )
