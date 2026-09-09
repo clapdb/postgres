@@ -236,6 +236,65 @@ set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
 }
 
 static int
+write_relation_page(uint32_t timeline, uint32_t block, uint64_t lsn)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+	int rc;
+
+	memset(page, 0x5A, sizeof(page));
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(timeline, &key, block, page, lsn, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
+static int
+unlink_relation(uint32_t timeline, uint64_t lsn)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_UNLINK;
+	ch.timeline = timeline;
+	ch.key = key;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK && ps_storage->sync() == 0;
+}
+
+static int
+reserve_pin(uint32_t timeline, uint32_t kind, uint64_t owner_id,
+			uint32_t generation, uint32_t resources, uint64_t lsn)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch.timeline = timeline;
+	ch.blocknum = kind;
+	ch.parent_timeline = resources;
+	ch.old_nblocks = generation;
+	ch.req_seq = owner_id;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
 drop_wal_pin(uint32_t timeline, uint64_t owner_id, uint32_t generation)
 {
 	PsChannel ch;
@@ -503,6 +562,53 @@ test_dependency_cutoffs(void)
 		  wal_index_progress(0, 0, WAL_TOTAL) &&
 		  maintenance_until_count(store, 0, 2),
 		  "child-local control history above its branch cap does not pin parent WAL");
+	close_store();
+	remove_tree(store);
+
+	/* The same raw dependency is released once the indexed page has a durable
+	 * stored version at or after the record and the materializer's cutoff
+	 * lets WAL-index compaction replace the FPI chain with that base. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
+		  maintenance_until_count(store, 0, 0),
+		  "a durable stored page base releases the raw WAL-index dependency");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override");
+	close_store();
+	remove_tree(store);
+
+	/* With no page-history owner at all, page compaction never prunes, so
+	 * every durable stored version is retained and remains a valid base. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  maintenance_until_count(store, 0, 0),
+		  "an unpruned stored page is a valid base without an owner floor");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override again");
+	close_store();
+	remove_tree(store);
+
+	/* A block outside the relation after a durable unlink has nothing left
+	 * to reconstruct; the unlink itself releases its raw dependency. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  unlink_relation(0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
+		  maintenance_until_count(store, 0, 0),
+		  "a durable unlink releases the raw WAL-index dependency of its blocks");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override after unlink");
 	close_store();
 	remove_tree(store);
 }

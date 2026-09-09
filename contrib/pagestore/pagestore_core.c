@@ -399,6 +399,30 @@ static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS]
 static int page_frontier_load(const char *store_dir);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
+static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+								uint32_t *nfences_out);
+/* Retention plan for one control object, computed over the image block's
+ * complete version chain and applied to every block of the pair. */
+#define PS_CONTROL_IMAGE_BLOCK 0u
+typedef struct PsControlChainPlan
+{
+	PsPruneVersion *chain;
+	uint32_t	nchain;
+	PsPruneVersion *kept;
+	uint32_t	nkept;
+	int			valid;
+} PsControlChainPlan;
+
+static int control_chain_plan(uint32_t timeline, const PsKey *key,
+							  uint64_t floor, const PsPruneFence *fences,
+							  uint32_t nfences, PsControlChainPlan *plan);
+static int control_chain_keeps(const PsControlChainPlan *plan, uint32_t block,
+							   const PsPruneVersion *v);
+static int prune_version_cmp(const void *va, const void *vb);
+static int retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
+											  uint64_t *floor_out, int map_locked);
+static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+							 uint32_t *nfences_out);
 
 #define PS_WALIDX_FRONTIER_MAGIC 0x46584957U /* "WIXF" */
 #define PS_WALIDX_FRONTIER_VERSION 2
@@ -2448,9 +2472,16 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint32_t	ndropped = 0;
 	PsPruneFence *fences = NULL;
 	uint32_t	nfences = 0;
+	PsPruneFence *control_fences = NULL;
+	uint32_t	ncontrol_fences = 0;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
+	if (control_prune_fences(timeline, &control_fences, &ncontrol_fences) != 0)
+	{
+		free(fences);
+		return -1;
+	}
 
 	order = malloc((size_t) *nrec * sizeof(*order));
 	versions = malloc((size_t) *nrec * sizeof(*versions));
@@ -2465,6 +2496,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		free(selected);
 		free(dropped);
 		free(fences);
+		free(control_fences);
 		return -1;
 	}
 	for (uint32_t i = 0; i < *nrec; i++)
@@ -2482,12 +2514,18 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 
 		while (end < *nrec && compact_same_page(&order[first], &order[end]))
 			end++;
-		/* Relation page history is the only history governed by the page-prune
-		 * frontier.  Control and SLRU pages are reader-artifact authority: an
-		 * exact checkpoint can require an older SLRU base even when its ordinary
-		 * relation pages have advanced.  Keep all non-relation versions until
-		 * their dedicated retention protocols prove them reclaimable. */
-		if (order[first].key.klass != PS_KLASS_RELATION)
+		/* Relation page history is governed by the page-prune frontier and the
+		 * exact page-history fences.  Control images and their same-version
+		 * redo-floor notes follow the same operational floor but are fenced by
+		 * every retained WAL boundary (control_prune_fences), so the WAL
+		 * retention floor derived from the surviving notes can advance without
+		 * ever dropping an image a reader or branch may still restore.  SLRU
+		 * pages are reader-artifact authority: an exact checkpoint can require
+		 * an older SLRU base even when its ordinary relation pages have
+		 * advanced.  Keep all SLRU and reader-snapshot versions until their
+		 * dedicated retention protocols prove them reclaimable. */
+		if (order[first].key.klass != PS_KLASS_RELATION &&
+			order[first].key.klass != PS_KLASS_CONTROL)
 		{
 			for (uint32_t i = first; i < end; i++)
 				selected[out++] = recs[order[i].source];
@@ -2498,6 +2536,28 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			versions[i - first] = order[i].version;
 		if (floor == 0)
 			memset(keep, 1, end - first);
+		else if (order[first].key.klass == PS_KLASS_CONTROL)
+		{
+			PsControlChainPlan plan;
+
+			if (control_chain_plan(timeline, &order[first].key, floor,
+								   control_fences, ncontrol_fences, &plan) != 0)
+			{
+				free(order);
+				free(versions);
+				free(keep);
+				free(selected);
+				free(dropped);
+				free(fences);
+				free(control_fences);
+				return -1;
+			}
+			for (uint32_t i = first; i < end; i++)
+				keep[i - first] = control_chain_keeps(&plan, order[first].block,
+													  &order[i].version);
+			free(plan.chain);
+			free(plan.kept);
+		}
 		else if (ps_page_prune_plan(versions, end - first,
 								(PsPruneFence) {floor, UINT64_MAX}, fences,
 									 nfences, keep) < 0)
@@ -2508,6 +2568,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			free(selected);
 			free(dropped);
 			free(fences);
+			free(control_fences);
 			return -1;
 		}
 		for (uint32_t i = first; i < end;)
@@ -2542,6 +2603,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	free(keep);
 	free(selected);
 	free(fences);
+	free(control_fences);
 	*nrec = out;
 	*dropped_out = dropped;
 	*ndropped_out = ndropped;
@@ -6873,6 +6935,29 @@ fork_meta_timeline_records_present_locked(uint32_t target)
  * metadata-only timeline is not covered by the old snapshot: its first event
  * is in the source suffix and still needs a real page frontier before source
  * growth may be charged as reclaimable debt. */
+/*
+ * A branch timeline without a durable page frontier has no operational
+ * cutoff of its own: nothing proves which of its fork events are still
+ * required.  Snapshot compaction retains such an entry in full and does not
+ * let it block the cutoff of the timelines that do have a proven frontier
+ * (exempt mode).  Reclaim-debt accounting stays strict: while any owner is
+ * unproven the source growth is not charged, so the controller can never
+ * throttle metadata churn that no snapshot could reclaim.  The root timeline
+ * is never exempt: without its frontier there is no cutoff at all.  Caller
+ * holds map-rd.
+ */
+static int
+fork_meta_entry_exempt(const ForkEnt *e)
+{
+	PsPruneFence frontier;
+
+	if (e->timeline >= MAX_TIMELINES || e->timeline == 0 ||
+		!timeline_has_parent(e->timeline))
+		return 0;
+	frontier = page_frontier_current(e->timeline);
+	return frontier.lsn == 0 || frontier.admission_seq == 0;
+}
+
 static int
 fork_meta_owner_covered_by_selected_cutoff(const ForkEnt *e)
 {
@@ -6925,7 +7010,7 @@ fork_meta_mark_deletion_cutover_done_locked(void)
  * conservative operational floor. */
 static int
 fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out, int filter_deleting,
-						  int preserve_survivors)
+						  int preserve_survivors, int exempt_missing)
 {
 	PsPruneFence cutoff = {0, 0};
 	int have = 0;
@@ -6947,7 +7032,7 @@ fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out, int filter_deleting,
 						owns = 1;
 						break;
 					}
-				if (!owns)
+				if (!owns || (exempt_missing && fork_meta_entry_exempt(e)))
 					continue;
 				{
 					PsPruneFence frontier = page_frontier_current(e->timeline);
@@ -7027,7 +7112,7 @@ fork_meta_source_cutoff_provable(void)
 	for (uint32_t sh = 0; sh < core_shards(); sh++)
 		ps_lock_shard_rd(sh);
 	ps_lock_map_rd();
-	rc = fork_meta_snapshot_cutoff(&cutoff, 0, 0);
+	rc = fork_meta_snapshot_cutoff(&cutoff, 0, 0, 0);
 	ps_unlock_map();
 	for (uint32_t sh = core_shards(); sh > 0; sh--)
 		ps_unlock_shard(sh - 1);
@@ -7271,7 +7356,13 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						nfences = out;
 					}
 				}
-				if (nitems != 0 && !preserve_survivors)
+				if (nitems != 0 && !preserve_survivors &&
+					fork_meta_entry_exempt(e))
+				{
+					for (uint32_t j = 0; j < nitems; j++)
+						keep[indices[j]] = 1;
+				}
+				else if (nitems != 0 && !preserve_survivors)
 				{
 					unsigned char *planned_keep = malloc(nitems);
 
@@ -7630,7 +7721,7 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 		fork_meta_mark_deletion_cutover_done_locked();
 	if ((!fork_meta_snapshot_due_locked() && !force_deleting) ||
 		fork_meta_snapshot_cutoff(&cutoff, filter_deleting,
-								  force_deleting) != 0)
+								  force_deleting, 1) != 0)
 	{
 		if (fork_meta_bytes_load() != 0)
 		{
@@ -9645,6 +9736,99 @@ typedef struct WalIdxItem
 	uint32_t	flags;
 } WalIdxItem;
 
+/*
+ * Durable replacement page bases for one WAL-index snapshot publication.
+ * For every indexed page of the candidate timeline the table lists the LSNs
+ * of page versions that are (a) durably covered by a sealed image layer or the
+ * shard's durable flush watermark and (b) retained by the current page-prune
+ * rule, so a stored image can stand in for the FPI-led redo chain it covers.
+ * The table is built under all shard read locks, the WAL-index prune read
+ * fence, and map-rd, which freeze owner pins and page compaction for the
+ * whole publication; it is consumed only by the same maintenance pass.
+ */
+typedef struct WalIdxBaseEntry
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t   *bases;			/* ascending, nonzero, unique */
+	uint32_t	nbases;
+} WalIdxBaseEntry;
+
+static WalIdxBaseEntry *walidx_plan_bases;
+static uint32_t walidx_plan_nbases;
+static int walidx_plan_bases_valid;
+
+static int
+walidx_base_entry_cmp(const void *va, const void *vb)
+{
+	const WalIdxBaseEntry *a = va;
+	const WalIdxBaseEntry *b = vb;
+	int c = memcmp(&a->key, &b->key, sizeof(a->key));
+
+	if (c != 0)
+		return c;
+	if (a->block != b->block)
+		return a->block < b->block ? -1 : 1;
+	return 0;
+}
+
+static int
+walidx_base_lsn_cmp(const void *va, const void *vb)
+{
+	uint64_t a = *(const uint64_t *) va;
+	uint64_t b = *(const uint64_t *) vb;
+
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static void
+walidx_plan_bases_free(void)
+{
+	for (uint32_t i = 0; i < walidx_plan_nbases; i++)
+		free(walidx_plan_bases[i].bases);
+	free(walidx_plan_bases);
+	walidx_plan_bases = NULL;
+	walidx_plan_nbases = 0;
+	walidx_plan_bases_valid = 0;
+}
+
+static const WalIdxBaseEntry *
+walidx_plan_bases_lookup(const PsKey *key, uint32_t block)
+{
+	WalIdxBaseEntry probe;
+
+	if (!walidx_plan_bases_valid || walidx_plan_nbases == 0)
+		return NULL;
+	memset(&probe, 0, sizeof(probe));
+	probe.key = *key;
+	probe.block = block;
+	return bsearch(&probe, walidx_plan_bases, walidx_plan_nbases,
+				   sizeof(*walidx_plan_bases), walidx_base_entry_cmp);
+}
+
+/* A page version is a durable base once a sealed layer holds it: either the
+ * segment copy is gone (layer origin) or the durable flush watermark of its
+ * shard covers the record. */
+static int
+walidx_base_version_durable(const PageVer *v)
+{
+	const Shard *s;
+
+	if (v->lsn == 0)
+		return 0;
+	if (v->seg < 0)
+		return 1;
+	if (v->shard >= core_shards())
+		return 0;
+	s = &g_shards[v->shard];
+	if (!s->flush_watermark_valid)
+		return 0;
+	return (uint32_t) v->seg < s->flush_watermark.seg_id ||
+		((uint32_t) v->seg == s->flush_watermark.seg_id &&
+		 v->off <= s->flush_watermark.seg_off &&
+		 page_size <= s->flush_watermark.seg_off - v->off);
+}
+
 /* Caller holds all shard write locks and map-rd.  The scan only touches the
  * in-memory WAL-index; it deliberately performs no I/O while map-rd is held. */
 static int
@@ -10983,9 +11167,164 @@ walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 		items[i].fpi =
 			(e->items[i].flags & PS_WAL_INDEX_FLAG_FPI) != 0;
 	}
-	rc = ps_walidx_prune_plan(items, (uint32_t) e->n, cutoff,
-							  horizons, nhorizons, keep);
+	{
+		const WalIdxBaseEntry *bases = walidx_plan_bases_lookup(&e->key, e->block);
+
+		rc = ps_walidx_prune_plan_bases(items, (uint32_t) e->n,
+										bases != NULL ? bases->bases : NULL,
+										bases != NULL ? bases->nbases : 0,
+										cutoff, horizons, nhorizons, keep);
+	}
 	free(items);
+	return rc;
+}
+
+/*
+ * Build the replacement-base table for one timeline.  Caller holds every
+ * shard read lock, the WAL-index prune read fence, and map-rd.  Failure
+ * leaves no table, which degrades to the FPI-only plan.
+ */
+static int
+walidx_plan_bases_build(uint32_t tl)
+{
+	uint64_t	floor = 0;
+	PsPruneFence *fences = NULL;
+	uint32_t	nfences = 0;
+	uint32_t	cap = 0;
+	int			rc = -1;
+
+	walidx_plan_bases_free();
+	if (retention_effective_floor_internal(tl,
+										   PS_RETENTION_RESOURCE_PAGE_HISTORY,
+										   &floor, 1) != 0 ||
+		page_prune_fences(tl, &fences, &nfences) != 0)
+		return -1;
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (WalIdxEnt *e = g_shards[shard].walidx[bucket]; e; e = e->next)
+			{
+				PageEnt    *p;
+				PsPruneVersion *chain;
+				unsigned char *keep;
+				uint64_t   *bases;
+				uint32_t	n;
+				uint32_t	nbases = 0;
+
+				ForkEnt    *f;
+				uint32_t	ndeaths = 0;
+
+				if (e->timeline != tl || e->n == 0)
+					continue;
+				p = page_find(tl, &e->key, e->block);
+				f = fork_find(tl, &e->key);
+				/* A definitive fork event that leaves this block outside the
+				 * relation (unlink, or truncate at or below it) is a base too:
+				 * at every horizon from that event on the block has no content
+				 * to reconstruct, so every record completing before it is
+				 * covered.  Fork metadata is durable before it is visible. */
+				if (f != NULL)
+					for (uint32_t i = 0; i < f->nev; i++)
+						if (f->ev[i].lsn != 0 &&
+							(f->ev[i].kind == FEV_DEAD ||
+							 (f->ev[i].kind == FEV_SET &&
+							  f->ev[i].nblocks <= e->block)))
+							ndeaths++;
+				n = p != NULL && p->nver > 0 ? (uint32_t) p->nver : 0;
+				if (n == 0 && ndeaths == 0)
+					continue;
+				chain = malloc((size_t) (n != 0 ? n : 1) * sizeof(*chain));
+				keep = malloc(n != 0 ? n : 1);
+				bases = malloc((size_t) (n + ndeaths) * sizeof(*bases));
+				if (chain == NULL || keep == NULL || bases == NULL)
+				{
+					free(chain);
+					free(keep);
+					free(bases);
+					goto out;
+				}
+				for (uint32_t i = 0; i < n; i++)
+				{
+					chain[i].lsn = p->vers[i].lsn;
+					chain[i].admission_seq = p->vers[i].admission_seq;
+				}
+				if (n != 0)
+					qsort(chain, n, sizeof(*chain), prune_version_cmp);
+				if (n == 0 || floor == 0)
+					memset(keep, 1, n != 0 ? n : 1);
+				else if (ps_page_prune_plan(chain, n,
+											(PsPruneFence) {floor, UINT64_MAX},
+											fences, nfences, keep) < 0)
+				{
+					free(chain);
+					free(keep);
+					free(bases);
+					goto out;
+				}
+				for (uint32_t i = 0; i < n; i++)
+				{
+					if (!keep[i])
+						continue;
+					for (int j = 0; j < p->nver; j++)
+						if (p->vers[j].lsn == chain[i].lsn &&
+							p->vers[j].admission_seq == chain[i].admission_seq &&
+							walidx_base_version_durable(&p->vers[j]))
+						{
+							bases[nbases++] = chain[i].lsn;
+							break;
+						}
+				}
+				if (f != NULL)
+					for (uint32_t i = 0; i < f->nev; i++)
+						if (f->ev[i].lsn != 0 &&
+							(f->ev[i].kind == FEV_DEAD ||
+							 (f->ev[i].kind == FEV_SET &&
+							  f->ev[i].nblocks <= e->block)))
+							bases[nbases++] = f->ev[i].lsn;
+				free(chain);
+				free(keep);
+				if (nbases == 0)
+				{
+					free(bases);
+					continue;
+				}
+				qsort(bases, nbases, sizeof(*bases), walidx_base_lsn_cmp);
+				{
+					uint32_t	w = 0;
+
+					for (uint32_t i = 0; i < nbases; i++)
+						if (w == 0 || bases[w - 1] != bases[i])
+							bases[w++] = bases[i];
+					nbases = w;
+				}
+				if (walidx_plan_nbases == cap)
+				{
+					uint32_t	ncap = cap != 0 ? cap * 2 : 64;
+					WalIdxBaseEntry *grown = realloc(walidx_plan_bases,
+													 (size_t) ncap * sizeof(*grown));
+
+					if (grown == NULL)
+					{
+						free(bases);
+						goto out;
+					}
+					walidx_plan_bases = grown;
+					cap = ncap;
+				}
+				walidx_plan_bases[walidx_plan_nbases].key = e->key;
+				walidx_plan_bases[walidx_plan_nbases].block = e->block;
+				walidx_plan_bases[walidx_plan_nbases].bases = bases;
+				walidx_plan_bases[walidx_plan_nbases].nbases = nbases;
+				walidx_plan_nbases++;
+			}
+	if (walidx_plan_nbases != 0)
+		qsort(walidx_plan_bases, walidx_plan_nbases, sizeof(*walidx_plan_bases),
+			  walidx_base_entry_cmp);
+	walidx_plan_bases_valid = 1;
+	rc = 0;
+out:
+	free(fences);
+	if (rc != 0)
+		walidx_plan_bases_free();
 	return rc;
 }
 
@@ -11632,6 +11971,12 @@ walidx_snapshot_publish_one(void)
 	if (candidate < 0)
 		return 0;
 
+	/* Shard read locks precede the prune fence and map-rd (the reclaim path's
+	 * order) only for the in-memory replacement-base scan; they are released
+	 * before any publication I/O.  map-rd, held for the whole publication,
+	 * excludes page compaction, so every base stays stored until commit. */
+	for (uint32_t shard = 0; shard < ns; shard++)
+		ps_lock_shard_rd(shard);
 	pthread_rwlock_rdlock(&walidx_prune_lock);
 	ps_lock_map_rd();
 	/* The first scan is a scheduling hint.  Recheck the timeline state while
@@ -11640,8 +11985,14 @@ walidx_snapshot_publish_one(void)
 	{
 		ps_unlock_map();
 		pthread_rwlock_unlock(&walidx_prune_lock);
+		for (uint32_t shard = ns; shard > 0; shard--)
+			ps_unlock_shard(shard - 1);
 		return 0;
 	}
+	if (walidx_plan_bases_build((uint32_t) candidate) != 0)
+		walidx_plan_bases_free();
+	for (uint32_t shard = ns; shard > 0; shard--)
+		ps_unlock_shard(shard - 1);
 	walidx_publish_wrlock();
 	{
 		uint32_t tl = (uint32_t) candidate;
@@ -11837,6 +12188,7 @@ publish_done:
 		walidx_snapshot_retry_at[candidate].tv_sec++;
 	}
 	walidx_publish_wrunlock();
+	walidx_plan_bases_free();
 	free(fences);
 	ps_unlock_map();
 	pthread_rwlock_unlock(&walidx_prune_lock);
@@ -13200,6 +13552,103 @@ retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
 	return 1;
 }
 
+static int
+prune_version_cmp(const void *va, const void *vb)
+{
+	const PsPruneVersion *a = va;
+	const PsPruneVersion *b = vb;
+
+	if (a->lsn != b->lsn)
+		return a->lsn < b->lsn ? -1 : 1;
+	if (a->admission_seq != b->admission_seq)
+		return a->admission_seq < b->admission_seq ? -1 : 1;
+	return 0;
+}
+
+/*
+ * Plan control-object retention over the block's complete version chain, not
+ * only the versions that happen to sit in the compacted layers.  The image
+ * (block 0) and its redo-floor note (block 1) are written as a pair at one
+ * version, but a flush boundary can leave one of them in the page log while
+ * the other is already in a layer.  Deciding on the layer subset alone could
+ * then keep an image whose same-version note was dropped, which collapses the
+ * WAL retention floor to retain-everything.  Planning over the full chain
+ * with LSN-only fences gives both blocks the same keep set.  A layer version
+ * is dropped only when the chain plan drops that exact identity.  Caller holds
+ * the shard write lock.
+ */
+static int
+control_chain_plan(uint32_t timeline, const PsKey *key, uint64_t floor,
+				   const PsPruneFence *fences, uint32_t nfences,
+				   PsControlChainPlan *plan)
+{
+	PageEnt    *e = page_find(timeline, key, PS_CONTROL_IMAGE_BLOCK);
+	unsigned char *keep;
+	uint32_t	n;
+
+	memset(plan, 0, sizeof(*plan));
+	if (e == NULL || e->nver <= 0)
+		return 0;
+	n = (uint32_t) e->nver;
+	plan->chain = malloc((size_t) n * sizeof(*plan->chain));
+	plan->kept = malloc((size_t) n * sizeof(*plan->kept));
+	keep = malloc(n);
+	if (plan->chain == NULL || plan->kept == NULL || keep == NULL)
+	{
+		free(plan->chain);
+		free(plan->kept);
+		free(keep);
+		memset(plan, 0, sizeof(*plan));
+		return -1;
+	}
+	for (uint32_t i = 0; i < n; i++)
+	{
+		plan->chain[i].lsn = e->vers[i].lsn;
+		plan->chain[i].admission_seq = e->vers[i].admission_seq;
+	}
+	qsort(plan->chain, n, sizeof(*plan->chain), prune_version_cmp);
+	plan->nchain = n;
+	if (ps_page_prune_plan(plan->chain, n, (PsPruneFence) {floor, UINT64_MAX},
+						   fences, nfences, keep) < 0)
+	{
+		free(plan->chain);
+		free(plan->kept);
+		free(keep);
+		memset(plan, 0, sizeof(*plan));
+		return -1;
+	}
+	for (uint32_t i = 0; i < n; i++)
+		if (keep[i])
+			plan->kept[plan->nkept++] = plan->chain[i];
+	free(keep);
+	plan->valid = 1;
+	return 0;
+}
+
+/*
+ * The image block follows the plan exactly.  A note (or admission-fence)
+ * block keeps every version the image plan keeps and, in addition, every
+ * version whose image has not been written yet: the shipper writes the note
+ * first, so a version present only in the note chain is a pair in flight and
+ * must survive until its image arrives and the pair can be judged together.
+ */
+static int
+control_chain_keeps(const PsControlChainPlan *plan, uint32_t block,
+					const PsPruneVersion *v)
+{
+	if (!plan->valid)
+		return 1;
+	for (uint32_t i = 0; i < plan->nkept; i++)
+		if (plan->kept[i].lsn == v->lsn)
+			return 1;
+	if (block == PS_CONTROL_IMAGE_BLOCK)
+		return 0;
+	for (uint32_t i = 0; i < plan->nchain; i++)
+		if (plan->chain[i].lsn == v->lsn)
+			return 0;
+	return 1;
+}
+
 /* Caller holds map-wr and the page-prune read fence. */
 static int
 page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -13228,6 +13677,68 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 				fences[nfences].lsn = projected;
 				fences[nfences].admission_seq = projected == pins[i].lsn &&
 					pins[i].admission_seq != 0 ? pins[i].admission_seq : UINT64_MAX;
+				nfences++;
+			}
+		}
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t cap = UINT64_MAX;
+		PsTimelineState state;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			ps_timeline_state(candidate, &state, NULL) &&
+			state != PS_TIMELINE_DELETED &&
+			retention_project_lsn(candidate, timeline, &cap))
+		{
+			fences[nfences].lsn = cap;
+			fences[nfences].admission_seq = UINT64_MAX;
+			nfences++;
+		}
+	}
+	free(pins);
+	*fences_out = fences;
+	*nfences_out = nfences;
+	return 0;
+}
+
+/*
+ * Control-object versions are retained by the same operational floor as
+ * relation pages, but their discrete fences are every retained WAL boundary:
+ * any owner pin that holds page history or WAL, and every live descendant's
+ * branch cap.  A reader or branch restores pg_control as-of its horizon, so
+ * the newest control image and redo-floor note at or below each boundary must
+ * survive, while versions above the operational floor stay eligible for later
+ * owners.  Fences are LSN-only so the image and its same-version note always
+ * receive the same keep decision.  Caller holds map-wr and the page-prune
+ * read fence.
+ */
+static int
+control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+					 uint32_t *nfences_out)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	PsPruneFence *fences;
+	uint32_t nfences = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	fences = malloc((size_t) (npins + MAX_TIMELINES) * sizeof(*fences));
+	if (fences == NULL)
+	{
+		free(pins);
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+		if ((pins[i].resources & (PS_RETENTION_RESOURCE_PAGE_HISTORY |
+								  PS_RETENTION_RESOURCE_WAL)) != 0)
+		{
+			uint64_t projected = pins[i].lsn;
+
+			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+			{
+				fences[nfences].lsn = projected;
+				fences[nfences].admission_seq = UINT64_MAX;
 				nfences++;
 			}
 		}
