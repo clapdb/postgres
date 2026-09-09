@@ -876,6 +876,42 @@ ps_death_supersedes(uint64 death, uint64 death_seq, XLogRecPtr base_end,
 	return death_seq > base_seq;
 }
 
+/* Fail closed on a daemon refusal: an unreadable or unanswerable stored
+ * base, size, or death must not turn into a fabricated page. */
+static void
+ps_redo_daemon_error(const char *what, const PageStoreRelKey *key,
+					 BlockNumber blocknum, XLogRecPtr lsn)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_IO_ERROR),
+			 errmsg("pagestore could not resolve %s of block %u of relation %u/%u/%u fork %d as of %X/%08X",
+					what, blocknum, key->spcOid, key->dbOid, key->relNumber,
+					key->forkNum, LSN_FORMAT_ARGS(lsn))));
+}
+
+static uint64
+ps_redo_nblocks_asof(const PageStoreRelKey *key, BlockNumber blocknum,
+					 XLogRecPtr lsn)
+{
+	uint64		nblocks = 0;
+
+	if (!pagestore_localsvc_nblocks_asof_checked(key, (uint64) lsn, &nblocks))
+		ps_redo_daemon_error("the relation size", key, blocknum, lsn);
+	return nblocks;
+}
+
+static uint64
+ps_redo_block_death(const PageStoreRelKey *key, BlockNumber blocknum,
+					XLogRecPtr lsn, uint64 *seq_out)
+{
+	uint64		death = 0;
+
+	if (!pagestore_localsvc_block_death_asof(key, blocknum, (uint64) lsn,
+											 &death, seq_out))
+		ps_redo_daemon_error("the fork death", key, blocknum, lsn);
+	return death;
+}
+
 static bool
 ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
 					XLogRecPtr lsn, char *out, XLogRecPtr *base_end_lsn,
@@ -883,10 +919,14 @@ ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
 {
 	uint64		version = 0;
 	uint64		version_seq = 0;
+	int			found;
 
 	*base_seq = 0;
-	if (pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out,
-										 &version, &version_seq))
+	found = pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out,
+											 &version, &version_seq);
+	if (found < 0)
+		ps_redo_daemon_error("the stored base", key, blocknum, lsn);
+	if (found > 0)
 	{
 		/*
 		 * The base position is the store's version identity, not the pd_lsn
@@ -901,7 +941,7 @@ ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
 			*base_seq = version_seq;
 		return true;
 	}
-	if (pagestore_localsvc_nblocks_asof(key, (uint64) lsn) > (uint64) blocknum)
+	if (ps_redo_nblocks_asof(key, blocknum, lsn) > (uint64) blocknum)
 	{
 		memset(out, 0, BLCKSZ);
 		*base_end_lsn = InvalidXLogRecPtr;
@@ -2278,12 +2318,12 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		if (result != NULL)
 		{
 			uint64		death_seq = 0;
-			uint64		death = pagestore_localsvc_block_death_asof(
-				&key, (BlockNumber) blocknum, (uint64) lsn, &death_seq);
+			uint64		death = ps_redo_block_death(&key, (BlockNumber) blocknum,
+													lsn, &death_seq);
 
 			if (ps_death_supersedes(death, death_seq, base_end, base_seq))
 			{
-				if (pagestore_localsvc_nblocks_asof(&key, (uint64) lsn) >
+				if (ps_redo_nblocks_asof(&key, (BlockNumber) blocknum, lsn) >
 					(uint64) blocknum)
 					memset(VARDATA(result), 0, BLCKSZ);
 				else
@@ -2573,12 +2613,12 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 */
 	{
 		uint64		death_seq = 0;
-		uint64		death = pagestore_localsvc_block_death_asof(
-			&key, (BlockNumber) blocknum, (uint64) lsn, &death_seq);
+		uint64		death = ps_redo_block_death(&key, (BlockNumber) blocknum,
+												lsn, &death_seq);
 
 		if (ps_death_supersedes(death, death_seq, base_end_lsn, base_seq))
 		{
-			if (pagestore_localsvc_nblocks_asof(&key, (uint64) lsn) <=
+			if (ps_redo_nblocks_asof(&key, (BlockNumber) blocknum, lsn) <=
 				(uint64) blocknum)
 			{
 				XLogReaderFree(reader);

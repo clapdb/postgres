@@ -399,9 +399,12 @@ identities are compared as (LSN, admission sequence) tuples end to end, the
 order `fork_page_invalidated()` already applies, so a page clamped to the
 LSN of the truncate it was written after keeps its bytes; an admitted
 artifact registers its fence under the same lock as the check that admitted
-it; a note whose image is still on its way keeps a single copy across
-mirror retries; and the soak measures allocated blocks rather than logical
-length and bounds the file count.  With that, 8000-round soaks keep every
+it and releases that fence again if the append fails; a note whose image is
+still on its way keeps a single copy across mirror retries; a stored base,
+size, or death the daemon cannot answer fails single-page redo closed
+(the SPDK frontend reports a failed page read as an error, never as an
+absent version); and the soak measures allocated blocks rather than
+logical length and bounds the file count.  With that, 8000-round soaks keep every
 category, forkmeta included, within bound.  Still required for the gate:
 
 - no owner establishes the durable operational cutoff that controllers

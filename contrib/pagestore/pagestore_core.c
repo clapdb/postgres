@@ -3183,6 +3183,8 @@ typedef struct ForkEnt
 
 static void artifact_fence_reset(void);
 static void artifact_fence_note(uint32_t timeline, uint64_t lsn);
+static void artifact_fence_reserve(uint32_t timeline, uint64_t lsn);
+static void artifact_fence_release(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_forget(uint32_t timeline);
 
 static void
@@ -13243,10 +13245,32 @@ page_lsn(const unsigned char *page)
  * sequential even though each logical page is small -- the property we want for
  * NVMe/SPDK and network transports.
  */
+static int append_page_impl(uint32_t timeline, const PsKey *key,
+							uint32_t block, const unsigned char *page,
+							uint64_t version, uint64_t *out_admission_seq,
+							uint64_t *artifact_lsn);
+
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			const unsigned char *page, uint64_t version,
 			uint64_t *out_admission_seq)
+{
+	uint64_t	artifact_lsn = 0;
+	int			rc = append_page_impl(timeline, key, block, page, version,
+									  out_admission_seq, &artifact_lsn);
+
+	/* An admitted artifact reserved its fence before the append; the version
+	 * itself made it durable on success, so the release only forgets the
+	 * fence of an append that failed. */
+	if (artifact_lsn != 0)
+		artifact_fence_release(timeline, artifact_lsn);
+	return rc;
+}
+
+static int
+append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
+				 const unsigned char *page, uint64_t version,
+				 uint64_t *out_admission_seq, uint64_t *artifact_lsn)
 {
 	SegRecHdr	hdr;
 	SegRecHdrAdmission admission_hdr;
@@ -13350,14 +13374,17 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		fenced = hdr.lsn >= frontier.lsn ||
 			ps_retention_page_fence_at(timeline, hdr.lsn) ||
 			page_frontier_structural_fence_active(timeline, timeline, hdr.lsn);
-		/* Register the artifact's fence while the fence that admitted it is
+		/* Reserve the artifact's fence while the fence that admitted it is
 		 * still held: control pruning plans under map-wr, so it cannot run
-		 * between this check and the registration, and once registered the
-		 * image survives the admitting pin being dropped.  A fence noted for
-		 * an append that then fails only retains until the next open rebuilds
-		 * the registry from the versions that exist. */
+		 * between this check and the reservation, and from here on the image
+		 * survives the admitting pin being dropped.  The caller releases the
+		 * reservation when the append finishes, which forgets the fence again
+		 * unless the version landed. */
 		if (fenced)
-			artifact_fence_note(timeline, hdr.lsn);
+		{
+			artifact_fence_reserve(timeline, hdr.lsn);
+			*artifact_lsn = hdr.lsn;
+		}
 		ps_unlock_map();
 		if (!fenced)
 			return -1;
@@ -14378,6 +14405,8 @@ typedef struct ArtifactFence
 {
 	uint32_t	timeline;
 	uint64_t	lsn;
+	uint32_t	pending;		/* appends admitted at this cutoff, in flight */
+	unsigned char durable;		/* an artifact version exists at this cutoff */
 } ArtifactFence;
 
 static ArtifactFence *artifact_fences;
@@ -14385,24 +14414,22 @@ static uint32_t nartifact_fences;
 static uint32_t artifact_fence_cap;
 static pthread_mutex_t artifact_fence_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void
-artifact_fence_note(uint32_t timeline, uint64_t lsn)
+/*
+ * Find or add the registry entry for (timeline, lsn).  Caller holds the
+ * registry lock.  Returns NULL when the registry is poisoned or cannot grow;
+ * the latter poisons it: an unrecorded artifact must not lose its control
+ * image, and control pruning then retains everything until the next open
+ * rebuilds the registry.
+ */
+static ArtifactFence *
+artifact_fence_entry(uint32_t timeline, uint64_t lsn)
 {
-	if (lsn == 0)
-		return;
-	pthread_mutex_lock(&artifact_fence_lock);
 	if (nartifact_fences == UINT32_MAX)
-	{
-		pthread_mutex_unlock(&artifact_fence_lock);
-		return;
-	}
+		return NULL;
 	for (uint32_t i = 0; i < nartifact_fences; i++)
 		if (artifact_fences[i].timeline == timeline &&
 			artifact_fences[i].lsn == lsn)
-		{
-			pthread_mutex_unlock(&artifact_fence_lock);
-			return;
-		}
+			return &artifact_fences[i];
 	if (nartifact_fences == artifact_fence_cap)
 	{
 		uint32_t	ncap = artifact_fence_cap != 0 ? artifact_fence_cap * 2 : 64;
@@ -14411,19 +14438,75 @@ artifact_fence_note(uint32_t timeline, uint64_t lsn)
 
 		if (grown == NULL)
 		{
-			/* Fail closed: an unrecorded artifact must not lose its control
-			 * image.  Poisoning the registry makes control pruning retain
-			 * everything until the next open rebuilds it. */
 			nartifact_fences = UINT32_MAX;
-			pthread_mutex_unlock(&artifact_fence_lock);
-			return;
+			return NULL;
 		}
 		artifact_fences = grown;
 		artifact_fence_cap = ncap;
 	}
+	memset(&artifact_fences[nartifact_fences], 0, sizeof(ArtifactFence));
 	artifact_fences[nartifact_fences].timeline = timeline;
 	artifact_fences[nartifact_fences].lsn = lsn;
-	nartifact_fences++;
+	return &artifact_fences[nartifact_fences++];
+}
+
+/* An artifact version exists at this cutoff (append, or recovery replay). */
+static void
+artifact_fence_note(uint32_t timeline, uint64_t lsn)
+{
+	ArtifactFence *entry;
+
+	if (lsn == 0)
+		return;
+	pthread_mutex_lock(&artifact_fence_lock);
+	entry = artifact_fence_entry(timeline, lsn);
+	if (entry != NULL)
+		entry->durable = 1;
+	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+/*
+ * An artifact append was admitted at this cutoff and is in flight: the fence
+ * holds from now on, so control pruning that runs before the version lands
+ * still keeps the image.  Every reserve is paired with a release.
+ */
+static void
+artifact_fence_reserve(uint32_t timeline, uint64_t lsn)
+{
+	ArtifactFence *entry;
+
+	if (lsn == 0)
+		return;
+	pthread_mutex_lock(&artifact_fence_lock);
+	entry = artifact_fence_entry(timeline, lsn);
+	if (entry != NULL)
+		entry->pending++;
+	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+/*
+ * The append that reserved this cutoff finished.  A fence with no version
+ * behind it and no other append in flight is forgotten again, so a failed
+ * append does not pin a control era until the next restart.
+ */
+static void
+artifact_fence_release(uint32_t timeline, uint64_t lsn)
+{
+	if (lsn == 0)
+		return;
+	pthread_mutex_lock(&artifact_fence_lock);
+	if (nartifact_fences != UINT32_MAX)
+		for (uint32_t i = 0; i < nartifact_fences; i++)
+			if (artifact_fences[i].timeline == timeline &&
+				artifact_fences[i].lsn == lsn)
+			{
+				if (artifact_fences[i].pending != 0)
+					artifact_fences[i].pending--;
+				if (artifact_fences[i].pending == 0 &&
+					!artifact_fences[i].durable)
+					artifact_fences[i] = artifact_fences[--nartifact_fences];
+				break;
+			}
 	pthread_mutex_unlock(&artifact_fence_lock);
 }
 

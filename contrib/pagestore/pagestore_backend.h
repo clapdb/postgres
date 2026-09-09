@@ -159,7 +159,9 @@ extern void pagestore_localsvc_bind_incarnation(uint32 timeline,
 extern uint64 pagestore_localsvc_expected_incarnation(void);
 extern void pagestore_localsvc_read_at(const PageStoreRelKey *key,
 									   BlockNumber blocknum, uint64 lsn, void *out);
-extern bool pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
+/* 1 = found (out, version, sequence filled), 0 = no version at or below
+ * lsn, -1 = the daemon could not read the version: never treat as absent. */
+extern int	pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 											 BlockNumber blocknum, uint64 lsn,
 											 void *out, uint64 *version_out,
 											 uint64 *version_seq_out);
@@ -217,9 +219,13 @@ extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 extern uint32 pagestore_localsvc_timeline(void);
 extern uint64 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key,
 											  uint64 lsn);
-extern uint64 pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
-												  BlockNumber blocknum,
-												  uint64 lsn, uint64 *seq_out);
+extern bool pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
+												BlockNumber blocknum, uint64 lsn,
+												uint64 *death_out,
+												uint64 *seq_out);
+extern bool pagestore_localsvc_nblocks_asof_checked(const PageStoreRelKey *key,
+													uint64 lsn,
+													uint64 *nblocks_out);
 extern int	pagestore_localsvc_exists_asof(const PageStoreRelKey *key,
 										   uint64 lsn);
 extern uint64 pagestore_localsvc_read_lsn(void);

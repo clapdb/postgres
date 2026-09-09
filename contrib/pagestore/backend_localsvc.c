@@ -976,7 +976,7 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
  * from the stored replacement base once WAL-index compaction has retired the
  * page's full-page image.
  */
-bool
+int
 pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 								 BlockNumber blocknum, uint64 lsn, void *out,
 								 uint64 *version_out, uint64 *version_seq_out)
@@ -988,8 +988,10 @@ pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 	ch->nblocks = 1;
 	ch->req_lsn = lsn;
 	ls_exec(ch);
-	if (ch->status != PS_STATUS_OK || ch->result == 0)
-		return false;
+	if (ch->status != PS_STATUS_OK)
+		return -1;
+	if (ch->result == 0)
+		return 0;
 	memcpy(out, ch->data, BLCKSZ);
 	/* the store's version of the page: its admission position, which a
 	 * clamped copy carries above the pd_lsn its bytes retain */
@@ -997,7 +999,7 @@ pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 		*version_out = ch->req_lsn;
 	if (version_seq_out != NULL)
 		*version_seq_out = ch->req_seq;
-	return true;
+	return 1;
 }
 
 /*
@@ -1502,10 +1504,10 @@ pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
  * Newest position at or below lsn at which the block was definitively outside
  * its relation (creation, truncate, unlink), or zero when none is retained.
  */
-uint64
+bool
 pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
 									BlockNumber blocknum, uint64 lsn,
-									uint64 *seq_out)
+									uint64 *death_out, uint64 *seq_out)
 {
 	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
@@ -1513,13 +1515,28 @@ pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
 	ch->blocknum = blocknum;
 	ch->req_lsn = lsn;
 	ls_exec(ch);
+	*death_out = 0;
+	*seq_out = 0;
 	if (ch->status != PS_STATUS_OK)
-	{
-		*seq_out = 0;
-		return 0;
-	}
+		return false;
+	*death_out = ch->req_lsn;
 	*seq_out = ch->req_seq;
-	return ch->req_lsn;
+	return true;
+}
+
+/* Relation size as of lsn, or false when the daemon refuses the horizon:
+ * redo must not read a refused answer as "the block does not exist". */
+bool
+pagestore_localsvc_nblocks_asof_checked(const PageStoreRelKey *key, uint64 lsn,
+										uint64 *nblocks_out)
+{
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
+
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	*nblocks_out = ch->result;
+	return ch->status == PS_STATUS_OK;
 }
 
 int

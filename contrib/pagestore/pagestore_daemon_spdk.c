@@ -137,6 +137,13 @@ read_done(void *arg, int ok)
 		if (rs->ch->opcode == PS_OP_READ_AT)
 			rs->ch->result = 1;
 	}
+	else
+	{
+		/* A stored version that could not be read is an error, never an
+		 * absent version: single-page redo would otherwise replace it with a
+		 * fabricated base, and a capped read would hand back zeroes. */
+		rs->ch->status = PS_STATUS_ERROR;
+	}
 	if (--rs->pending == 0)
 	{
 		rs->active = 0;			/* clear before publishing DONE */

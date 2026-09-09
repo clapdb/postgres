@@ -621,6 +621,54 @@ test_late_artifact_below_frontier_is_refused(void)
 	remove_tree(store);
 }
 
+/* An artifact admitted below the frontier reserves its fence before the
+ * bytes are written.  If the append then fails, the reservation is released
+ * and no fence remains, so an abandoned cutoff does not pin a control era
+ * until restart; a later successful append at the same cutoff fences it. */
+static void
+test_failed_artifact_append_releases_its_fence(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-release-XXXXXX";
+	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
+	unsigned char page[8192];
+	int rc;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the released fence test");
+	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
+		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
+		  write_relation(0, 0, 2900) && write_control(0, 3000, 2800),
+		  "write three checkpoints for the released fence test");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 3500),
+		  "materializer cutoff above every checkpoint for the released fence test");
+	run_maintenance(64);
+	close_store();
+	/* the next segment write fails: the seed is admitted but never lands */
+	check(setenv("PAGESTORE_TEST_FAIL_SEG_WRITES", "1", 1) == 0,
+		  "arm one failing segment write");
+	configure_core(1);
+	check(ps_core_open(store) == 0, "reopen with the failing write armed");
+	memset(page, 0x77, sizeof(page));
+	ps_lock_shard_wr(ps_shard_of(&seed));
+	rc = append_page(0, &seed, 0, page, 3500, NULL);
+	ps_unlock_shard(ps_shard_of(&seed));
+	check(rc != 0, "the admitted seed append fails at the segment write");
+	check(ps_test_artifact_fence_count(0) == 0,
+		  "a failed artifact append leaves no fence behind");
+	check(unsetenv("PAGESTORE_TEST_FAIL_SEG_WRITES") == 0,
+		  "disarm the failing segment write");
+	ps_lock_shard_wr(ps_shard_of(&seed));
+	rc = append_page(0, &seed, 0, page, 3500, NULL);
+	ps_unlock_shard(ps_shard_of(&seed));
+	check(rc == 0 && ps_storage->sync() == 0 &&
+		  ps_test_artifact_fence_count(0) == 1,
+		  "the retried seed append lands and fences its cutoff");
+	close_store();
+	remove_tree(store);
+}
+
 /* Independently versioned control blocks (materializer marker, checkpoints)
  * keep their own newest visible version, whether or not their LSNs coincide
  * with image versions the pair plan drops. */
@@ -680,6 +728,7 @@ main(void)
 	test_wal_only_pin_release_reschedules();
 	test_slru_seed_keeps_its_control_image();
 	test_late_artifact_below_frontier_is_refused();
+	test_failed_artifact_append_releases_its_fence();
 	test_independent_blocks_keep_their_newest();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
