@@ -736,6 +736,72 @@ begin_delete(uint32_t timeline)
 }
 
 /* Artifact fences registered on a branch leave with the branch. */
+/* The daemon's answer for single-page redo: the newest retained position at
+ * or below a horizon at which the block was outside its relation. */
+static uint64_t
+block_death_asof(uint32_t timeline, uint32_t block, uint64_t lsn)
+{
+	PsChannel	ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_BLOCK_DEATH;
+	ch.timeline = timeline;
+	ch.key = rel_key;
+	ch.blocknum = block;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&rel_key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&rel_key));
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK ? ch.req_lsn : UINT64_MAX;
+}
+
+/* Creation, truncates at or below the block, and unlink are deaths; growth
+ * after a death does not hide it; a branch inherits the deaths below its
+ * fork point and keeps its own to itself. */
+static void
+test_block_death_asof(void)
+{
+	char		store[] = "/tmp/pagestore-lifecycle-death-XXXXXX";
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the block death query");
+	check(fork_op(PS_OP_CREATE, 1000, 0, 0) &&
+		  fork_op(PS_OP_ZEROEXTEND, 1100, 2, 0) &&
+		  write_page(0, 1200, 0x11) && write_page(1, 1300, 0x12) &&
+		  fork_op(PS_OP_TRUNCATE, 2000, 1, 0) &&
+		  fork_op(PS_OP_ZEROEXTEND, 2100, 1, 1) &&
+		  write_page(1, 2200, 0x13),
+		  "create, write, truncate and regrow the second block");
+	check(block_death_asof(0, 1, 1500) == 1000,
+		  "creation is the newest death before the truncate");
+	check(block_death_asof(0, 1, 2050) == 2000,
+		  "the truncate is the death at its own horizon");
+	check(block_death_asof(0, 1, 2500) == 2000,
+		  "regrowth does not hide the death the chain was retired against");
+	check(block_death_asof(0, 0, 2500) == 1000,
+		  "a block the truncate kept last died at creation");
+	check(create_branch(1, 0, 2500), "branch at the regrown state");
+	check(block_death_asof(1, 1, 2600) == 2000,
+		  "the branch inherits the parent's death below its fork point");
+	check(branch_fork_op(1, PS_OP_TRUNCATE, 2700, 0, 0),
+		  "truncate the branch to nothing");
+	check(block_death_asof(1, 0, 2800) == 2700 &&
+		  block_death_asof(0, 0, 2800) == 1000,
+		  "a branch death is local to the branch");
+	check(fork_op(PS_OP_UNLINK, 3000, 0, 0), "unlink the relation on the parent");
+	check(block_death_asof(0, 0, 3500) == 3000 &&
+		  block_death_asof(0, 1, 3500) == 3000,
+		  "an unlink is a death for every block");
+	check(block_death_asof(0, 0, 0) == UINT64_MAX,
+		  "the query requires a horizon");
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_deleted_branch_forgets_artifact_fences(void)
 {
@@ -778,6 +844,7 @@ main(void)
 	test_frontier_less_branch_caps_cutoff();
 	test_dropped_relation_retires_its_layers();
 	test_deleted_branch_forgets_artifact_fences();
+	test_block_death_asof();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

@@ -505,6 +505,56 @@ test_slru_seed_keeps_its_control_image(void)
 	remove_tree(store);
 }
 
+/* An artifact shipped at a cutoff that page compaction already passed, with
+ * no fence at that cutoff, is refused: the control image it would resolve its
+ * era from is gone, so registering it would only pin a dead era.  At or above
+ * the frontier it is accepted as before. */
+static void
+test_late_artifact_below_frontier_is_refused(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-late-XXXXXX";
+	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
+	PsKey snapshot = {0, 0, 9, 0, PS_KLASS_READER_SNAPSHOT};
+	unsigned char page[8192];
+	int rc_below, rc_snapshot_below, rc_at;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the late artifact test");
+	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
+		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
+		  write_relation(0, 0, 2900) && write_control(0, 3000, 2800),
+		  "write three checkpoints");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 3500),
+		  "materializer cutoff above every checkpoint");
+	run_maintenance(64);
+	{
+		uint64_t version = 0;
+
+		check(!read_control_at(0, 0, 2000, &version),
+			  "the second checkpoint's control image was retired");
+	}
+	memset(page, 0x77, sizeof(page));
+	ps_lock_shard_wr(ps_shard_of(&seed));
+	rc_below = append_page(0, &seed, 0, page, 2000, NULL);
+	ps_unlock_shard(ps_shard_of(&seed));
+	ps_lock_shard_wr(ps_shard_of(&snapshot));
+	rc_snapshot_below = append_page(0, &snapshot, 0, page, 2000, NULL);
+	ps_unlock_shard(ps_shard_of(&snapshot));
+	check(rc_below != 0 && rc_snapshot_below != 0,
+		  "an SLRU seed or reader snapshot at the retired cutoff is refused");
+	check(ps_test_artifact_fence_count(0) == 0,
+		  "a refused artifact registers no fence");
+	ps_lock_shard_wr(ps_shard_of(&seed));
+	rc_at = append_page(0, &seed, 0, page, 3500, NULL);
+	ps_unlock_shard(ps_shard_of(&seed));
+	check(rc_at == 0 && ps_storage->sync() == 0,
+		  "an SLRU seed at the cutoff itself is accepted");
+	close_store();
+	remove_tree(store);
+}
+
 /* Independently versioned control blocks (materializer marker, checkpoints)
  * keep their own newest visible version, whether or not their LSNs coincide
  * with image versions the pair plan drops. */
@@ -562,6 +612,7 @@ main(void)
 	test_retry_copies_collapse();
 	test_wal_only_pin_release_reschedules();
 	test_slru_seed_keeps_its_control_image();
+	test_late_artifact_below_frontier_is_refused();
 	test_independent_blocks_keep_their_newest();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;

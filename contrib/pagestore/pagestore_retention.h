@@ -33,6 +33,7 @@ extern int ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
 										uint32_t *count_out);
 extern int ps_retention_lookup(uint32_t timeline, uint32_t owner_kind,
 									uint64_t owner_id, PsRetentionPin *pin_out);
+extern int ps_retention_page_fence_at(uint32_t timeline, uint64_t lsn);
 extern int ps_retention_page_fence_active(uint32_t timeline, uint64_t lsn,
 									uint64_t admission_seq);
 extern int ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,

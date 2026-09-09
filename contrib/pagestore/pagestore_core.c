@@ -5637,6 +5637,46 @@ fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 	return maxnb;
 }
 
+/*
+ * Newest position at or below read_lsn at which 'block' was definitively
+ * outside its fork (creation, a truncate at or below it, or unlink), on the
+ * timeline or the ancestry an as-of read walks; zero when none is retained.
+ * Regrowth after that position does not matter: single-page redo uses the
+ * position as a zero-page base and replays only the records after it, which
+ * is exactly how WAL-index compaction retired the earlier chain, while the
+ * compacted index may still list older records for older horizons.
+ */
+static uint64_t
+fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t read_lsn, uint64_t read_seq)
+{
+	TlWalk		w = tl_walk_first(timeline, read_lsn);
+
+	do
+	{
+		ForkEnt    *e = fork_find(w.tl, key);
+
+		if (e != NULL)
+		{
+			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+
+			for (uint32_t i = e->nev; i > 0; i--)
+			{
+				const ForkEvent *v = &e->ev[i - 1];
+
+				if (v->kind > FEV_DEAD || v->lsn == 0 || v->lsn > w.lsn ||
+					(v->lsn == w.lsn && seq_cap != 0 &&
+					 v->admission_seq != 0 && v->admission_seq > seq_cap))
+					continue;
+				if (v->kind == FEV_DEAD ||
+					(v->kind == FEV_SET && v->nblocks <= block))
+					return v->lsn;
+			}
+		}
+	} while (tl_walk_next(&w));
+	return 0;
+}
+
 /* Does the fork exist on 'timeline' or any ancestor, as of read_lsn? */
 static int
 fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
@@ -13259,6 +13299,29 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = cur ? cur->lsn + 1 : 1;
 		ps_unlock_map();
 	}
+	/*
+	 * An SLRU seed or reader snapshot resolves its control era from the newest
+	 * control image at or below its cutoff, and registering it fences that
+	 * image from then on.  Below the durable page frontier the image survives
+	 * only at a fence that already existed when compaction ran, so an artifact
+	 * shipped late at an unfenced cutoff is refused instead of being admitted
+	 * as a durable version whose era is already gone.
+	 */
+	if ((key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_READER_SNAPSHOT) &&
+		hdr.lsn != 0)
+	{
+		PsPruneFence frontier;
+		int			fenced;
+
+		ps_lock_map_rd();
+		frontier = page_frontier_current(timeline);
+		fenced = hdr.lsn >= frontier.lsn ||
+			ps_retention_page_fence_at(timeline, hdr.lsn) ||
+			page_frontier_structural_fence_active(timeline, timeline, hdr.lsn);
+		ps_unlock_map();
+		if (!fenced)
+			return -1;
+	}
 	hdr.len = page_size;
 
 	/*
@@ -15786,6 +15849,19 @@ ps_handle_meta(PsChannel *ch)
 			ch->result = fork_exists_through(tl, &ch->key,
 										 ch->req_lsn ? ch->req_lsn : UINT64_MAX,
 										 ch->req_seq) ? 1 : 0;
+			break;
+
+		case PS_OP_BLOCK_DEATH:
+			/* req_lsn caps the horizon and returns the answer: the newest
+			 * retained death of (key, blocknum) at or below it, or zero. */
+			if (ch->req_lsn == 0 ||
+				!page_frontier_ancestry_allows(tl, ch->req_lsn, ch->req_seq))
+			{
+				ch->status = PS_STATUS_ERROR;
+				break;
+			}
+			ch->req_lsn = fork_block_death_through(tl, &ch->key, ch->blocknum,
+												   ch->req_lsn, ch->req_seq);
 			break;
 
 		case PS_OP_UNLINK:

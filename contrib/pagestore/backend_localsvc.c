@@ -1491,6 +1491,23 @@ pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
 	return ch->result;
 }
 
+/*
+ * Newest position at or below lsn at which the block was definitively outside
+ * its relation (creation, truncate, unlink), or zero when none is retained.
+ */
+uint64
+pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
+									BlockNumber blocknum, uint64 lsn)
+{
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
+
+	ch->opcode = PS_OP_BLOCK_DEATH;
+	ch->blocknum = blocknum;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	return ch->status == PS_STATUS_OK ? ch->req_lsn : 0;
+}
+
 int
 pagestore_localsvc_exists_asof(const PageStoreRelKey *key, uint64 lsn)
 {

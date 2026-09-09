@@ -379,7 +379,16 @@ history (another owner's page fence at the same LSN can move first), and
 forkmeta compaction treats every WAL-index horizon as a fork-history horizon,
 so a WAL-index-only owner between two truncates keeps the death its chain
 was retired against and the regrowth after it
-(`pagestore_wal_reclaim_core_test`).  With that, 8000-round soaks keep every
+(`pagestore_wal_reclaim_core_test`).  Two consumers were then aligned with
+the compacted index: single-page redo asks the daemon for the newest fork
+death at or below its horizon (`PS_OP_BLOCK_DEATH`) and starts from a zero
+page there whenever that death is newer than the full-page image or stored
+version it found, because the index is the union of every horizon's chain
+and may still list pre-death records for an older owner; and an SLRU seed or
+reader snapshot shipped at a cutoff that page compaction already passed
+without a fence is refused, since the control image it would resolve its
+era from is gone (`pagestore_lifecycle_prune_test`,
+`pagestore_control_prune_test`).  With that, 8000-round soaks keep every
 category, forkmeta included, within bound.  Still required for the gate:
 
 - no owner establishes the durable operational cutoff that controllers

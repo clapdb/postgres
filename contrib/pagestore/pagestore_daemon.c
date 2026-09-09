@@ -516,6 +516,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_IMMEDSYNC:
 			return 1;
 		case PS_OP_EXISTS:
+		case PS_OP_BLOCK_DEATH:
 		case PS_OP_NBLOCKS:
 		case PS_OP_READV:
 		case PS_OP_READ_AT:

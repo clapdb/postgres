@@ -149,6 +149,7 @@ typedef enum PsOpcode
 	PS_OP_RETENTION_FLOOR,		/* effective floor for parent_timeline resource */
 	PS_OP_BEGIN_DELETE,			/* durable LIVE -> DELETING transition */
 	PS_OP_TIMELINE_STATE,		/* return lifecycle state/incarnation */
+	PS_OP_BLOCK_DEATH,			/* newest death of (key, blocknum) at/below req_lsn -> req_lsn */
 } PsOpcode;
 
 typedef enum PsTimelineState

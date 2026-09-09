@@ -2110,6 +2110,7 @@ PG_FUNCTION_INFO_V1(pagestore_redo_page);
 Datum
 pagestore_redo_page(PG_FUNCTION_ARGS)
 {
+	XLogRecPtr	fpi_end = InvalidXLogRecPtr;
 	Oid			relid = PG_GETARG_OID(0);
 	int32		forknum = PG_GETARG_INT32(1);
 	int32		blocknum = PG_GETARG_INT32(2);
@@ -2203,6 +2204,7 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 				result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 				SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
 				memcpy(VARDATA(result), page, BLCKSZ);
+				fpi_end = reader->EndRecPtr;
 			}
 			break;
 		}
@@ -2219,15 +2221,40 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	 * it exactly as the FPI would have been returned.
 	 */
 	{
-		XLogRecPtr	base_end;
+		XLogRecPtr	base_end = fpi_end;
 
-	if (result == NULL &&
-		ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page, &base_end))
-	{
-		result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
-		SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
-		memcpy(VARDATA(result), page, BLCKSZ);
-	}
+		if (result == NULL &&
+			ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+								&base_end))
+		{
+			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+			memcpy(VARDATA(result), page, BLCKSZ);
+		}
+		/*
+		 * The compacted index is the union of every horizon's chain, so the
+		 * image found above may predate a truncate or unlink that emptied the
+		 * block before lsn.  From that death on the block has no content: the
+		 * base is an all-zero page when the block exists again at lsn, and
+		 * nothing when it does not.
+		 */
+		if (result != NULL)
+		{
+			uint64		death = pagestore_localsvc_block_death_asof(
+				&key, (BlockNumber) blocknum, (uint64) lsn);
+
+			if (death != 0 && death >= (uint64) base_end)
+			{
+				if (pagestore_localsvc_nblocks_asof(&key, (uint64) lsn) >
+					(uint64) blocknum)
+					memset(VARDATA(result), 0, BLCKSZ);
+				else
+				{
+					pfree(result);
+					result = NULL;
+				}
+			}
+		}
 	}
 	pfree(page);
 
@@ -2491,6 +2518,43 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 			pfree(base);
 			pfree(page);
 			PG_RETURN_NULL();
+		}
+	}
+
+	/*
+	 * The compacted index is the union of every horizon's chain.  A record
+	 * retained for an older horizon may predate a truncate or unlink that
+	 * emptied this block before lsn; from that death on the block has no
+	 * content, so whenever the death is newer than the base selected above it
+	 * replaces it: an all-zero page, and only the records after the death
+	 * belong to this horizon's chain.  A block that does not exist again at
+	 * lsn has no page at all.
+	 */
+	{
+		uint64		death = pagestore_localsvc_block_death_asof(
+			&key, (BlockNumber) blocknum, (uint64) lsn);
+
+		if (death != 0 && death >= (uint64) base_end_lsn)
+		{
+			if (pagestore_localsvc_nblocks_asof(&key, (uint64) lsn) <=
+				(uint64) blocknum)
+			{
+				XLogReaderFree(reader);
+				pfree(pd);
+				pfree(recs);
+				pfree(base);
+				pfree(page);
+				PG_RETURN_NULL();
+			}
+			memset(base, 0, BLCKSZ);
+			base_end_lsn = InvalidXLogRecPtr;
+			base_idx = -1;
+			for (int i = 0; i < n; i++)
+				if (((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+					 recs[i].end_lsn <= death) ||
+					((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) == 0 &&
+					 recs[i].lsn < death))
+					base_idx = i;
 		}
 	}
 
