@@ -14292,17 +14292,22 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 		return 0;
 	if (!lsn_retained)
 	{
+		int			in_flight = 0;
+
 		for (uint32_t i = 0; i < plan->nchain; i++)
 			if (plan->chain[i].lsn == v->lsn)
 				return 0;		/* durable image planned away */
-		for (uint32_t i = 0; i < plan->npending; i++)
+		for (uint32_t i = 0; i < plan->npending && !in_flight; i++)
 			if (plan->pending[i] == v->lsn)
-				return 1;		/* image written, not durably covered yet */
-		if (v->lsn <= plan->image_max_lsn)
+				in_flight = 1;	/* image written, not durably covered yet */
+		if (!in_flight && v->lsn <= plan->image_max_lsn)
 			return 0;			/* image already pruned */
-		return 1;				/* image not written yet */
+		/* image on its way: one copy of the note waits for it, below */
 	}
-	/* Newest durably covered copy of this LSN across the block's chain. */
+	/* Newest durably covered copy of this LSN across the block's chain: a
+	 * mirror that timed out after the note and retried appended the same
+	 * bytes again under a new sequence, whether or not its image has
+	 * arrived yet, and only the newest copy needs to survive. */
 	if (entry != NULL)
 		for (int i = 0; i < entry->nver; i++)
 			if (entry->vers[i].lsn == v->lsn &&

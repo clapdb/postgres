@@ -96,6 +96,22 @@ write_control(uint32_t timeline, uint64_t version, uint64_t redo)
 	return ps_storage->sync() == 0;
 }
 
+/* The redo-floor note alone: a mirror that timed out before its image. */
+static int
+write_note(uint32_t timeline, uint64_t version, uint64_t redo)
+{
+	PsKey key = control_key();
+	unsigned char page[8192];
+	int rc;
+
+	ps_lock_shard_wr(ps_shard_of(&key));
+	memset(page, 0, sizeof(page));
+	memcpy(page, &redo, sizeof(redo));
+	rc = append_page(timeline, &key, 1, page, version, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
 static int
 write_relation(uint32_t timeline, uint32_t block, uint64_t lsn)
 {
@@ -421,6 +437,56 @@ test_retry_copies_collapse(void)
 	remove_tree(store);
 }
 
+/* A mirror that keeps timing out after its note but before its image
+ * appends the same note again under a new sequence each time.  Compaction
+ * keeps exactly one copy of that in-flight note while waiting for the image,
+ * so repeated failures cannot grow the control layers without bound. */
+static void
+test_in_flight_note_retries_collapse(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-inflight-XXXXXX";
+	PsKey key = control_key();
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the in-flight note test");
+	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
+		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
+		  write_note(0, 3000, 2800) && write_note(0, 3000, 2800) &&
+		  write_note(0, 3000, 2800),
+		  "two checkpoints, then a note retried three times without its image");
+	check(ps_test_page_version_count(0, &key, 0) == 2 &&
+		  ps_test_page_version_count(0, &key, 1) == 5,
+		  "every retried note copy exists before compaction");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 2500),
+		  "materializer cutoff above the second checkpoint");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &key, 1) == 2,
+		  "one copy of the in-flight note survives with the retained pair's note");
+	{
+		uint64_t version = 0;
+
+		check(read_control_at(0, 1, 3000, &version) && version == 2800,
+			  "the surviving in-flight note is still readable");
+	}
+	check(write_control(0, 3000, 2800) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 3500),
+		  "the image finally arrives and the cutoff moves past it");
+	run_maintenance(64);
+	{
+		uint64_t version = 0;
+
+		check(read_control_at(0, 0, 3000, &version) && version == 3000 &&
+			  read_control_at(0, 1, 3000, &version) && version == 2800,
+			  "the completed pair restores at its checkpoint");
+		check(wal_floor(0) == 2800, "the WAL floor follows the completed pair");
+	}
+	close_store();
+	remove_tree(store);
+}
+
 /* A WAL-only pin fences control images.  Dropping it must schedule the
  * control layers for pruning even when no layer-count threshold is crossed. */
 static void
@@ -610,6 +676,7 @@ main(void)
 	test_branch_cap_retains_its_checkpoint();
 	test_split_pair_is_never_unnoted();
 	test_retry_copies_collapse();
+	test_in_flight_note_retries_collapse();
 	test_wal_only_pin_release_reschedules();
 	test_slru_seed_keeps_its_control_image();
 	test_late_artifact_below_frontier_is_refused();

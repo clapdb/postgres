@@ -399,9 +399,10 @@ identities are compared as (LSN, admission sequence) tuples end to end, the
 order `fork_page_invalidated()` already applies, so a page clamped to the
 LSN of the truncate it was written after keeps its bytes; an admitted
 artifact registers its fence under the same lock as the check that admitted
-it; and the soak measures allocated blocks rather than logical length and
-bounds the file count.  With that, 8000-round soaks keep every category,
-forkmeta included, within bound.  Still required for the gate:
+it; a note whose image is still on its way keeps a single copy across
+mirror retries; and the soak measures allocated blocks rather than logical
+length and bounds the file count.  With that, 8000-round soaks keep every
+category, forkmeta included, within bound.  Still required for the gate:
 
 - no owner establishes the durable operational cutoff that controllers
   respect: the real materializer pins WAL and the WAL index but not page
