@@ -6468,7 +6468,8 @@ typedef struct ForkMetaRecV1
 	uint8_t		pad[3];
 } ForkMetaRecV1;
 
-#define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2" */
+#define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2": no record checksum (accepted) */
+#define FORK_META_V3_MAGIC 0x334d4b46 /* "FKM3": V2 layout, pad carries CRC-24 */
 #define FORK_META_SNAPSHOT_PAYLOAD_MAGIC 0x31534d46 /* "FMS1" */
 #define FORK_META_SNAPSHOT_PAYLOAD_VERSION 1
 #define FORK_META_SNAPSHOT_CHECKPOINT 0
@@ -6504,6 +6505,66 @@ typedef struct ForkMetaSnapshotPayloadHeader
 	uint64_t	checkpoint_bytes;
 	uint64_t	tail_bytes;
 } ForkMetaSnapshotPayloadHeader;
+
+/* CRC-24 (OpenPGP polynomial) over every record byte before the pad.  A V3
+ * record stores it in the three former pad bytes, so the 64-byte layout and
+ * every rec_len check stay unchanged while a flipped byte inside a record is
+ * detected; V2 records (zero pad, no checksum) remain readable. */
+static uint32_t
+fork_meta_rec_crc24(const ForkMetaRecV2 *rec)
+{
+	const unsigned char *bytes = (const unsigned char *) rec;
+	uint32_t	crc = 0xB704CEu;
+
+	for (size_t i = 0; i < offsetof(ForkMetaRecV2, pad); i++)
+	{
+		crc ^= (uint32_t) bytes[i] << 16;
+		for (int bit = 0; bit < 8; bit++)
+		{
+			crc <<= 1;
+			if (crc & 0x1000000u)
+				crc ^= 0x1864CFBu;
+		}
+	}
+	return crc & 0xFFFFFFu;
+}
+
+static void
+fork_meta_rec_seal(ForkMetaRecV2 *rec)
+{
+	uint32_t	crc;
+
+	rec->magic = FORK_META_V3_MAGIC;
+	crc = fork_meta_rec_crc24(rec);
+	rec->pad[0] = (uint8_t) (crc >> 16);
+	rec->pad[1] = (uint8_t) (crc >> 8);
+	rec->pad[2] = (uint8_t) crc;
+}
+
+static int
+fork_meta_magic_v2_family(uint32_t magic)
+{
+	return magic == FORK_META_V2_MAGIC || magic == FORK_META_V3_MAGIC;
+}
+
+/* Layout and checksum validity of a record read from the source log or a
+ * snapshot payload; field semantics are checked by the callers. */
+static int
+fork_meta_rec_wire_valid(const ForkMetaRecV2 *rec)
+{
+	if (rec->rec_len != sizeof(*rec))
+		return 0;
+	if (rec->magic == FORK_META_V2_MAGIC)
+		return rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
+	if (rec->magic == FORK_META_V3_MAGIC)
+	{
+		uint32_t	crc = fork_meta_rec_crc24(rec);
+
+		return rec->pad[0] == (uint8_t) (crc >> 16) &&
+			rec->pad[1] == (uint8_t) (crc >> 8) && rec->pad[2] == (uint8_t) crc;
+	}
+	return 0;
+}
 
 static uint64_t fork_meta_snapshot_generation;
 static uint64_t fork_meta_snapshot_cutoff_lsn;
@@ -6552,6 +6613,7 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 	rec.admission_seq = admission_seq;
 	rec.nblocks = nblocks;
 	rec.kind = kind;
+	fork_meta_rec_seal(&rec);
 	rc = ps_storage->fork_meta_append(&rec, sizeof(rec));
 	if (rc == 0)
 		fork_meta_bytes_add(sizeof(rec));
@@ -6582,6 +6644,7 @@ fork_meta_persist_segment(uint32_t timeline, const PsKey *key, uint64_t lsn,
 	rec.nblocks = nblocks;
 	rec.kind = kind == FEV_SEG_GROW ? FEV_SEG_GROW_BOUND :
 		FEV_SEG_COMMIT_BOUND;
+	fork_meta_rec_seal(&rec);
 	rc = ps_storage->fork_meta_append(&rec, sizeof(rec));
 	if (rc == 0)
 		fork_meta_bytes_add(sizeof(rec));
@@ -6939,6 +7002,7 @@ fork_meta_vec_record(ForkMetaByteVec *vec, uint32_t timeline,
 	rec.order_id = order_id;
 	rec.nblocks = nblocks;
 	rec.kind = kind;
+	fork_meta_rec_seal(&rec);
 	return fork_meta_vec_append(vec, &rec, sizeof(rec));
 }
 
@@ -6972,14 +7036,13 @@ fork_meta_ordered_marker_valid(const ForkMetaRecV2 *rec,
 		rec->kind == FEV_SEG_COMMIT_BOUND;
 	int unbound = rec->kind == FEV_SEG_GROW || rec->kind == FEV_SEG_COMMIT;
 
-	return (bound || unbound) && rec->magic == FORK_META_V2_MAGIC &&
-		rec->rec_len == sizeof(*rec) && rec->timeline < MAX_TIMELINES &&
+	return (bound || unbound) && fork_meta_rec_wire_valid(rec) &&
+		rec->timeline < MAX_TIMELINES &&
 		rec->key.klass <= PS_KLASS_READER_SNAPSHOT &&
 		rec->nblocks != 0 &&
 		((bound && rec->order_id != 0 &&
 		  (allow_zero_bound_seq || rec->admission_seq != 0)) ||
-		 (unbound && rec->order_id == 0 && rec->admission_seq == 0)) &&
-		rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
+		 (unbound && rec->order_id == 0 && rec->admission_seq == 0));
 }
 
 static int
@@ -6999,13 +7062,12 @@ fork_meta_snapshot_record_valid(const ForkMetaRecV2 *records, uint64_t index,
 		rec->kind <= FEV_SEG_COMMIT_BOUND;
 	int future;
 
-	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
 		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
 		(!ordered_marker && (rec->kind > FEV_DEAD || rec->order_id != 0)) ||
 		(ordered_marker && !fork_meta_ordered_marker_valid(rec, 1)) ||
-		rec->pad[0] != 0 || rec->pad[1] != 0 ||
-		rec->pad[2] != 0 || (rec->kind == FEV_DEAD && rec->nblocks != 0))
+		(rec->kind == FEV_DEAD && rec->nblocks != 0))
 	{
 		fprintf(stderr, "pagestore: invalid forkmeta snapshot record part=%u index=%llu kind=%u timeline=%u\n",
 				part, (unsigned long long) index, rec->kind, rec->timeline);
@@ -7223,23 +7285,21 @@ fork_meta_snapshot_marker_matches(const ForkMetaRecV2 *rec)
 	PsKey zero_key;
 
 	memset(&zero_key, 0, sizeof(zero_key));
-	return rec->magic == FORK_META_V2_MAGIC && rec->rec_len == sizeof(*rec) &&
+	return fork_meta_rec_wire_valid(rec) &&
 		rec->timeline == 0 && key_eq(&rec->key, &zero_key) &&
 		rec->lsn == fork_meta_snapshot_cutoff_lsn &&
 		rec->admission_seq == fork_meta_snapshot_cutoff_seq &&
 		rec->order_id == fork_meta_snapshot_generation && rec->nblocks == 0 &&
-		rec->kind == FEV_SNAPSHOT_BASE && rec->pad[0] == 0 &&
-		rec->pad[1] == 0 && rec->pad[2] == 0;
+		rec->kind == FEV_SNAPSHOT_BASE;
 }
 
 static int
 fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
 {
-	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
 		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
-		rec->admission_seq == 0 || rec->pad[0] != 0 || rec->pad[1] != 0 ||
-		rec->pad[2] != 0 ||
+		rec->admission_seq == 0 ||
 		!fork_meta_event_future(rec->lsn, rec->admission_seq,
 								fork_meta_snapshot_cutoff_lsn,
 								fork_meta_snapshot_cutoff_seq))
@@ -7298,7 +7358,7 @@ fork_meta_source_conflicts_with_snapshot(void)
 			return 1;
 		if (nread != (int) sizeof(rec))
 			return 0;			/* a torn tail is the unacknowledged crash tail */
-		if (rec.magic != FORK_META_V2_MAGIC)
+		if (!fork_meta_magic_v2_family(rec.magic))
 		{
 			/* A store migrated from the legacy layout can legitimately crash
 			 * after the manifest commit with its source still in that layout:
@@ -7324,10 +7384,10 @@ fork_meta_source_conflicts_with_snapshot(void)
 				off += sizeof(old);
 			continue;
 		}
-		if (rec.rec_len != sizeof(rec))
+		if (!fork_meta_rec_wire_valid(&rec))
 		{
-			fprintf(stderr, "pagestore: forkmeta source epoch record at %llu has an "
-					"invalid length while snapshot generation %llu is selected\n",
+			fprintf(stderr, "pagestore: forkmeta source epoch record at %llu is not "
+					"a valid record while snapshot generation %llu is selected\n",
 					(unsigned long long) off,
 					(unsigned long long) fork_meta_snapshot_generation);
 			return 1;
@@ -7440,11 +7500,19 @@ load_fork_meta(void)
 		if (nread != (int) sizeof(first))
 			break;
 		memset(&rec, 0, sizeof(rec));
-		if (first == FORK_META_V2_MAGIC)
+		if (fork_meta_magic_v2_family(first))
 		{
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
 			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
 				break;
+			if (!fork_meta_rec_wire_valid(&rec))
+			{
+				/* A complete record with a bad checksum is corruption, not a
+				 * torn tail; never replay or truncate past it. */
+				fprintf(stderr, "pagestore: forkmeta record at %llu fails its "
+						"checksum\n", (unsigned long long) off);
+				return -1;
+			}
 			rec_size = sizeof(rec);
 			if (rec.kind >= FEV_SEG_GROW &&
 				rec.kind <= FEV_SEG_COMMIT_BOUND)
@@ -7918,10 +7986,10 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			return 0;
 		if (nread != (int) sizeof(magic))
 			return -1;
-		if (magic == FORK_META_V2_MAGIC)
+		if (fork_meta_magic_v2_family(magic))
 		{
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
-			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
+			if (nread != (int) sizeof(rec) || !fork_meta_rec_wire_valid(&rec))
 				return -1;
 			if (fork_meta_ordered_marker_valid(&rec, 0) &&
 				(!filter_deleting ||
@@ -8010,12 +8078,10 @@ fork_meta_migration_marker_valid(const ForkMetaRecV2 *rec)
 	PsKey zero_key;
 
 	memset(&zero_key, 0, sizeof(zero_key));
-	return rec->magic == FORK_META_V2_MAGIC &&
-		rec->rec_len == sizeof(*rec) && rec->timeline == 0 &&
+	return fork_meta_rec_wire_valid(rec) && rec->timeline == 0 &&
 		key_eq(&rec->key, &zero_key) && rec->lsn == 0 &&
 		rec->admission_seq == 0 && rec->order_id == 0 && rec->nblocks == 0 &&
-		(rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED) &&
-		rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
+		(rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED);
 }
 
 typedef struct ForkMetaSnapshotSortRef
@@ -11418,10 +11484,9 @@ fork_meta_source_record_valid(const ForkMetaRecV2 *rec)
 	PsKey zero_key;
 	int ordered_marker;
 
-	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
-		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
-		rec->pad[0] != 0 || rec->pad[1] != 0 || rec->pad[2] != 0)
+		rec->key.klass > PS_KLASS_READER_SNAPSHOT)
 		return 0;
 	ordered_marker = rec->kind >= FEV_SEG_GROW &&
 		rec->kind <= FEV_SEG_COMMIT_BOUND;
@@ -11457,7 +11522,7 @@ fork_meta_source_has_timeline(uint32_t target)
 			return 0;
 		if (nread != (int) sizeof(first))
 			return -1;
-		if (first == FORK_META_V2_MAGIC)
+		if (fork_meta_magic_v2_family(first))
 		{
 			ForkMetaRecV2 rec;
 
@@ -19367,7 +19432,8 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		{"walidx_frontier", "walidx-prune.frontiers", PS_WALIDX_FRONTIER_MAGIC,
 		 PS_WALIDX_FRONTIER_VERSION},
 		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 2},
-		{"forkmeta", "forkmeta record", FORK_META_V2_MAGIC, 2},
+		{"forkmeta", "forkmeta record", FORK_META_V3_MAGIC, 3},
+		{"forkmeta", "forkmeta record (accepted legacy)", FORK_META_V2_MAGIC, 2},
 		{"forkmeta_snapshot", "forkmeta checkpoint/tail payload",
 		 FORK_META_SNAPSHOT_PAYLOAD_MAGIC, FORK_META_SNAPSHOT_PAYLOAD_VERSION},
 		{"walidx_snapshot", "walidx snapshot shard payload",

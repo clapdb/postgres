@@ -2017,6 +2017,7 @@ typedef struct TestForkMetaRec
 } TestForkMetaRec;
 
 #define TEST_FORK_META_V2_MAGIC 0x324d4b46
+#define TEST_FORK_META_V3_MAGIC 0x334d4b46
 typedef struct TestForkMetaRecV2
 {
 	uint32_t	magic;
@@ -2071,7 +2072,7 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 
 		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
 			break;
-		if (first == TEST_FORK_META_V2_MAGIC)
+		if (first == TEST_FORK_META_V2_MAGIC || first == TEST_FORK_META_V3_MAGIC)
 		{
 			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
 				break;
@@ -2126,7 +2127,7 @@ strip_bound_forkmeta_markers(const char *store)
 
 		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
 			break;
-		if (first == TEST_FORK_META_V2_MAGIC)
+		if (first == TEST_FORK_META_V2_MAGIC || first == TEST_FORK_META_V3_MAGIC)
 		{
 			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
 				break;
@@ -2259,7 +2260,9 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		fd = open(path, O_RDONLY);
 		memset(&rec2, 0, sizeof(rec2));
 		check(fd >= 0 && pread(fd, &rec2, sizeof(rec2), 0) ==
-			  (ssize_t) sizeof(rec2) && rec2.magic == TEST_FORK_META_V2_MAGIC &&
+			  (ssize_t) sizeof(rec2) &&
+			  (rec2.magic == TEST_FORK_META_V2_MAGIC ||
+			   rec2.magic == TEST_FORK_META_V3_MAGIC) &&
 			  rec2.kind == 4,
 			  "migration marker replaces the torn forkmeta prefix");
 		check(fd >= 0 && fstat(fd, &st) == 0 &&

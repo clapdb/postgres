@@ -17,6 +17,7 @@ static int checks;
 static int failed;
 
 #define TEST_FORK_META_V2_MAGIC 0x324d4b46U
+#define TEST_FORK_META_V3_MAGIC 0x334d4b46U
 #define TEST_FORK_META_SNAPSHOT_PAYLOAD_MAGIC 0x31534d46U
 #define TEST_FEV_GROW 0
 #define TEST_FEV_SET 1
@@ -393,7 +394,8 @@ source_is_marker_only(const char *store, TestForkMetaRecV2 *marker)
 	n = read(fd, marker, sizeof(*marker));
 	close(fd);
 	return n == (ssize_t) sizeof(*marker) &&
-		marker->magic == TEST_FORK_META_V2_MAGIC &&
+		(marker->magic == TEST_FORK_META_V2_MAGIC ||
+		 marker->magic == TEST_FORK_META_V3_MAGIC) &&
 		marker->rec_len == sizeof(*marker) &&
 		marker->kind == TEST_FEV_SNAPSHOT_BASE;
 }
@@ -407,6 +409,18 @@ append_source_bytes(const char *path, const void *data, size_t len)
 	if (fd >= 0 && close(fd) != 0)
 		ok = 0;
 	return ok;
+}
+
+
+/* The daemon seals what it writes as FKM3 (CRC-24 in the pad bytes).  A test
+ * that edits a copied record must present it as a legacy FKM2 record, which
+ * the loader still accepts, or its checksum would fail before the field it
+ * exercises is even examined. */
+static void
+as_legacy_record(TestForkMetaRecV2 *rec)
+{
+	rec->magic = TEST_FORK_META_V2_MAGIC;
+	memset(rec->pad, 0, sizeof(rec->pad));
 }
 
 static int
@@ -1587,6 +1601,8 @@ main(void)
 		torn = valid;
 		torn.lsn++;
 		torn.admission_seq++;
+		as_legacy_record(&valid);
+		as_legacy_record(&torn);
 		check(append_source_record(source, &valid) &&
 			  append_source_bytes(source, &torn, sizeof(torn) / 2),
 			  "append valid selected suffix followed by a torn crash tail");
@@ -1612,6 +1628,7 @@ main(void)
 		bad.admission_seq++;
 		bad.order_id = 0;
 		bad.kind = TEST_FEV_MIGRATED;
+		as_legacy_record(&bad);
 		check(append_source_record(source, &bad) && expect_open_failure(store),
 			  "stale migration marker after matching epoch fails startup closed");
 		check(restore_marker_only(source, sizeof(marker)),
@@ -1625,6 +1642,7 @@ main(void)
 		bad.order_id = 0;
 		bad.nblocks = 1;
 		bad.kind = TEST_FEV_GROW;
+		as_legacy_record(&bad);
 		check(append_source_record(source, &bad) && expect_open_failure(store),
 			  "malformed current-epoch timeline fails startup closed");
 		check(restore_marker_only(source, sizeof(marker)),
@@ -1632,6 +1650,7 @@ main(void)
 
 		bad.timeline = 0;
 		bad.kind = 255;
+		as_legacy_record(&bad);
 		check(append_source_record(source, &bad) && expect_open_failure(store),
 			  "malformed current-epoch kind fails startup closed");
 		check(restore_marker_only(source, sizeof(marker)),

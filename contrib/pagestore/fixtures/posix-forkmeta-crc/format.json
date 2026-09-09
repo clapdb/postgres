@@ -1,0 +1,104 @@
+[
+  {
+    "family": "control",
+    "artifact": "control object admission fence block",
+    "magic": "0x434e4641",
+    "version": 1
+  },
+  {
+    "family": "delta_layer",
+    "artifact": "delta layer footer",
+    "magic": "0x544c4450",
+    "version": 2
+  },
+  {
+    "family": "forkmeta",
+    "artifact": "forkmeta record",
+    "magic": "0x334d4b46",
+    "version": 3
+  },
+  {
+    "family": "forkmeta",
+    "artifact": "forkmeta record (accepted legacy)",
+    "magic": "0x324d4b46",
+    "version": 2
+  },
+  {
+    "family": "forkmeta_snapshot",
+    "artifact": "forkmeta checkpoint/tail payload",
+    "magic": "0x31534d46",
+    "version": 1
+  },
+  {
+    "family": "forkmeta_snapshot",
+    "artifact": "forkmeta_snapshots/forkmeta_manifest_v1",
+    "magic": "0x4d534946",
+    "version": 1
+  },
+  {
+    "family": "image_layer",
+    "artifact": "layer_<tl>_<id> footer",
+    "magic": "0x47494d50",
+    "version": 4
+  },
+  {
+    "family": "manifest",
+    "artifact": "layers.manifest record",
+    "magic": "0x504d414e",
+    "version": 3
+  },
+  {
+    "family": "page_frontier",
+    "artifact": "page-prune.frontiers",
+    "magic": "0x46504750",
+    "version": 3
+  },
+  {
+    "family": "retention",
+    "artifact": "retention.meta record",
+    "magic": "0x4e544552",
+    "version": 2
+  },
+  {
+    "family": "retention",
+    "artifact": "retention.state",
+    "magic": "0x53544552",
+    "version": 2
+  },
+  {
+    "family": "timelines",
+    "artifact": "timelines record",
+    "magic": "0x324d4c54",
+    "version": 2
+  },
+  {
+    "family": "wal_segment",
+    "artifact": "wal_segments_<tl>/walv1_* header",
+    "magic": "0x57534731",
+    "version": 1
+  },
+  {
+    "family": "wal_store",
+    "artifact": "wal_store_identity_v1",
+    "magic": "0x4d535732",
+    "version": 2
+  },
+  {
+    "family": "walidx_frontier",
+    "artifact": "walidx-prune.frontiers",
+    "magic": "0x46584957",
+    "version": 2
+  },
+  {
+    "family": "walidx_snapshot",
+    "artifact": "walidx snapshot shard payload",
+    "magic": "0x44534957",
+    "version": 3
+  },
+  {
+    "family": "walidx_snapshot",
+    "artifact": "walidx_snapshots_<tl>/walidx_manifest_v1",
+    "magic": "0x4d534957",
+    "version": 1
+  }
+]

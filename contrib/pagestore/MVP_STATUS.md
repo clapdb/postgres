@@ -664,31 +664,37 @@ advertise delta layers, which no maintenance path produces yet.  Captures run
 in a private directory and canonicalize the absolute layer locations the
 manifest persists, so repeated captures produce byte-identical archives, and
 the check starts every daemon with the configuration the archive records
-rather than today's defaults.  Four findings were fixed on the way: a store
-reopened at a new path was refused because layer locations recorded their
-absolute parent directory (a missing parent now rebases onto the store's own
-leaf; a foreign existing parent is still rejected); a damaged forkmeta
-snapshot marker silently discarded acknowledged post-cutover events (a source
-epoch that conflicts with the selected snapshot, an emptied source included,
-now refuses to open); a segment record header persisted its alignment padding
-uninitialized; and a fork-metadata snapshot part could be published in an
-order its own loader refuses, because ordered markers that live only in the
-source log were appended after the in-memory events of the same fork -- a
-below-floor copy followed by a higher-LSN write on the same relation
-published a snapshot the daemon then could not open, so each part is now
-sorted into per-fork order before it is written.  Two gaps remain documented in the check.  Forkmeta source records carry no
-checksum, so corruption inside a record is caught only by the oracle -- both
-the size it records and the position of the event, which the oracle now asks
-for on both sides of each boundary.  And a page-segment record can never be
-the only copy of a page: a cleanly stopped daemon flushes its memtable into a
-layer before it exits, so every archived page is also in a layer, and a read
-resolves there (`reads mem=0 layer=9 seg=0` on a reopened fixture).  The
-segment readers are still exercised -- every open replays the uncovered tail
-to rebuild the index, and a record whose framing is wrong fails that scan --
-but a mutation inside one cannot be observed through a read while the layer
-carries the same version.  Backend-side artifacts (reader manifests, branch
-bootstrap, materializer markers, the writer checkpoint block) and older
-format migrations remain for the next fixture slice.
+rather than today's defaults.  Forkmeta source and snapshot payload records
+are now sealed as FKM3, the FKM2 layout with a CRC-24 in the three former pad
+bytes, so a flipped byte inside a record is rejected at open; FKM2 records
+stay readable, and `fixtures/posix-mvp-baseline` (FKM2) is kept as the legacy
+fixture that must keep reopening while `fixtures/posix-forkmeta-crc` is the
+current one that pins the compiled identities and takes every mutation.  This
+was the first format change to go through the fixture process.  Five findings
+were fixed on the way: a store reopened at a new path was refused because
+layer locations recorded their absolute parent directory (a missing parent now
+rebases onto the store's own leaf; a foreign existing parent is still
+rejected); a damaged forkmeta snapshot marker silently discarded acknowledged
+post-cutover events (a source epoch that conflicts with the selected snapshot,
+an emptied source included, now refuses to open); a segment record header
+persisted its alignment padding uninitialized; a fork-metadata snapshot part
+could be published in an order its own loader refuses, because ordered markers
+that live only in the source log were appended after the in-memory events of
+the same fork -- a below-floor copy followed by a higher-LSN write on the same
+relation published a snapshot the daemon then could not open, so each part is
+now sorted into per-fork order before it is written; and a torn legacy prefix
+stayed repairable only after the unknown-magic check learned to read a legacy
+record first.  One gap remains documented in the check: a
+page-segment record can never be the only copy of a page, because a cleanly
+stopped daemon flushes its memtable into a layer before it exits, so every
+archived page is also in a layer and a read resolves there (`reads mem=0
+layer=9 seg=0` on a reopened fixture).  The segment readers are still
+exercised -- every open replays the uncovered tail to rebuild the index, and a
+record whose framing is wrong fails that scan -- but a mutation inside one
+cannot be observed through a read while the layer carries the same version.
+Backend-side artifacts (reader manifests, branch bootstrap,
+materializer markers, the writer checkpoint block) remain for the next fixture
+slice.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it

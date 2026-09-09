@@ -2381,6 +2381,7 @@ FORKMETA_SNAPSHOTS = Path("forkmeta_snapshots")
 FORKMETA_MANIFEST = FORKMETA_SNAPSHOTS / "forkmeta_manifest_v1"
 FORKMETA_PREPARED = FORKMETA_SNAPSHOTS / "forkmeta_prepared_v1"
 FORKMETA_V2_MAGIC = 0x324D4B46
+FORKMETA_V3_MAGIC = 0x334D4B46
 FORKMETA_SNAPSHOT_BASE_KIND = 10
 DELETE_BRANCH = 1
 MANIFEST_TMP = "layers.manifest.tmp"
@@ -2735,11 +2736,12 @@ def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
     nblocks = struct.unpack_from("=I", record, 56)[0]
     kind = record[60]
     pad = record[61:64]
-    if magic != FORKMETA_V2_MAGIC or rec_len != FORKMETA_RECORD_BYTES:
+    if magic not in (FORKMETA_V2_MAGIC, FORKMETA_V3_MAGIC) or rec_len != FORKMETA_RECORD_BYTES:
         return None
     return {
-        "timeline": timeline, "key": key, "lsn": lsn, "admission_seq": admission_seq,
-        "order_id": order_id, "nblocks": nblocks, "kind": kind, "pad": pad,
+        "magic": magic, "timeline": timeline, "key": key, "lsn": lsn,
+        "admission_seq": admission_seq, "order_id": order_id, "nblocks": nblocks,
+        "kind": kind, "pad": pad,
     }
 
 
@@ -3096,7 +3098,7 @@ def _forkmeta_marker_matches(store: Path, selected: dict[str, Any]) -> bool:
         head["lsn"] == selected["cutoff_lsn"] and \
         head["admission_seq"] == selected["cutoff_seq"] and \
         head["order_id"] == selected["generation"] and head["nblocks"] == 0 and \
-        head["pad"] == b"\0\0\0"
+        (head["magic"] != FORKMETA_V2_MAGIC or head["pad"] == b"\0\0\0")
 
 
 def _forkmeta_source_starts_with_marker(store: Path) -> bool:

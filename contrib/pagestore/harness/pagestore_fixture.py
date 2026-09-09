@@ -203,21 +203,21 @@ MUTATIONS = [
              lambda p: flip_byte(p, 32), OPEN_REJECTED),
     mutation("forkmeta.tail.unknown_magic", "forkmeta",
              lambda p: bump_le32(p, FORKMETA_RECORD_BYTES), OPEN_REJECTED),
-    # KNOWN GAP: forkmeta source records carry no checksum, so a flipped byte
-    # inside a record is caught only by the oracle, not by the format.  The
-    # size and the event's own position are both exposed that way: a moved
-    # create LSN stays above the cutoff, so the store opens and the latest
-    # size is unchanged, and only the as-of boundary moves.
+    # FKM3 records carry a CRC-24 in their former pad bytes, so a flipped byte
+    # inside one is now rejected at open rather than left to the oracle.  Each
+    # record is still addressed by the relation and the event it names: the
+    # source also carries the branch's page-growth records, and a position
+    # would move with the archive.
     mutation("forkmeta.tail.corrupt_nblocks", "forkmeta",
              lambda p: flip_byte(
                  p,
                  forkmeta_record_offset(p, FORKMETA_TAIL_REL, FORKMETA_KIND_SET) + 56,
-             ), USE_REJECTED),
+             ), OPEN_REJECTED),
     mutation("forkmeta.tail.corrupt_event_lsn", "forkmeta",
              lambda p: flip_byte(
                  p,
                  forkmeta_record_offset(p, FORKMETA_TAIL_REL, FORKMETA_KIND_CREATE) + 32,
-             ), USE_REJECTED),
+             ), OPEN_REJECTED),
     # a torn last record is the unacknowledged crash tail by contract; the
     # oracle notices because the fixture's event was in fact acknowledged
     mutation("forkmeta.tail.torn", "forkmeta",
@@ -610,6 +610,7 @@ def capture(args: argparse.Namespace) -> int:
     (fixture / FIXTURE_JSON).write_text(json.dumps({
         "schema": 1,
         "name": fixture.name,
+        "role": "current",
         "workload": "fixture",
         "daemon_args": DAEMON_ARGS,
         "daemon_env": DAEMON_ENV,
@@ -620,7 +621,8 @@ def capture(args: argparse.Namespace) -> int:
 
 
 def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
-                 metadata: dict[str, Any], identities: list[dict[str, Any]]) -> None:
+                 metadata: dict[str, Any],
+                 identities: list[dict[str, Any]] | None) -> None:
     store = root / "reopen"
     extract(fixture, store)
     if identities is not None:
@@ -695,13 +697,21 @@ def fixture_metadata(fixture: Path) -> dict[str, Any]:
             not isinstance(daemon_env, dict) or \
             not all(isinstance(k, str) and isinstance(v, str) for k, v in daemon_env.items()):
         raise FixtureError(f"{fixture / FIXTURE_JSON} has no usable daemon configuration")
-    metadata["daemon_args"], metadata["daemon_env"] = daemon_args, daemon_env
+    role = metadata.get("role", "current")
+    if role not in ("current", "legacy"):
+        raise FixtureError(f"{fixture / FIXTURE_JSON} has an unknown role {role!r}")
+    metadata["daemon_args"], metadata["daemon_env"], metadata["role"] = \
+        daemon_args, daemon_env, role
     return metadata
 
 
-def check(args: argparse.Namespace) -> int:
-    fixture = args.check
+def check_one(args: argparse.Namespace, fixture: Path) -> int:
+    """A "current" fixture pins the compiled identities and takes every
+    mutation; a "legacy" fixture records a format the daemon still reads, so
+    it only has to reopen with its oracle intact (an upgrade path)."""
     metadata = fixture_metadata(fixture)
+    role = metadata["role"]
+    print(f"--- fixture {fixture.name} ({role})")
     expected = json.loads((fixture / FORMAT_JSON).read_text(encoding="utf-8"))
     current = format_identities(args.format_tool)
     failures = 0
@@ -709,19 +719,29 @@ def check(args: argparse.Namespace) -> int:
         root = Path(temp)
         # Reopening comes first: an archive whose identities the binary has
         # moved past is exactly the upgrade path a fixture exists to prove,
-        # and it must still open before the identity table is judged.
-        check_reopen(args, root, fixture, metadata, current)
-        if current != expected:
-            print("FAIL - compiled persisted-format identities differ from the fixture:")
-            for item in current:
-                if item not in expected:
-                    print(f"  new or changed: {item}")
-            for item in expected:
-                if item not in current:
-                    print(f"  missing or changed: {item}")
-            print(f"  a persisted-format change must add or update a fixture ({fixture})")
+        # and it must still open before the identity table is judged.  Only a
+        # current fixture must carry every advertised format; a legacy one
+        # records formats the daemon has since moved past.
+        check_reopen(args, root, fixture, metadata,
+                     current if role == "current" else None)
+        if role == "current":
+            if current != expected:
+                print("FAIL - compiled persisted-format identities differ from the fixture:")
+                for item in current:
+                    if item not in expected:
+                        print(f"  new or changed: {item}")
+                for item in expected:
+                    if item not in current:
+                        print(f"  missing or changed: {item}")
+                print(f"  a persisted-format change must add or update a fixture ({fixture})")
+                return 1
+            print("ok   - compiled persisted-format identities match the fixture")
+        elif current == expected:
+            print("FAIL - a legacy fixture records the current identities; mark it current")
             return 1
-        print("ok   - compiled persisted-format identities match the fixture")
+        else:
+            print("ok   - legacy fixture records superseded identities")
+            return 0
         (root / "mutations").mkdir()
         for case in MUTATIONS:
             if args.only and case["name"] not in args.only:
@@ -745,11 +765,18 @@ def check(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def check(args: argparse.Namespace) -> int:
+    status = 0
+    for fixture in args.check:
+        status |= check_one(args, fixture)
+    return status
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--capture", type=Path, metavar="FIXTURE_DIR")
-    group.add_argument("--check", type=Path, metavar="FIXTURE_DIR")
+    group.add_argument("--check", type=Path, nargs="+", metavar="FIXTURE_DIR")
     parser.add_argument("--daemon-binary", type=Path, required=True)
     parser.add_argument("--client-binary", type=Path, required=True)
     parser.add_argument("--inspect-binary", type=Path, required=True)

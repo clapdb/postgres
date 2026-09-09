@@ -1014,9 +1014,10 @@ Expected scope: two or three focused PRs.
 
 ### H2. Add persisted-format fixtures and compatibility CI
 
-Status: **first slice implemented for daemon-side POSIX formats under the
-recommended D5 policy (flagged as an assumption while D5 stays open);
-backend-side artifact fixtures and older-format migrations remain**.
+Status: **daemon-side POSIX formats covered under the recommended D5 policy
+(flagged as an assumption while D5 stays open), including a legacy fixture
+exercised by the first format change; backend-side artifact fixtures
+remain**.
 
 The slice adds `pagestore_format.h` identities reported by every format-owning
 module, the `pagestore_format_versions` tool, the `fixture` workload of
@@ -1025,8 +1026,10 @@ check), and `fixtures/posix-mvp-baseline`.  The check enforces identity
 freshness, reopen with the oracle across a restart, and thirty-six declared
 mutations with their documented outcomes.  It surfaced and fixed two defects
 (relocated stores refused by absolute layer locations; a damaged forkmeta
-marker discarding acknowledged post-cutover events) and documents one gap
-(forkmeta source records have no checksum).
+marker discarding acknowledged post-cutover events).  The gap it documented
+(forkmeta source records had no checksum) is closed by FKM3 records, the
+same 64-byte layout with a CRC-24 in the former pad bytes; FKM2 stays
+readable and its fixture is the legacy one.
 
 Fixture families:
 
@@ -1197,6 +1200,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Sealed forkmeta source and snapshot payload records as FKM3 (FKM2 layout, CRC-24 in the former pad bytes; a complete record with a bad checksum refuses to open instead of being treated as a torn tail); FKM2 stays readable; `fixtures/posix-mvp-baseline` becomes the legacy fixture and `fixtures/posix-forkmeta-crc` the current one; the fixture check distinguishes legacy (reopen/oracle) from current (identity pin plus mutations) fixtures and takes several directories | First format change through the fixture process; cutover, crash-matrix, timeline, lifecycle unit tests; both fixtures checked; standalone and integration lanes |
 | 2026-09-10 | Added the first H2 persisted-format fixture slice: per-module format identities and `pagestore_format_versions`, a `fixture` workload covering every daemon-side POSIX family, `harness/pagestore_fixture.py` capture/check with identity freshness, reopen-and-restart oracle, and thirty-six mutation cases, `fixtures/posix-mvp-baseline`, meson and standalone CI checks; fixed relocated-store layer locations and a damaged forkmeta marker discarding post-cutover events; documented the forkmeta record checksum gap | Fixture check locally against the captured baseline; layer-store and forkmeta crash-matrix unit tests; standalone and integration lanes; D5 remains open and is flagged as an assumption |
 | 2026-09-10 | Added the H1 fork-metadata publication crash slice: a `forkmeta` gc_seed workload (page-pruning cutoff, thirty-two relations with create/zero-extend/truncate events on both sides of the cutoff, post-cutoff trickle for the second generation) composing the four existing `forkmeta.*` probes, with staged/selected/marker/GC snapshots, settled-generation recovery, current and retained fork sizes, refused below-cutoff queries, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |
 | 2026-09-10 | Added the H1 restart-combination slice: a `restart` operation for the writer runtime (writer, installed pinned readers via boot-control restore) and the materializer runtime (writer, supervisor-replaced worker, store with all computes down), plus `writer_reader_restart` and `materializer_restart_combinations` scenarios asserting reader horizon and prepared-xid hiding across restarts and materialized boundaries after writer, worker, and store restarts | Harness validation tests and meson plan checks; both scenarios in the integration CI lane; no SPDK execution |
