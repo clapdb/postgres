@@ -13,12 +13,13 @@
       "io_unit": 262144
     },
     "daemon_fault_smoke": {
-      "operations": ["crash", "set_fault", "release_fault", "layer_seed"],
+      "operations": ["crash", "set_fault", "release_fault", "layer_seed", "gc_seed"],
       "constraints": {
         "crash": {},
         "set_fault": {},
         "release_fault": {"target": ["store"]},
-        "layer_seed": {"target": ["store"]}
+        "layer_seed": {"target": ["store"]},
+        "gc_seed": {"target": ["store"], "workload": ["page_prune"]}
       },
       "protocol_version": 46,
       "page_size": 8192,
@@ -73,6 +74,7 @@
     "restart",
     "crash",
     "layer_seed",
+    "gc_seed",
     "advance",
     "assert",
     "materializer_fault",

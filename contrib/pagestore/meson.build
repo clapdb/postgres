@@ -89,6 +89,16 @@ pagestore_layer_crash_client = executable('pagestore_layer_crash_client',
 )
 contrib_targets += pagestore_layer_crash_client
 
+# Deterministic POSIX page-pruning crash workload/oracle used by the H1
+# harness slice: history below a configured cutoff is compacted, and the
+# scenarios crash at the replacement publication, the source mark-delete, and
+# the durable frontier advance.
+pagestore_gc_crash_client = executable('pagestore_gc_crash_client',
+  files('pagestore_gc_crash_client.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_gc_crash_client
+
 # Pure process-local unit test for the first crash-only named fault registry.
 pagestore_fault_test = executable('pagestore_fault_test',
   files('pagestore_fault_test.c', 'pagestore_fault.c'),
@@ -693,5 +703,23 @@ foreach layer_fault_scenario : [
     depends: [pagestore_daemon, pagestore_layer_crash_client, pagestore_inspect],
     suite: ['pagestore'],
     timeout: 60,
+  )
+endforeach
+foreach prune_fault_scenario : [
+  'page_prune_after_frontier',
+  'page_compaction_after_publish',
+  'page_gc_after_mark_delete',
+]
+  test('pagestore_harness_' + prune_fault_scenario,
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--daemon-fault-recovery', files('harness/scenarios/' + prune_fault_scenario + '.jsonl'),
+           '--daemon-binary', pagestore_daemon,
+           '--gc-client-binary', pagestore_gc_crash_client,
+           '--inspect-binary', pagestore_inspect],
+    depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect],
+    suite: ['pagestore'],
+    timeout: 90,
   )
 endforeach

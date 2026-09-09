@@ -885,9 +885,9 @@ remain separate gates.
 ### H1. Compose process-level crash scenarios
 
 Status: **materializer replay/restartpoint, branch prepared-receipt/service-
-restore, portable bootstrap/install, and POSIX image-layer publication slices
-implemented; manifest replacement, reclaim, and GC cases remain and
-depend on H0/R2-R5**.
+restore, portable bootstrap/install, POSIX image-layer publication, and POSIX
+page-pruning slices implemented; manifest replacement, WAL reclaim, WAL-index
+compaction, timeline deletion, and restart-combination cases remain**.
 
 Required scenario families:
 
@@ -915,6 +915,16 @@ fault machinery, while the harness immediately stops the complete materializer
 postmaster and lets the supervisor recover it; it does not assume that the
 checkpointer child is the supervisor's worker generation.  Each plan records
 both R1 and R2 relation metadata and requires the R2 main fork to grow.
+
+The page-pruning slice adds a `gc_seed` runtime operation to the daemon fault
+harness.  A dedicated IPC client seeds three generations of relation history
+and a newer block, arms the named fault marker, then installs a configured
+page-history owner at the cutoff; three process-abort scenarios crash after
+the durable page-prune frontier, after the compacted layer's manifest
+publication, and after the retired layer's mark-delete.  The snapshot, recovery
+read (published newest block, retained history at the cutoff, refused
+pre-cutoff version), manifest/local-layer reconciliation, and republished
+retained horizon are checked, followed by one idempotent restart.
 
 Acceptance:
 
@@ -1100,6 +1110,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Added the H1 page-pruning crash slice: a `gc_seed` daemon-harness operation backed by `pagestore_gc_crash_client` (three history generations, newer block, workload-armed fault, configured cutoff at 3500), three process aborts after the durable prune frontier, the compacted layer's manifest publication, and the retired layer's mark-delete, with snapshot, recovery-read, manifest reconciliation, retained-horizon, and idempotent-restart checks | Harness validation tests; three meson/CI scenarios against the POSIX daemon; no SPDK execution |
 | 2026-09-10 | Made the materializer's WAL-index horizon page-protected by its own derived cutoff (unless another WAL-index-only owner shares the LSN), so stored pages replace its FPI-led chains and the soak's WAL bound returns to two publication intervals | Reclaim-core case (a WAL/WAL-index materializer pin authorizes the base at its horizon; a shared LSN still does not); control/lifecycle/standalone suites; integration lane; 2400/8000-round soaks within the tighter bound |
 | 2026-09-10 | Added SLRU-class and reader-artifact retention: seeds (replay bases), reader snapshots, the live SLRU mirror, tombstones, and the watermark follow the relation plan below their consumers' pins and branch fork points, and a retired artifact releases its control-image fence (the registry now counts artifact versions) | Control-prune cases for a pinned reader, a branch fork point, a dropped pin, retry collapse, fence release, and restart; lifecycle/reclaim/standalone suites; integration lane; 2400/8000-round soaks |
 | 2026-09-10 | Added the nightly long-run soak workflow: a seed matrix (default three seeds at 8000 rounds) built from the freestanding daemon and harness, scheduled daily and dispatchable with chosen seeds/rounds, with per-job report summaries and 30-day JSON artifacts | Workflow YAML validated; the same soak binary and report format as the pull-request lane |

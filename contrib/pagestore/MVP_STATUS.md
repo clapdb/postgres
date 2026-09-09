@@ -89,6 +89,23 @@ retains the durable layer and republishes segment-backed coverage once; the
 second restart waits for background maintenance to compact that conservative
 duplicate to one layer. Clean shutdown alone does not guarantee compaction.
 
+The H1 page-pruning slice reuses that harness with a deterministic IPC
+workload (`pagestore_gc_crash_client`): three generations of relation history
+plus a newer block, then a configured page-history owner at the cutoff that
+lets maintenance retire the older history.  The workload arms the named fault
+itself right before it installs the cutoff, because the flush-driven
+compactions that run while the history is written have nothing to retire.
+Three process aborts cover the durable page-prune frontier, the compacted
+layer's manifest publication, and the retired layer's mark-delete step.  Each
+crash keeps the physical snapshot (a durable frontier file after the frontier
+stage, a non-empty manifest and at least two local layers otherwise), and
+recovery must serve the published newest block and the retained history at the
+cutoff, refuse the retired pre-cutoff version, reconcile the manifest to the
+local layer set with no pending deletions, and republish the configured
+horizon; a second restart proves idempotence.  WAL reclaim, WAL-index
+compaction, timeline deletion, manifest replacement, and compute-restart
+combinations remain outside the harness.
+
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer
 provider users share the same ownership mechanism. After successful manifest
@@ -480,11 +497,11 @@ to compare across nights.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 
-The POSIX image-layer publication slice is now covered by the declarative
-harness.  Other crash boundaries remain outside this slice.
+The POSIX image-layer publication and page-pruning slices are now covered by
+the declarative harness.  Other crash boundaries remain outside them.
 Before declaring the MVP repeatable, add process-level fault scenarios around
-manifest replacement and retention/reclaim/GC, plus
-a persisted-format fixture for restart/upgrade compatibility.
+manifest replacement, WAL reclaim, WAL-index compaction, and timeline
+deletion, plus a persisted-format fixture for restart/upgrade compatibility.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it

@@ -273,6 +273,7 @@ ACTION_FIELDS = {
     "set_fault": {"op", "id", "target", "fault", "action", "hit", "timeout", "extra"},
     "release_fault": {"op", "id", "target", "fault", "extra"},
     "layer_seed": {"op", "id", "target", "extra"},
+    "gc_seed": {"op", "id", "target", "workload", "extra"},
     "capture": {"op", "id", "target", "kind", "name", "horizon", "extra"},
     "compare": {"op", "id", "left", "right", "extra"},
     "expect_failure": {"op", "id", "target", "command", "sqlstate", "extra"},
@@ -300,6 +301,7 @@ REQUIRED_FIELDS = {
     "set_fault": {"target", "fault", "action"},
     "release_fault": {"target", "fault"},
     "layer_seed": {"target"},
+    "gc_seed": {"target", "workload"},
     "capture": {"target", "kind", "name", "horizon"},
     "compare": {"left", "right"},
     "expect_failure": {"target", "command"},
@@ -647,7 +649,7 @@ PG_CONTROL_FILE_SIZE = 8192
 
 RUNTIME_OPERATIONS = {
     "daemon_smoke": {"crash"},
-    "daemon_fault_smoke": {"crash", "set_fault", "release_fault", "layer_seed"},
+    "daemon_fault_smoke": {"crash", "set_fault", "release_fault", "layer_seed", "gc_seed"},
     "writer_smoke": {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
         "install_reader", "assert", "capture",
@@ -669,6 +671,7 @@ RUNTIME_CONSTRAINTS = {
         "set_fault": {},
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
+        "gc_seed": {"target": ["store"], "workload": ["page_prune"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -967,10 +970,13 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 f"runtime {runtime!r} uses materializer_fault for named process faults"
             )
     elif runtime == "daemon_fault_smoke":
-        seed_actions = [action for action in plan.actions if action["op"] == "layer_seed"]
+        seed_actions = [
+            action for action in plan.actions
+            if action["op"] in ("layer_seed", "gc_seed")
+        ]
         if len(seed_actions) > 1:
             raise PlanError(
-                f"runtime {runtime!r} permits at most one layer_seed action"
+                f"runtime {runtime!r} permits at most one layer_seed or gc_seed action"
             )
         named = [
             action for action in plan.actions
@@ -985,15 +991,22 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             )
         if seed_actions and plan.actions.index(seed_actions[0]) > plan.actions.index(named[0]):
             raise PlanError(
-                "runtime daemon_fault_smoke requires layer_seed before the named fault"
+                f"runtime daemon_fault_smoke requires {seed_actions[0]['op']} before the named fault"
             )
         fault = named[0]
-        if seed_actions and fault["fault"] not in {
+        if seed_actions and seed_actions[0]["op"] == "layer_seed" and fault["fault"] not in {
             "image_layer.after_create", "image_layer.after_write",
             "image_layer.after_seal", "image_layer.after_manifest_add",
         }:
             raise PlanError(
                 "runtime daemon_fault_smoke layer_seed requires an H1 image-layer fault"
+            )
+        if seed_actions and seed_actions[0]["op"] == "gc_seed" and fault["fault"] not in (
+            GC_WORKLOAD_FAULTS.get(seed_actions[0].get("workload"), set())
+        ):
+            raise PlanError(
+                "runtime daemon_fault_smoke gc_seed requires an H1 page-pruning fault "
+                "matching its workload"
             )
         releases = [
             action for action in plan.actions
@@ -2222,6 +2235,91 @@ def _capture_fault_diagnostics(
     return root / "fault-diagnostics.json"
 
 
+# The page-pruning H1 slice: history below a configured cutoff is compacted;
+# the three boundaries are the replacement layer publication, the retired
+# sources' durable mark-delete, and the durable page-prune frontier advance.
+GC_WORKLOAD_FAULTS = {
+    "page_prune": {
+        "page_compaction.after_publish",
+        "page_gc.after_mark_delete",
+        "page_prune.after_frontier",
+    },
+}
+GC_STAGES = {
+    "page_compaction.after_publish": "publish",
+    "page_gc.after_mark_delete": "mark_delete",
+    "page_prune.after_frontier": "frontier",
+}
+GC_DAEMON_ARGS = [
+    "--segment-size", "65536", "--flush-pages", "8", "--segment-gc", "0",
+    "--wal-high-water-bytes", "1048576", "--wal-catch-up-bytes", "1",
+]
+GC_RETAINED_HORIZON = 3500
+
+
+def _gc_fault_stage(fault_name: str) -> str | None:
+    return GC_STAGES.get(fault_name)
+
+
+def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
+    """Check process-abort physical state before recovery mutates the store.
+
+    Every stage follows a durable replacement publication, so the manifest
+    is published and at least the replacement layer exists; the retired
+    sources are unlinked only by recovery, so more than one layer remains.
+    """
+    files = _canonical_layer_files(store)
+    manifest = store / "layers.manifest"
+    manifest_size = manifest.stat().st_size if manifest.exists() else 0
+    if manifest_size == 0:
+        raise OracleMismatch(f"after_{stage} crash left no published layers.manifest")
+    if len(files) < 2:
+        raise OracleMismatch(
+            f"after_{stage} crash left {len(files)} canonical layer files, "
+            "expected the replacement next to its retired sources"
+        )
+    if stage == "frontier" and not (store / "page-prune.frontiers").exists():
+        raise OracleMismatch("after_frontier did not leave a durable page-prune frontier")
+
+
+def _check_gc_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    stage: str,
+    timeout: float,
+) -> None:
+    """After recovery the manifest is sane, the retired sources are gone once
+    cleanup has resumed, and the retained horizon is the configured cutoff."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+        if manifest.get("manifest_poisoned") is not False:
+            raise OracleMismatch(
+                f"after_{stage} recovery reported manifest_poisoned="
+                f"{manifest.get('manifest_poisoned')!r}"
+            )
+        layer_count = manifest.get("layer_count")
+        deleting = manifest.get("deleting_layers")
+        if isinstance(layer_count, int) and isinstance(deleting, int) and \
+                deleting == 0 and layer_count == manifest.get("local_layers"):
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery did not finish retiring sources within "
+                f"{poll_timeout:.3f}s; last manifest={manifest!r}"
+            )
+        time.sleep(min(0.05, deadline - now))
+    timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
+    if timeline.get("retained_horizon") != GC_RETAINED_HORIZON:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported retained_horizon="
+            f"{timeline.get('retained_horizon')!r}, expected {GC_RETAINED_HORIZON}"
+        )
+
+
 def _layer_fault_stage(fault_name: str) -> str | None:
     stages = {
         "image_layer.after_create": "create",
@@ -2336,11 +2434,14 @@ def _check_layer_manifest_after_restart(
 
 
 def _start_layer_client(
-    client: Path, shm: str, mode: str, log: Path,
+    client: Path, shm: str, mode: str, log: Path, arm_marker: Path | None = None,
 ) -> subprocess.Popen[str]:
+    command = [str(client.resolve()), "--shm", shm, "--mode", mode]
+    if arm_marker is not None:
+        command.extend(["--arm-marker", str(arm_marker)])
     with log.open("a", encoding="utf-8") as output:
         return subprocess.Popen(
-            [str(client.resolve()), "--shm", shm, "--mode", mode],
+            command,
             stdout=output, stderr=subprocess.STDOUT, text=True,
             env=private_environment(), start_new_session=True,
         )
@@ -2371,11 +2472,13 @@ def run_daemon_fault_recovery(
     rerun_command: list[str] | None = None,
     timeout: float = 15.0,
     layer_client: Path | None = None,
+    gc_client: Path | None = None,
 ) -> Path:
     """Run one pre-armed named daemon fault and prove recovery is idempotent."""
     daemon = daemon.resolve()
     inspector = inspector.resolve()
     layer_client = layer_client.resolve() if layer_client is not None else None
+    gc_client = gc_client.resolve() if gc_client is not None else None
     validate_plan(plan, capabilities, capabilities_path)
     validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
     root, temporary = run_root(requested_root)
@@ -2422,6 +2525,14 @@ def run_daemon_fault_recovery(
     if layer_seed_actions and layer_client is None:
         raise PlanError("layer_seed requires --layer-client-binary")
     layer_stage = _layer_fault_stage(action["fault"]) if layer_seed_actions else None
+    gc_seed_actions = [item for item in plan.actions if item["op"] == "gc_seed"]
+    if gc_seed_actions and gc_client is None:
+        raise PlanError("gc_seed requires --gc-client-binary")
+    gc_stage = _gc_fault_stage(action["fault"]) if gc_seed_actions else None
+    # Both seeds drive the same one-client workload protocol; the layer and
+    # page-pruning slices differ only in the binary, daemon flags, and oracles.
+    seed_client = gc_client if gc_seed_actions else layer_client
+    seed_actions = gc_seed_actions or layer_seed_actions
     validate_fault_action(
         action, capabilities, f"{plan.path}:{action['id']}", capabilities_path,
         require_model=action["op"] == "crash",
@@ -2496,6 +2607,8 @@ def run_daemon_fault_recovery(
         if layer_seed_actions:
             command.extend(["--segment-size", "65536", "--flush-pages", "2",
                             "--compact-layers", "1000"])
+        if gc_seed_actions:
+            command.extend(GC_DAEMON_ARGS)
         env = private_environment()
         if inject_fault:
             # Keep these names local and explicit: inherited PAGESTORE_* values
@@ -2562,16 +2675,23 @@ def run_daemon_fault_recovery(
         control.mkdir(mode=0o700)
         if any(control.iterdir()):
             raise PlanError(f"fault control path is not fresh: {control}")
-        _atomic_arm_marker(marker)
+        # The page-pruning workload arms the marker itself, right before it
+        # installs the cutoff: the flush-driven compactions that run while
+        # its history is written would otherwise trip the probe with nothing
+        # to retire.  Every other fault is armed before the daemon starts.
+        if not gc_seed_actions:
+            _atomic_arm_marker(marker)
         daemon_log.touch()
         emit("run_start", shm_base=shm_base)
         current_action_id = action["id"]
-        emit("fault_arm", target="store", name=fault_name, hit=fault_hit)
+        emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
+             armed_by="workload" if gc_seed_actions else "harness")
         process = start_daemon(True, action["id"])
-        if layer_seed_actions:
+        if seed_actions:
             wait_ready(process)
             layer_client_process = _start_layer_client(
-                layer_client, shm, "seed", trace / "layer-client.log"
+                seed_client, shm, "seed", trace / "layer-client.log",
+                arm_marker=marker if gc_seed_actions else None,
             )
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
@@ -2612,6 +2732,8 @@ def run_daemon_fault_recovery(
             shutil.copy2(report, trace / "fault-report.jsonl")
             if layer_stage is not None:
                 _check_layer_crash_snapshot(store, layer_stage)
+            if gc_stage is not None:
+                _check_gc_crash_snapshot(store, gc_stage)
             if layer_client_process is not None and layer_client_process.poll() is None:
                 layer_client_process.kill()
                 layer_client_process.wait(timeout=5)
@@ -2740,6 +2862,9 @@ def run_daemon_fault_recovery(
             _verify_layer_client(layer_client, shm, trace / "layer-client.log", timeout)
             manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
             _check_layer_manifest(manifest, layer_stage, False)
+        if gc_seed_actions:
+            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
+            _check_gc_recovery(inspector, shm, inspection_schema, gc_stage, timeout)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
@@ -2759,6 +2884,9 @@ def run_daemon_fault_recovery(
             _check_layer_manifest_after_restart(
                 inspector, shm, inspection_schema, layer_stage, timeout
             )
+        if gc_seed_actions:
+            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
+            _check_gc_recovery(inspector, shm, inspection_schema, gc_stage, timeout)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         emit("run_pass")
@@ -2795,6 +2923,8 @@ def run_daemon_fault_recovery(
                 "--daemon-binary", str(daemon), "--inspect-binary", str(inspector),
                 *( ["--layer-client-binary", str(layer_client)]
                    if layer_client is not None else [] ),
+                *( ["--gc-client-binary", str(gc_client)]
+                   if gc_client is not None else [] ),
                 "--run-root", str(root.parent / f"{root.name}.rerun"), "--keep",
             ],
         }
@@ -4213,6 +4343,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group.add_argument("--legacy-integration", action="store_true")
     parser.add_argument("--daemon-binary", type=Path)
     parser.add_argument("--layer-client-binary", type=Path)
+    parser.add_argument("--gc-client-binary", type=Path)
     parser.add_argument("--materializer-supervisor", type=Path)
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--integration-script", type=Path,
@@ -4341,6 +4472,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.daemon_binary, args.inspect_binary, args.run_root, args.keep,
                 args.capabilities, command,
                 layer_client=args.layer_client_binary,
+                gc_client=args.gc_client_binary,
             )
             if args.keep or args.run_root:
                 print(root)

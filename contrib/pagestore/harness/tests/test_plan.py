@@ -538,6 +538,80 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
                 MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
+    def test_page_prune_fault_scenarios_validate_as_composed_slices(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        scenario_dir = ROOT / "scenarios"
+        scenarios = [
+            scenario_dir / "page_prune_after_frontier.jsonl",
+            scenario_dir / "page_compaction_after_publish.jsonl",
+            scenario_dir / "page_gc_after_mark_delete.jsonl",
+        ]
+        for path in scenarios:
+            with self.subTest(scenario=path.name):
+                plan = MODULE.read_plan(path)
+                MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+                MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_gc_seed_requires_a_matching_page_pruning_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-gc-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "page_prune"},
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "image_layer.after_create",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed requires an H1 page-pruning fault"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_gc_seed_cannot_follow_named_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-gc-order", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "page_prune"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed before"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_gc_seed_rejects_an_unknown_workload(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-gc-workload", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "wal_index"},
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        with self.assertRaises(MODULE.PlanError):
+            MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
     def test_image_layer_seed_cannot_follow_named_fault(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
