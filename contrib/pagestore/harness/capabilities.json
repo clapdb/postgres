@@ -19,7 +19,7 @@
         "set_fault": {},
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
-        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index"]}
+        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim"]}
       },
       "protocol_version": 46,
       "page_size": 8192,

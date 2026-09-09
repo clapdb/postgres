@@ -495,7 +495,7 @@ test('pagestore_wal_segment',
 # Atomic immutable segment publication and cross-segment shipped-WAL reads.
 pagestore_wal_store_test = executable('pagestore_wal_store_test',
   files('pagestore_wal_store_test.c', 'pagestore_wal_store.c',
-        'pagestore_wal_segment.c'),
+        'pagestore_wal_segment.c', 'pagestore_fault.c'),
   install: false,
 )
 test('pagestore_wal_store',
@@ -710,6 +710,9 @@ foreach prune_fault_scenario : [
   'page_compaction_after_publish',
   'page_gc_after_mark_delete',
   'wal_index_after_frontier',
+  'wal_reclaim_before_unlink',
+  'wal_reclaim_after_unlink',
+  'wal_reclaim_before_dir_fsync',
 ]
   test('pagestore_harness_' + prune_fault_scenario,
     pagestore_harness_python,

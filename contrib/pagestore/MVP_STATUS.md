@@ -122,8 +122,20 @@ generation, whose identity the oracle records; recovery must commit that same
 generation -- not an equivalent one rebuilt under a new number, which the
 frontier was never published for -- and must serve the reader's exact chain
 and the newest chain while refusing the dropped middle point, and keep the WAL-index owner; a second restart proves idempotence.
-WAL reclaim, timeline deletion, manifest replacement, and compute-restart
-combinations remain outside the harness.
+
+The `wal_reclaim` workload ships three complete 1 MiB segments on timeline 0,
+publishes a control note whose redo is the shipped end, arms the fault, and
+commits WAL-index progress through that end so the whole sealed prefix is
+reclaimable.  Three named store-lock probes crash after the durable physical
+frontier and before the first unlink, after each authorized segment unlink,
+and after the last unlink but before the directory fsync that retires the
+residual prefix.  The crash snapshot must keep the shipped-WAL identity and
+exactly the expected number of sealed segments; recovery must finish the
+unlink retry, refuse reads below the frontier, keep the WAL end and the
+retain floor at the shipped end, clear the reclaimer's physical debt, and
+leave no retention owner; a second restart proves idempotence.  Timeline
+deletion, manifest replacement, and compute-restart combinations remain
+outside the harness.
 
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer
@@ -516,10 +528,10 @@ to compare across nights.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 
-The POSIX image-layer publication, page-pruning, and WAL-index compaction
-slices are now covered by the declarative harness.  Other crash boundaries
-remain outside them.  Before declaring the MVP repeatable, add process-level
-fault scenarios around manifest replacement, WAL reclaim, and timeline
+The POSIX image-layer publication, page-pruning, WAL-index compaction, and
+WAL reclaim slices are now covered by the declarative harness.  Other crash
+boundaries remain outside them.  Before declaring the MVP repeatable, add
+process-level fault scenarios around manifest replacement and timeline
 deletion, plus a persisted-format fixture for restart/upgrade compatibility.
 
 An advancing reader's data directory boots from the checkpoint its manifest

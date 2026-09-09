@@ -546,6 +546,9 @@ class PlanValidationTests(unittest.TestCase):
             scenario_dir / "page_compaction_after_publish.jsonl",
             scenario_dir / "page_gc_after_mark_delete.jsonl",
             scenario_dir / "wal_index_after_frontier.jsonl",
+            scenario_dir / "wal_reclaim_before_unlink.jsonl",
+            scenario_dir / "wal_reclaim_after_unlink.jsonl",
+            scenario_dir / "wal_reclaim_before_dir_fsync.jsonl",
         ]
         for path in scenarios:
             with self.subTest(scenario=path.name):

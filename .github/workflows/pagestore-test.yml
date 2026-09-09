@@ -142,14 +142,17 @@ jobs:
               --inspect-binary ./pagestore_inspect
           done
 
-      - name: Run page-pruning and WAL-index H1 crash scenarios
+      - name: Run page-pruning, WAL-index, and WAL-reclaim H1 crash scenarios
         working-directory: contrib/pagestore
         run: |
           for scenario in \
             page_prune_after_frontier \
             page_compaction_after_publish \
             page_gc_after_mark_delete \
-            wal_index_after_frontier; do
+            wal_index_after_frontier \
+            wal_reclaim_before_unlink \
+            wal_reclaim_after_unlink \
+            wal_reclaim_before_dir_fsync; do
             python3 harness/pagestore_harness.py \
               --capabilities harness/capabilities.json \
               --daemon-fault-recovery "harness/scenarios/${scenario}.jsonl" \

@@ -672,7 +672,7 @@ RUNTIME_CONSTRAINTS = {
         "set_fault": {},
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
-        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index"]},
+        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -2296,7 +2296,23 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
         "daemon_args": ["--walidx-snapshot-bytes", "1"],
         "retained_horizon": None,
     },
+    "wal_reclaim": {
+        "faults": {
+            "wal_reclaim.before_unlink",
+            "wal_reclaim.after_unlink",
+            "wal_reclaim.before_dir_fsync",
+        },
+        # the sealed prefix is three segments, below the high water so the
+        # workload's own appends are never throttled behind the reclaim
+        "daemon_args": ["--wal-high-water-bytes", "8388608",
+                        "--wal-catch-up-bytes", "1"],
+        "retained_horizon": None,
+    },
 }
+WAL_RECLAIM_SEGMENTS = 3
+WAL_RECLAIM_SEGMENT_DIR = Path("wal_segments_0")
+WAL_RECLAIM_SEGMENT_PREFIX = "walv1_1_"
+WAL_RECLAIM_IDENTITY = WAL_RECLAIM_SEGMENT_DIR / "wal_store_identity_v1"
 GC_WORKLOAD_FAULTS = {name: spec["faults"] for name, spec in GC_WORKLOADS.items()}
 # Each gc_seed workload installs its condition once, so its faults are
 # reachable exactly once per run; a plan asking for a later hit would wait
@@ -2308,6 +2324,9 @@ GC_STAGES = {
     "page_gc.after_mark_delete": "mark_delete",
     "page_prune.after_frontier": "frontier",
     "wal_index.after_frontier": "walidx_frontier",
+    "wal_reclaim.before_unlink": "reclaim_before_unlink",
+    "wal_reclaim.after_unlink": "reclaim_after_unlink",
+    "wal_reclaim.before_dir_fsync": "reclaim_before_dir_fsync",
 }
 WALIDX_SNAPSHOT_MAGIC = 0x4D534957          # "WISM"
 WALIDX_SNAPSHOT_VERSION = 1
@@ -2363,6 +2382,79 @@ def _page_frontier_fences(store: Path, timeline: int) -> list[tuple[int, int, in
         offset = 8 + (timeline * PAGE_FRONTIER_SLOTS + slot) * PAGE_FRONTIER_ENTRY_BYTES
         fences.append(struct.unpack_from("=QQQ", data, offset))
     return fences
+
+
+def _wal_segment_files(store: Path) -> list[str]:
+    directory = store / WAL_RECLAIM_SEGMENT_DIR
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.name.startswith(WAL_RECLAIM_SEGMENT_PREFIX)
+    )
+
+
+def _check_wal_reclaim_crash_snapshot(store: Path, stage: str, hit: int) -> None:
+    """The physical frontier is durable at every stage; the number of sealed
+    segments still on disk tells the stage apart: none unlinked before the
+    first unlink, one per hit after an unlink, none before the directory
+    fsync that retires the residual prefix."""
+    expected = {
+        "reclaim_before_unlink": WAL_RECLAIM_SEGMENTS,
+        "reclaim_after_unlink": WAL_RECLAIM_SEGMENTS - hit,
+        "reclaim_before_dir_fsync": 0,
+    }[stage]
+    if not (store / WAL_RECLAIM_IDENTITY).exists():
+        raise OracleMismatch(f"after_{stage} crash left no shipped-WAL identity")
+    files = _wal_segment_files(store)
+    if len(files) != expected:
+        raise OracleMismatch(
+            f"after_{stage} crash left {len(files)} sealed WAL segments "
+            f"{files!r}, expected {expected}"
+        )
+
+
+def _check_wal_reclaim_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+    timeout: float,
+) -> None:
+    """The verify client already waited for the prefix reads to be refused;
+    the segment files must be gone, the identity kept, and the reclaimer
+    must have released its physical debt."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        files = _wal_segment_files(store)
+        if not files:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery left sealed WAL segments {files!r} "
+                f"after {poll_timeout:.3f}s"
+            )
+        time.sleep(min(0.05, deadline - now))
+    if not (store / WAL_RECLAIM_IDENTITY).exists():
+        raise OracleMismatch(f"after_{stage} recovery lost the shipped-WAL identity")
+    backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
+    if backpressure.get("wal_throttled") not in (0, False) or \
+            backpressure.get("wal_lag_bytes") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery kept WAL reclaim debt: "
+            f"throttled={backpressure.get('wal_throttled')!r} "
+            f"lag={backpressure.get('wal_lag_bytes')!r}"
+        )
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected none"
+        )
+
+
 
 
 def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
@@ -2423,7 +2515,7 @@ def _gc_granted_cutoff_seq(control: Path) -> int | None:
 
 
 def _check_gc_crash_snapshot(
-    store: Path, stage: str, control: Path
+    store: Path, stage: str, control: Path, hit: int = 1
 ) -> dict[str, Any] | None:
     """Check the stage-specific durable state before recovery mutates the store.
 
@@ -2435,6 +2527,9 @@ def _check_gc_crash_snapshot(
     the durable frontier but precedes the generation commit, so the prepared
     generation is still staged.
     """
+    if stage.startswith("reclaim_"):
+        _check_wal_reclaim_crash_snapshot(store, stage, hit)
+        return
     if stage == "walidx_frontier":
         if not (store / "walidx-prune.frontiers").exists():
             raise OracleMismatch(
@@ -2648,6 +2743,11 @@ def _check_gc_recovery(
     if workload == "wal_index":
         return _check_walidx_recovery(inspector, shm, inspection_schema, store,
                                       stage, crash_state)
+    if workload == "wal_reclaim":
+        _check_wal_reclaim_recovery(
+            inspector, shm, inspection_schema, store, stage, timeout
+        )
+        return
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -3192,7 +3292,8 @@ def run_daemon_fault_recovery(
                 # what the crash left behind, for the recovery oracles that
                 # must prove recovery settled on it rather than on an
                 # equivalent state of its own making
-                crash_state = _check_gc_crash_snapshot(store, gc_stage, control)
+                crash_state = _check_gc_crash_snapshot(store, gc_stage, control,
+                                                       fault_hit)
             if layer_client_process is not None and layer_client_process.poll() is None:
                 layer_client_process.kill()
                 layer_client_process.wait(timeout=5)

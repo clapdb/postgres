@@ -25,6 +25,12 @@
  * serve the reader's chain plus the newest chain and requires the dropped
  * point below the durable frontier to stay refused.
  *
+ * The wal_reclaim workload ships three sealed 1 MiB segments, publishes a
+ * control note at the shipped end, arms the fault, and commits WAL-index
+ * progress through the end so the whole prefix is reclaimable.  Its verify
+ * mode waits for the prefix reads to be refused and requires the WAL end and
+ * retain floor to stay at the shipped end.
+ *
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
@@ -53,6 +59,14 @@
 #define WALIDX_READER UINT64_C(5001)
 #define WALIDX_READER_LSN UINT64_C(40)
 #define WALIDX_DROPPED_LSN UINT64_C(60)
+
+/* wal_reclaim workload: three complete 1 MiB shipped-WAL segments on timeline
+ * 0 whose control note and WAL-index progress both reach the end, so the
+ * whole sealed prefix is reclaimable. */
+#define RECLAIM_SEGMENT (UINT64_C(1024) * 1024)
+#define RECLAIM_SEGMENTS 3u
+#define RECLAIM_TOTAL (RECLAIM_SEGMENT * RECLAIM_SEGMENTS)
+#define RECLAIM_CHUNK (64u * 1024u)
 
 static void *shm_base;
 static int shm_fd = -1;
@@ -348,6 +362,125 @@ walidx_seed(void)
 	wait_forever();
 }
 
+/* ---- wal_reclaim workload ---------------------------------------------- */
+
+static void
+set_control(PsChannel *ch)
+{
+	set_relation(ch);
+	memset(&ch->key, 0, sizeof(ch->key));
+	ch->key.klass = PS_KLASS_CONTROL;
+}
+
+/* Publishes one control block at the given version; block 1 carries the
+ * redo floor note that derives the timeline's WAL cutoff. */
+static void
+write_control(uint32_t block, uint64_t version, uint64_t redo)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint32_t	nblocks;
+
+	set_control(ch);
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("control object create failed");
+	set_control(ch);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK)
+		die("control object size read failed");
+	nblocks = ch->result;
+	set_control(ch);
+	ch->opcode = block < nblocks ? PS_OP_WRITEV : PS_OP_EXTEND;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->req_lsn = version;
+	memset(ch->data, block == 0 ? 0xC3 : 0, page_size);
+	if (block == 1)
+		memcpy(ch->data, &redo, sizeof(redo));
+	if (execute()->status != PS_STATUS_OK)
+		die("control block write failed");
+}
+
+static void
+reclaim_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	lsn = 0;
+
+	while (lsn < RECLAIM_TOTAL)
+	{
+		set_relation(ch);
+		ch->opcode = PS_OP_WAL_APPEND;
+		ch->req_lsn = lsn;
+		ch->datalen = RECLAIM_CHUNK;
+		memset(ch->data, (int) (1 + lsn / RECLAIM_SEGMENT), RECLAIM_CHUNK);
+		if (execute()->status != PS_STATUS_OK)
+			die("WAL append failed");
+		lsn += RECLAIM_CHUNK;
+	}
+	write_control(0, RECLAIM_TOTAL, RECLAIM_TOTAL);
+	write_control(1, RECLAIM_TOTAL, RECLAIM_TOTAL);
+	/* The retained base needs both the note and durable WAL-index progress
+	 * through the sealed prefix; arm before the commit that completes it. */
+	arm_fault();
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = RECLAIM_TOTAL;
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL-index progress commit failed");
+	wait_forever();
+}
+
+static int
+wal_read_status(uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = lsn;
+	ch->datalen = 64;
+	return execute()->status;
+}
+
+static void
+reclaim_verify(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	struct timespec pause_interval = {0, 20000000};
+	int			reclaimed = 0;
+
+	/* Recovery retries the interrupted prefix unlink asynchronously; the
+	 * sealed prefix must be gone within a bounded wait. */
+	for (int i = 0; i < 500; i++)
+	{
+		if (wal_read_status(0) != PS_STATUS_OK &&
+			wal_read_status(RECLAIM_TOTAL - RECLAIM_SEGMENT) != PS_STATUS_OK)
+		{
+			reclaimed = 1;
+			break;
+		}
+		nanosleep(&pause_interval, NULL);
+	}
+	if (!reclaimed)
+		die("recovery did not finish reclaiming the sealed WAL prefix");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != RECLAIM_TOTAL)
+		die("recovery changed the timeline's WAL end");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != RECLAIM_TOTAL)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: recovery reports WAL retain "
+				"floor %llu, expected %llu\n", (unsigned long long) ch->req_lsn,
+				(unsigned long long) RECLAIM_TOTAL);
+		exit(1);
+	}
+}
+
 /* Returns the daemon status; on OK fills *count and out[] (up to max_out). */
 static int
 walidx_get(uint64_t lsn_max, PsWalRec *out, uint32_t max_out, int *count)
@@ -562,18 +695,26 @@ main(int argc, char **argv)
 			cutoff_seq_file = argv[++i];
 		else
 			die("usage: --shm NAME --mode seed|verify "
-				"[--workload page_prune|wal_index] [--arm-marker PATH] "
-				"[--resume-file PATH] [--cutoff-seq-file PATH]");
+				"[--workload page_prune|wal_index|wal_reclaim] "
+				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0) ||
 		(strcmp(workload, "page_prune") != 0 &&
-		 strcmp(workload, "wal_index") != 0))
+		 strcmp(workload, "wal_index") != 0 &&
+		 strcmp(workload, "wal_reclaim") != 0))
 		die("usage: --shm NAME --mode seed|verify "
-			"[--workload page_prune|wal_index] [--arm-marker PATH] "
-			"[--resume-file PATH] [--cutoff-seq-file PATH]");
+			"[--workload page_prune|wal_index|wal_reclaim] "
+			"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
-	if (strcmp(workload, "wal_index") == 0)
+	if (strcmp(workload, "wal_reclaim") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			reclaim_seed();
+		else
+			reclaim_verify();
+	}
+	else if (strcmp(workload, "wal_index") == 0)
 	{
 		if (strcmp(mode, "seed") == 0)
 			walidx_seed();
