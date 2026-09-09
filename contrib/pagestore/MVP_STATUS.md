@@ -198,6 +198,20 @@ invalidates the declared checkpoint, so a later reader base or capture
 must declare a new one.  Remaining outside
 the harness: branch-compute restarts, which the golden scenario covers.
 
+The `forkmeta` workload composes the four fork-metadata publication probes
+(after the fsync'd prepared generation, after the manifest commit, after the
+source-epoch rewrite, and after the retired generation's GC) on the daemon:
+the page-pruning history proves the cutoff through its frontier, thirty-two
+relations carry create, zero-extend, and truncate events on both sides of
+the cutoff, and a trickle of further fork events after the cutoff drives the
+second generation that retires the first.  Snapshots check the staged
+generation without a selected manifest, the selected manifest before and
+after the source-epoch marker, and exactly one generation pair after GC;
+recovery must settle on one selected generation behind its marker, serve
+every relation's current size and its retained size history above the
+cutoff, refuse size queries below the cutoff, keep the page-pruning
+guarantees, and republish the configured horizon.
+
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer
 provider users share the same ownership mechanism. After successful manifest
@@ -590,13 +604,13 @@ to compare across nights.
 ### 5. Composed crash and format-compatibility coverage -- partial
 
 The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
-reclaim, timeline deletion, manifest replacement, and compute-restart slices
-are now covered by the declarative harness.  The deletion slice crashes on
-both sides of its first transition: before the DELETING record is durable the
-request is lost and the branch must survive intact, and after each later
-boundary the cleanup must resume.  Its workload seeds a live sibling branch
-with the same kind of private state, so cleanup that reached past its owner
-would be caught.  Before declaring the MVP
+reclaim, timeline deletion, manifest replacement, fork-metadata publication,
+and compute-restart slices are now covered by the declarative harness.  The
+deletion slice crashes on both sides of its first transition: before the
+DELETING record is durable the request is lost and the branch must survive
+intact, and after each later boundary the cleanup must resume.  Its workload
+seeds a live sibling branch with the same kind of private state, so cleanup
+that reached past its owner would be caught.  Before declaring the MVP
 repeatable, add a persisted-format fixture for restart/upgrade
 compatibility.
 

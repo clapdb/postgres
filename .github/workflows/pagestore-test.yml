@@ -142,7 +142,7 @@ jobs:
               --inspect-binary ./pagestore_inspect
           done
 
-      - name: Run page-pruning, WAL-index, WAL-reclaim, deletion, and manifest H1 crash scenarios
+      - name: Run page-pruning, WAL-index, WAL-reclaim, deletion, manifest, and forkmeta H1 crash scenarios
         working-directory: contrib/pagestore
         run: |
           for scenario in \
@@ -159,7 +159,11 @@ jobs:
             timeline_delete_after_deleted \
             timeline_delete_before_deleting \
             manifest_compact_after_tmp_sync \
-            manifest_compact_after_rename; do
+            manifest_compact_after_rename \
+            forkmeta_after_prepare \
+            forkmeta_after_manifest_commit \
+            forkmeta_after_source_rewrite \
+            forkmeta_after_snapshot_gc; do
             python3 harness/pagestore_harness.py \
               --capabilities harness/capabilities.json \
               --daemon-fault-recovery "harness/scenarios/${scenario}.jsonl" \

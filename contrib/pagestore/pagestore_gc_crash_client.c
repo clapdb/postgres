@@ -42,6 +42,12 @@
  * compaction churn grows the manifest log past its rewrite trigger.  Its
  * verify mode reads every page back.
  *
+ * The forkmeta workload layers persisted fork-size events for many relations
+ * on the page_prune history, arms the fault, installs the cutoff pin, and
+ * keeps trickling fork events so a second generation retires the first.
+ * Its verify mode checks current sizes, retained size history above the
+ * cutoff, and refused queries below it, on top of the page_prune oracle.
+ *
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
@@ -96,6 +102,14 @@
 /* manifest_compact workload: enough flushed layers and compaction churn,
  * released from a paused maintenance loop, that the manifest log is rewritten. */
 #define MANIFEST_PAGES 320u
+
+/* forkmeta workload: the page_prune history plus persisted fork-size events
+ * (create, zero-extend, truncate) on many relations, so the fork-metadata
+ * log exceeds the snapshot trigger once the page frontier proves a cutoff. */
+#define FORKMETA_FIRST_REL 5000u
+#define FORKMETA_RELS 32u
+#define FORKMETA_TRICKLE_REL 7000u
+#define FORKMETA_TRICKLE_RELS 400u
 
 static void *shm_base;
 static int shm_fd = -1;
@@ -255,13 +269,10 @@ wait_forever(void)
 }
 
 static void
-seed(void)
+page_history_seed(unsigned char *page)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
-	unsigned char *page = malloc(page_size);
 
-	if (page == NULL)
-		die("out of memory");
 	set_relation(ch);
 	ch->opcode = PS_OP_CREATE;
 	ch->req_lsn = 500;
@@ -280,8 +291,15 @@ seed(void)
 		}
 	}
 	write_block(page, 0, 4000, 40);
-	/* the durable page cutoff that lets maintenance retire the history
-	 * below it */
+}
+
+/* The durable page cutoff that lets maintenance retire the history below
+ * it, and the page frontier that proves the fork-metadata cutoff. */
+static void
+page_cutoff_pin(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
 	set_relation(ch);
 	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
 	ch->blocknum = PS_RETENTION_OWNER_CONFIGURED;
@@ -312,6 +330,17 @@ seed(void)
 				die("cannot publish the granted admission sequence");
 		}
 	}
+}
+
+static void
+seed(void)
+{
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	page_history_seed(page);
+	page_cutoff_pin();
 	/* Arm the named fault only once the cutoff is durable: the probes also
 	 * run for the flush-driven compactions that had nothing to retire, so a
 	 * marker created earlier could be consumed by a pass planned against the
@@ -321,6 +350,123 @@ seed(void)
 	arm_fault();
 	free(page);
 	wait_forever();
+}
+
+/* ---- forkmeta workload ------------------------------------------------- */
+
+static void verify(void);
+
+static void
+set_forkmeta_relation(PsChannel *ch, uint32_t index)
+{
+	set_relation(ch);
+	ch->key.relNumber = FORKMETA_FIRST_REL + index;
+}
+
+/* Even relations truncate below the cutoff, odd ones above it, so the
+ * snapshot compacts one half and retains the other half's history. */
+static uint32_t
+forkmeta_expected_size(uint32_t index)
+{
+	return index % 2 == 0 ? 2 : 3;
+}
+
+static void
+forkmeta_create_grow(uint32_t rel, uint64_t lsn, uint32_t nblocks)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = lsn;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork create failed");
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_ZEROEXTEND;
+	ch->blocknum = 0;
+	ch->nblocks = nblocks;
+	ch->req_lsn = lsn + 1000;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork zero-extend failed");
+}
+
+static void
+forkmeta_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	page_history_seed(page);
+	/* Persisted fork-size events the segment log cannot re-derive: a create
+	 * and an allocation-only growth below the page cutoff for every
+	 * relation, then a truncate below the cutoff (even) or above it (odd). */
+	for (uint32_t i = 0; i < FORKMETA_RELS; i++)
+	{
+		forkmeta_create_grow(FORKMETA_FIRST_REL + i, 1000 + i, 4);
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_TRUNCATE;
+		ch->nblocks = forkmeta_expected_size(i);
+		ch->req_lsn = i % 2 == 0 ? 2500 + i : 4500 + i;
+		if (execute()->status != PS_STATUS_OK)
+			die("fork truncate failed");
+	}
+	free(page);
+	arm_fault();
+	page_cutoff_pin();
+	/* Keep appending fork-size events after the cutoff is proven, so a
+	 * second generation is published and the first one is retired; this is
+	 * the only way the snapshot GC boundary is reached.  Relations created
+	 * here are not part of the oracle. */
+	{
+		struct timespec pause_interval = {0, 20000000};
+
+		for (uint32_t j = 0; j < FORKMETA_TRICKLE_RELS; j++)
+		{
+			forkmeta_create_grow(FORKMETA_TRICKLE_REL + j, 6000 + j, 2);
+			nanosleep(&pause_interval, NULL);
+		}
+	}
+	wait_forever();
+}
+
+static void
+forkmeta_verify(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	verify();
+	for (uint32_t i = 0; i < FORKMETA_RELS; i++)
+	{
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_NBLOCKS;
+		if (execute()->status != PS_STATUS_OK ||
+			ch->result != forkmeta_expected_size(i))
+		{
+			fprintf(stderr, "pagestore_gc_crash_client: relation %u has %u "
+					"blocks after recovery, expected %u\n",
+					FORKMETA_FIRST_REL + i, (unsigned) ch->result,
+					forkmeta_expected_size(i));
+			exit(1);
+		}
+		/* the growth to four blocks is retained above the cutoff for the
+		 * odd relations, whose truncate comes later */
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_NBLOCKS;
+		ch->req_lsn = 4200 + i;
+		if (execute()->status != PS_STATUS_OK ||
+			ch->result != (i % 2 == 0 ? 2u : 4u))
+			die("recovery lost the fork size history retained above the cutoff");
+		/* history below the durable cutoff is refused, never guessed */
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_NBLOCKS;
+		ch->req_lsn = 2200 + i;
+		if (execute()->status == PS_STATUS_OK)
+			die("recovery answered a fork size query below the durable cutoff");
+	}
 }
 
 /* ---- wal_index workload ------------------------------------------------ */
@@ -1203,8 +1349,8 @@ main(int argc, char **argv)
 		else
 			die("usage: --shm NAME --mode seed|verify "
 				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
-				"timeline_delete_abort|manifest_compact] [--arm-marker PATH] "
-				"[--resume-file PATH] [--cutoff-seq-file PATH]");
+				"timeline_delete_abort|manifest_compact|forkmeta] "
+				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0) ||
@@ -1213,13 +1359,21 @@ main(int argc, char **argv)
 		 strcmp(workload, "wal_reclaim") != 0 &&
 		 strcmp(workload, "timeline_delete") != 0 &&
 		 strcmp(workload, "timeline_delete_abort") != 0 &&
-		 strcmp(workload, "manifest_compact") != 0))
+		 strcmp(workload, "manifest_compact") != 0 &&
+		 strcmp(workload, "forkmeta") != 0))
 		die("usage: --shm NAME --mode seed|verify "
 			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
-			"timeline_delete_abort|manifest_compact] [--arm-marker PATH] "
-			"[--resume-file PATH] [--cutoff-seq-file PATH]");
+			"timeline_delete_abort|manifest_compact|forkmeta] "
+			"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
-	if (strcmp(workload, "manifest_compact") == 0)
+	if (strcmp(workload, "forkmeta") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			forkmeta_seed();
+		else
+			forkmeta_verify();
+	}
+	else if (strcmp(workload, "manifest_compact") == 0)
 	{
 		if (strcmp(mode, "seed") == 0)
 			manifest_seed();

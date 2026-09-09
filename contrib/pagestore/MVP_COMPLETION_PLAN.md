@@ -507,7 +507,12 @@ Expected scope: one or two PRs.
 
 ### R4b. Compact and reclaim fork metadata
 
-Status: **runtime implementation and the focused POSIX crash-matrix first slice are implemented; the full R4b acceptance matrix remains incomplete**.
+Status: **runtime implementation, the POSIX crash matrix, and the composed
+H1 publication scenarios are implemented; the acceptance matrix is covered
+for the POSIX MVP boundary** (per-horizon existence/size equivalence across
+compaction by the R6 soak's reader and branch verifications, crash and
+concurrent-append coverage by the matrix, and every publication boundary by
+the composed daemon scenarios; SPDK remains outside the claim).
 
 The pure forkmeta keep-planner and exhaustive unit/property coverage now define
 the event visibility, exact-fence base retention, legacy sequence handling, and
@@ -532,7 +537,8 @@ boundaries. It reopens each store in a fresh parent, checks the exact named
 fault report and exit 88, and covers deterministic concurrent append overlap
 plus four configured POSIX shards. This work does not claim coverage of every
 internal unlink/fsync instruction, SPDK hardware, or the remaining composed H1
-crash scenarios; the full R4b acceptance gate remains incomplete.
+crash scenarios at the time it landed; the composed `forkmeta` daemon
+scenarios now cover those boundaries, and SPDK stays outside the claim.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
@@ -572,7 +578,9 @@ Acceptance:
   during source-log removal may roll acknowledged metadata back;
 - concurrent metadata mutations at every publication/crash boundary reopen
   with every acknowledged event exactly once;
-- H1 exercises each publication boundary before R6 begins its soak.
+- H1 exercises each publication boundary before R6 begins its soak
+  (composed daemon scenarios now cover prepare, manifest commit, source
+  rewrite, and snapshot GC).
 
 Expected scope: one implementation PR and one crash-test PR.
 
@@ -887,9 +895,9 @@ remain separate gates.
 Status: **materializer replay/restartpoint, branch prepared-receipt/service-
 restore, portable bootstrap/install, POSIX image-layer publication, POSIX
 page-pruning, POSIX WAL-index compaction, POSIX WAL reclaim, POSIX timeline
-deletion, POSIX manifest replacement, and writer/reader/materializer/store
-restart-combination slices implemented; branch-compute restarts remain with
-the golden scenario**.
+deletion, POSIX manifest replacement, POSIX fork-metadata publication, and
+writer/reader/materializer/store restart-combination slices implemented;
+branch-compute restarts remain with the golden scenario**.
 
 Required scenario families:
 
@@ -975,6 +983,13 @@ generation), and the store (supervisor and computes stopped, daemon
 restarted on the same shared memory, computes and supervisor returned).
 `writer_reader_restart` and `materializer_restart_combinations` compose
 them with horizon, visibility, boundary, and zero-lag assertions.
+
+The fork-metadata slice composes the existing `forkmeta.*` probes on the
+daemon through a `forkmeta` gc_seed workload: the page-pruning history and
+cutoff pin prove the cutoff, thirty-two relations carry persisted fork-size
+events on both sides of it, and a post-cutoff trickle publishes the second
+generation that retires the first.  This closes the R4b acceptance item that
+H1 exercise each publication boundary in a composed process-crash scenario.
 
 Acceptance:
 
@@ -1160,6 +1175,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Added the H1 fork-metadata publication crash slice: a `forkmeta` gc_seed workload (page-pruning cutoff, thirty-two relations with create/zero-extend/truncate events on both sides of the cutoff, post-cutoff trickle for the second generation) composing the four existing `forkmeta.*` probes, with staged/selected/marker/GC snapshots, settled-generation recovery, current and retained fork sizes, refused below-cutoff queries, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |
 | 2026-09-10 | Added the H1 restart-combination slice: a `restart` operation for the writer runtime (writer, installed pinned readers via boot-control restore) and the materializer runtime (writer, supervisor-replaced worker, store with all computes down), plus `writer_reader_restart` and `materializer_restart_combinations` scenarios asserting reader horizon and prepared-xid hiding across restarts and materialized boundaries after writer, worker, and store restarts | Harness validation tests and meson plan checks; both scenarios in the integration CI lane; no SPDK execution |
 | 2026-09-10 | Added the H1 manifest replacement crash slice: map-held probes after the fsync'd compacted temp log and after its rename, crashed temp-log removal on manifest open, a `manifest_compact` gc_seed workload (320 pages under a harness-held maintenance pause, workload-armed fault and release), per-stage temp-file snapshots, reconciled-manifest recovery with every page served and no temp log, and idempotent restart | Harness validation tests; two meson/CI scenarios against the POSIX daemon; manifest unit test; no SPDK execution |
 | 2026-09-10 | Added the H1 timeline deletion crash slice: lock-held probes after the durable DELETING event, after private WAL/WAL-index removal, after a shared segment rewrite, and after the durable DELETED event; a `timeline_delete` gc_seed workload (branch with private WAL, WAL-index interval, owner layer, shared-segment pages, workload-armed BEGIN_DELETE); per-stage private-artifact snapshots, DELETED-with-token recovery, parent readable, branch reads rejected, owner artifacts gone, manifest reconciled, no owner, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |

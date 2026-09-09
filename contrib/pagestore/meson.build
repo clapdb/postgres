@@ -722,6 +722,10 @@ foreach prune_fault_scenario : [
   'timeline_delete_before_deleting',
   'manifest_compact_after_tmp_sync',
   'manifest_compact_after_rename',
+  'forkmeta_after_prepare',
+  'forkmeta_after_manifest_commit',
+  'forkmeta_after_source_rewrite',
+  'forkmeta_after_snapshot_gc',
 ]
   test('pagestore_harness_' + prune_fault_scenario,
     pagestore_harness_python,

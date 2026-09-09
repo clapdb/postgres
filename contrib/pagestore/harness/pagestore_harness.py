@@ -675,7 +675,7 @@ RUNTIME_CONSTRAINTS = {
         "layer_seed": {"target": ["store"]},
         "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim",
                                                       "timeline_delete", "timeline_delete_abort",
-                                                      "manifest_compact"]},
+                                                      "manifest_compact", "forkmeta"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -2355,11 +2355,33 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
         "retained_horizon": None,
         "pause_maintenance": True,
     },
+    "forkmeta": {
+        "faults": {
+            "forkmeta.after_prepare",
+            "forkmeta.after_manifest_commit",
+            "forkmeta.after_source_rewrite",
+            "forkmeta.after_snapshot_gc",
+        },
+        # the page_prune history proves the cutoff through its frontier; the
+        # operational snapshot trigger is lowered to its floor so the seeded
+        # fork-size events are enough to publish a generation
+        "daemon_args": [
+            "--segment-size", "65536", "--flush-pages", "8", "--segment-gc", "0",
+            "--wal-high-water-bytes", "1048576", "--wal-catch-up-bytes", "1",
+        ],
+        "daemon_env": {"PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES": "1024"},
+        "retained_horizon": 3500,
+    },
 }
 # The supervisor's own pg_ctl stop and start are each bounded by its command
 # timeout (never below 60s), and a stop request cannot interrupt one.
 SUPERVISOR_COMMAND_TIMEOUT = 60
 SUPERVISOR_STOP_TIMEOUT = 2 * SUPERVISOR_COMMAND_TIMEOUT + 15
+FORKMETA_SNAPSHOTS = Path("forkmeta_snapshots")
+FORKMETA_MANIFEST = FORKMETA_SNAPSHOTS / "forkmeta_manifest_v1"
+FORKMETA_PREPARED = FORKMETA_SNAPSHOTS / "forkmeta_prepared_v1"
+FORKMETA_V2_MAGIC = 0x324D4B46
+FORKMETA_SNAPSHOT_BASE_KIND = 10
 DELETE_BRANCH = 1
 MANIFEST_TMP = "layers.manifest.tmp"
 WAL_RECLAIM_SEGMENTS = 3
@@ -2396,6 +2418,10 @@ GC_STAGES = {
     "timeline_delete.before_deleting": "delete_before_deleting",
     "manifest_compact.after_tmp_sync": "manifest_tmp_sync",
     "manifest_compact.after_rename": "manifest_rename",
+    "forkmeta.after_prepare": "forkmeta_prepare",
+    "forkmeta.after_manifest_commit": "forkmeta_manifest_commit",
+    "forkmeta.after_source_rewrite": "forkmeta_source_rewrite",
+    "forkmeta.after_snapshot_gc": "forkmeta_snapshot_gc",
 }
 WALIDX_SNAPSHOT_MAGIC = 0x4D534957          # "WISM"
 WALIDX_SNAPSHOT_VERSION = 1
@@ -2607,6 +2633,87 @@ def _manifest_removed_layers(records: list[tuple[int, bytes]]) -> dict[int, int]
             if layer_id in owner:
                 removed[layer_id] = owner.pop(layer_id)
     return removed
+def _forkmeta_generation_files(store: Path) -> list[str]:
+    directory = store / FORKMETA_SNAPSHOTS
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.name.startswith(("forkmeta_checkpoint_v1_", "forkmeta_tail_v1_"))
+    )
+
+
+def _forkmeta_source_starts_with_marker(store: Path) -> bool:
+    """True when the shared forkmeta log's first record is a snapshot-base
+    marker, i.e. the source epoch has been rewritten behind a snapshot."""
+    source = store / "forkmeta"
+    try:
+        with source.open("rb") as handle:
+            head = handle.read(8)
+            if len(head) < 8:
+                return False
+            magic, rec_len = struct.unpack("<II", head)
+            if magic != FORKMETA_V2_MAGIC or rec_len < 12:
+                return False
+            handle.seek(0)
+            record = handle.read(rec_len)
+    except OSError:
+        return False
+    return len(record) == rec_len and record[rec_len - 4] == FORKMETA_SNAPSHOT_BASE_KIND
+
+
+def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
+    """Prepare leaves the staged generation without a selected manifest;
+    commit selects it while the source still names the old epoch; the
+    rewrite puts the snapshot-base marker at the head of the source; GC
+    leaves exactly the selected generation's files."""
+    prepared = (store / FORKMETA_PREPARED).exists()
+    manifest = (store / FORKMETA_MANIFEST).exists()
+    marker = _forkmeta_source_starts_with_marker(store)
+    files = _forkmeta_generation_files(store)
+    if stage == "forkmeta_prepare":
+        if not prepared or manifest:
+            raise OracleMismatch(
+                f"after_prepare crash left prepared={prepared} manifest={manifest}"
+            )
+        return
+    if not manifest:
+        raise OracleMismatch(f"after_{stage} crash left no selected forkmeta manifest")
+    if stage == "forkmeta_manifest_commit" and marker:
+        raise OracleMismatch(
+            "after_manifest_commit crash already rewrote the forkmeta source"
+        )
+    if stage == "forkmeta_source_rewrite" and not marker:
+        raise OracleMismatch(
+            "after_source_rewrite crash left the forkmeta source without its marker"
+        )
+    if stage == "forkmeta_snapshot_gc" and len(files) != 2:
+        raise OracleMismatch(
+            f"after_snapshot_gc crash left generation files {files!r}, expected one pair"
+        )
+
+
+def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> None:
+    """Recovery selects one durable generation, finishes any staged or retired
+    file cleanup, and serves the source behind its marker."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        files = _forkmeta_generation_files(store)
+        prepared = (store / FORKMETA_PREPARED).exists()
+        if (store / FORKMETA_MANIFEST).exists() and not prepared and \
+                len(files) == 2 and _forkmeta_source_starts_with_marker(store):
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery did not settle the forkmeta snapshot: "
+                f"prepared={prepared} files={files!r} "
+                f"marker={_forkmeta_source_starts_with_marker(store)}"
+            )
+        time.sleep(min(0.05, deadline - now))
+
+
 def _check_manifest_crash_snapshot(store: Path, stage: str) -> None:
     """Before the rename the live log is intact next to the fsync'd temp
     file; after it the compacted log has replaced the live log."""
@@ -3111,6 +3218,9 @@ def _check_gc_crash_snapshot(
     if stage.startswith("manifest_"):
         _check_manifest_crash_snapshot(store, stage)
         return
+    if stage.startswith("forkmeta_"):
+        _check_forkmeta_crash_snapshot(store, stage)
+        return
     if stage == "walidx_frontier":
         if not (store / "walidx-prune.frontiers").exists():
             raise OracleMismatch(
@@ -3367,6 +3477,8 @@ def _check_gc_recovery(
             f"after_{stage} recovery reported retained_horizon="
             f"{timeline.get('retained_horizon')!r}, expected {expected_horizon}"
         )
+    if workload == "forkmeta":
+        _check_forkmeta_recovery(store, stage, timeout)
 
 
 def _gc_converged_state(store: Path) -> dict[str, Any]:
@@ -3743,6 +3855,8 @@ def run_daemon_fault_recovery(
                     GC_WORKLOADS[gc_workload]["daemon_args"]:
                 command.extend(["--test-maintenance-pause-file", str(pause_file)])
         env = private_environment()
+        if gc_seed_actions:
+            env.update(GC_WORKLOADS[gc_workload].get("daemon_env", {}))
         if inject_fault:
             # Keep these names local and explicit: inherited PAGESTORE_* values
             # are removed by private_environment before this point.
