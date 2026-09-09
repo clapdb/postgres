@@ -18,6 +18,13 @@
  * history at the cutoff is still served, and that the pruned history below
  * the cutoff cannot be resurrected once recovery cleanup has run.
  *
+ * The wal_index workload targets the WAL-index compaction boundary instead:
+ * a fixed WAL-index reader at 40 under three FPI-led chains on one block and
+ * one committed interval, armed before the commit that makes the interval a
+ * snapshot candidate.  Its verify mode waits for the retried generation to
+ * serve the reader's chain plus the newest chain and requires the dropped
+ * point below the durable frontier to stay refused.
+ *
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
@@ -29,11 +36,23 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <errno.h>
+
 #include "pagestore_ipc.h"
 
 #define TEST_REL 4343u
 #define TEST_OWNER UINT64_C(23000)
 #define TEST_CUTOFF UINT64_C(3500)
+
+/* wal_index workload: one metadata-complete WAL-index interval on timeline 0
+ * with a fixed WAL-index reader below the operational chain.  Compaction
+ * keeps the reader's exact FPI-led chain (10, 30) and the newest chain
+ * (90, 110) and drops the middle chain (50, 70). */
+#define WALIDX_BLOCK 12u
+#define WALIDX_WAL_BYTES 512u
+#define WALIDX_READER UINT64_C(5001)
+#define WALIDX_READER_LSN UINT64_C(40)
+#define WALIDX_DROPPED_LSN UINT64_C(60)
 
 static void *shm_base;
 static int shm_fd = -1;
@@ -44,6 +63,7 @@ static const char *resume_file;
 /* where the seed records the admission sequence its reservation was granted,
  * so the oracle can require the durable frontier to carry it */
 static const char *cutoff_seq_file;
+static const char *workload = "page_prune";
 
 static void
 die(const char *message)
@@ -163,6 +183,35 @@ write_block(unsigned char *page, uint32_t block, uint64_t lsn,
 }
 
 static void
+arm_fault(void)
+{
+	int			fd;
+
+	if (arm_marker != NULL)
+	{
+		fd = open(arm_marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		if (fd < 0)
+			die("cannot arm the named fault marker");
+		close(fd);
+	}
+	/* Maintenance was paused while this seed installed the condition its
+	 * boundary needs; releasing it here means the first pass it runs is
+	 * planned against that condition and can reach the armed probe. */
+	if (resume_file != NULL && unlink(resume_file) != 0 && errno != ENOENT)
+		die("cannot release the paused maintenance loop");
+}
+
+static void
+wait_forever(void)
+{
+	/* The fault fires in daemon maintenance, not in this request stream.
+	 * Stay alive until the harness reaps this process, so a daemon that
+	 * never reaches the boundary is reported as an unreached fault. */
+	for (;;)
+		pause();
+}
+
+static void
 seed(void)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
@@ -226,25 +275,141 @@ seed(void)
 	 * old floor and validate the wrong transition.  The registry reads the
 	 * marker at probe time, so arming after daemon start is the same
 	 * protocol the standalone crash cases use. */
-	if (arm_marker != NULL)
-	{
-		int			fd = open(arm_marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
-
-		if (fd < 0)
-			die("cannot arm the named fault marker");
-		close(fd);
-	}
-	/* Maintenance was paused across the cutoff and the arming, so the first
-	 * pass it runs is planned against the new floor and can reach the armed
-	 * probe.  Release it now. */
-	if (resume_file != NULL && unlink(resume_file) != 0)
-		die("cannot release the paused maintenance loop");
+	arm_fault();
 	free(page);
-	/* The fault fires in daemon maintenance, not in this request stream.
-	 * Stay alive until the harness reaps this process, so a daemon that
-	 * never reaches the boundary is reported as an unreached fault. */
-	for (;;)
-		pause();
+	wait_forever();
+}
+
+/* ---- wal_index workload ------------------------------------------------ */
+
+static void
+walidx_pin_reader(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->blocknum = PS_RETENTION_OWNER_READER;
+	ch->parent_timeline = PS_RETENTION_RESOURCE_WAL_INDEX;
+	ch->old_nblocks = 1;
+	ch->req_seq = WALIDX_READER;
+	ch->req_lsn = WALIDX_READER_LSN;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixed WAL-index reader registration failed");
+}
+
+static void
+walidx_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+	const uint64_t lsns[] = {10, 30, 50, 70, 90, 110};
+	const uint32_t flags[] = {
+		PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+		PS_WAL_INDEX_FLAG_KNOWN,
+		PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+		PS_WAL_INDEX_FLAG_KNOWN,
+		PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+		PS_WAL_INDEX_FLAG_KNOWN
+	};
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = 0;
+	ch->datalen = WALIDX_WAL_BYTES;
+	memset(ch->data, 0, WALIDX_WAL_BYTES);
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL append failed");
+	walidx_pin_reader();
+	set_relation(ch);
+	for (uint32_t i = 0; i < 6; i++)
+	{
+		entries[i].key = ch->key;
+		entries[i].block = WALIDX_BLOCK;
+		entries[i].flags = flags[i];
+		entries[i].lsn = lsns[i];
+		entries[i].end_lsn = lsns[i] + 1;
+	}
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = 6;
+	ch->datalen = 6 * sizeof(*entries);
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL-index batch add failed");
+	/* Arm before the commit that makes the interval a snapshot candidate:
+	 * nothing is published before progress moves, so this is the only
+	 * publication the daemon can reach. */
+	arm_fault();
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = WALIDX_WAL_BYTES;
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL-index progress commit failed");
+	wait_forever();
+}
+
+/* Returns the daemon status; on OK fills *count and out[] (up to max_out). */
+static int
+walidx_get(uint64_t lsn_max, PsWalRec *out, uint32_t max_out, int *count)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_INDEX_GET;
+	ch->blocknum = WALIDX_BLOCK;
+	ch->nblocks = 0;
+	ch->req_lsn = lsn_max;
+	ch->pad1 = 0;
+	execute();
+	*count = (int) ch->result;
+	if (ch->status == PS_STATUS_OK && *count > 0)
+		memcpy(out, ch->data,
+			   (size_t) (*count < (int) max_out ? *count : (int) max_out) *
+			   sizeof(*out));
+	return ch->status;
+}
+
+static void
+walidx_verify(void)
+{
+	PsWalRec	out[8];
+	struct timespec pause_interval = {0, 20000000};
+	int			count = 0;
+	int			compacted = 0;
+
+	/* Restart retries the prepared generation behind its durable frontier
+	 * asynchronously; the compacted chains must appear within a bounded
+	 * wait. */
+	for (int i = 0; i < 500; i++)
+	{
+		if (walidx_get(WALIDX_WAL_BYTES, out, 8, &count) == PS_STATUS_OK &&
+			count == 4)
+		{
+			compacted = 1;
+			break;
+		}
+		nanosleep(&pause_interval, NULL);
+	}
+	if (!compacted)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: recovery did not serve the "
+				"compacted WAL-index chains (count %d)\n", count);
+		exit(1);
+	}
+	if (out[0].lsn != 10 || out[1].lsn != 30 || out[2].lsn != 90 ||
+		out[3].lsn != 110)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: unexpected compacted chains "
+				"%llu %llu %llu %llu\n", (unsigned long long) out[0].lsn,
+				(unsigned long long) out[1].lsn, (unsigned long long) out[2].lsn,
+				(unsigned long long) out[3].lsn);
+		exit(1);
+	}
+	if (walidx_get(WALIDX_READER_LSN, out, 8, &count) != PS_STATUS_OK ||
+		count != 2 || out[0].lsn != 10 || out[1].lsn != 30)
+		die("recovery lost the fixed reader's retained WAL-index chain");
+	if (walidx_get(WALIDX_DROPPED_LSN, out, 8, &count) == PS_STATUS_OK)
+		die("recovery resurrected a WAL-index point below the durable frontier");
 }
 
 static uint64_t
@@ -350,18 +515,33 @@ main(int argc, char **argv)
 			mode = argv[++i];
 		else if (strcmp(argv[i], "--arm-marker") == 0 && i + 1 < argc)
 			arm_marker = argv[++i];
+		else if (strcmp(argv[i], "--workload") == 0 && i + 1 < argc)
+			workload = argv[++i];
 		else if (strcmp(argv[i], "--resume-file") == 0 && i + 1 < argc)
 			resume_file = argv[++i];
 		else if (strcmp(argv[i], "--cutoff-seq-file") == 0 && i + 1 < argc)
 			cutoff_seq_file = argv[++i];
 		else
-			die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+			die("usage: --shm NAME --mode seed|verify "
+				"[--workload page_prune|wal_index] [--arm-marker PATH] "
+				"[--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
-		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0))
-		die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0) ||
+		(strcmp(workload, "page_prune") != 0 &&
+		 strcmp(workload, "wal_index") != 0))
+		die("usage: --shm NAME --mode seed|verify "
+			"[--workload page_prune|wal_index] [--arm-marker PATH] "
+			"[--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
-	if (strcmp(mode, "seed") == 0)
+	if (strcmp(workload, "wal_index") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			walidx_seed();
+		else
+			walidx_verify();
+	}
+	else if (strcmp(mode, "seed") == 0)
 		seed();
 	else
 		verify();

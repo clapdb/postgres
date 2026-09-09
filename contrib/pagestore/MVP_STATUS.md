@@ -110,8 +110,18 @@ readiness is published as soon as the maintenance thread exists, so a
 comparison made while it runs can precede the pass startup marked due.  Compaction accordingly leaves a converged shard
 alone: a single source with nothing to prune is already its own compacted
 result, so it is no longer rewritten into a fresh layer by the pruning pass
-each startup marks due.  WAL reclaim, WAL-index
-compaction, timeline deletion, manifest replacement, and compute-restart
+each startup marks due.
+
+The same workload binary carries a `wal_index` workload for the WAL-index
+compaction boundary: one metadata-complete interval on timeline 0 with a
+fixed WAL-index reader at 40 below FPI-led chains at 10/30, 50/70, and
+90/110, published under a one-byte `--walidx-snapshot-bytes` trigger so the
+first committed interval is a compaction candidate.  The process abort after
+the durable frontier must leave the frontier file and the staged, uncommitted
+generation; recovery must retry and commit that generation, serve the
+reader's exact chain and the newest chain while refusing the dropped middle
+point, and keep the WAL-index owner; a second restart proves idempotence.
+WAL reclaim, timeline deletion, manifest replacement, and compute-restart
 combinations remain outside the harness.
 
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
@@ -505,10 +515,10 @@ to compare across nights.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 
-The POSIX image-layer publication and page-pruning slices are now covered by
-the declarative harness.  Other crash boundaries remain outside them.
-Before declaring the MVP repeatable, add process-level fault scenarios around
-manifest replacement, WAL reclaim, WAL-index compaction, and timeline
+The POSIX image-layer publication, page-pruning, and WAL-index compaction
+slices are now covered by the declarative harness.  Other crash boundaries
+remain outside them.  Before declaring the MVP repeatable, add process-level
+fault scenarios around manifest replacement, WAL reclaim, and timeline
 deletion, plus a persisted-format fixture for restart/upgrade compatibility.
 
 An advancing reader's data directory boots from the checkpoint its manifest

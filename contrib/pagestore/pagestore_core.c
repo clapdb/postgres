@@ -73,6 +73,7 @@ uint64_t	wal_reclaim_high_water_bytes;
 uint64_t	wal_reclaim_catchup_bytes;
 uint64_t	walidx_reclaim_high_water_bytes;
 uint64_t	walidx_reclaim_catchup_bytes;
+uint64_t	walidx_snapshot_trigger_option_bytes;
 uint64_t	forkmeta_reclaim_high_water_bytes;
 uint64_t	forkmeta_reclaim_catchup_bytes;
 /*
@@ -12997,6 +12998,8 @@ walidx_snapshot_trigger_bytes(void)
 	unsigned long long parsed;
 	char *end = NULL;
 
+	if (walidx_snapshot_trigger_option_bytes != 0)
+		return walidx_snapshot_trigger_option_bytes;
 	if (value == NULL)
 		return WALIDX_SNAPSHOT_DEFAULT_TRIGGER;
 	errno = 0;

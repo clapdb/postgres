@@ -709,6 +709,7 @@ foreach prune_fault_scenario : [
   'page_prune_after_frontier',
   'page_compaction_after_publish',
   'page_gc_after_mark_delete',
+  'wal_index_after_frontier',
 ]
   test('pagestore_harness_' + prune_fault_scenario,
     pagestore_harness_python,

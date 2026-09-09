@@ -545,6 +545,7 @@ class PlanValidationTests(unittest.TestCase):
             scenario_dir / "page_prune_after_frontier.jsonl",
             scenario_dir / "page_compaction_after_publish.jsonl",
             scenario_dir / "page_gc_after_mark_delete.jsonl",
+            scenario_dir / "wal_index_after_frontier.jsonl",
         ]
         for path in scenarios:
             with self.subTest(scenario=path.name):
@@ -569,7 +570,7 @@ class PlanValidationTests(unittest.TestCase):
         ])
         plan = MODULE.read_plan(path)
         MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
-        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed requires an H1 page-pruning fault"):
+        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed requires an H1 fault matching"):
             MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
     def test_page_pruning_fault_requires_its_gc_seed(self):
@@ -640,7 +641,7 @@ class PlanValidationTests(unittest.TestCase):
                 "contracts": ["fault_reachability"],
                 "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
             },
-            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "wal_index"},
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "timeline_delete"},
             {
                 "op": "crash", "id": "fault", "target": "store",
                 "model": "process_abort", "fault": "page_prune.after_frontier",
@@ -650,6 +651,26 @@ class PlanValidationTests(unittest.TestCase):
         plan = MODULE.read_plan(path)
         with self.assertRaises(MODULE.PlanError):
             MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_wal_index_seed_rejects_a_page_pruning_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-walidx-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "wal_index"},
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed requires an H1 fault matching"):
             MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
     def test_image_layer_seed_cannot_follow_named_fault(self):

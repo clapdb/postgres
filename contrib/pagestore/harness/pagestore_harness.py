@@ -672,7 +672,7 @@ RUNTIME_CONSTRAINTS = {
         "set_fault": {},
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
-        "gc_seed": {"target": ["store"], "workload": ["page_prune"]},
+        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -1018,8 +1018,8 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 GC_WORKLOAD_FAULTS.get(seed_actions[0].get("workload"), set())
             ):
                 raise PlanError(
-                    "runtime daemon_fault_smoke gc_seed requires an H1 page-pruning fault "
-                    "matching its workload"
+                    "runtime daemon_fault_smoke gc_seed requires an H1 fault matching "
+                    "its workload"
                 )
             reachable = GC_FAULT_MAX_HITS.get(fault["fault"], GC_FAULT_DEFAULT_MAX_HIT)
             if fault.get("hit", 1) > reachable:
@@ -2272,13 +2272,32 @@ def _capture_fault_diagnostics(
 # The page-pruning H1 slice: history below a configured cutoff is compacted;
 # the three boundaries are the replacement layer publication, the retired
 # sources' durable mark-delete, and the durable page-prune frontier advance.
-GC_WORKLOAD_FAULTS = {
+# Each gc_seed workload names the H1 faults it can reach, the daemon flags
+# that make the publication observable at the workload's scale, and the
+# retained page-history horizon recovery must republish (None when the
+# workload pins no page history).
+GC_WORKLOADS: dict[str, dict[str, Any]] = {
     "page_prune": {
-        "page_compaction.after_publish",
-        "page_gc.after_mark_delete",
-        "page_prune.after_frontier",
+        "faults": {
+            "page_compaction.after_publish",
+            "page_gc.after_mark_delete",
+            "page_prune.after_frontier",
+        },
+        "daemon_args": [
+            "--segment-size", "65536", "--flush-pages", "8", "--segment-gc", "0",
+            "--wal-high-water-bytes", "1048576", "--wal-catch-up-bytes", "1",
+        ],
+        "retained_horizon": 3500,
+    },
+    "wal_index": {
+        "faults": {"wal_index.after_frontier"},
+        # one metadata-complete interval must make the timeline a snapshot
+        # candidate; the geometric default trigger needs a mebibyte of index
+        "daemon_args": ["--walidx-snapshot-bytes", "1"],
+        "retained_horizon": None,
     },
 }
+GC_WORKLOAD_FAULTS = {name: spec["faults"] for name, spec in GC_WORKLOADS.items()}
 # Each gc_seed workload installs its condition once, so its faults are
 # reachable exactly once per run; a plan asking for a later hit would wait
 # for work the seed never creates again and expire as FaultNotReached.
@@ -2288,12 +2307,10 @@ GC_STAGES = {
     "page_compaction.after_publish": "publish",
     "page_gc.after_mark_delete": "mark_delete",
     "page_prune.after_frontier": "frontier",
+    "wal_index.after_frontier": "walidx_frontier",
 }
-GC_DAEMON_ARGS = [
-    "--segment-size", "65536", "--flush-pages", "8", "--segment-gc", "0",
-    "--wal-high-water-bytes", "1048576", "--wal-catch-up-bytes", "1",
-]
-GC_RETAINED_HORIZON = 3500
+WALIDX_PREPARED = Path("walidx_snapshots_0") / "walidx_prepared_v1"
+WALIDX_MANIFEST = Path("walidx_snapshots_0") / "walidx_manifest_v1"
 
 
 def _gc_fault_stage(fault_name: str) -> str | None:
@@ -2408,8 +2425,26 @@ def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
     manifest ADD lands after the frontier probe, and the sources' tombstones
     after the publication probe.  The newest layer id on disk is the
     replacement; whether the manifest names it, and whether any tombstone
-    exists yet, tells the three boundaries apart.
+    exists yet, tells the three boundaries apart.  The WAL-index stage follows
+    the durable frontier but precedes the generation commit, so the prepared
+    generation is still staged.
     """
+    if stage == "walidx_frontier":
+        if not (store / "walidx-prune.frontiers").exists():
+            raise OracleMismatch(
+                "after_walidx_frontier did not leave a durable WAL-index frontier"
+            )
+        if not (store / WALIDX_PREPARED).exists():
+            raise OracleMismatch(
+                "after_walidx_frontier did not leave the prepared WAL-index "
+                "generation staged for its restart retry"
+            )
+        if (store / WALIDX_MANIFEST).exists():
+            raise OracleMismatch(
+                "after_walidx_frontier committed the WAL-index generation "
+                "before the probe"
+            )
+        return
     files = _canonical_layer_files(store)
     if len(files) < 2:
         raise OracleMismatch(
@@ -2440,13 +2475,14 @@ def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
     # this store defines timeline 0 with the first incarnation, so the cutoff
     # must be published for that one, not merely for some slot, and at the
     # admission sequence the reservation was granted
+    expected = GC_WORKLOADS["page_prune"]["retained_horizon"]
     granted = _gc_granted_cutoff_seq(control)
-    if not any(incarnation == 1 and lsn == GC_RETAINED_HORIZON and
+    if not any(incarnation == 1 and lsn == expected and
                (granted is None or seq == granted)
                for incarnation, lsn, seq in fences):
         raise OracleMismatch(
             f"after_{stage} published timeline 0 fences {fences!r}, expected the "
-            f"configured cutoff {GC_RETAINED_HORIZON} in incarnation 1 at "
+            f"configured cutoff {expected} in incarnation 1 at "
             f"admission sequence {granted}"
         )
     if stage == "frontier":
@@ -2483,17 +2519,52 @@ def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
             )
 
 
+def _check_walidx_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+) -> None:
+    """The verify client already waited for the compacted chains, so the
+    retried generation is committed: the staged copy is gone, the committed
+    manifest exists, and the fixed WAL-index reader survived recovery."""
+    if (store / WALIDX_PREPARED).exists():
+        raise OracleMismatch(
+            f"after_{stage} recovery served the compacted chains but left the "
+            "prepared WAL-index generation staged"
+        )
+    if not (store / WALIDX_MANIFEST).exists():
+        raise OracleMismatch(
+            f"after_{stage} recovery did not commit the WAL-index generation"
+        )
+    if not (store / "walidx-prune.frontiers").exists():
+        raise OracleMismatch(f"after_{stage} recovery lost the WAL-index frontier")
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or \
+            owners.get("wal_index_owners") != 1 or \
+            owners.get("page_history_owners") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected one "
+            "WAL-index owner and no page-history owner"
+        )
+
+
 def _check_gc_recovery(
     inspector: Path,
     shm: str,
     inspection_schema: dict[str, Any],
     store: Path,
+    workload: str,
     stage: str,
     timeout: float,
 ) -> None:
     """After recovery the manifest is sane, the retired sources are gone once
     cleanup has resumed (only the replacement remains, in the manifest and on
     disk), and the retained horizon is the configured cutoff."""
+    if workload == "wal_index":
+        _check_walidx_recovery(inspector, shm, inspection_schema, store, stage)
+        return
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -2517,11 +2588,12 @@ def _check_gc_recovery(
                 f"{poll_timeout:.3f}s; last manifest={manifest!r}, files={[f.name for f in files]!r}"
             )
         time.sleep(min(0.05, deadline - now))
+    expected_horizon = GC_WORKLOADS[workload]["retained_horizon"]
     timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
-    if timeline.get("retained_horizon") != GC_RETAINED_HORIZON:
+    if timeline.get("retained_horizon") != expected_horizon:
         raise OracleMismatch(
             f"after_{stage} recovery reported retained_horizon="
-            f"{timeline.get('retained_horizon')!r}, expected {GC_RETAINED_HORIZON}"
+            f"{timeline.get('retained_horizon')!r}, expected {expected_horizon}"
         )
 
 
@@ -2688,9 +2760,12 @@ def _check_layer_manifest_after_restart(
 
 def _start_layer_client(
     client: Path, shm: str, mode: str, log: Path, arm_marker: Path | None = None,
-    resume_file: Path | None = None, cutoff_seq_file: Path | None = None,
+    workload: str | None = None, resume_file: Path | None = None,
+    cutoff_seq_file: Path | None = None,
 ) -> subprocess.Popen[str]:
     command = [str(client.resolve()), "--shm", shm, "--mode", mode]
+    if workload is not None:
+        command.extend(["--workload", workload])
     if arm_marker is not None:
         command.extend(["--arm-marker", str(arm_marker)])
     if resume_file is not None:
@@ -2705,10 +2780,15 @@ def _start_layer_client(
         )
 
 
-def _verify_layer_client(client: Path, shm: str, log: Path, timeout: float) -> None:
+def _verify_layer_client(
+    client: Path, shm: str, log: Path, timeout: float, workload: str | None = None,
+) -> None:
+    command = [str(client.resolve()), "--shm", shm, "--mode", "verify"]
+    if workload is not None:
+        command.extend(["--workload", workload])
     with log.open("a", encoding="utf-8") as output:
         result = subprocess.run(
-            [str(client.resolve()), "--shm", shm, "--mode", "verify"],
+            command,
             stdout=output, stderr=subprocess.STDOUT, text=True,
             env=private_environment(), timeout=max(5.0, timeout), check=False,
         )
@@ -2787,6 +2867,7 @@ def run_daemon_fault_recovery(
     if gc_seed_actions and gc_client is None:
         raise PlanError("gc_seed requires --gc-client-binary")
     gc_stage = _gc_fault_stage(action["fault"]) if gc_seed_actions else None
+    gc_workload = gc_seed_actions[0]["workload"] if gc_seed_actions else None
     # Both seeds drive the same one-client workload protocol; the layer and
     # page-pruning slices differ only in the binary, daemon flags, and oracles.
     seed_client = gc_client if gc_seed_actions else layer_client
@@ -2872,7 +2953,7 @@ def run_daemon_fault_recovery(
             command.extend(["--segment-size", "65536", "--flush-pages", "2",
                             "--compact-layers", "1000"])
         if gc_seed_actions:
-            command.extend(GC_DAEMON_ARGS)
+            command.extend(GC_WORKLOADS[gc_workload]["daemon_args"])
             if inject_fault and gc_pauses_maintenance:
                 command.extend(["--test-maintenance-pause-file", str(pause_file)])
         env = private_environment()
@@ -2970,6 +3051,7 @@ def run_daemon_fault_recovery(
             layer_client_process = _start_layer_client(
                 seed_client, shm, "seed", trace / "layer-client.log",
                 arm_marker=marker if gc_seed_actions else None,
+                workload=gc_workload,
                 resume_file=pause_file if gc_pauses_maintenance else None,
                 cutoff_seq_file=cutoff_seq_file if gc_seed_actions else None,
             )
@@ -3153,8 +3235,10 @@ def run_daemon_fault_recovery(
             manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
             _check_layer_manifest(manifest, layer_stage, False)
         if gc_seed_actions:
-            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
-            _check_gc_recovery(inspector, shm, inspection_schema, store, gc_stage, timeout)
+            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
+                                 workload=gc_workload)
+            _check_gc_recovery(inspector, shm, inspection_schema, store,
+                               gc_workload, gc_stage, timeout)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
@@ -3178,8 +3262,10 @@ def run_daemon_fault_recovery(
                 inspector, shm, inspection_schema, layer_stage, timeout
             )
         if gc_seed_actions:
-            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
-            _check_gc_recovery(inspector, shm, inspection_schema, store, gc_stage, timeout)
+            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
+                                 workload=gc_workload)
+            _check_gc_recovery(inspector, shm, inspection_schema, store,
+                               gc_workload, gc_stage, timeout)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         if gc_seed_actions:
