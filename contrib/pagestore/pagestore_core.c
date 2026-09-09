@@ -419,6 +419,19 @@ static int control_chain_plan(uint32_t timeline, const PsKey *key,
 static int control_chain_keeps(const PsControlChainPlan *plan, uint32_t block,
 							   const PsPruneVersion *v);
 static int prune_version_cmp(const void *va, const void *vb);
+struct ForkEnt;
+typedef struct ForkMetaWalIdxPage ForkMetaWalIdxPage;
+static int fork_meta_walidx_pages_build(ForkMetaWalIdxPage **pages_out,
+										uint32_t *n_out);
+static void fork_meta_required_fences(const struct ForkEnt *e,
+									  const uint32_t *indices, uint32_t nitems,
+									  const ForkMetaWalIdxPage *pages,
+									  uint32_t npages, unsigned char *required);
+static uint64_t walidx_progress_read(uint32_t tl);
+static int prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
+								const PsPruneVersion *versions, uint32_t n,
+								uint32_t idx, uint64_t floor,
+								const PsPruneFence *fences, uint32_t nfences);
 static int retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 											  uint64_t *floor_out, int map_locked);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -2570,6 +2583,16 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			free(fences);
 			free(control_fences);
 			return -1;
+		}
+		else
+		{
+			for (uint32_t i = first; i < end; i++)
+				if (keep[i - first] && order[i].version.lsn < floor &&
+					!prune_version_needed(timeline, &order[first].key,
+										  order[first].block, versions,
+										  end - first, i - first, floor,
+										  fences, nfences))
+					keep[i - first] = 0;
 		}
 		for (uint32_t i = first; i < end;)
 		{
@@ -7288,11 +7311,16 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						  int filter_deleting, int preserve_survivors)
 {
 	PsKey zero_key;
+	ForkMetaWalIdxPage *walidx_pages = NULL;
+	uint32_t	nwalidx_pages = 0;
 
 	memset(&zero_key, 0, sizeof(zero_key));
 	if (fork_meta_vec_record(source, 0, &zero_key, cutoff.lsn,
 						 cutoff.admission_seq, generation,
 						 0, FEV_SNAPSHOT_BASE) != 0)
+		return -1;
+	if (!preserve_survivors &&
+		fork_meta_walidx_pages_build(&walidx_pages, &nwalidx_pages) != 0)
 		return -1;
 	for (uint32_t sh = 0; sh < core_shards(); sh++)
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
@@ -7365,12 +7393,20 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				else if (nitems != 0 && !preserve_survivors)
 				{
 					unsigned char *planned_keep = malloc(nitems);
+					unsigned char *required = malloc(nitems);
 
-					if (planned_keep == NULL)
+					if (planned_keep == NULL || required == NULL)
+					{
+						free(planned_keep);
+						free(required);
 						goto fail_entry;
-					planned = ps_forkmeta_prune_plan(events, nitems,
+					}
+					fork_meta_required_fences(e, indices, nitems, walidx_pages,
+											  nwalidx_pages, required);
+					planned = ps_forkmeta_prune_plan_required(events, nitems,
 						(PsForkMetaFence) {cutoff.lsn, cutoff.admission_seq},
-						fences, nfences, planned_keep);
+						fences, nfences, required, planned_keep);
+					free(required);
 					if (planned < 0)
 					{
 						free(planned_keep);
@@ -7436,8 +7472,10 @@ fail_entry:
 				free(keep);
 				free(raw_fences);
 				free(fences);
+				free(walidx_pages);
 				return -1;
 			}
+	free(walidx_pages);
 	if (fork_meta_snapshot_append_source_markers(checkpoint, tail, cutoff,
 											 filter_deleting,
 											 preserve_survivors) != 0)
@@ -7646,6 +7684,7 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	uint64_t freeze_seq;
 	int force_deleting;
 	int filter_deleting;
+	int preserve_survivors;
 	int overflow_cutover;
 	int rc = 0;
 
@@ -7730,6 +7769,22 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 		}
 		return 0;
 	}
+	/* A deletion-forced generation preserves every surviving record only
+	 * when no operational cutoff can be proven.  With a proven cutoff it
+	 * compacts survivors like an ordinary generation; otherwise a store whose
+	 * branches come and go faster than the size trigger fires would never
+	 * compact at all. */
+	preserve_survivors = force_deleting;
+	if (force_deleting)
+	{
+		PsPruneFence proven;
+
+		if (fork_meta_snapshot_cutoff(&proven, filter_deleting, 0, 1) == 0)
+		{
+			cutoff = proven;
+			preserve_survivors = 0;
+		}
+	}
 	{
 		PsForkmetaSnapshotPrepared pending;
 		int pending_rc = ps_forkmeta_snapshot_read_prepared(
@@ -7780,7 +7835,7 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	freeze_seq--;
 	if (fork_meta_snapshot_build(&checkpoint, &tail, &source, cutoff,
 								 generation, freeze_seq, filter_deleting,
-								 force_deleting) != 0)
+								 preserve_survivors) != 0)
 		goto retry_done;
 	cp.data = checkpoint.data;
 	cp.len = checkpoint.len;
@@ -11179,6 +11234,152 @@ walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 	return rc;
 }
 
+/* One indexed page of the WAL index: the oldest record it still names.  A
+ * definitive fork event that kills the block must survive forkmeta compaction
+ * while such a record precedes it, because WAL-index compaction uses that
+ * death as the replacement base which retires the record. */
+struct ForkMetaWalIdxPage
+{
+	uint32_t	timeline;
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	min_lsn;
+};
+
+static int
+fork_meta_walidx_page_cmp(const void *va, const void *vb)
+{
+	const ForkMetaWalIdxPage *a = va;
+	const ForkMetaWalIdxPage *b = vb;
+	int			c;
+
+	if (a->timeline != b->timeline)
+		return a->timeline < b->timeline ? -1 : 1;
+	c = memcmp(&a->key, &b->key, sizeof(a->key));
+	if (c != 0)
+		return c;
+	if (a->block != b->block)
+		return a->block < b->block ? -1 : 1;
+	return 0;
+}
+
+/* Caller holds every shard lock.  Returns the sorted table, or -1 on OOM. */
+static int
+fork_meta_walidx_pages_build(ForkMetaWalIdxPage **pages_out, uint32_t *n_out)
+{
+	ForkMetaWalIdxPage *pages = NULL;
+	uint32_t	n = 0;
+	uint32_t	cap = 0;
+
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (WalIdxEnt *e = g_shards[sh].walidx[bucket]; e; e = e->next)
+			{
+				if (e->n == 0)
+					continue;
+				if (n == cap)
+				{
+					uint32_t	ncap = cap != 0 ? cap * 2 : 256;
+					ForkMetaWalIdxPage *grown = realloc(pages,
+														(size_t) ncap * sizeof(*grown));
+
+					if (grown == NULL)
+					{
+						free(pages);
+						return -1;
+					}
+					pages = grown;
+					cap = ncap;
+				}
+				pages[n].timeline = e->timeline;
+				pages[n].key = e->key;
+				pages[n].block = e->block;
+				pages[n].min_lsn = e->items[0].lsn;
+				n++;
+			}
+	if (n != 0)
+		qsort(pages, n, sizeof(*pages), fork_meta_walidx_page_cmp);
+	*pages_out = pages;
+	*n_out = n;
+	return 0;
+}
+
+/* Whether definitive event (lsn, seq) invalidates a page version (vlsn,
+ * vseq): the same order fork_page_invalidated() applies on the read path. */
+static int
+fork_meta_event_after_version(uint64_t lsn, uint64_t seq, uint64_t vlsn,
+							  uint64_t vseq)
+{
+	if (lsn != 0 && vlsn != 0)
+		return lsn > vlsn || (lsn == vlsn && seq > vseq);
+	return seq > vseq;
+}
+
+/*
+ * Mark the definitive events of one fork that must survive compaction because
+ * a retained page version, or a still-indexed WAL record, of a block they
+ * kill predates them.  Image compaction drops invalidated versions and
+ * WAL-index compaction retires covered records, so these requirements shrink
+ * on their own.  Caller holds every shard lock.
+ */
+static void
+fork_meta_required_fences(const ForkEnt *e, const uint32_t *indices,
+						  uint32_t nitems,
+						  const ForkMetaWalIdxPage *pages, uint32_t npages,
+						  unsigned char *required)
+{
+	uint32_t	lo = 0;
+	uint32_t	hi = npages;
+
+	memset(required, 0, nitems);
+	/* Locate this fork's indexed pages: [lo, hi) after the binary search. */
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+		ForkMetaWalIdxPage probe;
+
+		memset(&probe, 0, sizeof(probe));
+		probe.timeline = e->timeline;
+		probe.key = e->key;
+		if (fork_meta_walidx_page_cmp(&pages[mid], &probe) < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	for (uint32_t j = 0; j < nitems; j++)
+	{
+		const ForkEvent *ev = &e->ev[indices[j]];
+		uint32_t	first_dead;
+
+		if (ev->kind != FEV_SET && ev->kind != FEV_DEAD)
+			continue;
+		first_dead = ev->kind == FEV_DEAD ? 0 : ev->nblocks;
+		for (const PageEnt *page = e->pages; page != NULL && !required[j];
+			 page = page->fork_next)
+		{
+			if (page->block < first_dead)
+				continue;
+			for (int v = 0; v < page->nver; v++)
+				if (fork_meta_event_after_version(ev->lsn, ev->admission_seq,
+												  page->vers[v].lsn,
+												  page->vers[v].admission_seq))
+				{
+					required[j] = 1;
+					break;
+				}
+		}
+		for (uint32_t p = lo; p < npages && !required[j]; p++)
+		{
+			if (pages[p].timeline != e->timeline ||
+				!key_eq(&pages[p].key, &e->key))
+				break;
+			if (pages[p].block >= first_dead && ev->lsn != 0 &&
+				pages[p].min_lsn < ev->lsn)
+				required[j] = 1;
+		}
+	}
+}
+
 /*
  * Build the replacement-base table for one timeline.  Caller holds every
  * shard read lock, the WAL-index prune read fence, and map-rd.  Failure
@@ -11190,6 +11391,8 @@ walidx_plan_bases_build(uint32_t tl)
 	uint64_t	floor = 0;
 	PsPruneFence *fences = NULL;
 	uint32_t	nfences = 0;
+	uint64_t   *horizons = NULL;
+	uint32_t	nhorizons = 0;
 	uint32_t	cap = 0;
 	int			rc = -1;
 
@@ -11199,6 +11402,30 @@ walidx_plan_bases_build(uint32_t tl)
 										   &floor, 1) != 0 ||
 		page_prune_fences(tl, &fences, &nfences) != 0)
 		return -1;
+	/* The horizons WAL-index compaction will plan for: a block that this
+	 * timeline's own lifecycle proves absent at a horizon has nothing to
+	 * reconstruct there, which covers every record completing before it. */
+	{
+		uint64_t   *wfences = NULL;
+		uint32_t	nwfences = 0;
+
+		if (walidx_prune_fences(tl, &wfences, &nwfences) != 0)
+		{
+			free(fences);
+			return -1;
+		}
+		horizons = malloc((size_t) (nwfences + 1) * sizeof(*horizons));
+		if (horizons == NULL)
+		{
+			free(wfences);
+			free(fences);
+			return -1;
+		}
+		horizons[nhorizons++] = walidx_progress_read(tl);
+		for (uint32_t i = 0; i < nwfences; i++)
+			horizons[nhorizons++] = wfences[i];
+		free(wfences);
+	}
 	for (uint32_t shard = 0; shard < core_shards(); shard++)
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
 			for (WalIdxEnt *e = g_shards[shard].walidx[bucket]; e; e = e->next)
@@ -11229,6 +11456,17 @@ walidx_plan_bases_build(uint32_t tl)
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
 							ndeaths++;
+				if (f != NULL)
+					for (uint32_t i = 0; i < nhorizons; i++)
+					{
+						uint32_t	nb = 0;
+						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
+						fork_asof_hop(f, horizons[i], 0, &nb);
+
+						if (state == FORK_HOP_DEAD ||
+							(state == FORK_HOP_DEF && nb <= e->block))
+							ndeaths++;
+					}
 				n = p != NULL && p->nver > 0 ? (uint32_t) p->nver : 0;
 				if (n == 0 && ndeaths == 0)
 					continue;
@@ -11274,12 +11512,24 @@ walidx_plan_bases_build(uint32_t tl)
 						}
 				}
 				if (f != NULL)
+				{
 					for (uint32_t i = 0; i < f->nev; i++)
 						if (f->ev[i].lsn != 0 &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
 							bases[nbases++] = f->ev[i].lsn;
+					for (uint32_t i = 0; i < nhorizons; i++)
+					{
+						uint32_t	nb = 0;
+						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
+						fork_asof_hop(f, horizons[i], 0, &nb);
+
+						if (state == FORK_HOP_DEAD ||
+							(state == FORK_HOP_DEF && nb <= e->block))
+							bases[nbases++] = horizons[i];
+					}
+				}
 				free(chain);
 				free(keep);
 				if (nbases == 0)
@@ -11322,6 +11572,7 @@ walidx_plan_bases_build(uint32_t tl)
 	walidx_plan_bases_valid = 1;
 	rc = 0;
 out:
+	free(horizons);
 	free(fences);
 	if (rc != 0)
 		walidx_plan_bases_free();
@@ -13647,6 +13898,54 @@ control_chain_keeps(const PsControlChainPlan *plan, uint32_t block,
 		if (plan->chain[i].lsn == v->lsn)
 			return 0;
 	return 1;
+}
+
+/*
+ * A version the planner kept for the operational floor or a discrete fence is
+ * only worth retaining if a reader at that horizon can actually see its bytes.
+ * When a later truncate/drop invalidates the block at every horizon the
+ * version serves, the read path answers "no content" with or without it, so
+ * dropping it is invisible to readers and lets forkmeta compaction retire the
+ * invalidation fence that only existed for it.  Versions at or above the
+ * floor are legal future fences and are never dropped here.  Caller holds the
+ * shard write lock (fork_find, fork_page_invalidated).
+ */
+static int
+prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
+					 const PsPruneVersion *versions, uint32_t n, uint32_t idx,
+					 uint64_t floor, const PsPruneFence *fences,
+					 uint32_t nfences)
+{
+	const ForkEnt *fe = fork_find(timeline, key);
+
+	if (fe == NULL || fe->ndef == 0)
+		return 1;
+	for (uint32_t h = 0; h <= nfences; h++)
+	{
+		PsPruneFence horizon = h == 0 ? (PsPruneFence) {floor, 0} : fences[h - 1];
+		int			visible = -1;
+		PageVer		pv;
+
+		if (h != 0 && horizon.admission_seq == UINT64_MAX)
+			horizon.admission_seq = 0;
+		for (uint32_t i = 0; i < n; i++)
+			if (versions[i].lsn <= horizon.lsn &&
+				(versions[i].lsn < horizon.lsn || horizon.admission_seq == 0 ||
+				 versions[i].admission_seq == 0 ||
+				 versions[i].admission_seq <= horizon.admission_seq))
+				visible = (int) i;
+			else if (versions[i].lsn > horizon.lsn)
+				break;
+		if (visible != (int) idx)
+			continue;
+		memset(&pv, 0, sizeof(pv));
+		pv.lsn = versions[idx].lsn;
+		pv.admission_seq = versions[idx].admission_seq;
+		if (!fork_page_invalidated(fe, block, &pv, horizon.lsn,
+								   horizon.admission_seq))
+			return 1;
+	}
+	return 0;
 }
 
 /* Caller holds map-wr and the page-prune read fence. */

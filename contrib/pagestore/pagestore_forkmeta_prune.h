@@ -39,15 +39,18 @@ typedef struct PsForkMetaFence
  * accepted in arbitrary order and duplicates are harmless.
  *
  * The planner marks every event not visible at the operational cutoff as the
- * future tail.  For the cutoff and each supplied fence it retains every
- * visible SET/DEAD boundary, plus the maximum visible GROW strictly after the
- * latest visible definitive event (latest source event wins a tie).  If no
- * definitive event is visible, the maximum visible GROW in the whole prefix
- * is retained instead.  The keep mask is the union across all horizons.
- * keep receives one byte per input event.  The planner uses no storage
- * proportional to the input.  nitems above INT_MAX are rejected because the
- * return type is int.  The planner returns the number kept, or -1 when the
- * input cannot be proven valid and safe.
+ * future tail.  For the cutoff and each supplied fence it retains the base
+ * the reader resolves there: the latest visible SET/DEAD, the maximum visible
+ * GROW strictly after it (or the maximum visible GROW in the whole prefix
+ * when no definitive event is visible), and the visible SET/DEAD with the
+ * smallest size (latest on a tie), which is the inheritance fence a branch
+ * applies to its ancestors.  `required` marks events the caller must keep
+ * regardless: a definitive event still needed to invalidate a retained page
+ * version that predates it.  The keep mask is the union across all horizons
+ * and required events.  keep receives one byte per input event.  The planner
+ * uses no storage proportional to the input.  nitems above INT_MAX are
+ * rejected because the return type is int.  The planner returns the number
+ * kept, or -1 when the input cannot be proven valid and safe.
  */
 extern int ps_forkmeta_prune_plan(const PsForkMetaEvent *events,
 						  uint32_t nitems,
@@ -55,5 +58,11 @@ extern int ps_forkmeta_prune_plan(const PsForkMetaEvent *events,
 						  const PsForkMetaFence *fences,
 						  uint32_t nfences,
 						  unsigned char *keep);
-
+extern int ps_forkmeta_prune_plan_required(const PsForkMetaEvent *events,
+										   uint32_t nitems,
+										   PsForkMetaFence cutoff,
+										   const PsForkMetaFence *fences,
+										   uint32_t nfences,
+										   const unsigned char *required,
+										   unsigned char *keep);
 #endif

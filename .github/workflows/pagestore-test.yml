@@ -93,6 +93,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o storage_posix_wal_test storage_posix_wal_test.c storage_posix.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_control_prune_test pagestore_control_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_lifecycle_prune_test pagestore_lifecycle_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o storage_posix_fork_owner_test storage_posix_fork_owner_test.c storage_posix.c pagestore_store_owner.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_fault_test pagestore_fault_test.c pagestore_fault.c -pthread
 
@@ -199,6 +200,10 @@ jobs:
       - name: Run control-object retention unit test
         working-directory: contrib/pagestore
         run: ./pagestore_control_prune_test
+
+      - name: Run bounded fork-lifecycle history test
+        working-directory: contrib/pagestore
+        run: ./pagestore_lifecycle_prune_test
 
       # R6 bounded-space acceptance: a real daemon under the composed retention
       # workload must keep every persisted category within its declared bound

@@ -27,23 +27,34 @@ retain_horizon(const PsForkMetaEvent *events, uint32_t nitems,
 			   PsForkMetaFence horizon, unsigned char *keep)
 {
 	uint32_t latest_def = 0;
+	uint32_t min_fence = 0;
 	uint32_t largest_grow = 0;
 	int have_def = 0;
 	int have_grow = 0;
 
 	for (uint32_t i = 0; i < nitems; i++)
 	{
+		uint32_t size;
+
 		if (!event_visible(&events[i], horizon))
 			continue;
-		if (events[i].kind == PS_FORKMETA_SET ||
-			events[i].kind == PS_FORKMETA_DEAD)
-		{
-			latest_def = i;
-			have_def = 1;
-			keep[i] = 1;
-		}
+		if (events[i].kind != PS_FORKMETA_SET &&
+			events[i].kind != PS_FORKMETA_DEAD)
+			continue;
+		size = events[i].kind == PS_FORKMETA_DEAD ? 0 : events[i].nblocks;
+		latest_def = i;
+		/* The smallest visible definitive size fences inherited blocks; a
+		 * later event wins a tie so the fence stays with the newest history. */
+		if (!have_def || size <= (events[min_fence].kind == PS_FORKMETA_DEAD ?
+								  0 : events[min_fence].nblocks))
+			min_fence = i;
+		have_def = 1;
 	}
-
+	if (have_def)
+	{
+		keep[latest_def] = 1;
+		keep[min_fence] = 1;
+	}
 	for (uint32_t i = have_def ? latest_def + 1 : 0; i < nitems; i++)
 	{
 		if (event_visible(&events[i], horizon) &&
@@ -62,10 +73,12 @@ retain_horizon(const PsForkMetaEvent *events, uint32_t nitems,
 }
 
 int
-ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
-					   PsForkMetaFence cutoff,
-					   const PsForkMetaFence *fences, uint32_t nfences,
-					   unsigned char *keep)
+ps_forkmeta_prune_plan_required(const PsForkMetaEvent *events,
+								uint32_t nitems, PsForkMetaFence cutoff,
+								const PsForkMetaFence *fences,
+								uint32_t nfences,
+								const unsigned char *required,
+								unsigned char *keep)
 {
 	int kept = 0;
 	uint64_t last_nonzero_seq = 0;
@@ -81,7 +94,6 @@ ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
 	if (nitems == 0)
 		return 0;
 	memset(keep, 0, nitems);
-
 	for (uint32_t i = 0; i < nitems; i++)
 	{
 		if (events[i].kind > PS_FORKMETA_DEAD ||
@@ -97,10 +109,10 @@ ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
 				return -1;
 			last_nonzero_seq = events[i].admission_seq;
 		}
-		if (!event_visible(&events[i], cutoff))
+		if (!event_visible(&events[i], cutoff) ||
+			(required != NULL && required[i]))
 			keep[i] = 1;
 	}
-
 	retain_horizon(events, nitems, cutoff, keep);
 	for (uint32_t i = 0; i < nfences; i++)
 		retain_horizon(events, nitems, fences[i], keep);
@@ -108,4 +120,14 @@ ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
 		if (keep[i])
 			kept++;
 	return kept;
+}
+
+int
+ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
+					   PsForkMetaFence cutoff,
+					   const PsForkMetaFence *fences, uint32_t nfences,
+					   unsigned char *keep)
+{
+	return ps_forkmeta_prune_plan_required(events, nitems, cutoff, fences,
+										   nfences, NULL, keep);
 }
