@@ -137,9 +137,22 @@ number of sealed segments; recovery must finish the unlink retry, refuse
 reads below the frontier, keep the WAL end and the retain floor at the
 shipped end, clear the reclaimer's physical debt, and leave no retention
 owner; a second restart must then reproduce that settled shipped-WAL state,
-metadata and files alike.  Timeline
-deletion, manifest replacement, and compute-restart combinations remain
-outside the harness.
+metadata and files alike.
+
+The `timeline_delete` workload creates a branch of timeline 0 with its own
+shipped WAL, a committed WAL-index interval, and enough relation pages for an
+owner layer and several shared segments, then arms the fault and issues
+BEGIN_DELETE.  Four lock-held probes crash after the fsync'd DELETING event
+and before its publication, after the owner's private WAL and WAL-index
+artifacts are removed, after a shared page segment is atomically rewritten
+without the owner's records, and after the fsync'd DELETED event and before
+its publication.  The crash snapshot must keep the private WAL at the first
+boundary, have removed it from the second on, and leave no owner artifact
+once DELETED is durable; recovery must reach DELETED with the incarnation
+token, keep serving the parent's page, reject branch reads, leave no owner
+artifact, reconcile the manifest, and register no owner; a second restart
+proves idempotence.  Manifest replacement and compute-restart combinations
+remain outside the harness.
 
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer
@@ -532,11 +545,12 @@ to compare across nights.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 
-The POSIX image-layer publication, page-pruning, WAL-index compaction, and
-WAL reclaim slices are now covered by the declarative harness.  Other crash
-boundaries remain outside them.  Before declaring the MVP repeatable, add
-process-level fault scenarios around manifest replacement and timeline
-deletion, plus a persisted-format fixture for restart/upgrade compatibility.
+The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
+reclaim, and timeline deletion slices are now covered by the declarative
+harness.  Other crash boundaries remain outside them.  Before declaring the
+MVP repeatable, add process-level fault scenarios around manifest
+replacement, plus a persisted-format fixture for restart/upgrade
+compatibility.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it

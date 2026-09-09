@@ -549,6 +549,10 @@ class PlanValidationTests(unittest.TestCase):
             scenario_dir / "wal_reclaim_before_unlink.jsonl",
             scenario_dir / "wal_reclaim_after_unlink.jsonl",
             scenario_dir / "wal_reclaim_before_dir_fsync.jsonl",
+            scenario_dir / "timeline_delete_after_deleting.jsonl",
+            scenario_dir / "timeline_delete_after_wal_cleanup.jsonl",
+            scenario_dir / "timeline_delete_after_segment_rewrite.jsonl",
+            scenario_dir / "timeline_delete_after_deleted.jsonl",
         ]
         for path in scenarios:
             with self.subTest(scenario=path.name):

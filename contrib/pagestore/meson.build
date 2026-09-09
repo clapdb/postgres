@@ -713,6 +713,10 @@ foreach prune_fault_scenario : [
   'wal_reclaim_before_unlink',
   'wal_reclaim_after_unlink',
   'wal_reclaim_before_dir_fsync',
+  'timeline_delete_after_deleting',
+  'timeline_delete_after_wal_cleanup',
+  'timeline_delete_after_segment_rewrite',
+  'timeline_delete_after_deleted',
 ]
   test('pagestore_harness_' + prune_fault_scenario,
     pagestore_harness_python,

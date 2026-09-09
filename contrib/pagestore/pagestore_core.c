@@ -4485,6 +4485,10 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	}
 	if (ps_storage->seg_rewrite(s->id, seg, replacement, out_off) != 0)
 		goto fail;
+	/* The rewritten segment is durable; recovery rescans it, so the in-memory
+	 * relocation below is the only state a crash here can lose. */
+	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_SEGMENT_REWRITE) != 0)
+		goto fail;
 	for (uint32_t i = 0; i < nrelocs; i++)
 	{
 		SegmentReloc *r = &relocs[i];
@@ -11149,6 +11153,9 @@ timeline_delete_wal_cleanup_one(void)
 			wal_segment_store_opened[tl] = 0;
 		}
 		rc = ps_storage->timeline_wal_cleanup(tl);
+		if (rc == 0 &&
+			ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_WAL_CLEANUP) != 0)
+			rc = -1;
 		if (rc == 0)
 		{
 			wal_runtime_purge(tl);
@@ -11537,7 +11544,8 @@ timeline_delete_publish_one(void)
 		pthread_rwlock_wrlock(wal_lock);
 		ps_lock_map_wr();
 		if (timeline_delete_publish_ready(tl) &&
-			timeline_persist_state(tl, PS_TIMELINE_DELETED, incarnation) == 0)
+			timeline_persist_state(tl, PS_TIMELINE_DELETED, incarnation) == 0 &&
+			ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_DELETED) == 0)
 		{
 			/* The append is fsync-durable before this release publication. */
 			__atomic_store_n(&timelines[tl].state, PS_TIMELINE_DELETED,
@@ -16661,6 +16669,8 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 		return -1;
 	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
 										incarnation) != 0)
+		return -1;
+	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_DELETING) != 0)
 		return -1;
 	/* All writers are drained by the caller's lifecycle/admission fences.  Drop
 	 * their staged pages now so shutdown cannot publish a fresh manifest layer

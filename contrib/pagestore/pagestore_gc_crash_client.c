@@ -31,6 +31,12 @@
  * mode waits for the prefix reads to be refused and requires the WAL end and
  * retain floor to stay at the shipped end.
  *
+ * The timeline_delete workload creates a branch with private shipped WAL, a
+ * committed WAL-index interval, an owner layer, and shared-segment pages,
+ * arms the fault, and issues BEGIN_DELETE.  Its verify mode waits for
+ * DELETED, keeps the parent's page readable, and requires branch reads to be
+ * rejected.
+ *
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
@@ -67,6 +73,13 @@
 #define RECLAIM_SEGMENTS 3u
 #define RECLAIM_TOTAL (RECLAIM_SEGMENT * RECLAIM_SEGMENTS)
 #define RECLAIM_CHUNK (64u * 1024u)
+
+/* timeline_delete workload: a branch of timeline 0 with its own shipped WAL,
+ * WAL-index interval, and flushed relation pages, then BEGIN_DELETE. */
+#define DELETE_BRANCH 1u
+#define DELETE_FORK_LSN UINT64_C(65536)
+#define DELETE_WAL_BYTES 65536u
+#define DELETE_PAGES 24u
 
 static void *shm_base;
 static int shm_fd = -1;
@@ -360,6 +373,177 @@ walidx_seed(void)
 	if (execute()->status != PS_STATUS_OK)
 		die("WAL-index progress commit failed");
 	wait_forever();
+}
+
+/* ---- timeline_delete workload ------------------------------------------ */
+
+static void read_latest(unsigned char *page, uint32_t block);
+static void die_page(const char *message, uint32_t block,
+					 const unsigned char *page);
+
+static uint64_t branch_incarnation;
+
+static void
+set_timeline(PsChannel *ch, uint32_t timeline, uint64_t incarnation)
+{
+	ch->timeline = timeline;
+	ch->incarnation = incarnation;
+}
+
+static void
+delete_write_block(unsigned char *page, uint32_t timeline, uint64_t incarnation,
+				   uint32_t block, uint64_t lsn, unsigned char tag)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	fill_page(page, lsn, tag);
+	set_relation(ch);
+	set_timeline(ch, timeline, incarnation);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	memcpy(ch->data, page, page_size);
+	if (execute()->status != PS_STATUS_OK)
+		die("branch page write failed");
+}
+
+static void
+delete_wal_append(uint32_t timeline, uint64_t incarnation, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	set_timeline(ch, timeline, incarnation);
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = lsn;
+	ch->datalen = DELETE_WAL_BYTES;
+	memset(ch->data, (int) (timeline + 1), DELETE_WAL_BYTES);
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL append failed");
+}
+
+static int
+timeline_state(uint32_t timeline, uint64_t *incarnation)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->timeline = timeline;
+	ch->opcode = PS_OP_TIMELINE_STATE;
+	if (execute()->status != PS_STATUS_OK)
+		return -1;
+	if (incarnation != NULL)
+		*incarnation = ch->req_seq;
+	return (int) ch->result;
+}
+
+static void
+delete_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	parent_incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	set_relation(ch);
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = 100;
+	if (execute()->status != PS_STATUS_OK)
+		die("relation create failed");
+	delete_write_block(page, 0, 0, 0, 200, 7);
+	delete_wal_append(0, 0, 0);
+	if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE)
+		die("timeline 0 is not live");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, 0);
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->parent_timeline = 0;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = parent_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch create failed");
+	branch_incarnation = ch->incarnation;
+	/* private shipped WAL plus a committed WAL-index interval */
+	delete_wal_append(DELETE_BRANCH, branch_incarnation, DELETE_FORK_LSN);
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	{
+		PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+		entries[0].key = ch->key;
+		entries[0].block = 0;
+		entries[0].flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+		entries[0].lsn = DELETE_FORK_LSN + 16;
+		entries[0].end_lsn = DELETE_FORK_LSN + 17;
+	}
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = 1;
+	ch->datalen = sizeof(PsWalIndexEntry);
+	if (execute()->status != PS_STATUS_OK)
+		die("branch WAL-index add failed");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = DELETE_FORK_LSN + DELETE_WAL_BYTES;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch WAL-index progress commit failed");
+	/* enough branch pages in shared segments that maintenance flushes an
+	 * owner layer and the deletion must rewrite segments and retire a layer */
+	for (uint32_t block = 0; block < DELETE_PAGES; block++)
+		delete_write_block(page, DELETE_BRANCH, branch_incarnation, block,
+						   DELETE_FORK_LSN + 1000 + block,
+						   (unsigned char) (0x40 + block));
+	free(page);
+	arm_fault();
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->req_seq = branch_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("BEGIN_DELETE failed");
+	wait_forever();
+}
+
+static void
+delete_verify(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	struct timespec pause_interval = {0, 20000000};
+	uint64_t	incarnation = 0;
+	int			state = -1;
+
+	if (page == NULL)
+		die("out of memory");
+	for (int i = 0; i < 500; i++)
+	{
+		state = timeline_state(DELETE_BRANCH, &incarnation);
+		if (state == PS_TIMELINE_DELETED)
+			break;
+		nanosleep(&pause_interval, NULL);
+	}
+	if (state != PS_TIMELINE_DELETED)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: branch did not reach DELETED "
+				"(state %d)\n", state);
+		exit(1);
+	}
+	if (incarnation == 0)
+		die("DELETED branch lost its incarnation token");
+	/* the parent keeps serving its own page; the branch rejects reads */
+	read_latest(page, 0);
+	if (!page_has_tag(page, 7))
+		die_page("deletion damaged the parent's page", 0, page);
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status == PS_STATUS_OK)
+		die("a DELETED branch still serves reads");
+	free(page);
 }
 
 /* ---- wal_reclaim workload ---------------------------------------------- */
@@ -695,19 +879,27 @@ main(int argc, char **argv)
 			cutoff_seq_file = argv[++i];
 		else
 			die("usage: --shm NAME --mode seed|verify "
-				"[--workload page_prune|wal_index|wal_reclaim] "
+				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete] "
 				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0) ||
 		(strcmp(workload, "page_prune") != 0 &&
 		 strcmp(workload, "wal_index") != 0 &&
-		 strcmp(workload, "wal_reclaim") != 0))
+		 strcmp(workload, "wal_reclaim") != 0 &&
+		 strcmp(workload, "timeline_delete") != 0))
 		die("usage: --shm NAME --mode seed|verify "
-			"[--workload page_prune|wal_index|wal_reclaim] "
+			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete] "
 			"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
-	if (strcmp(workload, "wal_reclaim") == 0)
+	if (strcmp(workload, "timeline_delete") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			delete_seed();
+		else
+			delete_verify();
+	}
+	else if (strcmp(workload, "wal_reclaim") == 0)
 	{
 		if (strcmp(mode, "seed") == 0)
 			reclaim_seed();

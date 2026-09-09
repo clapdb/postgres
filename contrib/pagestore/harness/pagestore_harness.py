@@ -672,7 +672,7 @@ RUNTIME_CONSTRAINTS = {
         "set_fault": {},
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
-        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim"]},
+        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim", "timeline_delete"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -2308,7 +2308,21 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
                         "--wal-catch-up-bytes", "1"],
         "retained_horizon": None,
     },
+    "timeline_delete": {
+        "faults": {
+            "timeline_delete.after_deleting",
+            "timeline_delete.after_wal_cleanup",
+            "timeline_delete.after_segment_rewrite",
+            "timeline_delete.after_deleted",
+        },
+        # small segments and an eager flush give the branch an owner layer
+        # and several shared segments for the deletion to filter
+        "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
+                        "--segment-gc", "0"],
+        "retained_horizon": None,
+    },
 }
+DELETE_BRANCH = 1
 WAL_RECLAIM_SEGMENTS = 3
 WAL_RECLAIM_SEGMENT_BYTES = 1024 * 1024
 WAL_RECLAIM_TOTAL = WAL_RECLAIM_SEGMENTS * WAL_RECLAIM_SEGMENT_BYTES
@@ -2336,6 +2350,10 @@ GC_STAGES = {
     "wal_reclaim.before_unlink": "reclaim_before_unlink",
     "wal_reclaim.after_unlink": "reclaim_after_unlink",
     "wal_reclaim.before_dir_fsync": "reclaim_before_dir_fsync",
+    "timeline_delete.after_deleting": "delete_deleting",
+    "timeline_delete.after_wal_cleanup": "delete_wal_cleanup",
+    "timeline_delete.after_segment_rewrite": "delete_segment_rewrite",
+    "timeline_delete.after_deleted": "delete_deleted",
 }
 WALIDX_SNAPSHOT_MAGIC = 0x4D534957          # "WISM"
 WALIDX_SNAPSHOT_VERSION = 1
@@ -2428,6 +2446,82 @@ def _wal_store_metadata(store: Path) -> dict[str, Any] | None:
         "directory_start_lsn": directory_start,
         "retained_base_lsn": retained_base, "end_lsn": end,
     }
+
+def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
+    """Private WAL, WAL-index, and owner-layer artifacts of one timeline."""
+    names = []
+    prefixes = (f"wal_{timeline}", f"walidx_{timeline}_", f"wal_segments_{timeline}",
+                f"walidx_snapshots_{timeline}", f"layer_{timeline}_")
+    for entry in sorted(store.iterdir()):
+        name = entry.name
+        if name == f"wal_{timeline}" or name.startswith(f"wal_{timeline}.") or \
+                any(name.startswith(prefix) for prefix in prefixes[1:]):
+            names.append(name)
+    return names
+
+
+def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
+    """DELETING is durable at every stage; the owner's private WAL artifacts
+    survive the first boundary and are gone from the second on, and nothing
+    of the owner remains once DELETED is durable."""
+    artifacts = _branch_private_artifacts(store, DELETE_BRANCH)
+    wal = [name for name in artifacts if not name.startswith(f"layer_{DELETE_BRANCH}_")]
+    if stage == "delete_deleting":
+        if f"wal_{DELETE_BRANCH}" not in wal:
+            raise OracleMismatch(
+                "after_deleting crash removed the branch's private WAL before "
+                f"cleanup could start: {artifacts!r}"
+            )
+        return
+    if wal:
+        raise OracleMismatch(
+            f"after_{stage} crash left private WAL artifacts {wal!r}"
+        )
+    if stage == "delete_deleted" and artifacts:
+        raise OracleMismatch(
+            f"after_deleted crash left owner artifacts {artifacts!r}"
+        )
+
+
+def _check_delete_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+    timeout: float,
+) -> None:
+    """The verify client already waited for DELETED; the owner's artifacts
+    must be gone, the manifest reconciled, and no owner registered."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        artifacts = _branch_private_artifacts(store, DELETE_BRANCH)
+        manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+        if manifest.get("manifest_poisoned") is not False:
+            raise OracleMismatch(
+                f"after_{stage} recovery reported manifest_poisoned="
+                f"{manifest.get('manifest_poisoned')!r}"
+            )
+        settled = not artifacts and manifest.get("deleting_layers") == 0 and \
+            manifest.get("layer_count") == manifest.get("local_layers")
+        if settled:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery left artifacts {artifacts!r} manifest "
+                f"{manifest!r} after {poll_timeout:.3f}s"
+            )
+        time.sleep(min(0.05, deadline - now))
+    timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
+    if timeline.get("parent_timeline") != -1:
+        raise OracleMismatch(f"after_{stage} recovery changed timeline 0: {timeline!r}")
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected none"
+        )
 
 
 def _check_wal_reclaim_crash_snapshot(store: Path, stage: str, hit: int) -> None:
@@ -2587,6 +2681,9 @@ def _check_gc_crash_snapshot(
     """
     if stage.startswith("reclaim_"):
         _check_wal_reclaim_crash_snapshot(store, stage, hit)
+        return
+    if stage.startswith("delete_"):
+        _check_delete_crash_snapshot(store, stage)
         return
     if stage == "walidx_frontier":
         if not (store / "walidx-prune.frontiers").exists():
@@ -2805,6 +2902,9 @@ def _check_gc_recovery(
         return _check_wal_reclaim_recovery(
             inspector, shm, inspection_schema, store, stage, timeout
         )
+    if workload == "timeline_delete":
+        _check_delete_recovery(inspector, shm, inspection_schema, store, stage, timeout)
+        return
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:

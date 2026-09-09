@@ -15,6 +15,15 @@ PAGESTORE_FAULT_POINT(WAL_INDEX_AFTER_FRONTIER, "wal_index.after_frontier", "sto
 PAGESTORE_FAULT_POINT(WAL_RECLAIM_BEFORE_UNLINK, "wal_reclaim.before_unlink", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(WAL_RECLAIM_AFTER_UNLINK, "wal_reclaim.after_unlink", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(WAL_RECLAIM_BEFORE_DIR_FSYNC, "wal_reclaim.before_dir_fsync", "store", "process_abort", "crash", 1, 0)
+// Timeline deletion probes are lock-held process-abort boundaries: after the
+// fsync'd DELETING event and before its in-memory publication, after the
+// owner's private WAL/WAL-index artifacts are removed, after a shared page
+// segment is atomically rewritten without the owner's records, and after the
+// fsync'd DELETED event and before its in-memory publication.
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETING, "timeline_delete.after_deleting", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_WAL_CLEANUP, "timeline_delete.after_wal_cleanup", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_SEGMENT_REWRITE, "timeline_delete.after_segment_rewrite", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETED, "timeline_delete.after_deleted", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_PREPARE, "forkmeta.after_prepare", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_MANIFEST_COMMIT, "forkmeta.after_manifest_commit", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SOURCE_REWRITE, "forkmeta.after_source_rewrite", "store", "process_abort", "crash", 1, 0)
