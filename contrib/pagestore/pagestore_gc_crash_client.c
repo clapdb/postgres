@@ -37,6 +37,11 @@
  * DELETED, keeps the parent's page readable, and requires branch reads to be
  * rejected.
  *
+ * The manifest_compact workload writes 320 pages while the harness holds
+ * maintenance paused, then arms the fault and releases maintenance so layer
+ * compaction churn grows the manifest log past its rewrite trigger.  Its
+ * verify mode reads every page back.
+ *
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
@@ -87,6 +92,10 @@
 /* a fresh branch of a fresh store gets its first incarnation token; the
  * verify oracle compares recovery against that seeded value */
 #define DELETE_INCARNATION UINT64_C(1)
+
+/* manifest_compact workload: enough flushed layers and compaction churn,
+ * released from a paused maintenance loop, that the manifest log is rewritten. */
+#define MANIFEST_PAGES 320u
 
 static void *shm_base;
 static int shm_fd = -1;
@@ -382,7 +391,7 @@ walidx_seed(void)
 	wait_forever();
 }
 
-/* ---- timeline_delete workload ------------------------------------------ */
+/* ---- manifest_compact workload ----------------------------------------- */
 
 static void read_latest(unsigned char *page, uint32_t block);
 static void die_page(const char *message, uint32_t block,
@@ -390,6 +399,57 @@ static void die_page(const char *message, uint32_t block,
 static void delete_seed_survivor(unsigned char *page);
 static void delete_verify_survivor(unsigned char *page);
 static void delete_verify_live(void);
+
+
+static unsigned char
+manifest_tag(uint32_t block)
+{
+	return (unsigned char) (block * 7 + 1);
+}
+
+static void
+manifest_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	set_relation(ch);
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = 100;
+	if (execute()->status != PS_STATUS_OK)
+		die("relation create failed");
+	/* Maintenance is paused by the harness while these land: the write path
+	 * still flushes full memtables into layers (ADD and watermark records),
+	 * but layer compaction and the manifest rewrite wait for the release. */
+	for (uint32_t block = 0; block < MANIFEST_PAGES; block++)
+		write_block(page, block, 1000 + block, manifest_tag(block));
+	free(page);
+	arm_fault();
+	if (resume_file != NULL && unlink(resume_file) != 0)
+		die("cannot release the paused maintenance loop");
+	wait_forever();
+}
+
+static void
+manifest_verify(void)
+{
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	for (uint32_t block = 0; block < MANIFEST_PAGES; block++)
+	{
+		read_latest(page, block);
+		if (!page_has_tag(page, manifest_tag(block)))
+			die_page("recovery does not serve a page written before the "
+					 "manifest rewrite", block, page);
+	}
+	free(page);
+}
+
+/* ---- timeline_delete workload ------------------------------------------ */
 
 static uint64_t branch_incarnation;
 
@@ -1140,8 +1200,9 @@ main(int argc, char **argv)
 			cutoff_seq_file = argv[++i];
 		else
 			die("usage: --shm NAME --mode seed|verify "
-				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete"
-				"|timeline_delete_abort] [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
+				"timeline_delete_abort|manifest_compact] [--arm-marker PATH] "
+				"[--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0) ||
@@ -1149,12 +1210,21 @@ main(int argc, char **argv)
 		 strcmp(workload, "wal_index") != 0 &&
 		 strcmp(workload, "wal_reclaim") != 0 &&
 		 strcmp(workload, "timeline_delete") != 0 &&
-		 strcmp(workload, "timeline_delete_abort") != 0))
+		 strcmp(workload, "timeline_delete_abort") != 0 &&
+		 strcmp(workload, "manifest_compact") != 0))
 		die("usage: --shm NAME --mode seed|verify "
-			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete"
-			"|timeline_delete_abort] [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
+			"timeline_delete_abort|manifest_compact] [--arm-marker PATH] "
+			"[--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
-	if (strcmp(workload, "timeline_delete") == 0)
+	if (strcmp(workload, "manifest_compact") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			manifest_seed();
+		else
+			manifest_verify();
+	}
+	else if (strcmp(workload, "timeline_delete") == 0)
 	{
 		if (strcmp(mode, "seed") == 0)
 			delete_seed();

@@ -673,7 +673,8 @@ RUNTIME_CONSTRAINTS = {
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
         "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim",
-                                                      "timeline_delete", "timeline_delete_abort"]},
+                                                      "timeline_delete", "timeline_delete_abort",
+                                                      "manifest_compact"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -2333,8 +2334,23 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
                         "--segment-gc", "0"],
         "retained_horizon": DELETE_FORK_LSN,
     },
+    "manifest_compact": {
+        "faults": {
+            "manifest_compact.after_tmp_sync",
+            "manifest_compact.after_rename",
+        },
+        # eager flushes and a low layer-compaction threshold grow the manifest
+        # log past its rewrite trigger; maintenance stays paused (the
+        # {pause} file) until the workload has written every page
+        "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
+                        "--compact-layers", "2", "--segment-gc", "0",
+                        "--test-maintenance-pause-file", "{pause}"],
+        "retained_horizon": None,
+        "pause_maintenance": True,
+    },
 }
 DELETE_BRANCH = 1
+MANIFEST_TMP = "layers.manifest.tmp"
 WAL_RECLAIM_SEGMENTS = 3
 WAL_RECLAIM_SEGMENT_BYTES = 1024 * 1024
 WAL_RECLAIM_TOTAL = WAL_RECLAIM_SEGMENTS * WAL_RECLAIM_SEGMENT_BYTES
@@ -2367,6 +2383,8 @@ GC_STAGES = {
     "timeline_delete.after_segment_rewrite": "delete_segment_rewrite",
     "timeline_delete.after_deleted": "delete_deleted",
     "timeline_delete.before_deleting": "delete_before_deleting",
+    "manifest_compact.after_tmp_sync": "manifest_tmp_sync",
+    "manifest_compact.after_rename": "manifest_rename",
 }
 WALIDX_SNAPSHOT_MAGIC = 0x4D534957          # "WISM"
 WALIDX_SNAPSHOT_VERSION = 1
@@ -2578,6 +2596,57 @@ def _manifest_removed_layers(records: list[tuple[int, bytes]]) -> dict[int, int]
             if layer_id in owner:
                 removed[layer_id] = owner.pop(layer_id)
     return removed
+def _check_manifest_crash_snapshot(store: Path, stage: str) -> None:
+    """Before the rename the live log is intact next to the fsync'd temp
+    file; after it the compacted log has replaced the live log."""
+    manifest = store / "layers.manifest"
+    if not manifest.exists() or manifest.stat().st_size == 0:
+        raise OracleMismatch(f"after_{stage} crash left no layers.manifest")
+    tmp = store / MANIFEST_TMP
+    if stage == "manifest_tmp_sync" and not tmp.exists():
+        raise OracleMismatch("after_tmp_sync crash left no compacted temp manifest")
+    if stage == "manifest_rename" and tmp.exists():
+        raise OracleMismatch("after_rename crash left the temp manifest after its rename")
+
+
+def _check_manifest_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+    timeout: float,
+) -> None:
+    """Either log replays to the same layer map: the manifest is sane and
+    reconciled with the local layers, and no crashed temp file leaks."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+        if manifest.get("manifest_poisoned") is not False:
+            raise OracleMismatch(
+                f"after_{stage} recovery reported manifest_poisoned="
+                f"{manifest.get('manifest_poisoned')!r}"
+            )
+        if manifest.get("deleting_layers") == 0 and \
+                manifest.get("layer_count") == manifest.get("local_layers") and \
+                isinstance(manifest.get("layer_count"), int) and \
+                manifest.get("layer_count") > 0:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery did not reconcile the manifest within "
+                f"{poll_timeout:.3f}s; last manifest={manifest!r}"
+            )
+        time.sleep(min(0.05, deadline - now))
+    if (store / MANIFEST_TMP).exists():
+        raise OracleMismatch(f"after_{stage} recovery kept the crashed temp manifest")
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected none"
+        )
 
 
 # A sealed segment is named walv1_<store>_<segment number, 20 digits>; the
@@ -3001,6 +3070,9 @@ def _check_gc_crash_snapshot(
     if stage.startswith("delete_"):
         _check_delete_crash_snapshot(store, stage)
         return
+    if stage.startswith("manifest_"):
+        _check_manifest_crash_snapshot(store, stage)
+        return
     if stage == "walidx_frontier":
         if not (store / "walidx-prune.frontiers").exists():
             raise OracleMismatch(
@@ -3224,6 +3296,9 @@ def _check_gc_recovery(
     if workload == "timeline_delete_abort":
         return _check_delete_abort_recovery(inspector, shm, inspection_schema,
                                             store)
+    if workload == "manifest_compact":
+        return _check_manifest_recovery(inspector, shm, inspection_schema,
+                                        store, stage, timeout)
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -3486,6 +3561,7 @@ def run_daemon_fault_recovery(
     trace = root / "trace"
     store = root / "store"
     control = root / "fault-control"
+    pause_file = control / "maintenance-pause"
     trace.mkdir()
     store.mkdir()
     shutil.copy2(plan.path, root / "plan.jsonl")
@@ -3528,6 +3604,9 @@ def run_daemon_fault_recovery(
     gc_stage = _gc_fault_stage(action["fault"]) if gc_seed_actions else None
     crash_state: dict[str, Any] | None = None
     gc_workload = gc_seed_actions[0]["workload"] if gc_seed_actions else None
+    gc_pauses_maintenance = bool(
+        gc_seed_actions and GC_WORKLOADS[gc_workload].get("pause_maintenance")
+    )
     # Both seeds drive the same one-client workload protocol; the layer and
     # page-pruning slices differ only in the binary, daemon flags, and oracles.
     seed_client = gc_client if gc_seed_actions else layer_client
@@ -3613,8 +3692,15 @@ def run_daemon_fault_recovery(
             command.extend(["--segment-size", "65536", "--flush-pages", "2",
                             "--compact-layers", "1000"])
         if gc_seed_actions:
-            command.extend(GC_WORKLOADS[gc_workload]["daemon_args"])
-            if inject_fault and gc_pauses_maintenance:
+            command.extend(
+                arg.replace("{pause}", str(pause_file))
+                for arg in GC_WORKLOADS[gc_workload]["daemon_args"]
+            )
+            # workloads whose own daemon_args do not name the pause file still
+            # start paused while the seed installs its cutoff and arms
+            if inject_fault and gc_pauses_maintenance and \
+                    "--test-maintenance-pause-file" not in \
+                    GC_WORKLOADS[gc_workload]["daemon_args"]:
                 command.extend(["--test-maintenance-pause-file", str(pause_file)])
         env = private_environment()
         if inject_fault:
@@ -3688,6 +3774,11 @@ def run_daemon_fault_recovery(
         # to retire.  Every other fault is armed before the daemon starts.
         if not gc_seed_actions:
             _atomic_arm_marker(marker)
+        # A workload that needs its writes complete before maintenance runs
+        # starts the crash generation paused; the workload removes the file
+        # once it has armed the fault.  Restarts never pause.
+        if gc_pauses_maintenance:
+            pause_file.touch()
         daemon_log.touch()
         emit("run_start", shm_base=shm_base)
         current_action_id = action["id"]

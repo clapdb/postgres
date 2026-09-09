@@ -541,6 +541,22 @@ ps_manifest_open(const char *store_dir)
 	}
 	if (manifest_validate_repair_marker() < 0)
 		goto fail;
+	/* A compaction that crashed before its rename leaves a complete or partial
+	 * temp file next to the live log.  It is never replayed, and the next
+	 * compaction truncates it, so remove it here rather than let a crashed
+	 * rewrite leak until then.  Only its absence is required. */
+	{
+		char		tmp[4096];
+
+		n = snprintf(tmp, sizeof(tmp), "%s.tmp", manifest_path);
+		if (n < 0 || (size_t) n >= sizeof(tmp))
+		{
+			errno = ENAMETOOLONG;
+			goto fail;
+		}
+		if (unlink(tmp) != 0 && errno != ENOENT)
+			goto fail;
+	}
 	/* replay truncates any torn tail; start clean */
 	__atomic_store_n(&manifest_poisoned, 0, __ATOMIC_RELEASE);
 	manifest_nrecords = 0;
@@ -1263,9 +1279,21 @@ ps_manifest_compact(void)
 		unlink(tmp);			/* never touched the live manifest */
 		return -1;
 	}
+	if (ps_fault_probe(PS_FAULT_POINT_MANIFEST_COMPACT_AFTER_TMP_SYNC) != 0)
+	{
+		unlink(tmp);
+		return -1;
+	}
 	if (rename(tmp, manifest_path) != 0)
 	{
 		unlink(tmp);
+		return -1;
+	}
+	/* The rename is durable only after the directory fsync below; a crash
+	 * here replays whichever log the directory entry names. */
+	if (ps_fault_probe(PS_FAULT_POINT_MANIFEST_COMPACT_AFTER_RENAME) != 0)
+	{
+		__atomic_store_n(&manifest_poisoned, 1, __ATOMIC_RELEASE);
 		return -1;
 	}
 	if (manifest_fsync_dir() != 0)

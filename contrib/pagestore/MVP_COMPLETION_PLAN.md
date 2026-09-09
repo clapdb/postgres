@@ -886,8 +886,8 @@ remain separate gates.
 
 Status: **materializer replay/restartpoint, branch prepared-receipt/service-
 restore, portable bootstrap/install, POSIX image-layer publication, POSIX
-page-pruning, POSIX WAL-index compaction, POSIX WAL reclaim, and POSIX
-timeline deletion slices implemented; manifest replacement and
+page-pruning, POSIX WAL-index compaction, POSIX WAL reclaim, POSIX timeline
+deletion, and POSIX manifest replacement slices implemented;
 restart-combination cases remain**.
 
 Required scenario families:
@@ -955,6 +955,15 @@ then a workload-armed BEGIN_DELETE.  Snapshots check the owner's private
 artifacts per stage; recovery must reach DELETED with its incarnation token,
 keep the parent readable, reject branch reads, remove every owner artifact,
 reconcile the manifest, and register no owner.
+
+The manifest replacement slice adds two map-held probes around the atomic
+`layers.manifest` rewrite (`manifest_compact.after_tmp_sync`,
+`manifest_compact.after_rename`), removes a crashed compaction's temp log on
+manifest open, and adds a `manifest_compact` gc_seed workload that writes 320
+pages under a harness-held maintenance pause (`--test-maintenance-pause-file`)
+before arming the fault and releasing maintenance.  Snapshots check the temp
+file per stage; recovery must replay to a reconciled manifest, serve every
+page, and leave no temp log.
 
 Acceptance:
 
@@ -1140,6 +1149,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Added the H1 manifest replacement crash slice: map-held probes after the fsync'd compacted temp log and after its rename, crashed temp-log removal on manifest open, a `manifest_compact` gc_seed workload (320 pages under a harness-held maintenance pause, workload-armed fault and release), per-stage temp-file snapshots, reconciled-manifest recovery with every page served and no temp log, and idempotent restart | Harness validation tests; two meson/CI scenarios against the POSIX daemon; manifest unit test; no SPDK execution |
 | 2026-09-10 | Added the H1 timeline deletion crash slice: lock-held probes after the durable DELETING event, after private WAL/WAL-index removal, after a shared segment rewrite, and after the durable DELETED event; a `timeline_delete` gc_seed workload (branch with private WAL, WAL-index interval, owner layer, shared-segment pages, workload-armed BEGIN_DELETE); per-stage private-artifact snapshots, DELETED-with-token recovery, parent readable, branch reads rejected, owner artifacts gone, manifest reconciled, no owner, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |
 | 2026-09-10 | Added the H1 WAL reclaim crash slice: named store-lock probes before the first unlink, after each unlink, and before the residual-prefix directory fsync; a `wal_reclaim` gc_seed workload (three sealed segments, control note at the shipped end, workload-armed fault, WAL-index progress); per-stage sealed-segment snapshot counts, unlink-retry recovery, refused prefix reads, WAL end/retain floor, cleared reclaim debt, no owner, and idempotent restart | Harness validation tests; three meson/CI scenarios against the POSIX daemon; fault registry and WAL-store unit tests; no SPDK execution |
 | 2026-09-10 | Added the H1 WAL-index compaction crash slice: a `wal_index` gc_seed workload (fixed WAL-index reader at 40 under three FPI-led chains, one committed interval, workload-armed fault), a `--walidx-snapshot-bytes` daemon trigger override, and a process abort after the durable WAL-index frontier with staged-generation snapshot, retried commit, chain/refusal reads, owner, and idempotent-restart checks | Harness validation tests; meson/CI scenario against the POSIX daemon; no SPDK execution |

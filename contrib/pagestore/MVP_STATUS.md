@@ -156,8 +156,19 @@ proves idempotence.  A fifth probe crashes on the old-state side of the
 first transition, where the request is lost: the branch must keep its
 lifecycle, its artifacts, and its persisted ancestry -- parent, fork point
 and parent token, none of which the pages it serves would reveal -- and the
-root must still carry the cap both live branches fork at.  Manifest
-replacement and compute-restart combinations remain outside the harness.
+root must still carry the cap both live branches fork at.
+
+The `manifest_compact` workload writes 320 relation pages while the harness
+holds maintenance paused, so the write path flushes layers and their manifest
+records but layer compaction and the manifest rewrite wait; it then arms the
+fault and releases maintenance.  Two map-held probes crash after the
+compacted temp log is fsync'd and before the rename, and after the rename
+and before the directory fsync.  The crash snapshot must keep a non-empty
+live log with the temp file present before the rename and absent after it;
+recovery must replay either log to a sane manifest reconciled with the local
+layers, serve every page written before the rewrite, remove a crashed temp
+log on open, and register no owner; a second restart proves idempotence.
+Compute-restart combinations remain outside the harness.
 
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer
@@ -551,15 +562,14 @@ to compare across nights.
 ### 5. Composed crash and format-compatibility coverage -- partial
 
 The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
-reclaim, and timeline deletion slices are now covered by the declarative
-harness.  The deletion slice crashes on both sides of its first transition:
-before the DELETING record is durable the request is lost and the branch must
-survive intact, and after each later boundary the cleanup must resume.  Its
-workload seeds a live sibling branch with the same kind of private state, so
-cleanup that reached past its owner would be caught.  Other crash boundaries
-remain outside them.  Before declaring the
-MVP repeatable, add process-level fault scenarios around manifest
-replacement, plus a persisted-format fixture for restart/upgrade
+reclaim, timeline deletion, and manifest replacement slices are now covered
+by the declarative harness.  The deletion slice crashes on both sides of its
+first transition: before the DELETING record is durable the request is lost
+and the branch must survive intact, and after each later boundary the cleanup
+must resume.  Its workload seeds a live sibling branch with the same kind of
+private state, so cleanup that reached past its owner would be caught.
+Compute-restart combinations remain outside them.  Before declaring the MVP
+repeatable, add a persisted-format fixture for restart/upgrade
 compatibility.
 
 An advancing reader's data directory boots from the checkpoint its manifest

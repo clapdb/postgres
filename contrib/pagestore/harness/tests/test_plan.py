@@ -553,6 +553,8 @@ class PlanValidationTests(unittest.TestCase):
             scenario_dir / "timeline_delete_after_wal_cleanup.jsonl",
             scenario_dir / "timeline_delete_after_segment_rewrite.jsonl",
             scenario_dir / "timeline_delete_after_deleted.jsonl",
+            scenario_dir / "manifest_compact_after_tmp_sync.jsonl",
+            scenario_dir / "manifest_compact_after_rename.jsonl",
         ]
         for path in scenarios:
             with self.subTest(scenario=path.name):

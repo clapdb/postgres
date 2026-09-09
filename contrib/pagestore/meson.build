@@ -718,6 +718,8 @@ foreach prune_fault_scenario : [
   'timeline_delete_after_segment_rewrite',
   'timeline_delete_after_deleted',
   'timeline_delete_before_deleting',
+  'manifest_compact_after_tmp_sync',
+  'manifest_compact_after_rename',
 ]
   test('pagestore_harness_' + prune_fault_scenario,
     pagestore_harness_python,

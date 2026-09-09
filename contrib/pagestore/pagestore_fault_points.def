@@ -25,6 +25,11 @@ PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETING, "timeline_delete.after_del
 PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_WAL_CLEANUP, "timeline_delete.after_wal_cleanup", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_SEGMENT_REWRITE, "timeline_delete.after_segment_rewrite", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETED, "timeline_delete.after_deleted", "store", "process_abort", "crash", 1, 0)
+// Manifest replacement probes bracket the atomic rewrite of layers.manifest
+// under map-wr: after the compacted temp file is fsync'd and before the
+// rename, and after the rename and before the directory fsync.
+PAGESTORE_FAULT_POINT(MANIFEST_COMPACT_AFTER_TMP_SYNC, "manifest_compact.after_tmp_sync", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(MANIFEST_COMPACT_AFTER_RENAME, "manifest_compact.after_rename", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_PREPARE, "forkmeta.after_prepare", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_MANIFEST_COMMIT, "forkmeta.after_manifest_commit", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SOURCE_REWRITE, "forkmeta.after_source_rewrite", "store", "process_abort", "crash", 1, 0)
