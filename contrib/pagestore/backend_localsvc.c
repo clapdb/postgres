@@ -971,6 +971,38 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 }
 
 /*
+ * Like pagestore_localsvc_read_at, but reports whether the store holds a
+ * version of the page at or below lsn.  Single-page redo uses it to start
+ * from the stored replacement base once WAL-index compaction has retired the
+ * page's full-page image.
+ */
+int
+pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
+								 BlockNumber blocknum, uint64 lsn, void *out,
+								 uint64 *version_out, uint64 *version_seq_out)
+{
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
+
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = blocknum;
+	ch->nblocks = 1;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	if (ch->status != PS_STATUS_OK)
+		return -1;
+	if (ch->result == 0)
+		return 0;
+	memcpy(out, ch->data, BLCKSZ);
+	/* the store's version of the page: its admission position, which a
+	 * clamped copy carries above the pd_lsn its bytes retain */
+	if (version_out != NULL)
+		*version_out = ch->req_lsn;
+	if (version_seq_out != NULL)
+		*version_seq_out = ch->req_seq;
+	return 1;
+}
+
+/*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.
@@ -1466,6 +1498,45 @@ pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
 	ch->req_lsn = lsn;
 	ls_exec(ch);
 	return ch->result;
+}
+
+/*
+ * Newest position at or below lsn at which the block was definitively outside
+ * its relation (creation, truncate, unlink), or zero when none is retained.
+ */
+bool
+pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
+									BlockNumber blocknum, uint64 lsn,
+									uint64 *death_out, uint64 *seq_out)
+{
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
+
+	ch->opcode = PS_OP_BLOCK_DEATH;
+	ch->blocknum = blocknum;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	*death_out = 0;
+	*seq_out = 0;
+	if (ch->status != PS_STATUS_OK)
+		return false;
+	*death_out = ch->req_lsn;
+	*seq_out = ch->req_seq;
+	return true;
+}
+
+/* Relation size as of lsn, or false when the daemon refuses the horizon:
+ * redo must not read a refused answer as "the block does not exist". */
+bool
+pagestore_localsvc_nblocks_asof_checked(const PageStoreRelKey *key, uint64 lsn,
+										uint64 *nblocks_out)
+{
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
+
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	*nblocks_out = ch->result;
+	return ch->status == PS_STATUS_OK;
 }
 
 int

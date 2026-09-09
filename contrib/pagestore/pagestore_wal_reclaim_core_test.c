@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "pagestore_forkmeta_snapshot.h"
 
 #include "pagestore_core.h"
 #include "pagestore_retention.h"
@@ -105,7 +106,7 @@ append_wal_bytes(uint32_t timeline, uint64_t start, uint32_t len)
 }
 
 static int
-wal_index_add(uint32_t timeline, uint64_t lsn)
+wal_index_add_record(uint32_t timeline, uint64_t lsn, uint32_t block, int fpi)
 {
 	PsChannel ch;
 	PsWalIndexEntry entry;
@@ -114,10 +115,10 @@ wal_index_add(uint32_t timeline, uint64_t lsn)
 	memset(&ch, 0, sizeof(ch));
 	memset(&entry, 0, sizeof(entry));
 	entry.key = key;
-	entry.block = 0;
+	entry.block = block;
 	entry.lsn = lsn;
 	entry.end_lsn = lsn + 50;
-	entry.flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+	entry.flags = PS_WAL_INDEX_FLAG_KNOWN | (fpi ? PS_WAL_INDEX_FLAG_FPI : 0);
 	ch.opcode = PS_OP_WAL_INDEX_ADD_BATCH;
 	ch.timeline = timeline;
 	ch.key = key;
@@ -131,6 +132,32 @@ wal_index_add(uint32_t timeline, uint64_t lsn)
 	ps_unlock_shard(ps_shard_of(&key));
 	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
+}
+
+static int
+wal_index_add(uint32_t timeline, uint64_t lsn)
+{
+	return wal_index_add_record(timeline, lsn, 0, 1);
+}
+
+/* Number of indexed records for (relation, block) at or below lsn_max. */
+static int
+wal_index_count(uint32_t timeline, uint32_t block, uint64_t lsn_max)
+{
+	PsChannel ch;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_INDEX_GET;
+	ch.timeline = timeline;
+	ch.key = key;
+	ch.blocknum = block;
+	ch.req_lsn = lsn_max;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK ? (int) ch.result : -1;
 }
 
 static int
@@ -233,6 +260,136 @@ static int
 set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
 {
 	return set_wal_pin_generation(timeline, owner_id, 1, lsn);
+}
+
+static int
+write_keyed_page(uint32_t timeline, const PsKey *keyp, uint32_t block,
+				 uint64_t lsn)
+{
+	PsKey key = *keyp;
+	unsigned char page[8192];
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+	int rc;
+
+	memset(page, 0x5A, sizeof(page));
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(timeline, &key, block, page, lsn, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
+static int
+write_relation_page(uint32_t timeline, uint32_t block, uint64_t lsn)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	return write_keyed_page(timeline, &key, block, lsn);
+}
+
+
+static int
+unlink_relation(uint32_t timeline, uint64_t lsn)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_UNLINK;
+	ch.timeline = timeline;
+	ch.key = key;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK && ps_storage->sync() == 0;
+}
+
+static int
+fork_op_keyed(uint32_t timeline, const PsKey *keyp, PsOpcode opcode,
+			  uint64_t lsn, uint32_t nblocks, uint32_t block)
+{
+	PsKey key = *keyp;
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = opcode;
+	ch.timeline = timeline;
+	ch.key = key;
+	ch.req_lsn = lsn;
+	ch.nblocks = nblocks;
+	ch.blocknum = block;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK && ps_storage->sync() == 0;
+}
+
+static int
+truncate_relation(uint32_t timeline, uint64_t lsn, uint32_t nblocks)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	return fork_op_keyed(timeline, &key, PS_OP_TRUNCATE, lsn, nblocks, 0);
+}
+
+/* Create or regrow the relation to one zero block, as a truncate-then-extend
+ * writer would, then store a page for block 0. */
+static int
+regrow_relation(uint32_t timeline, uint64_t lsn)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	return fork_op_keyed(timeline, &key, PS_OP_ZEROEXTEND, lsn, 1, 0) &&
+		write_relation_page(timeline, 0, lsn + 10);
+}
+
+/* Enough fork-lifecycle bytes on other relations to reach the forkmeta
+ * snapshot trigger without touching the relation under test. */
+static int
+churn_fork_bytes(uint32_t timeline, uint64_t lsn)
+{
+	for (uint32_t i = 0; i < 48; i++)
+	{
+		PsKey key = {1, 1, 100 + i, 0, PS_KLASS_RELATION};
+
+		if (!fork_op_keyed(timeline, &key, PS_OP_CREATE, lsn + 2 * i, 0, 0) ||
+			!fork_op_keyed(timeline, &key, PS_OP_ZEROEXTEND, lsn + 2 * i + 1,
+						   1, 0))
+			return 0;
+	}
+	return 1;
+}
+
+static int
+reserve_pin(uint32_t timeline, uint32_t kind, uint64_t owner_id,
+			uint32_t generation, uint32_t resources, uint64_t lsn)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch.timeline = timeline;
+	ch.blocknum = kind;
+	ch.parent_timeline = resources;
+	ch.old_nblocks = generation;
+	ch.req_seq = owner_id;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
 }
 
 static int
@@ -503,6 +660,261 @@ test_dependency_cutoffs(void)
 		  wal_index_progress(0, 0, WAL_TOTAL) &&
 		  maintenance_until_count(store, 0, 2),
 		  "child-local control history above its branch cap does not pin parent WAL");
+	close_store();
+	remove_tree(store);
+
+	/* The same raw dependency is released once the indexed page has a durable
+	 * stored version at or after the record and the materializer's cutoff
+	 * lets WAL-index compaction replace the FPI chain with that base. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
+		  maintenance_until_count(store, 0, 0),
+		  "a durable stored page base releases the raw WAL-index dependency");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override");
+	close_store();
+	remove_tree(store);
+
+	/* With no page-history owner nothing protects a stored version for a
+	 * later owner's horizon, so the FPI chain is kept and the dependency
+	 * stays. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "a stored page without any page-history owner is not a base");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override again");
+	close_store();
+	remove_tree(store);
+
+	/* A WAL-index-only owner is not protected by page-history retention, so
+	 * its horizon keeps the FPI-led chain even though a stored image exists;
+	 * the raw dependency therefore stays. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
+					  PS_RETENTION_RESOURCE_WAL_INDEX, limited + 200) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "a WAL-index-only owner keeps its FPI chain despite a stored image");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override after the WAL-index owner");
+	close_store();
+	remove_tree(store);
+
+	/* A materializer that pins only WAL resources establishes no page-history
+	 * floor; its horizon keeps the FPI chain like any other unprotected one. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL) &&
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "a WAL-only materializer pin does not authorize the stored base");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override after the WAL-only pin");
+	close_store();
+	remove_tree(store);
+
+	/* Protection belongs to the horizon's own owner: a page-history owner at
+	 * the same LSN as a WAL-index-only owner may advance or drop its pin
+	 * first, so it does not authorize the base for the other owner's
+	 * horizon and the FPI chain stays. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
+					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL) &&
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "another owner's page fence at the same LSN does not authorize the base");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override after the shared LSN");
+	close_store();
+	remove_tree(store);
+
+	/* A block outside the relation after a durable unlink has nothing left
+	 * to reconstruct; the unlink itself releases its raw dependency. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  unlink_relation(0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
+		  maintenance_until_count(store, 0, 0),
+		  "a durable unlink releases the raw WAL-index dependency of its blocks");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override after unlink");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * A chain retired against a fork death depends on that death as its
+ * zero-page base.  Once the pre-death FPI is gone the truncate is neither the
+ * latest nor the smallest definitive event, so forkmeta compaction would
+ * forget it and a WAL-index-only horizon between the two truncates would be
+ * left with neither an FPI nor a base: the chain fails closed and every later
+ * record accumulates.  The death must stay required for the chain's lifetime.
+ */
+/* The selected forkmeta snapshot generation, zero before the first one. */
+static uint64_t
+selected_forkmeta_generation(const char *store)
+{
+	char directory[1024];
+	PsForkmetaSnapshot selected;
+	uint64_t generation = 0;
+
+	memset(&selected, 0, sizeof(selected));
+	selected.directory_fd = selected.checkpoint_fd = selected.tail_fd = -1;
+	if (snprintf(directory, sizeof(directory), "%s/forkmeta_snapshots",
+				 store) > 0 &&
+		ps_forkmeta_snapshot_open(&selected, directory) == 0)
+	{
+		generation = selected.generation;
+		ps_forkmeta_snapshot_close(&selected);
+	}
+	return generation;
+}
+
+/* Drive maintenance until the block's index holds `wanted` records. */
+static int
+maintenance_until_index_count(uint32_t block, int wanted)
+{
+	for (int i = 0; i < 150; i++)
+	{
+		if (wal_index_count(0, block, WAL_TOTAL) == wanted)
+			return 1;
+		(void) ps_core_maintenance();
+		usleep(20000);
+	}
+	return wal_index_count(0, block, WAL_TOTAL) == wanted;
+}
+
+/* Drive maintenance until forkmeta compaction publishes a generation newer
+ * than `previous`, then a few more rounds so WAL-index compaction replans
+ * against the compacted fork history. */
+static int
+maintenance_until_forkmeta_generation(const char *store, uint64_t previous)
+{
+	int published = 0;
+
+	for (int i = 0; i < 200 && !published; i++)
+	{
+		(void) ps_test_forkmeta_force_due();
+		(void) ps_core_maintenance();
+		published = selected_forkmeta_generation(store) > previous;
+		if (!published)
+			usleep(20000);
+	}
+	for (int i = 0; i < 8; i++)
+		(void) ps_core_maintenance();
+	return published;
+}
+
+static void
+test_death_base_survives_prefix_prune(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	const uint64_t first_death = limited + 100;
+	const uint64_t second_death = limited + 300;
+	char store[] = "/tmp/pagestore-wal-policy-death-base-XXXXXX";
+	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int count = -1;
+
+	configure_core();
+	/* Forkmeta compaction is a segment-GC maintenance class. */
+	segment_gc_enabled = 1;
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
+		  "arm the WAL-index and forkmeta compaction triggers");
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 0) &&
+		  fork_op_keyed(0, &rel, PS_OP_CREATE, 50, 0, 0) &&
+		  regrow_relation(0, 90) &&
+		  wal_index_add_record(0, 1000, 0, 1) &&
+		  truncate_relation(0, first_death, 0) &&
+		  regrow_relation(0, limited + 140) &&
+		  wal_index_add_record(0, limited + 200, 0, 0) &&
+		  truncate_relation(0, second_death, 0) &&
+		  regrow_relation(0, limited + 340) &&
+		  wal_index_add_record(0, 2 * WAL_SEGMENT + 100, 0, 0) &&
+		  wal_index_add_record(0, 2 * WAL_SEGMENT + 600, 0, 1) &&
+		  churn_fork_bytes(0, limited + 400) &&
+		  wal_index_progress(0, 0, 2 * WAL_SEGMENT + 650),
+		  "build a regrown block whose old chain is retired against a truncate");
+	/* A WAL-index-only owner between the two truncates, and a page-history
+	 * owner at the end so page compaction drops the versions the truncates
+	 * invalidated and nothing else keeps the first truncate required.  The
+	 * shipper's progress is the only other WAL-index horizon. */
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, limited + 250) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY |
+					  PS_RETENTION_RESOURCE_WAL, WAL_TOTAL),
+		  "pin a horizon between the truncates and one at the end");
+	check(maintenance_until_forkmeta_generation(store, 0),
+		  "forkmeta compaction publishes once the cutoff is provable");
+	count = wal_index_count(0, 0, WAL_TOTAL);
+	check(count == 2, "the old chain is retired against the first truncate");
+	if (count != 2)
+		fprintf(stderr, "  retained records after the first compaction: %d\n",
+				count);
+	/* More lifecycle bytes elsewhere force another generation now that no
+	 * page version and no pre-truncate record keeps the first truncate. */
+	check(churn_fork_bytes(0, WAL_TOTAL + 1000) &&
+		  maintenance_until_forkmeta_generation(
+			  store, selected_forkmeta_generation(store)),
+		  "a second forkmeta generation compacts the relation's history");
+	/* New records and the progress that covers them schedule the next
+	 * WAL-index compaction, as shipping does in production. */
+	check(wal_index_add_record(0, 2 * WAL_SEGMENT + 700, 0, 0) &&
+		  wal_index_add_record(0, 2 * WAL_SEGMENT + 800, 0, 1) &&
+		  wal_index_progress(0, 2 * WAL_SEGMENT + 650, 2 * WAL_SEGMENT + 850),
+		  "extend the chain with a record and a newer FPI");
+	check(maintenance_until_index_count(0, 2), "the chain still compacts against the retained death");
+	count = wal_index_count(0, 0, WAL_TOTAL);
+	if (count != 2)
+		fprintf(stderr, "  retained records after the second compaction: %d\n",
+				count);
+	close_store();
+	configure_core();
+	segment_gc_enabled = 1;
+	check(ps_core_open(store) == 0, "reopen the store after compaction");
+	check(wal_index_add_record(0, 2 * WAL_SEGMENT + 900, 0, 0) &&
+		  wal_index_add_record(0, 2 * WAL_SEGMENT + 1000, 0, 1) &&
+		  wal_index_progress(0, 2 * WAL_SEGMENT + 850, 2 * WAL_SEGMENT + 1050),
+		  "extend the chain again after the restart");
+	check(maintenance_until_index_count(0, 2), "the retained death still bases the chain after restart");
+	count = wal_index_count(0, 0, WAL_TOTAL);
+	if (count != 2)
+		fprintf(stderr, "  retained records after restart: %d\n", count);
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0 &&
+		  unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES") == 0,
+		  "clear the compaction trigger overrides");
 	close_store();
 	remove_tree(store);
 }
@@ -1365,6 +1777,7 @@ main(void)
 	test_no_floor_or_progress();
 	test_preselection_skips_empty_reclaim();
 	test_dependency_cutoffs();
+	test_death_base_survives_prefix_prune();
 	test_natural_nonzero_start();
 	test_progress_beyond_immutable_end();
 	test_child_branch_cap();

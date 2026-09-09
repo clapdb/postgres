@@ -137,6 +137,13 @@ read_done(void *arg, int ok)
 		if (rs->ch->opcode == PS_OP_READ_AT)
 			rs->ch->result = 1;
 	}
+	else
+	{
+		/* A stored version that could not be read is an error, never an
+		 * absent version: single-page redo would otherwise replace it with a
+		 * fabricated base, and a capped read would hand back zeroes. */
+		rs->ch->status = PS_STATUS_ERROR;
+	}
 	if (--rs->pending == 0)
 	{
 		rs->active = 0;			/* clear before publishing DONE */
@@ -188,6 +195,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_IMMEDSYNC:
 			return 1;
 		case PS_OP_EXISTS:
+		case PS_OP_BLOCK_DEATH:
 		case PS_OP_NBLOCKS:
 		case PS_OP_READV:
 		case PS_OP_READ_AT:
@@ -364,6 +372,7 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 				 * found-ness (ch->result) until the page actually lands, so a failed
 				 * async read does not advertise a zero-filled page as found */
 				ch->req_lsn = v->lsn;
+				ch->req_seq = v->admission_seq;
 				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
 									  v->admission_seq,
 									  ch->data))

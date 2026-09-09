@@ -308,6 +308,63 @@ test('pagestore_wal_reclaim_core',
   timeout: 60,
 )
 
+# Control-object retention during image compaction: the newest pg_control
+# image/note pair at or below every retained WAL boundary survives, so the WAL
+# retention floor can advance; planned over the complete version chain.
+pagestore_control_prune_test = executable('pagestore_control_prune_test',
+  files('pagestore_control_prune_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_control_prune',
+  pagestore_control_prune_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Bounded fork-lifecycle history: invalidated page versions leave image
+# layers, and forkmeta compaction keeps only base, fence, and growth per
+# horizon plus the fences a retained version or indexed record still needs.
+pagestore_lifecycle_prune_test = executable('pagestore_lifecycle_prune_test',
+  files('pagestore_lifecycle_prune_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_lifecycle_prune',
+  pagestore_lifecycle_prune_test,
+  suite: ['pagestore'],
+  timeout: 120,
+)
+
+# R6 bounded-space soak: one real POSIX daemon under a seeded writer,
+# materializer, reader, branch, and restart workload with declared physical
+# bounds per persisted category.  PAGESTORE_SOAK_ROUNDS lengthens the run.
+pagestore_soak_test = executable('pagestore_soak_test',
+  files('pagestore_soak_test.c'),
+  install: false,
+)
+test('pagestore_soak',
+  pagestore_soak_test,
+  args: [pagestore_daemon],
+  depends: [pagestore_daemon],
+  suite: ['pagestore'],
+  timeout: 600,
+)
+
 # Deterministic page/WAL lag-controller and admission-wait coverage.
 pagestore_backpressure_test = executable('pagestore_backpressure_test',
   files('pagestore_backpressure_test.c', 'pagestore_core.c',

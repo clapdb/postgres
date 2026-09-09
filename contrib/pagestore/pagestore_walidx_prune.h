@@ -27,4 +27,31 @@ extern int ps_walidx_prune_plan(const PsWalIdxPruneItem *items, uint32_t n,
 								uint64_t cutoff, const uint64_t *horizons,
 								uint32_t nhorizons, unsigned char *keep);
 
+/*
+ * Like ps_walidx_prune_plan, with replacement bases.  `bases` are ascending,
+ * nonzero page-version LSNs whose complete page image is durably stored;
+ * `deaths` are ascending, nonzero LSNs at or after which the block is
+ * definitively outside its relation (unlink, truncate, or an absence proven
+ * at a planning horizon), so nothing at all needs reconstructing there.  At
+ * a horizon the chain may start at the newest visible base instead of an
+ * FPI: every record completing at or below that base is covered, a page
+ * whose newest visible record is covered needs no entry at that horizon, and
+ * a visible chain without an FPI no longer fails closed when a base precedes
+ * its uncovered records.
+ *
+ * A stored base is only a promise while the page-history retention that
+ * keeps it also protects the horizon.  `cutoff_bases_ok` and the per-horizon
+ * `horizon_bases_ok` flags say which horizons are protected that way; an
+ * unprotected horizon ignores stored bases and keeps its FPI-led chain.
+ * Death bases hold at every horizon.  Unsorted or zero bases fail closed.
+ */
+extern int ps_walidx_prune_plan_bases(const PsWalIdxPruneItem *items,
+									  uint32_t n, const uint64_t *bases,
+									  uint32_t nbases, const uint64_t *deaths,
+									  uint32_t ndeaths, uint64_t cutoff,
+									  int cutoff_bases_ok,
+									  const uint64_t *horizons,
+									  uint32_t nhorizons,
+									  const unsigned char *horizon_bases_ok,
+									  unsigned char *keep);
 #endif

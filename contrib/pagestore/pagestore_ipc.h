@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		45	/* 45: relation inspection incarnation fence;
+#define PS_SHM_VERSION		46	/* 46: block death as-of query (PS_OP_BLOCK_DEATH);
+								 * 45: relation inspection incarnation fence;
 								 * 44: isolated relation inspection request;
 							 * relation inspection uses an fd lock and
 							 * publishes directly IDLE -> REQUEST;
@@ -149,6 +150,7 @@ typedef enum PsOpcode
 	PS_OP_RETENTION_FLOOR,		/* effective floor for parent_timeline resource */
 	PS_OP_BEGIN_DELETE,			/* durable LIVE -> DELETING transition */
 	PS_OP_TIMELINE_STATE,		/* return lifecycle state/incarnation */
+	PS_OP_BLOCK_DEATH,			/* newest death of (key, blocknum) at/below req_lsn -> req_lsn */
 } PsOpcode;
 
 typedef enum PsTimelineState

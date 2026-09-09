@@ -850,6 +850,106 @@ pagestore_read_at(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/*
+ * Replacement base for single-page redo when the WAL index carries no
+ * full-page image at or below lsn: the durable stored version if the store
+ * has one, otherwise an all-zero page when the block exists at lsn (it was
+ * truncated or dropped and regrown, and every earlier record was retired
+ * behind that absence).  Returns false when the block does not exist at lsn.
+ */
+/*
+ * Does a fork death at (death, death_seq) come after a base at (base_end,
+ * base_seq)?  The same order fork_page_invalidated() applies to a stored
+ * version: a same-LSN tie is broken by the admission sequence, so a page
+ * clamped to the LSN of the truncate it was written after keeps its bytes.
+ * A full-page image or a zero page carries no sequence (zero), so a death at
+ * its LSN, admitted later, supersedes it.
+ */
+static bool
+ps_death_supersedes(uint64 death, uint64 death_seq, XLogRecPtr base_end,
+					uint64 base_seq)
+{
+	if (death == 0)
+		return false;
+	if (death != (uint64) base_end)
+		return death > (uint64) base_end;
+	return death_seq > base_seq;
+}
+
+/* Fail closed on a daemon refusal: an unreadable or unanswerable stored
+ * base, size, or death must not turn into a fabricated page. */
+static void
+ps_redo_daemon_error(const char *what, const PageStoreRelKey *key,
+					 BlockNumber blocknum, XLogRecPtr lsn)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_IO_ERROR),
+			 errmsg("pagestore could not resolve %s of block %u of relation %u/%u/%u fork %d as of %X/%08X",
+					what, blocknum, key->spcOid, key->dbOid, key->relNumber,
+					key->forkNum, LSN_FORMAT_ARGS(lsn))));
+}
+
+static uint64
+ps_redo_nblocks_asof(const PageStoreRelKey *key, BlockNumber blocknum,
+					 XLogRecPtr lsn)
+{
+	uint64		nblocks = 0;
+
+	if (!pagestore_localsvc_nblocks_asof_checked(key, (uint64) lsn, &nblocks))
+		ps_redo_daemon_error("the relation size", key, blocknum, lsn);
+	return nblocks;
+}
+
+static uint64
+ps_redo_block_death(const PageStoreRelKey *key, BlockNumber blocknum,
+					XLogRecPtr lsn, uint64 *seq_out)
+{
+	uint64		death = 0;
+
+	if (!pagestore_localsvc_block_death_asof(key, blocknum, (uint64) lsn,
+											 &death, seq_out))
+		ps_redo_daemon_error("the fork death", key, blocknum, lsn);
+	return death;
+}
+
+static bool
+ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
+					XLogRecPtr lsn, char *out, XLogRecPtr *base_end_lsn,
+					uint64 *base_seq)
+{
+	uint64		version = 0;
+	uint64		version_seq = 0;
+	int			found;
+
+	*base_seq = 0;
+	found = pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out,
+											 &version, &version_seq);
+	if (found < 0)
+		ps_redo_daemon_error("the stored base", key, blocknum, lsn);
+	if (found > 0)
+	{
+		/*
+		 * The base position is the store's version identity, not the pd_lsn
+		 * the bytes carry: a page clamped above its pd_lsn (a branch copy, or
+		 * a page written below a truncate's growth floor) reflects the state
+		 * at its admission, and the records before that position were retired
+		 * behind it.
+		 */
+		*base_end_lsn = (XLogRecPtr) version > PageGetLSN((Page) out) ?
+			(XLogRecPtr) version : PageGetLSN((Page) out);
+		if ((XLogRecPtr) version >= PageGetLSN((Page) out))
+			*base_seq = version_seq;
+		return true;
+	}
+	if (ps_redo_nblocks_asof(key, blocknum, lsn) > (uint64) blocknum)
+	{
+		memset(out, 0, BLCKSZ);
+		*base_end_lsn = InvalidXLogRecPtr;
+		return true;
+	}
+	return false;
+}
+
 /* SQL-callable protocol probes used by integration tests and controller bringup. */
 PG_FUNCTION_INFO_V1(pagestore_retention_set);
 
@@ -2085,6 +2185,7 @@ PG_FUNCTION_INFO_V1(pagestore_redo_page);
 Datum
 pagestore_redo_page(PG_FUNCTION_ARGS)
 {
+	XLogRecPtr	fpi_end = InvalidXLogRecPtr;
 	Oid			relid = PG_GETARG_OID(0);
 	int32		forknum = PG_GETARG_INT32(1);
 	int32		blocknum = PG_GETARG_INT32(2);
@@ -2108,7 +2209,26 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
 									  (uint64) lsn, &recs);
 	if (n == 0)
-		PG_RETURN_NULL();
+	{
+		XLogRecPtr	base_end;
+		uint64		base_seq = 0;
+
+		/* WAL-index compaction leaves no record at all for a page whose
+		 * durable stored version (or proven absence) covers every visible
+		 * record; that stored version is then the base. */
+		page = palloc(BLCKSZ);
+		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+								&base_end, &base_seq))
+		{
+			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+			memcpy(VARDATA(result), page, BLCKSZ);
+		}
+		pfree(page);
+		if (result == NULL)
+			PG_RETURN_NULL();
+		PG_RETURN_BYTEA_P(result);
+	}
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -2160,6 +2280,7 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 				result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 				SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
 				memcpy(VARDATA(result), page, BLCKSZ);
+				fpi_end = reader->EndRecPtr;
 			}
 			break;
 		}
@@ -2170,6 +2291,49 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	if (pd != NULL)
 		pfree(pd);
 	pfree(recs);
+	/*
+	 * WAL-index compaction retires a page's full-page image once a durable
+	 * stored version covers it.  That stored version is then the base: return
+	 * it exactly as the FPI would have been returned.
+	 */
+	{
+		XLogRecPtr	base_end = fpi_end;
+		uint64		base_seq = 0;
+
+		if (result == NULL &&
+			ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+								&base_end, &base_seq))
+		{
+			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+			memcpy(VARDATA(result), page, BLCKSZ);
+		}
+		/*
+		 * The compacted index is the union of every horizon's chain, so the
+		 * image found above may predate a truncate or unlink that emptied the
+		 * block before lsn.  From that death on the block has no content: the
+		 * base is an all-zero page when the block exists again at lsn, and
+		 * nothing when it does not.
+		 */
+		if (result != NULL)
+		{
+			uint64		death_seq = 0;
+			uint64		death = ps_redo_block_death(&key, (BlockNumber) blocknum,
+													lsn, &death_seq);
+
+			if (ps_death_supersedes(death, death_seq, base_end, base_seq))
+			{
+				if (ps_redo_nblocks_asof(&key, (BlockNumber) blocknum, lsn) >
+					(uint64) blocknum)
+					memset(VARDATA(result), 0, BLCKSZ);
+				else
+				{
+					pfree(result);
+					result = NULL;
+				}
+			}
+		}
+	}
 	pfree(page);
 
 	if (result == NULL)
@@ -2290,6 +2454,8 @@ PG_FUNCTION_INFO_V1(pagestore_redo_page_asof);
 Datum
 pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 {
+	bool		death_based = false;
+	uint64		base_seq = 0;
 	Oid			relid = PG_GETARG_OID(0);
 	int32		forknum = PG_GETARG_INT32(1);
 	int32		blocknum = PG_GETARG_INT32(2);
@@ -2323,7 +2489,26 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
 									  (uint64) lsn, &recs);
 	if (n == 0)
+	{
+		XLogRecPtr	base_end;
+		uint64		base_seq = 0;
+
+		/* No record survives WAL-index compaction: the durable stored version
+		 * at or below lsn (or a zero page for a regrown block) already is the
+		 * page as of lsn; a truncated or dropped block is absent. */
+		page = palloc(BLCKSZ);
+		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+								&base_end, &base_seq))
+		{
+			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+			memcpy(VARDATA(result), page, BLCKSZ);
+			pfree(page);
+			PG_RETURN_BYTEA_P(result);
+		}
+		pfree(page);
 		PG_RETURN_NULL();
+	}
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -2389,13 +2574,75 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 
 	if (base_idx < 0)
 	{
-		/* no base image indexed for this block; cannot materialize yet */
-		XLogReaderFree(reader);
-		pfree(pd);
-		pfree(recs);
-		pfree(base);
-		pfree(page);
-		PG_RETURN_NULL();
+		/*
+		 * No full-page image is indexed at or below lsn.  WAL-index compaction
+		 * retires an FPI once a durable stored version covers it, so the stored
+		 * version at or below lsn is the replacement base: start from it and
+		 * apply only the records that complete after its pd_lsn.
+		 */
+		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, base,
+								&base_end_lsn, &base_seq))
+		{
+			for (int i = 0; i < n; i++)
+				if (((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+					 recs[i].end_lsn <= (uint64) base_end_lsn) ||
+					((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) == 0 &&
+					 recs[i].lsn < (uint64) base_end_lsn))
+					base_idx = i;
+		}
+		else
+		{
+			/* no base at all for this block; cannot materialize yet */
+			XLogReaderFree(reader);
+			pfree(pd);
+			pfree(recs);
+			pfree(base);
+			pfree(page);
+			PG_RETURN_NULL();
+		}
+	}
+
+	/*
+	 * The compacted index is the union of every horizon's chain.  A record
+	 * retained for an older horizon may predate a truncate or unlink that
+	 * emptied this block before lsn; from that death on the block has no
+	 * content, so whenever the death is newer than the base selected above it
+	 * replaces it: an all-zero page, and only the records after the death
+	 * belong to this horizon's chain.  A block that does not exist again at
+	 * lsn has no page at all.
+	 */
+	{
+		uint64		death_seq = 0;
+		uint64		death = ps_redo_block_death(&key, (BlockNumber) blocknum,
+												lsn, &death_seq);
+
+		if (ps_death_supersedes(death, death_seq, base_end_lsn, base_seq))
+		{
+			if (ps_redo_nblocks_asof(&key, (BlockNumber) blocknum, lsn) <=
+				(uint64) blocknum)
+			{
+				XLogReaderFree(reader);
+				pfree(pd);
+				pfree(recs);
+				pfree(base);
+				pfree(page);
+				PG_RETURN_NULL();
+			}
+			memset(base, 0, BLCKSZ);
+			base_end_lsn = InvalidXLogRecPtr;
+			base_idx = -1;
+			for (int i = 0; i < n; i++)
+				if (((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+					 recs[i].end_lsn <= death) ||
+					((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) == 0 &&
+					 recs[i].lsn < death))
+					base_idx = i;
+			/* The death is the newest at or below lsn and the block exists
+			 * again there, so the block is live: the truncate scan below
+			 * would only rediscover this death from a retained pre-death
+			 * record (a block regrown by zero-extend has no newer one). */
+			death_based = true;
+		}
 	}
 
 	/*
@@ -2404,6 +2651,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * materialize a stale page for it.  recs[n - 1].lsn is the block's newest record
 	 * at/below lsn.
 	 */
+	if (!death_based)
 	{
 		volatile RedoBlockLiveness liveness = REDO_BLOCK_SCAN_INCOMPLETE;
 		bool		saved_liveness_from_store = ps_redo_liveness_from_store;

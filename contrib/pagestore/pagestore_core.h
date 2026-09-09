@@ -158,6 +158,9 @@ extern void ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag);
 extern void ps_test_backpressure_set_forkmeta_lag(uint64_t forkmeta_lag);
 extern int ps_test_forkmeta_force_due(void);
 extern int ps_test_forkmeta_serviceable_work_due(void);
+extern uint32_t ps_test_page_version_count(uint32_t timeline, const PsKey *key,
+										   uint32_t block);
+extern uint32_t ps_test_artifact_fence_count(uint32_t timeline);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
@@ -283,6 +286,10 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
  * page is unwritten, -1 if an authoritative stored version cannot be read, and
  * -2 when the requested capped horizon has been reclaimed.
  */
+extern int	read_resolve_version(uint32_t timeline, const PsKey *key,
+								 uint32_t block, uint64_t read_lsn,
+								 uint64_t read_seq, unsigned char *out,
+								 uint64_t *out_ver, uint64_t *out_seq);
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,
 						 unsigned char *out, uint64_t *out_ver);

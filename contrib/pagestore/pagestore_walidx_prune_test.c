@@ -76,6 +76,61 @@ main(void)
 	check(ps_walidx_prune_plan(NULL, 1, 80, NULL, 0, keep) == -1,
 		  "missing item array is rejected");
 
+	{
+		/* Durable replacement page bases supersede the records they cover. */
+		uint64_t base60[] = {60};
+		uint64_t base80[] = {80};
+		uint64_t base20[] = {20};
+		uint64_t base_future[] = {100};
+		uint64_t unsorted_bases[] = {60, 40};
+		uint64_t zero_base[] = {0};
+		unsigned char ok1[] = {1};
+		unsigned char no1[] = {0};
+
+		check(ps_walidx_prune_plan_bases(items, 6, base60, 1, NULL, 0, 80, 1,
+										 NULL, 0, NULL, keep) == 3 &&
+			  !keep[0] && !keep[1] && !keep[2] && keep[3] && keep[4] && keep[5],
+			  "a stored image covers the FPI and every earlier record");
+		check(ps_walidx_prune_plan_bases(items, 6, base80, 1, NULL, 0, 80, 1,
+										 NULL, 0, NULL, keep) == 2 &&
+			  !keep[3] && keep[4] && keep[5],
+			  "an image at the cutoff leaves only the future tail");
+		check(ps_walidx_prune_plan_bases(no_base, 2, base20, 1, NULL, 0, 40, 1,
+										 NULL, 0, NULL, keep) == 1 &&
+			  !keep[0] && keep[1],
+			  "a page without any FPI compacts from a stored image");
+		check(ps_walidx_prune_plan_bases(items, 6, base_future, 1, NULL, 0, 80,
+										 1, NULL, 0, NULL, keep) == 4 && keep[2],
+			  "an image after the cutoff is not yet visible");
+		check(ps_walidx_prune_plan_bases(items, 6, base60, 1, NULL, 0, 100, 1,
+										 (uint64_t[]) {40}, 1, ok1, keep) == 4 &&
+			  keep[0] && keep[1] && !keep[2] && !keep[3] && keep[4] && keep[5],
+			  "an older horizon below the image still keeps its FPI chain");
+		check(ps_walidx_prune_plan_bases(items, 6, base60, 1, NULL, 0, 100, 1,
+										 (uint64_t[]) {80}, 1, ok1, keep) == 3 &&
+			  !keep[2] && keep[3] && keep[4] && keep[5],
+			  "a horizon above the image starts its chain after the image");
+		check(ps_walidx_prune_plan_bases(items, 6, base60, 1, NULL, 0, 80, 0,
+										 NULL, 0, NULL, keep) == 4 && keep[2],
+			  "an unprotected cutoff ignores stored images and keeps its FPI");
+		check(ps_walidx_prune_plan_bases(items, 6, base60, 1, NULL, 0, 100, 1,
+										 (uint64_t[]) {80}, 1, no1, keep) == 4 &&
+			  keep[2] && keep[3] && keep[4] && keep[5],
+			  "an unprotected horizon keeps its FPI chain despite the image");
+		check(ps_walidx_prune_plan_bases(items, 6, NULL, 0, base60, 1, 80, 0,
+										 (uint64_t[]) {80}, 1, no1, keep) == 3 &&
+			  !keep[2] && keep[3],
+			  "a death base holds even at unprotected horizons");
+		check(ps_walidx_prune_plan_bases(items, 6, unsorted_bases, 2, NULL, 0,
+										 80, 1, NULL, 0, NULL, keep) == -1,
+			  "unsorted bases fail closed");
+		check(ps_walidx_prune_plan_bases(items, 6, zero_base, 1, NULL, 0, 80, 1,
+										 NULL, 0, NULL, keep) == -1,
+			  "a zero base fails closed");
+		check(ps_walidx_prune_plan_bases(items, 6, NULL, 0, NULL, 0, 80, 1,
+										 NULL, 0, NULL, keep) == 4,
+			  "no bases behaves exactly like the FPI-only planner");
+	}
 	printf("pagestore_walidx_prune_test: %d checks, %d failed\n", run, failed);
 	return failed != 0;
 }

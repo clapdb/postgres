@@ -460,10 +460,13 @@ handle_request(PsChannel *ch)
 			{
 				uint64_t	read_lsn = ch->req_lsn;
 				uint64_t	resolved = 0;
+				uint64_t	resolved_seq = 0;
 				int			read_result;
 
-				read_result = read_resolve(tl, &ch->key, ch->blocknum, read_lsn,
-												  ch->req_seq, ch->data, &resolved);
+				read_result = read_resolve_version(tl, &ch->key, ch->blocknum,
+												   read_lsn, ch->req_seq,
+												   ch->data, &resolved,
+												   &resolved_seq);
 				/* READ_AT is a diagnostic found-ness probe: reclaimed history is
 				 * reported as absent.  Capped READV above fails closed instead. */
 				if (read_result == -2)
@@ -484,6 +487,7 @@ handle_request(PsChannel *ch)
 					{
 						ch->result = 1;
 						ch->req_lsn = resolved;
+						ch->req_seq = resolved_seq;
 					}
 				}
 				else
@@ -516,6 +520,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_IMMEDSYNC:
 			return 1;
 		case PS_OP_EXISTS:
+		case PS_OP_BLOCK_DEATH:
 		case PS_OP_NBLOCKS:
 		case PS_OP_READV:
 		case PS_OP_READ_AT:

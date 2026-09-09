@@ -706,7 +706,42 @@ Expected scope: one or two PRs.
 
 ### R6. Prove bounded space
 
-Status: **blocked on R2-R5 and R5b**.
+Status: **soak implemented and in CI; every persisted category proven
+bounded on CI-sized and 6000/8000-round runs; owner-less branch timelines
+and SLRU-class versions remain**.
+
+`pagestore_soak_test` is the acceptance harness.  It plays every retention
+role over the daemon protocol: a WAL-shipping writer with a bounded live set
+(update, extend, truncate, unlink/recreate), a materializer that mirrors
+control note/image pairs, publishes durable WAL-index progress, and advances
+an exact `(LSN, admission_seq)` owner pin, an advancing and a fixed reader
+whose pinned views are verified by as-of reads and sizes, copy-on-write
+branches that are written, read for fork-point isolation, durably deleted, and
+reused by incarnation, and clean/crash daemon restarts with full-model
+re-verification.  Physical bytes are sampled per persisted category against
+declared during-run and quiescent bounds derived from the controller
+configuration, and the report carries logical/physical bytes, approximate
+write amplification, per-controller lag, throttle and wait time, catch-up
+time, and active owners.  Bugs it exposed and the fixes that landed with it:
+control-image/note pairs are now pruned like relation pages but fenced by every
+retained WAL boundary and planned over the complete version chain
+(`pagestore_control_prune_test`); WAL-index compaction takes durable stored
+page versions and fork-level deaths as replacement bases
+(`ps_walidx_prune_plan_bases`, reclaim core cases); and forkmeta snapshot
+compaction exempts frontier-less branch timelines instead of failing closed
+for every timeline, capping the cutoff at each live branch's fork point so
+its own lower-LSN mutations stay admissible, while reclaim-debt accounting
+stays strict.  Control-image retention also fences every retained SLRU seed
+and reader artifact, keeps one physical copy per retained version across
+mirror retries, and is rescheduled whenever a WAL-resource pin or a deleted
+branch cap changes; single-page redo starts from the stored replacement base
+when the WAL index no longer carries a full-page image.  Longer runs
+then exposed unbounded fork-lifecycle history: image compaction now drops
+page versions invalidated at every horizon they serve, the forkmeta planner
+keeps only the base, inheritance fence, and growth per horizon plus the
+definitive events a retained version or a still-indexed WAL record needs, and
+deletion-forced generations compact survivors whenever a cutoff is proven
+(`pagestore_lifecycle_prune_test`, `ps_forkmeta_prune_plan_required`).
 
 Add a deterministic soak scenario with bounded live data but repeated updates,
 WAL generation, compaction, reader advancement, branch creation/deletion, and
@@ -726,6 +761,20 @@ Acceptance:
   per-category GC lag/catch-up time, backpressure time, and active retention
   owners;
 - retained SQL-visible state remains correct throughout the run.
+
+Remaining before the gate closes:
+
+- no owner establishes the durable operational cutoff that controllers
+  respect: the real materializer pins WAL and the WAL index but not page
+  history, and a branch compute pins nothing, so in that topology page
+  history and control images are never pruned, WAL-index compaction cannot
+  substitute stored images for FPI chains (a stored base is only trusted at a
+  page-history fence), and shipped WAL stays pinned by cold pages.  The
+  checkpoint admission fence those computes already mirror is the intended
+  cutoff, but branch/reader preparation must select and pin its horizon
+  before that cutoff can pass it;
+- SLRU-class object versions need their dedicated retention protocol;
+- a longer soak configuration (nightly).
 
 Expected scope: one PR.  Passing it closes the retention MVP gate.
 
@@ -1047,6 +1096,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
 | 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
 | 2026-08-28 | Added R3b-2 standalone crash-safe physical immutable-prefix reclamation: `ps_wal_store_reclaim_prefix()` publishes retained/physical frontiers before unlink, uses the WAL mutex as a reader drain/barrier, fully validates/sorts residual candidates before ascending unlink, revalidates every main-catalog candidate immediately before unlink, keeps partial unlink catalog state exact, fences ambiguous directory fsync, and retries residual prefixes after restart; no core maintenance or cutoff policy | Final focused WAL-store test: 167 checks, 0 failures; includes reverse-enumeration candidate ordering, scan-error zero-unlink, low/middle main-catalog corruption and residual corruption, lowest/middle unlink failures, per-candidate header/CRC validation, real fork/`_exit` stops before unlink/after partial unlink/before directory fsync, pending-reclaim advance fencing, deterministic reader-barrier timing, idempotence, boundary rejection, and restart retry |

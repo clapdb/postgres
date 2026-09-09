@@ -51,7 +51,7 @@ new daemon's zeroing/recovery window.
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
-| Retention horizon authority | Reader/materializer owners plus page-history, WAL, WAL-index, and forkmeta reclaim frontiers/controllers implemented; queue-bound evidence remains R6 | restart/corruption tests, exact-fence admission, branch projection, page/WAL-index publication crash tests, forkmeta observer/controller tests, and bounded page churn |
+| Retention horizon authority | Reader/materializer owners plus page-history, WAL, WAL-index, and forkmeta reclaim frontiers/controllers implemented; control-image pruning, WAL-index replacement bases, and bounded fork-lifecycle history close the reclamation loop for owned timelines | restart/corruption tests, exact-fence admission, branch projection, page/WAL-index publication crash tests, forkmeta observer/controller tests, bounded page churn, and the `pagestore_soak_test` bounded-space run |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
 
@@ -349,6 +349,75 @@ obsolete snapshot/temp debt; its forkmeta gate is limited to forkmeta-growing
 mutations and its snapshot maintenance can be forced below the geometric
 trigger.  All three controllers are POSIX-only; forkmeta does not claim the
 remaining R6 queue-bound soak/tuning work.
+
+The R6 bounded-space soak (`pagestore_soak_test`, standalone CI) now drives one
+real POSIX daemon with a seeded writer over a bounded live set, a materializer
+publishing exact cutoffs, fixed and advancing readers, short-lived
+copy-on-write branches created and durably deleted, and clean/crash restarts,
+measuring every persisted category against declared bounds.  Its first runs
+found three retention gaps that are now closed on `pagestore`: control-object
+versions were never pruned, so the WAL retention floor never advanced;
+WAL-index compaction retained an FPI-led chain per page even when a durable
+stored page version (or a fork-level death) already covered it, so cold pages
+pinned raw WAL forever; and a branch timeline without a page frontier blocked
+forkmeta compaction for every timeline (such a branch now caps the cutoff at
+its fork point instead).  With those fixes the CI-sized run
+keeps page, layer, WAL, WAL-index, retention, and timeline storage within
+bound and reclaims shipped WAL down to the last immutable segment.  A fourth
+gap showed only in longer runs: the forkmeta planner retained every visible
+SET/DEAD event as an invalidation fence, so truncate/unlink churn grew the
+checkpoint linearly, and deletion-forced generations copied every surviving
+record.  Now image compaction drops page versions that a later truncate or
+drop invalidates at every horizon they serve, the planner keeps only the
+base, the inheritance fence, and the growth per horizon plus the definitive
+events a retained version or a still-indexed WAL record needs, and a
+deletion-forced generation compacts survivors whenever a cutoff is proven
+(`pagestore_lifecycle_prune_test`).  Review of those fixes tightened two
+rules that the soak's owner mix could not expose: a stored replacement base
+is trusted only at a WAL-index horizon whose own owner also holds page
+history (another owner's page fence at the same LSN can move first), and
+forkmeta compaction treats every WAL-index horizon as a fork-history horizon,
+so a WAL-index-only owner between two truncates keeps the death its chain
+was retired against and the regrowth after it
+(`pagestore_wal_reclaim_core_test`).  Two consumers were then aligned with
+the compacted index: single-page redo asks the daemon for the newest fork
+death at or below its horizon (`PS_OP_BLOCK_DEATH`) and starts from a zero
+page there whenever that death is newer than the full-page image or stored
+version it found, because the index is the union of every horizon's chain
+and may still list pre-death records for an older owner; and an SLRU seed or
+reader snapshot shipped at a cutoff that page compaction already passed
+without a fence is refused, since the control image it would resolve its
+era from is gone (`pagestore_lifecycle_prune_test`,
+`pagestore_control_prune_test`).  For those consumers to be exact at a
+WAL-index-only owner's horizon, forkmeta compaction keeps the size envelope
+at every horizon (each definitive event that is the newest death of some
+block, not only the latest and the smallest), and the as-of size, existence,
+and death queries are admissible at WAL-index horizons below the page
+frontier like the WAL-index reads retained for that owner are
+(`pagestore_forkmeta_prune_test`, `pagestore_lifecycle_prune_test`).  Those
+identities are compared as (LSN, admission sequence) tuples end to end, the
+order `fork_page_invalidated()` already applies, so a page clamped to the
+LSN of the truncate it was written after keeps its bytes; an admitted
+artifact registers its fence under the same lock as the check that admitted
+it and releases that fence again if the append fails; a note whose image is
+still on its way keeps a single copy across mirror retries; a stored base,
+size, or death the daemon cannot answer fails single-page redo closed
+(the SPDK frontend reports a failed page read as an error, never as an
+absent version); and the soak measures allocated blocks rather than
+logical length and bounds the file count.  With that, 8000-round soaks keep every
+category, forkmeta included, within bound.  Still required for the gate:
+
+- no owner establishes the durable operational cutoff that controllers
+  respect: the real materializer pins WAL and the WAL index but not page
+  history, and a branch compute pins nothing, so in that topology page
+  history and control images are never pruned, WAL-index compaction cannot
+  substitute stored images for FPI chains (a stored base is only trusted at a
+  page-history fence), and shipped WAL stays pinned by cold pages.  The
+  checkpoint admission fence those computes already mirror is the intended
+  cutoff, but branch/reader preparation must select and pin its horizon
+  before that cutoff can pass it;
+- SLRU-class object versions are still retained without a dedicated protocol;
+- a nightly long-run soak configuration.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 

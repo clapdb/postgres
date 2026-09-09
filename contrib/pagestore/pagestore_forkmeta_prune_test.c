@@ -86,15 +86,72 @@ same_value(RefValue a, RefValue b)
 	return a.state == b.state && a.nblocks == b.nblocks;
 }
 
-static int
-preserves_visible_definitives(const PsForkMetaEvent *events, uint32_t nitems,
-					  const unsigned char *keep, PsForkMetaFence fence)
+/* The inheritance fence a branch applies to inherited blocks: the smallest
+ * visible definitive size.  Compaction must never raise it. */
+static uint32_t
+min_fence(const PsForkMetaEvent *events, uint32_t nitems,
+		  const unsigned char *keep, PsForkMetaFence fence)
 {
+	uint32_t result = UINT32_MAX;
+
 	for (uint32_t i = 0; i < nitems; i++)
-		if (oracle_visible(&events[i], fence) &&
-			(events[i].kind == PS_FORKMETA_SET ||
-			 events[i].kind == PS_FORKMETA_DEAD) && !keep[i])
+	{
+		uint32_t size;
+
+		if ((keep != NULL && !keep[i]) || !oracle_visible(&events[i], fence))
+			continue;
+		if (events[i].kind == PS_FORKMETA_SET)
+			size = events[i].nblocks;
+		else if (events[i].kind == PS_FORKMETA_DEAD)
+			size = 0;
+		else
+			continue;
+		if (size < result)
+			result = size;
+	}
+	return result;
+}
+
+/* The newest visible definitive event that leaves 'block' outside the fork:
+ * the zero-page base WAL-index compaction and single-page redo rely on.
+ * Compaction must answer it identically for every block. */
+static int
+newest_death(const PsForkMetaEvent *events, uint32_t nitems,
+			 const unsigned char *keep, PsForkMetaFence fence, uint32_t block)
+{
+	int result = -1;
+
+	for (uint32_t i = 0; i < nitems; i++)
+	{
+		if ((keep != NULL && !keep[i]) || !oracle_visible(&events[i], fence))
+			continue;
+		if (events[i].kind == PS_FORKMETA_DEAD ||
+			(events[i].kind == PS_FORKMETA_SET && events[i].nblocks <= block))
+			result = (int) i;
+	}
+	return result;
+}
+
+static int
+same_deaths(const PsForkMetaEvent *events, uint32_t nitems,
+			const unsigned char *keep, PsForkMetaFence fence)
+{
+	unsigned char all[32];
+
+	memset(all, 1, sizeof(all));
+	/* every definitive size is the smallest block some death applies to */
+	for (uint32_t i = 0; i < nitems; i++)
+	{
+		uint32_t block;
+
+		if (events[i].kind != PS_FORKMETA_SET &&
+			events[i].kind != PS_FORKMETA_DEAD)
+			continue;
+		block = events[i].kind == PS_FORKMETA_DEAD ? 0 : events[i].nblocks;
+		if (newest_death(events, nitems, all, fence, block) !=
+			newest_death(events, nitems, keep, fence, block))
 			return 0;
+	}
 	return 1;
 }
 
@@ -107,12 +164,16 @@ check_model(const PsForkMetaEvent *events, uint32_t nitems,
 	memset(all, 1, sizeof(all));
 	check(same_value(fold(events, nitems, all, cutoff),
 					 fold(events, nitems, keep, cutoff)), name);
-	check(preserves_visible_definitives(events, nitems, keep, cutoff), name);
+	check(min_fence(events, nitems, all, cutoff) ==
+		  min_fence(events, nitems, keep, cutoff), name);
+	check(same_deaths(events, nitems, keep, cutoff), name);
 	for (uint32_t f = 0; f < nfences; f++)
 	{
 		check(same_value(fold(events, nitems, all, fences[f]),
 					 fold(events, nitems, keep, fences[f])), name);
-		check(preserves_visible_definitives(events, nitems, keep, fences[f]), name);
+		check(min_fence(events, nitems, all, fences[f]) ==
+			  min_fence(events, nitems, keep, fences[f]), name);
+		check(same_deaths(events, nitems, keep, fences[f]), name);
 	}
 }
 
@@ -286,7 +347,7 @@ main(void)
 	check(ps_forkmeta_prune_plan(set_grow_set, 3,
 							 (PsForkMetaFence) {30, 3}, NULL, 0, mask) == 2 &&
 					 mask[0] && !mask[1] && mask[2],
-					 "all visible definitive boundaries are retained");
+					 "the latest definitive base and the smallest fence are retained");
 	check(ps_forkmeta_prune_plan(set_grow_set, 3,
 							 (PsForkMetaFence) {30, 3},
 							 (PsForkMetaFence[]) {{20, 2}}, 1, mask) == 3 &&
@@ -307,8 +368,8 @@ main(void)
 							 (PsForkMetaFence) {20, 2}, NULL, 0, mask) == -1,
 				 "legacy entry cannot hide decreasing same-LSN sequence");
 	check(ps_forkmeta_prune_plan(dead_then_grow, 3,
-							 (PsForkMetaFence) {30, 3}, NULL, 0, mask) == 3 &&
-					 mask[0] && mask[1] && mask[2] &&
+							 (PsForkMetaFence) {30, 3}, NULL, 0, mask) == 2 &&
+					 !mask[0] && mask[1] && mask[2] &&
 				 fold(dead_then_grow, 3, NULL,
 					  (PsForkMetaFence) {30, 3}).state == REF_DEF &&
 				 fold(dead_then_grow, 3, NULL,
@@ -356,6 +417,39 @@ main(void)
 				 "item count above INT_MAX rejected before access");
 #endif
 
+	{
+		/* Repeated truncate/regrow churn keeps one base, one fence, and one
+		 * growth per horizon instead of every boundary. */
+		PsForkMetaEvent churn[] = {
+			{10, 1, 0, PS_FORKMETA_SET},
+			{20, 2, 8, PS_FORKMETA_GROW},
+			{30, 3, 2, PS_FORKMETA_SET},
+			{40, 4, 9, PS_FORKMETA_GROW},
+			{50, 5, 3, PS_FORKMETA_SET},
+			{60, 6, 7, PS_FORKMETA_GROW},
+			{70, 7, 1, PS_FORKMETA_SET},
+			{80, 8, 6, PS_FORKMETA_GROW}
+		};
+		unsigned char required[8] = {0};
+
+		check(ps_forkmeta_prune_plan(churn, 8, (PsForkMetaFence) {80, 8},
+								 NULL, 0, mask) == 3 &&
+			  mask[0] && !mask[1] && !mask[2] && !mask[3] && !mask[4] &&
+			  !mask[5] && mask[6] && mask[7],
+			  "truncate churn compacts to base, fence, and growth");
+		required[4] = 1;
+		check(ps_forkmeta_prune_plan_required(churn, 8,
+										  (PsForkMetaFence) {80, 8}, NULL, 0,
+										  required, mask) == 4 &&
+			  mask[0] && mask[4] && mask[6] && mask[7],
+			  "a required invalidation fence is retained");
+		check(ps_forkmeta_prune_plan_required(churn, 8,
+										  (PsForkMetaFence) {80, 8},
+										  (PsForkMetaFence[]) {{45, 0}}, 1,
+										  NULL, mask) == 5 &&
+			  mask[0] && mask[2] && mask[3] && mask[6] && mask[7],
+			  "a discrete fence adds its own base and growth");
+	}
 		/* Exercise the reference model on a hand-written case as well as random
 		 * valid streams. */
 		check(ps_forkmeta_prune_plan(lifecycle, 5, (PsForkMetaFence) {30, 4},

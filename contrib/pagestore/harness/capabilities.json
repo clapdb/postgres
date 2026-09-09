@@ -8,7 +8,7 @@
       "constraints": {
         "crash": {"target": ["store"], "model": ["power_loss"], "forbidden_fields": ["fault"]}
       },
-      "protocol_version": 45,
+      "protocol_version": 46,
       "page_size": 8192,
       "io_unit": 262144
     },
@@ -20,7 +20,7 @@
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]}
       },
-      "protocol_version": 45,
+      "protocol_version": 46,
       "page_size": 8192,
       "io_unit": 262144
     },
@@ -35,7 +35,7 @@
         "assert": {"oracle": ["sql_scalar"]},
         "capture": {"target": ["writer"], "kind": ["reader_datadir"]}
       },
-      "protocol_version": 45,
+      "protocol_version": 46,
       "page_size": 8192,
       "io_unit": 262144
     },
@@ -49,7 +49,7 @@
         "materializer_fault": {"target": ["materializer"], "action": ["pause"]},
         "inspect_relation": {"target": ["materializer"]}
       },
-      "protocol_version": 45,
+      "protocol_version": 46,
       "page_size": 8192,
       "io_unit": 262144
     }

@@ -28,22 +28,41 @@ retain_horizon(const PsForkMetaEvent *events, uint32_t nitems,
 {
 	uint32_t latest_def = 0;
 	uint32_t largest_grow = 0;
+	uint32_t envelope = UINT32_MAX;
 	int have_def = 0;
 	int have_grow = 0;
 
-	for (uint32_t i = 0; i < nitems; i++)
+	/*
+	 * Walking newest to oldest, every visible definitive event whose size is
+	 * a new strict minimum is the newest death of the blocks at or above that
+	 * size: the latest one fixes the size at the horizon, the smallest fences
+	 * inherited blocks, and each one in between is the zero-page base that
+	 * WAL-index compaction and single-page redo use for the blocks it killed
+	 * last.  An equal size does not start a new death, so the newest of equal
+	 * sizes is the one kept and truncate churn at the same sizes adds nothing.
+	 */
+	for (uint32_t i = nitems; i > 0; i--)
 	{
-		if (!event_visible(&events[i], horizon))
+		uint32_t size;
+
+		if (!event_visible(&events[i - 1], horizon))
 			continue;
-		if (events[i].kind == PS_FORKMETA_SET ||
-			events[i].kind == PS_FORKMETA_DEAD)
+		if (events[i - 1].kind != PS_FORKMETA_SET &&
+			events[i - 1].kind != PS_FORKMETA_DEAD)
+			continue;
+		size = events[i - 1].kind == PS_FORKMETA_DEAD ? 0 :
+			events[i - 1].nblocks;
+		if (!have_def)
 		{
-			latest_def = i;
+			latest_def = i - 1;
 			have_def = 1;
-			keep[i] = 1;
+		}
+		if (size < envelope)
+		{
+			keep[i - 1] = 1;
+			envelope = size;
 		}
 	}
-
 	for (uint32_t i = have_def ? latest_def + 1 : 0; i < nitems; i++)
 	{
 		if (event_visible(&events[i], horizon) &&
@@ -62,10 +81,12 @@ retain_horizon(const PsForkMetaEvent *events, uint32_t nitems,
 }
 
 int
-ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
-					   PsForkMetaFence cutoff,
-					   const PsForkMetaFence *fences, uint32_t nfences,
-					   unsigned char *keep)
+ps_forkmeta_prune_plan_required(const PsForkMetaEvent *events,
+								uint32_t nitems, PsForkMetaFence cutoff,
+								const PsForkMetaFence *fences,
+								uint32_t nfences,
+								const unsigned char *required,
+								unsigned char *keep)
 {
 	int kept = 0;
 	uint64_t last_nonzero_seq = 0;
@@ -81,7 +102,6 @@ ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
 	if (nitems == 0)
 		return 0;
 	memset(keep, 0, nitems);
-
 	for (uint32_t i = 0; i < nitems; i++)
 	{
 		if (events[i].kind > PS_FORKMETA_DEAD ||
@@ -97,10 +117,10 @@ ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
 				return -1;
 			last_nonzero_seq = events[i].admission_seq;
 		}
-		if (!event_visible(&events[i], cutoff))
+		if (!event_visible(&events[i], cutoff) ||
+			(required != NULL && required[i]))
 			keep[i] = 1;
 	}
-
 	retain_horizon(events, nitems, cutoff, keep);
 	for (uint32_t i = 0; i < nfences; i++)
 		retain_horizon(events, nitems, fences[i], keep);
@@ -108,4 +128,14 @@ ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
 		if (keep[i])
 			kept++;
 	return kept;
+}
+
+int
+ps_forkmeta_prune_plan(const PsForkMetaEvent *events, uint32_t nitems,
+					   PsForkMetaFence cutoff,
+					   const PsForkMetaFence *fences, uint32_t nfences,
+					   unsigned char *keep)
+{
+	return ps_forkmeta_prune_plan_required(events, nitems, cutoff, fences,
+										   nfences, NULL, keep);
 }
