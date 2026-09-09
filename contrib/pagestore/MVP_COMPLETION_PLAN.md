@@ -764,9 +764,15 @@ Acceptance:
 
 Remaining before the gate closes:
 
-- owner-less direct-write timelines need an operational floor derived from the
-  checkpoint admission fence they already mirror, so a branch compute's page
-  history and fork events are bounded and its frontier can be published;
+- no owner establishes the durable operational cutoff that controllers
+  respect: the real materializer pins WAL and the WAL index but not page
+  history, and a branch compute pins nothing, so in that topology page
+  history and control images are never pruned, WAL-index compaction cannot
+  substitute stored images for FPI chains (a stored base is only trusted at a
+  page-history fence), and shipped WAL stays pinned by cold pages.  The
+  checkpoint admission fence those computes already mirror is the intended
+  cutoff, but branch/reader preparation must select and pin its horizon
+  before that cutoff can pass it;
 - SLRU-class object versions need their dedicated retention protocol;
 - a longer soak configuration (nightly).
 

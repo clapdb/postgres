@@ -409,10 +409,13 @@ static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 #define PS_CONTROL_PAIRED_BLOCKS 3u
 typedef struct PsControlChainPlan
 {
-	PsPruneVersion *chain;
+	PsPruneVersion *chain;		/* durably covered image versions */
 	uint32_t	nchain;
 	PsPruneVersion *kept;
 	uint32_t	nkept;
+	uint64_t   *pending;		/* image versions not durably covered yet */
+	uint32_t	npending;
+	uint64_t	image_max_lsn;	/* newest image version of any durability */
 	int			valid;
 } PsControlChainPlan;
 
@@ -426,6 +429,8 @@ static int control_chain_keeps(const PsControlChainPlan *plan,
 							   const PsPruneVersion *v);
 static struct PageEnt *page_find(uint32_t timeline, const PsKey *key, uint32_t block);
 static int prune_version_cmp(const void *va, const void *vb);
+struct PageVer;
+static int walidx_base_version_durable(const PageVer *v);
 struct ForkEnt;
 typedef struct ForkMetaWalIdxPage ForkMetaWalIdxPage;
 static int fork_meta_walidx_pages_build(ForkMetaWalIdxPage **pages_out,
@@ -2587,6 +2592,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			}
 			free(plan.chain);
 			free(plan.kept);
+			free(plan.pending);
 		}
 		else if (ps_page_prune_plan(versions, end - first,
 								(PsPruneFence) {floor, UINT64_MAX}, fences,
@@ -3177,6 +3183,7 @@ typedef struct ForkEnt
 
 static void artifact_fence_reset(void);
 static void artifact_fence_note(uint32_t timeline, uint64_t lsn);
+static void artifact_fence_forget(uint32_t timeline);
 
 static void
 free_page_fork_indexes(void)
@@ -4166,6 +4173,7 @@ fail:
 static void
 page_cleanup_purge_timeline_locked(uint32_t timeline)
 {
+	artifact_fence_forget(timeline);
 	for (uint32_t sh = 0; sh < core_shards(); sh++)
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
 		{
@@ -9895,13 +9903,21 @@ typedef struct WalIdxBaseEntry
 {
 	PsKey		key;
 	uint32_t	block;
-	uint64_t   *bases;			/* ascending, nonzero, unique */
+	uint64_t   *bases;			/* stored images: ascending, nonzero, unique */
 	uint32_t	nbases;
+	uint64_t   *deaths;			/* proven absences: ascending, nonzero, unique */
+	uint32_t	ndeaths;
 } WalIdxBaseEntry;
 
 static WalIdxBaseEntry *walidx_plan_bases;
 static uint32_t walidx_plan_nbases;
 static int walidx_plan_bases_valid;
+/* Horizons whose page history is protected for as long as they exist: the
+ * exact page-history fences (owner pins carrying page history, live branch
+ * caps).  Only such a horizon may rely on a stored image as its replacement
+ * base; any other horizon keeps its FPI-led chain. */
+static uint64_t *walidx_plan_protected;
+static uint32_t walidx_plan_nprotected;
 
 static int
 walidx_base_entry_cmp(const void *va, const void *vb)
@@ -9930,11 +9946,28 @@ static void
 walidx_plan_bases_free(void)
 {
 	for (uint32_t i = 0; i < walidx_plan_nbases; i++)
+	{
 		free(walidx_plan_bases[i].bases);
+		free(walidx_plan_bases[i].deaths);
+	}
 	free(walidx_plan_bases);
 	walidx_plan_bases = NULL;
 	walidx_plan_nbases = 0;
 	walidx_plan_bases_valid = 0;
+	free(walidx_plan_protected);
+	walidx_plan_protected = NULL;
+	walidx_plan_nprotected = 0;
+}
+
+static int
+walidx_plan_horizon_protected(uint64_t horizon)
+{
+	if (!walidx_plan_bases_valid)
+		return 0;
+	for (uint32_t i = 0; i < walidx_plan_nprotected; i++)
+		if (walidx_plan_protected[i] == horizon)
+			return 1;
+	return 0;
 }
 
 static const WalIdxBaseEntry *
@@ -11317,11 +11350,28 @@ walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 	}
 	{
 		const WalIdxBaseEntry *bases = walidx_plan_bases_lookup(&e->key, e->block);
+		unsigned char *ok = NULL;
 
+		if (nhorizons != 0)
+		{
+			ok = malloc(nhorizons);
+			if (ok == NULL)
+			{
+				free(items);
+				return -1;
+			}
+			for (uint32_t i = 0; i < nhorizons; i++)
+				ok[i] = walidx_plan_horizon_protected(horizons[i]);
+		}
 		rc = ps_walidx_prune_plan_bases(items, (uint32_t) e->n,
 										bases != NULL ? bases->bases : NULL,
 										bases != NULL ? bases->nbases : 0,
-										cutoff, horizons, nhorizons, keep);
+										bases != NULL ? bases->deaths : NULL,
+										bases != NULL ? bases->ndeaths : 0,
+										cutoff,
+										walidx_plan_horizon_protected(cutoff),
+										horizons, nhorizons, ok, keep);
+		free(ok);
 	}
 	free(items);
 	return rc;
@@ -11495,6 +11545,18 @@ walidx_plan_bases_build(uint32_t tl)
 										   &floor, 1) != 0 ||
 		page_prune_fences(tl, &fences, &nfences) != 0)
 		return -1;
+	/* Protected horizons are exactly the page-history fences: owner pins
+	 * carrying page history and live branch caps.  Only they keep the
+	 * "newest version at or below" that a stored replacement base is. */
+	walidx_plan_protected = malloc((size_t) (nfences + 1) *
+								   sizeof(*walidx_plan_protected));
+	if (walidx_plan_protected == NULL)
+	{
+		free(fences);
+		return -1;
+	}
+	for (uint32_t i = 0; i < nfences; i++)
+		walidx_plan_protected[walidx_plan_nprotected++] = fences[i].lsn;
 	/* The horizons WAL-index compaction will plan for: a block that this
 	 * timeline's own lifecycle proves absent at a horizon has nothing to
 	 * reconstruct there, which covers every record completing before it. */
@@ -11531,7 +11593,9 @@ walidx_plan_bases_build(uint32_t tl)
 				uint32_t	nbases = 0;
 
 				ForkEnt    *f;
+				uint64_t   *deaths;
 				uint32_t	ndeaths = 0;
+				uint32_t	ndeaths_out = 0;
 
 				if (e->timeline != tl || e->n == 0)
 					continue;
@@ -11565,12 +11629,16 @@ walidx_plan_bases_build(uint32_t tl)
 					continue;
 				chain = malloc((size_t) (n != 0 ? n : 1) * sizeof(*chain));
 				keep = malloc(n != 0 ? n : 1);
-				bases = malloc((size_t) (n + ndeaths) * sizeof(*bases));
-				if (chain == NULL || keep == NULL || bases == NULL)
+				bases = malloc((size_t) (n != 0 ? n : 1) * sizeof(*bases));
+				deaths = malloc((size_t) (ndeaths != 0 ? ndeaths : 1) *
+								sizeof(*deaths));
+				if (chain == NULL || keep == NULL || bases == NULL ||
+					deaths == NULL)
 				{
 					free(chain);
 					free(keep);
 					free(bases);
+					free(deaths);
 					goto out;
 				}
 				for (uint32_t i = 0; i < n; i++)
@@ -11589,6 +11657,7 @@ walidx_plan_bases_build(uint32_t tl)
 					free(chain);
 					free(keep);
 					free(bases);
+					free(deaths);
 					goto out;
 				}
 				for (uint32_t i = 0; i < n; i++)
@@ -11611,7 +11680,7 @@ walidx_plan_bases_build(uint32_t tl)
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
-							bases[nbases++] = f->ev[i].lsn;
+							deaths[ndeaths_out++] = f->ev[i].lsn;
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
@@ -11620,24 +11689,36 @@ walidx_plan_bases_build(uint32_t tl)
 
 						if (state == FORK_HOP_DEAD ||
 							(state == FORK_HOP_DEF && nb <= e->block))
-							bases[nbases++] = horizons[i];
+							deaths[ndeaths_out++] = horizons[i];
 					}
 				}
 				free(chain);
 				free(keep);
-				if (nbases == 0)
+				if (nbases == 0 && ndeaths_out == 0)
 				{
 					free(bases);
+					free(deaths);
 					continue;
 				}
-				qsort(bases, nbases, sizeof(*bases), walidx_base_lsn_cmp);
+				if (nbases != 0)
 				{
 					uint32_t	w = 0;
 
+					qsort(bases, nbases, sizeof(*bases), walidx_base_lsn_cmp);
 					for (uint32_t i = 0; i < nbases; i++)
 						if (w == 0 || bases[w - 1] != bases[i])
 							bases[w++] = bases[i];
 					nbases = w;
+				}
+				if (ndeaths_out != 0)
+				{
+					uint32_t	w = 0;
+
+					qsort(deaths, ndeaths_out, sizeof(*deaths), walidx_base_lsn_cmp);
+					for (uint32_t i = 0; i < ndeaths_out; i++)
+						if (w == 0 || deaths[w - 1] != deaths[i])
+							deaths[w++] = deaths[i];
+					ndeaths_out = w;
 				}
 				if (walidx_plan_nbases == cap)
 				{
@@ -11648,6 +11729,7 @@ walidx_plan_bases_build(uint32_t tl)
 					if (grown == NULL)
 					{
 						free(bases);
+						free(deaths);
 						goto out;
 					}
 					walidx_plan_bases = grown;
@@ -11657,6 +11739,8 @@ walidx_plan_bases_build(uint32_t tl)
 				walidx_plan_bases[walidx_plan_nbases].block = e->block;
 				walidx_plan_bases[walidx_plan_nbases].bases = bases;
 				walidx_plan_bases[walidx_plan_nbases].nbases = nbases;
+				walidx_plan_bases[walidx_plan_nbases].deaths = deaths;
+				walidx_plan_bases[walidx_plan_nbases].ndeaths = ndeaths_out;
 				walidx_plan_nbases++;
 			}
 	if (walidx_plan_nbases != 0)
@@ -13933,22 +14017,47 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 	memset(plan, 0, sizeof(*plan));
 	if (e == NULL || e->nver <= 0)
 		return 0;
-	n = (uint32_t) e->nver;
-	plan->chain = malloc((size_t) n * sizeof(*plan->chain));
-	plan->kept = malloc((size_t) n * sizeof(*plan->kept));
-	keep = malloc(n);
-	if (plan->chain == NULL || plan->kept == NULL || keep == NULL)
+	n = 0;
+	plan->chain = malloc((size_t) e->nver * sizeof(*plan->chain));
+	plan->kept = malloc((size_t) e->nver * sizeof(*plan->kept));
+	plan->pending = malloc((size_t) e->nver * sizeof(*plan->pending));
+	keep = malloc((size_t) e->nver);
+	if (plan->chain == NULL || plan->kept == NULL || plan->pending == NULL ||
+		keep == NULL)
 	{
 		free(plan->chain);
 		free(plan->kept);
+		free(plan->pending);
 		free(keep);
 		memset(plan, 0, sizeof(*plan));
 		return -1;
 	}
-	for (uint32_t i = 0; i < n; i++)
+	/* Only durably covered versions take part: compaction copies bytes from
+	 * the source layers, so a newer segment-only version that has not been
+	 * flushed yet must not displace the durable copy it will replace later.
+	 * Such pending versions, and the newest image LSN of any durability, let
+	 * the paired blocks tell "image still on its way" from "image pruned". */
+	for (int i = 0; i < e->nver; i++)
 	{
-		plan->chain[i].lsn = e->vers[i].lsn;
-		plan->chain[i].admission_seq = e->vers[i].admission_seq;
+		if (e->vers[i].lsn > plan->image_max_lsn)
+			plan->image_max_lsn = e->vers[i].lsn;
+		if (walidx_base_version_durable(&e->vers[i]))
+		{
+			plan->chain[n].lsn = e->vers[i].lsn;
+			plan->chain[n].admission_seq = e->vers[i].admission_seq;
+			n++;
+		}
+		else
+			plan->pending[plan->npending++] = e->vers[i].lsn;
+	}
+	if (n == 0)
+	{
+		free(keep);
+		free(plan->chain);
+		free(plan->kept);
+		free(plan->pending);
+		memset(plan, 0, sizeof(*plan));
+		return 0;
 	}
 	qsort(plan->chain, n, sizeof(*plan->chain), prune_version_cmp);
 	plan->nchain = n;
@@ -13957,6 +14066,7 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		free(plan->chain);
 		free(plan->kept);
+		free(plan->pending);
 		free(keep);
 		memset(plan, 0, sizeof(*plan));
 		return -1;
@@ -13972,13 +14082,16 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 /*
  * The image block follows the plan exactly, tuple by tuple.  A note (or
  * admission-fence) block keeps one physical copy of every version LSN the
- * image plan keeps and, in addition, of every LSN whose image has not been
- * written yet: the shipper writes the note first, so a version present only
- * in the note chain is a pair in flight and must survive until its image
- * arrives and the pair can be judged together.  A mirror retry after an IPC
- * timeout appends the same bytes again under a new admission sequence; only
- * the newest copy of a retained LSN is kept, so retries cannot accumulate.
- * Caller holds the shard write lock.
+ * image plan keeps and, in addition, of every LSN whose image is still on
+ * its way: the shipper writes the note first and images arrive in version
+ * order, so a note newer than every image, or whose image is not durably
+ * covered yet, is a pair in flight and must survive until the pair can be
+ * judged together.  A note whose LSN is older than the newest image but
+ * absent from the image chain belongs to an image that was already pruned
+ * and goes with it.  A mirror retry after an IPC timeout appends the same
+ * bytes again under a new admission sequence; only the newest copy of a
+ * retained LSN is kept, so retries cannot accumulate.  Caller holds the
+ * shard write lock.
  */
 static int
 control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
@@ -14004,13 +14117,20 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 	{
 		for (uint32_t i = 0; i < plan->nchain; i++)
 			if (plan->chain[i].lsn == v->lsn)
-				return 0;
+				return 0;		/* durable image planned away */
+		for (uint32_t i = 0; i < plan->npending; i++)
+			if (plan->pending[i] == v->lsn)
+				return 1;		/* image written, not durably covered yet */
+		if (v->lsn <= plan->image_max_lsn)
+			return 0;			/* image already pruned */
+		return 1;				/* image not written yet */
 	}
-	/* Newest copy of this LSN across the block's complete chain. */
+	/* Newest durably covered copy of this LSN across the block's chain. */
 	if (entry != NULL)
 		for (int i = 0; i < entry->nver; i++)
 			if (entry->vers[i].lsn == v->lsn &&
-				entry->vers[i].admission_seq > v->admission_seq)
+				entry->vers[i].admission_seq > v->admission_seq &&
+				walidx_base_version_durable(&entry->vers[i]))
 				return 0;
 	return 1;
 }
@@ -14089,6 +14209,11 @@ artifact_fence_note(uint32_t timeline, uint64_t lsn)
 	if (lsn == 0)
 		return;
 	pthread_mutex_lock(&artifact_fence_lock);
+	if (nartifact_fences == UINT32_MAX)
+	{
+		pthread_mutex_unlock(&artifact_fence_lock);
+		return;
+	}
 	for (uint32_t i = 0; i < nartifact_fences; i++)
 		if (artifact_fences[i].timeline == timeline &&
 			artifact_fences[i].lsn == lsn)
@@ -14114,13 +14239,41 @@ artifact_fence_note(uint32_t timeline, uint64_t lsn)
 		artifact_fences = grown;
 		artifact_fence_cap = ncap;
 	}
+	artifact_fences[nartifact_fences].timeline = timeline;
+	artifact_fences[nartifact_fences].lsn = lsn;
+	nartifact_fences++;
+	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+/* A deleted (or reused) timeline's artifacts are purged with its pages. */
+static void
+artifact_fence_forget(uint32_t timeline)
+{
+	uint32_t	w = 0;
+
+	pthread_mutex_lock(&artifact_fence_lock);
 	if (nartifact_fences != UINT32_MAX)
 	{
-		artifact_fences[nartifact_fences].timeline = timeline;
-		artifact_fences[nartifact_fences].lsn = lsn;
-		nartifact_fences++;
+		for (uint32_t i = 0; i < nartifact_fences; i++)
+			if (artifact_fences[i].timeline != timeline)
+				artifact_fences[w++] = artifact_fences[i];
+		nartifact_fences = w;
 	}
 	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+uint32_t
+ps_test_artifact_fence_count(uint32_t timeline)
+{
+	uint32_t	n = 0;
+
+	pthread_mutex_lock(&artifact_fence_lock);
+	if (nartifact_fences != UINT32_MAX)
+		for (uint32_t i = 0; i < nartifact_fences; i++)
+			if (artifact_fences[i].timeline == timeline)
+				n++;
+	pthread_mutex_unlock(&artifact_fence_lock);
+	return n;
 }
 
 static void

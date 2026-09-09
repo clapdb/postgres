@@ -706,6 +706,70 @@ test_dropped_relation_retires_its_layers(void)
 	remove_tree(store);
 }
 
+static int
+begin_delete(uint32_t timeline)
+{
+	PsChannel	ch;
+	PsTimelineState state;
+	uint64_t	incarnation = 0;
+
+	if (!ps_timeline_state(timeline, &state, &incarnation))
+		return 0;
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_BEGIN_DELETE;
+	ch.timeline = timeline;
+	ch.req_seq = incarnation;
+	ch.status = PS_STATUS_OK;
+	if (ps_lifecycle_write_lock() != 0)
+		return 0;
+	if (ps_admission_write_lock() != 0)
+	{
+		ps_lifecycle_write_unlock();
+		return 0;
+	}
+	ps_lock_map_wr();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_admission_write_unlock();
+	ps_lifecycle_write_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+/* Artifact fences registered on a branch leave with the branch. */
+static void
+test_deleted_branch_forgets_artifact_fences(void)
+{
+	char		store[] = "/tmp/pagestore-lifecycle-artifact-XXXXXX";
+	PsKey		seed = {0, 0, 9, 0, PS_KLASS_SLRU};
+	unsigned char page[8192];
+	PsTimelineState state = PS_TIMELINE_LIVE;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the artifact fence test");
+	check(fork_op(PS_OP_CREATE, 1000, 0, 0) && write_page(0, 1010, 0xF0) &&
+		  create_branch(1, 0, 1020), "fork a branch");
+	memset(page, 0x55, sizeof(page));
+	ps_lock_shard_wr(ps_shard_of(&seed));
+	check(append_page(1, &seed, 0, page, 1500, NULL) == 0,
+		  "ship an SLRU seed on the branch");
+	ps_unlock_shard(ps_shard_of(&seed));
+	check(ps_test_artifact_fence_count(1) == 1,
+		  "the branch registers its artifact fence");
+	check(begin_delete(1), "begin deleting the branch");
+	for (int i = 0; i < 200 && state != PS_TIMELINE_DELETED; i++)
+	{
+		(void) ps_core_maintenance();
+		(void) ps_timeline_state(1, &state, NULL);
+		usleep(5000);
+	}
+	check(state == PS_TIMELINE_DELETED, "the branch reaches DELETED");
+	check(ps_test_artifact_fence_count(1) == 0,
+		  "deletion forgets the branch's artifact fences");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -713,6 +777,7 @@ main(void)
 	test_reader_pin_keeps_invalidated_history();
 	test_frontier_less_branch_caps_cutoff();
 	test_dropped_relation_retires_its_layers();
+	test_deleted_branch_forgets_artifact_fences();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

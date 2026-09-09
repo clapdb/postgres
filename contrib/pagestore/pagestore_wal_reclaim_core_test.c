@@ -582,17 +582,57 @@ test_dependency_cutoffs(void)
 	close_store();
 	remove_tree(store);
 
-	/* With no page-history owner at all, page compaction never prunes, so
-	 * every durable stored version is retained and remains a valid base. */
+	/* With no page-history owner nothing protects a stored version for a
+	 * later owner's horizon, so the FPI chain is kept and the dependency
+	 * stays. */
 	configure_core();
 	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
-		  maintenance_until_count(store, 0, 0),
-		  "an unpruned stored page is a valid base without an owner floor");
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "a stored page without any page-history owner is not a base");
 	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
 		  "clear the WAL-index snapshot trigger override again");
+	close_store();
+	remove_tree(store);
+
+	/* A WAL-index-only owner is not protected by page-history retention, so
+	 * its horizon keeps the FPI-led chain even though a stored image exists;
+	 * the raw dependency therefore stays. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
+					  PS_RETENTION_RESOURCE_WAL_INDEX, limited + 200) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "a WAL-index-only owner keeps its FPI chain despite a stored image");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override after the WAL-index owner");
+	close_store();
+	remove_tree(store);
+
+	/* A materializer that pins only WAL resources establishes no page-history
+	 * floor; its horizon keeps the FPI chain like any other unprotected one. */
+	configure_core();
+	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL) &&
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "a WAL-only materializer pin does not authorize the stored base");
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the WAL-index snapshot trigger override after the WAL-only pin");
 	close_store();
 	remove_tree(store);
 

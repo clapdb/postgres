@@ -850,6 +850,31 @@ pagestore_read_at(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/*
+ * Replacement base for single-page redo when the WAL index carries no
+ * full-page image at or below lsn: the durable stored version if the store
+ * has one, otherwise an all-zero page when the block exists at lsn (it was
+ * truncated or dropped and regrown, and every earlier record was retired
+ * behind that absence).  Returns false when the block does not exist at lsn.
+ */
+static bool
+ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
+					XLogRecPtr lsn, char *out, XLogRecPtr *base_end_lsn)
+{
+	if (pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out))
+	{
+		*base_end_lsn = PageGetLSN((Page) out);
+		return true;
+	}
+	if (pagestore_localsvc_nblocks_asof(key, (uint64) lsn) > (uint64) blocknum)
+	{
+		memset(out, 0, BLCKSZ);
+		*base_end_lsn = InvalidXLogRecPtr;
+		return true;
+	}
+	return false;
+}
+
 /* SQL-callable protocol probes used by integration tests and controller bringup. */
 PG_FUNCTION_INFO_V1(pagestore_retention_set);
 
@@ -2109,12 +2134,14 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 									  (uint64) lsn, &recs);
 	if (n == 0)
 	{
+		XLogRecPtr	base_end;
+
 		/* WAL-index compaction leaves no record at all for a page whose
-		 * durable stored version covers every visible record; that stored
-		 * version is then the base. */
+		 * durable stored version (or proven absence) covers every visible
+		 * record; that stored version is then the base. */
 		page = palloc(BLCKSZ);
-		if (pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
-											 (uint64) lsn, page))
+		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+								&base_end))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -2191,13 +2218,16 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	 * stored version covers it.  That stored version is then the base: return
 	 * it exactly as the FPI would have been returned.
 	 */
+	{
+		XLogRecPtr	base_end;
+
 	if (result == NULL &&
-		pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
-										 (uint64) lsn, page))
+		ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page, &base_end))
 	{
 		result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 		SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
 		memcpy(VARDATA(result), page, BLCKSZ);
+	}
 	}
 	pfree(page);
 
@@ -2353,12 +2383,14 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 									  (uint64) lsn, &recs);
 	if (n == 0)
 	{
+		XLogRecPtr	base_end;
+
 		/* No record survives WAL-index compaction: the durable stored version
-		 * at or below lsn already is the page as of lsn, including a later
-		 * truncate or drop, which the store answers as "no content". */
+		 * at or below lsn (or a zero page for a regrown block) already is the
+		 * page as of lsn; a truncated or dropped block is absent. */
 		page = palloc(BLCKSZ);
-		if (pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
-											 (uint64) lsn, page))
+		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+								&base_end))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 			SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -2440,10 +2472,9 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		 * version at or below lsn is the replacement base: start from it and
 		 * apply only the records that complete after its pd_lsn.
 		 */
-		if (pagestore_localsvc_read_at_found(&key, (BlockNumber) blocknum,
-											 (uint64) lsn, base))
+		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, base,
+								&base_end_lsn))
 		{
-			base_end_lsn = PageGetLSN((Page) base);
 			for (int i = 0; i < n; i++)
 				if (((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
 					 recs[i].end_lsn <= (uint64) base_end_lsn) ||

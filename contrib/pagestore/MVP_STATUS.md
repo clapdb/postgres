@@ -375,9 +375,15 @@ deletion-forced generation compacts survivors whenever a cutoff is proven
 (`pagestore_lifecycle_prune_test`).  With that, 8000-round soaks keep every
 category, forkmeta included, within bound.  Still required for the gate:
 
-- an owner-less direct-write timeline (a branch compute) has no operational
-  floor, so its own page history and fork events are never pruned; the
-  checkpoint admission fence it already mirrors is the intended cutoff;
+- no owner establishes the durable operational cutoff that controllers
+  respect: the real materializer pins WAL and the WAL index but not page
+  history, and a branch compute pins nothing, so in that topology page
+  history and control images are never pruned, WAL-index compaction cannot
+  substitute stored images for FPI chains (a stored base is only trusted at a
+  page-history fence), and shipped WAL stays pinned by cold pages.  The
+  checkpoint admission fence those computes already mirror is the intended
+  cutoff, but branch/reader preparation must select and pin its horizon
+  before that cutoff can pass it;
 - SLRU-class object versions are still retained without a dedicated protocol;
 - a nightly long-run soak configuration.
 
