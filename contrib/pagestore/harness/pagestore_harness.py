@@ -2519,13 +2519,22 @@ def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
             )
 
 
+def _walidx_generation_files(store: Path) -> list[str]:
+    """The committed WAL-index snapshot manifest and the shard payloads
+    beside it, as the names that identify one generation."""
+    directory = store / "walidx_snapshots_0"
+    if not directory.is_dir():
+        return []
+    return sorted(entry.name for entry in directory.iterdir() if entry.is_file())
+
+
 def _check_walidx_recovery(
     inspector: Path,
     shm: str,
     inspection_schema: dict[str, Any],
     store: Path,
     stage: str,
-) -> None:
+) -> dict[str, Any] | None:
     """The verify client already waited for the compacted chains, so the
     retried generation is committed: the staged copy is gone, the committed
     manifest exists, and the fixed WAL-index reader survived recovery."""
@@ -2548,6 +2557,12 @@ def _check_walidx_recovery(
             f"after_{stage} recovery reported owners={owners!r}, expected one "
             "WAL-index owner and no page-history owner"
         )
+    # the committed generation, so a restart that republishes it can be told
+    # from one that adopts what recovery already committed
+    return {
+        "manifest": (store / WALIDX_MANIFEST).read_bytes(),
+        "files": _walidx_generation_files(store),
+    }
 
 
 def _check_gc_recovery(
@@ -2558,13 +2573,12 @@ def _check_gc_recovery(
     workload: str,
     stage: str,
     timeout: float,
-) -> None:
+) -> dict[str, Any] | None:
     """After recovery the manifest is sane, the retired sources are gone once
     cleanup has resumed (only the replacement remains, in the manifest and on
     disk), and the retained horizon is the configured cutoff."""
     if workload == "wal_index":
-        _check_walidx_recovery(inspector, shm, inspection_schema, store, stage)
-        return
+        return _check_walidx_recovery(inspector, shm, inspection_schema, store, stage)
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -3234,11 +3248,12 @@ def run_daemon_fault_recovery(
             _verify_layer_client(layer_client, shm, trace / "layer-client.log", timeout)
             manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
             _check_layer_manifest(manifest, layer_stage, False)
+        recovered_state = None
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
                                  workload=gc_workload)
-            _check_gc_recovery(inspector, shm, inspection_schema, store,
-                               gc_workload, gc_stage, timeout)
+            recovered_state = _check_gc_recovery(inspector, shm, inspection_schema,
+                                                 store, gc_workload, gc_stage, timeout)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
@@ -3264,8 +3279,15 @@ def run_daemon_fault_recovery(
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
                                  workload=gc_workload)
-            _check_gc_recovery(inspector, shm, inspection_schema, store,
-                               gc_workload, gc_stage, timeout)
+            restarted_state = _check_gc_recovery(inspector, shm, inspection_schema,
+                                                 store, gc_workload, gc_stage, timeout)
+            # nothing mutates the store between the two starts, so a restart
+            # that republishes a generation is not idempotent
+            if restarted_state != recovered_state:
+                raise OracleMismatch(
+                    f"clean restart changed the settled state from "
+                    f"{recovered_state!r} to {restarted_state!r}"
+                )
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         if gc_seed_actions:

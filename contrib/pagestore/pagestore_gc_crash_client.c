@@ -396,20 +396,59 @@ walidx_verify(void)
 				"compacted WAL-index chains (count %d)\n", count);
 		exit(1);
 	}
-	if (out[0].lsn != 10 || out[1].lsn != 30 || out[2].lsn != 90 ||
-		out[3].lsn != 110)
+	/* The seeded tuples, not only their positions: a recovery that keeps the
+	 * LSNs but drops an end position, a flag or the source timeline no longer
+	 * describes chains WAL replay can follow. */
 	{
-		fprintf(stderr, "pagestore_gc_crash_client: unexpected compacted chains "
-				"%llu %llu %llu %llu\n", (unsigned long long) out[0].lsn,
-				(unsigned long long) out[1].lsn, (unsigned long long) out[2].lsn,
-				(unsigned long long) out[3].lsn);
-		exit(1);
+		const uint64_t expect_lsn[] = {10, 30, 90, 110};
+		const uint32_t expect_flags[] = {
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN
+		};
+
+		for (int i = 0; i < 4; i++)
+			if (out[i].lsn != expect_lsn[i] ||
+				out[i].end_lsn != expect_lsn[i] + 1 ||
+				out[i].flags != expect_flags[i] || out[i].timeline != 0)
+			{
+				fprintf(stderr, "pagestore_gc_crash_client: unexpected compacted "
+						"chain %d: lsn=%llu end=%llu flags=%u timeline=%u\n", i,
+						(unsigned long long) out[i].lsn,
+						(unsigned long long) out[i].end_lsn,
+						out[i].flags, out[i].timeline);
+				exit(1);
+			}
 	}
 	if (walidx_get(WALIDX_READER_LSN, out, 8, &count) != PS_STATUS_OK ||
-		count != 2 || out[0].lsn != 10 || out[1].lsn != 30)
+		count != 2 || out[0].lsn != 10 || out[1].lsn != 30 ||
+		out[0].end_lsn != 11 || out[1].end_lsn != 31 ||
+		out[0].flags != (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) ||
+		out[1].flags != PS_WAL_INDEX_FLAG_KNOWN ||
+		out[0].timeline != 0 || out[1].timeline != 0)
 		die("recovery lost the fixed reader's retained WAL-index chain");
 	if (walidx_get(WALIDX_DROPPED_LSN, out, 8, &count) == PS_STATUS_OK)
 		die("recovery resurrected a WAL-index point below the durable frontier");
+	/* The retained pin must still be the seeded reader itself.  A pin that
+	 * kept the horizon but lost its owner identity leaves the real owner
+	 * unable to advance or drop it, and nothing else here would notice. */
+	{
+		PsChannel  *ch = ps_channel(shm_base, channel);
+
+		set_relation(ch);
+		ch->timeline = 0;
+		ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+		ch->blocknum = PS_RETENTION_OWNER_READER;
+		ch->req_seq = WALIDX_READER;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1)
+			die("recovery lost the seeded WAL-index reader's pin");
+		if (ch->timeline != 0 || ch->blocknum != PS_RETENTION_OWNER_READER ||
+			ch->req_seq != WALIDX_READER || ch->old_nblocks != 1 ||
+			ch->parent_timeline != PS_RETENTION_RESOURCE_WAL_INDEX ||
+			ch->req_lsn != WALIDX_READER_LSN)
+			die("recovery changed the seeded WAL-index reader's identity");
+	}
 }
 
 static uint64_t
