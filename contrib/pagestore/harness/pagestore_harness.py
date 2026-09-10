@@ -2736,7 +2736,7 @@ def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
     nblocks = struct.unpack_from("=I", record, 56)[0]
     kind = record[60]
     pad = record[61:64]
-    if magic not in (FORKMETA_V2_MAGIC, FORKMETA_V3_MAGIC) or rec_len != FORKMETA_RECORD_BYTES:
+    if not _forkmeta_record_wire_valid(record):
         return None
     return {
         "magic": magic, "timeline": timeline, "key": key, "lsn": lsn,
@@ -2749,6 +2749,29 @@ FORKMETA_CUTOFF_LSN = 3500          # the workload's sole proven page frontier
 FORKMETA_SEED_FIRST_REL = 5000      # the gc client's oracle relations ...
 FORKMETA_SEED_RELS = 32             # ... and their count
 FORKMETA_SET_KIND = 1
+
+
+def _forkmeta_record_wire_valid(record: bytes) -> bool:
+    """A record's layout and checksum, the same test the daemon applies: a
+    legacy record carries a zero pad, a checksummed one carries the CRC-24
+    (OpenPGP polynomial) of every byte before that pad."""
+    magic, rec_len = struct.unpack_from("=II", record, 0)
+    if rec_len != FORKMETA_RECORD_BYTES:
+        return False
+    pad = record[61:64]
+    if magic == FORKMETA_V2_MAGIC:
+        return pad == b"\x00\x00\x00"
+    if magic != FORKMETA_V3_MAGIC:
+        return False
+    crc = 0xB704CE
+    for byte in record[:61]:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    crc &= 0xFFFFFF
+    return pad == bytes((crc >> 16, (crc >> 8) & 0xFF, crc & 0xFF))
 
 
 def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[str, Any]] | None:
@@ -2770,9 +2793,9 @@ def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[st
     for offset in range(0, complete, FORKMETA_RECORD_BYTES):
         record = data[offset:offset + FORKMETA_RECORD_BYTES]
         magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
-        # both the checksummed current record and the legacy one it replaced
-        if magic not in (FORKMETA_V2_MAGIC, FORKMETA_V3_MAGIC) or \
-                rec_len != FORKMETA_RECORD_BYTES:
+        # both the checksummed current record and the legacy one it replaced,
+        # each held to the checksum rule of its own version
+        if not _forkmeta_record_wire_valid(record):
             return None
         lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
         records.append({
