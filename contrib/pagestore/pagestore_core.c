@@ -2577,8 +2577,20 @@ artifact_generation_needed(uint64_t lsn, const uint64_t *generations,
 		artifact_generation_at(generations, ngenerations, floor) == lsn)
 		return 1;
 	for (uint32_t f = 0; f < nfences; f++)
+	{
+		/* The same distinction applies to every retained horizon, not only
+		 * the floor: a fence above a reader snapshot -- a live descendant
+		 * branch, say -- never resolves that snapshot, so only a fence that
+		 * names its horizon exactly can keep it. */
+		if (!replay_base)
+		{
+			if (fences[f].lsn == lsn)
+				return 1;
+			continue;
+		}
 		if (artifact_generation_at(generations, ngenerations, fences[f].lsn) == lsn)
 			return 1;
+	}
 	return 0;
 }
 

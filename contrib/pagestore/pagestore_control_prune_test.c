@@ -900,12 +900,16 @@ test_stale_artifacts_are_retired(void)
 	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 9, 1,
 					  PS_RETENTION_RESOURCE_ALL, 1500),
 		  "a reader pins the cutoff it captures its artifacts at");
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 10, 1,
+					  PS_RETENTION_RESOURCE_ALL, 1500),
+		  "a second reader pins the same cutoff and captures nothing later");
 	check(write_object(0, PS_KLASS_SLRU, 7, 0, 1500, 0x71) &&
 		  write_object(0, PS_KLASS_SLRU, 7, 1, 1500, 0x72) &&
 		  write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500, 0x73) &&
 		  write_object(0, PS_KLASS_SLRU, 7, 0, 2500, 0x74) &&
 		  write_object(0, PS_KLASS_SLRU, 7, 0, 2500, 0x75) &&
-		  write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500, 0x76),
+		  write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500, 0x76) &&
+		  write_object(0, PS_KLASS_READER_SNAPSHOT, 10, 0, 1500, 0x77),
 		  "artifacts at the reader's cutoff and at a branch base (with a retry)");
 	check(create_branch(1, 0, 2500), "a branch forks at the second cutoff");
 	check(ps_test_artifact_fence_count(0) == 2,
@@ -919,12 +923,14 @@ test_stale_artifacts_are_retired(void)
 	 * retried copies included. */
 	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 1500 &&
 		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500) == 1500 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 10, 0, 1500) == 1500 &&
 		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
 		  ps_test_page_version_count(0, &seed7, 0) == 3 &&
 		  ps_test_artifact_fence_count(0) == 2,
 		  "artifacts at and above the reader's pin survive");
-	check(drop_pin(0, PS_RETENTION_OWNER_READER, 9, 1),
-		  "the reader releases its pin");
+	check(drop_pin(0, PS_RETENTION_OWNER_READER, 9, 1) &&
+		  drop_pin(0, PS_RETENTION_OWNER_READER, 10, 1),
+		  "the readers release their pins");
 	run_maintenance(64);
 	/* Only the branch's fork point remains below the floor.  A consumer at
 	 * that fork reads the seed at exactly the newest generation at or below
@@ -937,6 +943,12 @@ test_stale_artifacts_are_retired(void)
 		  "a dropped pin retires the artifacts it protected below the floor");
 	check(object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 0,
 		  "a seed page missing from the newer generation at the fork is not kept");
+	/* The second reader's snapshot has no later generation, so the branch's
+	 * fork point is the newest horizon above it.  A snapshot is read at
+	 * exactly the horizon it was captured for, and no fence names 1500 any
+	 * more, so the fork above it must not keep it the way it keeps a seed. */
+	check(object_version_at(0, PS_KLASS_READER_SNAPSHOT, 10, 0, 1500) == 0,
+		  "a snapshot with no fence at its own horizon is retired, not held by a fence above it");
 	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
 		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500) == 2500 &&
 		  ps_test_page_version_count(0, &seed7, 0) == 1,
