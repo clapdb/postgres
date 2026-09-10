@@ -2598,10 +2598,15 @@ compact_emit_grouped(const CompactOrder *order, uint32_t first, uint32_t end,
 			   order[next].version.admission_seq ==
 			   order[i].version.admission_seq)
 			next++;
-		for (uint32_t j = i; j < next; j++)
-			if (keep[j - first])
+		/* The sorted order breaks an identity tie by input index, and the
+		 * input is read in layer-id order, so the last kept copy is the one
+		 * a read resolves to.  Legacy records share (LSN, admission
+		 * sequence) even when their bytes differ, which is exactly when this
+		 * choice decides what survives. */
+		for (uint32_t j = next; j > i; j--)
+			if (keep[j - 1 - first])
 			{
-				kept_source = (int) order[j].source;
+				kept_source = (int) order[j - 1].source;
 				break;
 			}
 		if (kept_source >= 0)
@@ -2925,6 +2930,22 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			d->timeline == timeline &&
 			layer_shard_from_id(d->layer_id) == shard)
 			old[nold++] = *d;
+	}
+	/* Read the sources in layer-id order.  A lookup resolves two copies of
+	 * one identity by the highest layer id, and legacy records carry no
+	 * admission sequence, so the compaction input must be ordered the same
+	 * way for its own tie-break to select the copy a read would serve. */
+	for (uint32_t i = 1; i < nold; i++)
+	{
+		PsLayerDesc entry = old[i];
+		uint32_t	j = i;
+
+		while (j > 0 && old[j - 1].layer_id > entry.layer_id)
+		{
+			old[j] = old[j - 1];
+			j--;
+		}
+		old[j] = entry;
 	}
 	/* A read snapshots and pins the complete timeline layer set before doing
 	 * remote I/O.  Do not publish a partial compaction while any source is
