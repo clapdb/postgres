@@ -230,7 +230,10 @@ def canonicalize_manifest(store: Path) -> None:
     if not path.exists():
         return
     data = path.read_bytes()
-    prefix = str(store).encode() + b"/"
+    # the daemon persists the resolved spelling of the store path, which
+    # differs from the one handed to it when a temporary directory contains a
+    # symlink component
+    prefix = str(store.resolve()).encode() + b"/"
     out = bytearray()
     offset = 0
     while offset + MANIFEST_HEADER_BYTES <= len(data):

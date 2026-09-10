@@ -721,7 +721,11 @@ foreach layer_fault_scenario : [
 endforeach
 # Persisted-format fixture: the compiled identities must match the committed
 # fixture, the fixture must reopen with its oracle intact, and every declared
-# mutation must be rejected as documented.
+# mutation must be rejected as documented.  The archive holds the raw C
+# structures a little-endian host wrote, and both the daemon and the checker
+# read them in native order, so the fixture is skipped where the host byte
+# order differs; a big-endian baseline would be a second archive.
+if host_machine.endian() == 'little'
 test('pagestore_persisted_format_fixture',
   pagestore_harness_python,
   args: [files('harness/pagestore_fixture.py'),
@@ -735,6 +739,7 @@ test('pagestore_persisted_format_fixture',
   suite: ['pagestore'],
   timeout: 300,
 )
+endif
 foreach prune_fault_scenario : [
   'page_prune_after_frontier',
   'page_compaction_after_publish',
