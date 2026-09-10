@@ -33,6 +33,9 @@ fi
 BIN=$(dirname "$PGCTL")
 ROOT=$(dirname "$BIN")
 export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
+# A loaded CI runner can take longer than pg_ctl's one-minute default to
+# reach a ready postmaster; a slow start is not a failed one.
+export PGCTLTIMEOUT=${PGCTLTIMEOUT:-180}
 DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 
 SOCKROOT=$(mktemp -d /tmp/psint-sock.XXXXXX)
@@ -2059,9 +2062,17 @@ assert "$($P -c "SELECT pagestore_rel_exists_asof('asof_t', 0, '$preCREATE'::pg_
 	"the fork does not exist at a horizon below its creation"
 assert "$($P -c "SELECT $szR > 10;")" "t" "the shipped table has a real page count at R"
 $P -q -c "DELETE FROM asof_t WHERE id > 10;" >/dev/null
-$P -c "VACUUM asof_t;" >/dev/null	# trims trailing pages: an LSN-stamped store truncate
-$P -c "CHECKPOINT;" >/dev/null
-szNow=$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, pg_current_wal_lsn());")
+# VACUUM trims the trailing pages (an LSN-stamped store truncate), but it
+# abandons the truncation when another backend asks for a conflicting lock,
+# so retry until the size settles instead of reading one interrupted attempt.
+szNow=
+for _ in 1 2 3 4 5; do
+	$P -c "VACUUM asof_t;" >/dev/null
+	$P -c "CHECKPOINT;" >/dev/null
+	szNow=$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, pg_current_wal_lsn());")
+	[ "$szNow" = "1" ] && break
+	sleep 1
+done
 assert "$($P -c "SELECT $szNow < $szR;")" "t" "the newest horizon sees the vacuum-truncated size"
 assert "$szNow" "1" \
 	"the newest as-of size is the vacuum-truncated one page (rows 1-10 live in block 0)"
