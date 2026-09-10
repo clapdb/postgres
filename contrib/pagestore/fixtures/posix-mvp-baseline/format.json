@@ -72,6 +72,12 @@
     "version": 2
   },
   {
+    "family": "store_config",
+    "artifact": ".pagestore-nshards decimal shard count",
+    "magic": "0x00000000",
+    "version": 1
+  },
+  {
     "family": "timelines",
     "artifact": "timelines record",
     "magic": "0x324d4c54",

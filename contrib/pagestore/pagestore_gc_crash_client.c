@@ -1301,6 +1301,27 @@ fixture_verify(void)
 	if (execute()->status != PS_STATUS_OK ||
 		ch->req_lsn != FIXTURE_FORK_LSN + DELETE_WAL_BYTES)
 		die("fixture branch lost its WAL-index progress");
+	/* The progress record is only half the log format: read the seeded
+	 * entry back so the current WAL-index record reader is exercised too. */
+	{
+		PsWalRec	out[4];
+
+		set_relation(ch);
+		set_timeline(ch, FIXTURE_BRANCH, incarnation);
+		ch->opcode = PS_OP_WAL_INDEX_GET;
+		ch->blocknum = 0;
+		ch->nblocks = 0;
+		ch->req_lsn = FIXTURE_FORK_LSN + DELETE_WAL_BYTES;
+		ch->pad1 = 0;
+		if (execute()->status != PS_STATUS_OK || (int) ch->result < 1)
+			die("fixture branch lost its WAL-index entry");
+		memcpy(out, ch->data, sizeof(*out));
+		if (out[0].lsn != FIXTURE_FORK_LSN + 16 ||
+			out[0].end_lsn != FIXTURE_FORK_LSN + 17 ||
+			(out[0].flags & (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI)) !=
+			(PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI))
+			die("fixture branch WAL-index entry changed");
+	}
 	if (timeline_state(FIXTURE_DELETED_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
 		die("fixture deleted branch is not DELETED");
 	free(page);

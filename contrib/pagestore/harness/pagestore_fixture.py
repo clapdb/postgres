@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import gzip
-import io
 import json
 import os
 import shutil
@@ -161,6 +160,10 @@ MUTATIONS = [
              lambda p: flip_byte(p, -1), OPEN_REJECTED),
     # the epoch watermark is the acknowledged length of its log; a damaged
     # one cannot be told from a lost suffix, so the store fails closed
+    # the shard count is a headerless decimal; a value it never wrote is
+    # damage, and a store that cannot prove its shard count fails closed
+    mutation("store_config.shard_count", ".pagestore-nshards",
+             lambda p: flip_byte(p, 0), OPEN_REJECTED),
     mutation("walidx_watermark.crc", "walidx_0_0_e*.size",
              lambda p: flip_byte(p, 8), OPEN_REJECTED),
     mutation("walidx_watermark.truncated", "walidx_0_0_e*.size",

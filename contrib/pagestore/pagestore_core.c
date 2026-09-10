@@ -1770,6 +1770,11 @@ layer_matches_read_shard(const PsLayerDesc *layer, uint32_t shard)
 		(layer->legacy_shard_zero && layer_shard == 0 && shard != 0);
 }
 
+/* The shard count is persisted as a decimal number with no header, so its
+ * schema number is what a fixture pins: a different representation must bump
+ * it and ship a fixture that carries the new one. */
+#define PS_STORE_SHARD_COUNT_SCHEMA 1
+
 static int
 store_shard_count_path(const char *store_dir, char *path, size_t path_len)
 {
@@ -19379,6 +19384,10 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		{"walidx_log", "walidx_<tl>_<shard> record", WALIDX_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> progress record",
 		 WALIDX_PROGRESS_MAGIC, 0},
+		/* Headerless persisted configuration: the schema number stands in
+		 * for a magic, which is why it reports zero. */
+		{"store_config", ".pagestore-nshards decimal shard count", 0,
+		 PS_STORE_SHARD_COUNT_SCHEMA},
 	};
 
 	*out = identities;
