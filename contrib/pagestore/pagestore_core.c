@@ -2537,6 +2537,25 @@ compact_same_page(const CompactOrder *a, const CompactOrder *b)
 		a->key.forkNum == b->key.forkNum && a->key.klass == b->key.klass;
 }
 
+/* The first index whose value is at least x, in a sorted array. */
+static uint32_t
+lower_bound_u64(const uint64_t *values, uint32_t n, uint64_t x)
+{
+	uint32_t	lo = 0,
+				hi = n;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (values[mid] < x)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 /* Collapse a sorted array to its distinct values, returning how many remain. */
 static uint32_t
 unique_sorted_u64(uint64_t *values, uint32_t n)
@@ -2634,18 +2653,8 @@ static int
 artifact_generation_required(const uint64_t *required, uint32_t nrequired,
 							 uint64_t lsn)
 {
-	uint32_t	lo = 0,
-				hi = nrequired;
+	uint32_t	lo = lower_bound_u64(required, nrequired, lsn);
 
-	while (lo < hi)
-	{
-		uint32_t	mid = lo + (hi - lo) / 2;
-
-		if (required[mid] < lsn)
-			lo = mid + 1;
-		else
-			hi = mid;
-	}
 	return lo < nrequired && required[lo] == lsn;
 }
 
@@ -4608,11 +4617,36 @@ static void
 page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 							   uint32_t nrec)
 {
-	/* the cutoff of every retired artifact version, at most one per dropped
-	 * record; the fences they back are settled once each below */
-	uint64_t   *retired = nrec != 0
-		? malloc((size_t) nrec * sizeof(*retired)) : NULL;
-	uint32_t	nretired = 0;
+	/*
+	 * The artifact cutoffs these records retire, each with the versions
+	 * retired at it.  One dropped identity can match several in-memory
+	 * versions -- legacy records share an identity even when their bytes
+	 * differ -- so the counts are accumulated per cutoff rather than one
+	 * entry per retired version, which no per-record bound would cover.
+	 */
+	uint64_t   *cutoffs = nrec != 0
+		? malloc((size_t) nrec * sizeof(*cutoffs)) : NULL;
+	uint32_t   *retired = NULL;
+	uint32_t	ncutoffs = 0;
+
+	if (cutoffs != NULL)
+	{
+		for (uint32_t r = 0; r < nrec; r++)
+			if (recs[r].lsn != 0 &&
+				(recs[r].key.klass == PS_KLASS_SLRU ||
+				 recs[r].key.klass == PS_KLASS_READER_SNAPSHOT))
+				cutoffs[ncutoffs++] = recs[r].lsn;
+		qsort(cutoffs, ncutoffs, sizeof(*cutoffs), cmp_u64);
+		ncutoffs = unique_sorted_u64(cutoffs, ncutoffs);
+		retired = ncutoffs != 0
+			? calloc(ncutoffs, sizeof(*retired)) : NULL;
+		if (retired == NULL)
+		{
+			free(cutoffs);
+			cutoffs = NULL;
+			ncutoffs = 0;
+		}
+	}
 
 	for (uint32_t r = 0; r < nrec;)
 	{
@@ -4658,8 +4692,10 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 			else if (e->key.klass == PS_KLASS_SLRU ||
 					 e->key.klass == PS_KLASS_READER_SNAPSHOT)
 			{
-				if (retired != NULL)
-					retired[nretired++] = v->lsn;
+				uint32_t	at = lower_bound_u64(cutoffs, ncutoffs, v->lsn);
+
+				if (at < ncutoffs && cutoffs[at] == v->lsn)
+					retired[at]++;
 				else
 					artifact_fence_forget_versions(timeline, v->lsn, 1);
 			}
@@ -4681,20 +4717,11 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 	 * searched the fence table from the start for each, under the shard and
 	 * map write locks; count them per cutoff and search once.
 	 */
-	if (retired != NULL)
-	{
-		qsort(retired, nretired, sizeof(*retired), cmp_u64);
-		for (uint32_t i = 0; i < nretired;)
-		{
-			uint32_t	j = i + 1;
-
-			while (j < nretired && retired[j] == retired[i])
-				j++;
-			artifact_fence_forget_versions(timeline, retired[i], j - i);
-			i = j;
-		}
-		free(retired);
-	}
+	for (uint32_t i = 0; i < ncutoffs; i++)
+		if (retired[i] != 0)
+			artifact_fence_forget_versions(timeline, cutoffs[i], retired[i]);
+	free(cutoffs);
+	free(retired);
 
 	const PsKey *last_wal_less = NULL;
 
