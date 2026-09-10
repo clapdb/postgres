@@ -20,6 +20,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2261,36 +2262,99 @@ def _gc_fault_stage(fault_name: str) -> str | None:
     return GC_STAGES.get(fault_name)
 
 
-def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
-    """Check process-abort physical state before recovery mutates the store.
+MANIFEST_MAGIC = 0x504D414E
+MANIFEST_VERSION = 3
+MANIFEST_ADD_LAYER = 1
+MANIFEST_MARK_DELETE = 4
 
-    Every stage follows a durable replacement publication, so the manifest
-    is published and at least the replacement layer exists; the retired
-    sources are unlinked only by recovery, so more than one layer remains.
+
+def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
+    """(type, payload) of every complete layers.manifest record, in order."""
+    manifest = store / "layers.manifest"
+    if not manifest.exists():
+        return []
+    data = manifest.read_bytes()
+    records: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset + 20 <= len(data):
+        magic, version, kind, length, _crc = struct.unpack_from("<IIIII", data, offset)
+        if magic != MANIFEST_MAGIC or version != MANIFEST_VERSION:
+            break
+        if offset + 20 + length > len(data):
+            break
+        records.append((kind, data[offset + 20:offset + 20 + length]))
+        offset += 20 + length
+    return records
+
+
+def _manifest_names_layer(records: list[tuple[int, bytes]], kind: int, layer_id: int) -> bool:
+    needle = struct.pack("<Q", layer_id)
+    return any(k == kind and needle in payload for k, payload in records)
+
+
+def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
+    """Check the stage-specific durable state before recovery mutates the store.
+
+    The replacement layer file is sealed before the frontier advances, its
+    manifest ADD lands after the frontier probe, and the sources' tombstones
+    after the publication probe.  The newest layer id on disk is the
+    replacement; whether the manifest names it, and whether any tombstone
+    exists yet, tells the three boundaries apart.
     """
     files = _canonical_layer_files(store)
-    manifest = store / "layers.manifest"
-    manifest_size = manifest.stat().st_size if manifest.exists() else 0
-    if manifest_size == 0:
-        raise OracleMismatch(f"after_{stage} crash left no published layers.manifest")
     if len(files) < 2:
         raise OracleMismatch(
             f"after_{stage} crash left {len(files)} canonical layer files, "
             "expected the replacement next to its retired sources"
         )
-    if stage == "frontier" and not (store / "page-prune.frontiers").exists():
-        raise OracleMismatch("after_frontier did not leave a durable page-prune frontier")
+    records = _manifest_records(store)
+    if not records:
+        raise OracleMismatch(f"after_{stage} crash left no published layers.manifest")
+    ids = {int(path.name.rsplit("_", 1)[1], 16) for path in files}
+    replacement = max(ids)
+    published = _manifest_names_layer(records, MANIFEST_ADD_LAYER, replacement)
+    # earlier flush-driven passes may have retired layers of their own; only
+    # tombstones on the sources still on disk belong to the crashed pass
+    tombstones = sum(
+        1 for layer_id in ids
+        if layer_id != replacement and
+        _manifest_names_layer(records, MANIFEST_MARK_DELETE, layer_id)
+    )
+    if stage == "frontier":
+        if not (store / "page-prune.frontiers").exists():
+            raise OracleMismatch("after_frontier did not leave a durable page-prune frontier")
+        if published:
+            raise OracleMismatch(
+                "after_frontier crash already published the replacement layer"
+            )
+    elif stage == "publish":
+        if not published:
+            raise OracleMismatch(
+                f"after_publish crash did not publish replacement layer {replacement:#x}"
+            )
+        if tombstones:
+            raise OracleMismatch(
+                f"after_publish crash already wrote {tombstones} source tombstone(s)"
+            )
+    elif stage == "mark_delete":
+        if not published or tombstones == 0:
+            raise OracleMismatch(
+                "after_mark_delete crash left no source tombstone behind the "
+                f"published replacement (published={published}, tombstones={tombstones})"
+            )
 
 
 def _check_gc_recovery(
     inspector: Path,
     shm: str,
     inspection_schema: dict[str, Any],
+    store: Path,
     stage: str,
     timeout: float,
 ) -> None:
     """After recovery the manifest is sane, the retired sources are gone once
-    cleanup has resumed, and the retained horizon is the configured cutoff."""
+    cleanup has resumed (only the replacement remains, in the manifest and on
+    disk), and the retained horizon is the configured cutoff."""
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -2302,14 +2366,16 @@ def _check_gc_recovery(
             )
         layer_count = manifest.get("layer_count")
         deleting = manifest.get("deleting_layers")
+        files = _canonical_layer_files(store)
         if isinstance(layer_count, int) and isinstance(deleting, int) and \
-                deleting == 0 and layer_count == manifest.get("local_layers"):
+                deleting == 0 and layer_count == manifest.get("local_layers") == 1 and \
+                len(files) == 1:
             break
         now = time.monotonic()
         if now >= deadline:
             raise HarnessTimeout(
-                f"after_{stage} recovery did not finish retiring sources within "
-                f"{poll_timeout:.3f}s; last manifest={manifest!r}"
+                f"after_{stage} recovery did not retire the source layers within "
+                f"{poll_timeout:.3f}s; last manifest={manifest!r}, files={[f.name for f in files]!r}"
             )
         time.sleep(min(0.05, deadline - now))
     timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
@@ -2684,8 +2750,16 @@ def run_daemon_fault_recovery(
         daemon_log.touch()
         emit("run_start", shm_base=shm_base)
         current_action_id = action["id"]
-        emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
-             armed_by="workload" if gc_seed_actions else "harness")
+        if gc_seed_actions:
+            # the workload creates the marker itself; fault_arm is recorded
+            # when that marker is observed, so the event log places the
+            # arming after the history writes it must follow
+            emit("fault_configured", target="store", name=fault_name, hit=fault_hit,
+                 armed_by="workload")
+        else:
+            emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
+                 armed_by="harness")
+        workload_armed = not gc_seed_actions
         process = start_daemon(True, action["id"])
         if seed_actions:
             wait_ready(process)
@@ -2696,6 +2770,10 @@ def run_daemon_fault_recovery(
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
             while process.poll() is None and time.monotonic() < deadline:
+                if not workload_armed and marker.exists():
+                    workload_armed = True
+                    emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
+                         armed_by="workload")
                 if layer_client_process is not None and layer_client_process.poll() is not None:
                     if layer_client_process.returncode == 0:
                         raise FaultNotReached(
@@ -2705,6 +2783,12 @@ def run_daemon_fault_recovery(
                         f"layer workload exited with status {layer_client_process.returncode}"
                     )
                 time.sleep(0.02)
+            if not workload_armed and marker.exists():
+                # the daemon may have crashed within the same poll interval
+                # in which the workload armed it
+                workload_armed = True
+                emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
+                     armed_by="workload")
             if process.poll() is None:
                 raise FaultNotReached(
                     f"deadline waiting for fault {fault_name!r} expired; expected crash was unhit"
@@ -2864,7 +2948,7 @@ def run_daemon_fault_recovery(
             _check_layer_manifest(manifest, layer_stage, False)
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
-            _check_gc_recovery(inspector, shm, inspection_schema, gc_stage, timeout)
+            _check_gc_recovery(inspector, shm, inspection_schema, store, gc_stage, timeout)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
@@ -2886,7 +2970,7 @@ def run_daemon_fault_recovery(
             )
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
-            _check_gc_recovery(inspector, shm, inspection_schema, gc_stage, timeout)
+            _check_gc_recovery(inspector, shm, inspection_schema, store, gc_stage, timeout)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         emit("run_pass")

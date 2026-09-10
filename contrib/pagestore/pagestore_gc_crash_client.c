@@ -249,6 +249,8 @@ die_page(const char *message, uint32_t block, const unsigned char *page)
 	exit(1);
 }
 
+/* 1 when a version at or below lsn is served, 0 when the daemon reports
+ * none, -1 when the read itself failed.  A failure is never "pruned". */
 static int
 read_at(unsigned char *page, uint32_t block, uint64_t lsn)
 {
@@ -259,7 +261,7 @@ read_at(unsigned char *page, uint32_t block, uint64_t lsn)
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
 	if (execute()->status != PS_STATUS_OK)
-		return 0;
+		return -1;
 	if (ch->result != 0 && page != NULL)
 		memcpy(page, ch->data, page_size);
 	return ch->result != 0;
@@ -268,7 +270,11 @@ read_at(unsigned char *page, uint32_t block, uint64_t lsn)
 static int
 read_at_found(uint32_t block, uint64_t lsn)
 {
-	return read_at(NULL, block, lsn);
+	int			found = read_at(NULL, block, lsn);
+
+	if (found < 0)
+		die("as-of read failed after recovery");
+	return found;
 }
 
 static void
@@ -286,7 +292,7 @@ verify(void)
 	if (!page_has_tag(page, 1))
 		die_page("recovery lost a block present only in the compacted layer", 1, page);
 	/* The configured owner at 3500 keeps the newest block 0 at or below it. */
-	if (!read_at(page, 0, 3500))
+	if (read_at(page, 0, 3500) != 1)
 		die("recovery lost the retained block 0 history at the cutoff");
 	if (!page_has_tag(page, 30))
 		die_page("recovery serves the wrong block 0 version at the cutoff", 0, page);
