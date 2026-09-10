@@ -2537,6 +2537,18 @@ compact_same_page(const CompactOrder *a, const CompactOrder *b)
 		a->key.forkNum == b->key.forkNum && a->key.klass == b->key.klass;
 }
 
+/* Collapse a sorted array to its distinct values, returning how many remain. */
+static uint32_t
+unique_sorted_u64(uint64_t *values, uint32_t n)
+{
+	uint32_t	out = 0;
+
+	for (uint32_t i = 0; i < n; i++)
+		if (out == 0 || values[out - 1] != values[i])
+			values[out++] = values[i];
+	return out;
+}
+
 /*
  * The exact-generation artifact classes (SLRU seeds, reader snapshots) are
  * consumed at exactly the LSN they were captured at; a consumer whose base
@@ -2548,50 +2560,93 @@ compact_same_page(const CompactOrder *a, const CompactOrder *b)
  * this compaction's input; a generation held only in layers outside the
  * input is unknown here, which only ever keeps more.
  */
+static int
+cmp_u64(const void *a, const void *b)
+{
+	uint64_t	x = *(const uint64_t *) a;
+	uint64_t	y = *(const uint64_t *) b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* The newest generation at or below the horizon, over the object's sorted
+ * distinct generations. */
 static uint64_t
 artifact_generation_at(const uint64_t *generations, uint32_t ngenerations,
 					   uint64_t horizon)
 {
-	uint64_t	best = 0;
+	uint32_t	lo = 0,
+				hi = ngenerations;
 
-	for (uint32_t i = 0; i < ngenerations; i++)
-		if (generations[i] != 0 && generations[i] <= horizon &&
-			generations[i] > best)
-			best = generations[i];
-	return best;
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (generations[mid] <= horizon)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo == 0 ? 0 : generations[lo - 1];
+}
+
+/*
+ * The generations of one object that any retained horizon can still consume,
+ * built once for the whole object rather than rederived for every page copy.
+ *
+ * A seed is a replay base: a horizon above the floor is served by the newest
+ * seed at or below it plus the WAL after it, so the newest generation below
+ * the floor, and below every fence, survives.  A reader snapshot is not: its
+ * consumer resolves it at exactly the horizon it was captured for, so a fence
+ * keeps it only by naming that horizon, and a fence above it -- a live
+ * descendant branch, say -- never resolves it.  A required value that is not
+ * a generation of this object simply matches no record.
+ */
+static uint32_t
+artifact_required_generations(const uint64_t *generations, uint32_t ngenerations,
+							  uint64_t floor, const PsPruneFence *fences,
+							  uint32_t nfences, int replay_base,
+							  uint64_t *required)
+{
+	uint32_t	n = 0;
+
+	if (replay_base)
+	{
+		uint64_t	base = artifact_generation_at(generations, ngenerations, floor);
+
+		if (base != 0)
+			required[n++] = base;
+	}
+	for (uint32_t f = 0; f < nfences; f++)
+	{
+		uint64_t	value = replay_base
+			? artifact_generation_at(generations, ngenerations, fences[f].lsn)
+			: fences[f].lsn;
+
+		if (value != 0)
+			required[n++] = value;
+	}
+	qsort(required, n, sizeof(*required), cmp_u64);
+	return unique_sorted_u64(required, n);
 }
 
 static int
-artifact_generation_needed(uint64_t lsn, const uint64_t *generations,
-						   uint32_t ngenerations, uint64_t floor,
-						   const PsPruneFence *fences, uint32_t nfences,
-						   int replay_base)
+artifact_generation_required(const uint64_t *required, uint32_t nrequired,
+							 uint64_t lsn)
 {
-	/* A seed is a replay base: a horizon above the floor is served by the
-	 * newest seed at or below it plus the WAL after it, so the newest
-	 * generation below the floor must survive.  A reader snapshot is not:
-	 * its consumer resolves it at exactly the horizon it was captured for,
-	 * so once no fence names that horizon nothing can ask for it, and
-	 * keeping it would pin its control era and WAL floor forever. */
-	if (replay_base &&
-		artifact_generation_at(generations, ngenerations, floor) == lsn)
-		return 1;
-	for (uint32_t f = 0; f < nfences; f++)
+	uint32_t	lo = 0,
+				hi = nrequired;
+
+	while (lo < hi)
 	{
-		/* The same distinction applies to every retained horizon, not only
-		 * the floor: a fence above a reader snapshot -- a live descendant
-		 * branch, say -- never resolves that snapshot, so only a fence that
-		 * names its horizon exactly can keep it. */
-		if (!replay_base)
-		{
-			if (fences[f].lsn == lsn)
-				return 1;
-			continue;
-		}
-		if (artifact_generation_at(generations, ngenerations, fences[f].lsn) == lsn)
-			return 1;
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (required[mid] < lsn)
+			lo = mid + 1;
+		else
+			hi = mid;
 	}
-	return 0;
+	return lo < nrequired && required[lo] == lsn;
 }
 
 /*
@@ -2656,6 +2711,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint32_t	ncontrol_fences = 0;
 	uint64_t   *obj_generations = NULL;
 	uint32_t	obj_ngenerations = 0;
+	uint64_t   *obj_required = NULL;
+	uint32_t	obj_nrequired = 0;
 	uint32_t	obj_hi = 0;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
@@ -2672,7 +2729,10 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	selected = malloc((size_t) *nrec * sizeof(*selected));
 	dropped = malloc((size_t) *nrec * sizeof(*dropped));
 	obj_generations = malloc((size_t) *nrec * sizeof(*obj_generations));
-	if (!order || !versions || !keep || !selected || !dropped || !obj_generations)
+	/* one required generation per fence, plus the floor's */
+	obj_required = malloc(((size_t) nfences + 1) * sizeof(*obj_required));
+	if (!order || !versions || !keep || !selected || !dropped ||
+		!obj_generations || !obj_required)
 	{
 		free(order);
 		free(versions);
@@ -2680,6 +2740,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		free(selected);
 		free(dropped);
 		free(obj_generations);
+		free(obj_required);
 		free(fences);
 		free(control_fences);
 		return -1;
@@ -2721,8 +2782,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			if (floor != 0 && (exact_generations || latest_state))
 			{
 				PsPruneFence plan_floor = {floor, UINT64_MAX};
-				const uint64_t *generations = NULL;
-				uint32_t	ngenerations = 0;
 
 				/* The live mirror, tombstones, and watermark are read at the
 				 * newest horizon by their consumer, and by a branch at its
@@ -2753,23 +2812,26 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 							obj_hi++;
 						obj_ngenerations = 0;
 						for (uint32_t i = lo; i < obj_hi; i++)
-						{
-							uint64_t	g = order[i].version.lsn;
-							uint32_t	j;
-
-							/* copies of one version are adjacent, and pages
-							 * of one generation share its LSN */
-							if (i > lo && order[i - 1].version.lsn == g)
-								continue;
-							for (j = 0; j < obj_ngenerations; j++)
-								if (obj_generations[j] == g)
-									break;
-							if (j == obj_ngenerations)
-								obj_generations[obj_ngenerations++] = g;
-						}
+							if (order[i].version.lsn != 0)
+								obj_generations[obj_ngenerations++] =
+									order[i].version.lsn;
+						/* Sorting once beats deduplicating by searching what
+						 * has been found so far, which is quadratic in the
+						 * generations an object accumulates, and it leaves
+						 * the list ordered for the horizon lookups below. */
+						qsort(obj_generations, obj_ngenerations,
+							  sizeof(*obj_generations), cmp_u64);
+						obj_ngenerations = unique_sorted_u64(obj_generations,
+															 obj_ngenerations);
+						/* The generations any retained horizon can still
+						 * consume do not depend on the page, so resolve the
+						 * floor and every fence once for the object instead
+						 * of once per surviving copy. */
+						obj_nrequired = artifact_required_generations(
+							obj_generations, obj_ngenerations, floor,
+							fences, nfences, klass == PS_KLASS_SLRU,
+							obj_required);
 					}
-					generations = obj_generations;
-					ngenerations = obj_ngenerations;
 				}
 				/* SLRU-class objects and reader artifacts are consumed as-of
 				 * a horizon their consumer pinned first (a reader, a branch
@@ -2794,14 +2856,13 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				 * a copy from an older generation of a page the newer
 				 * generation no longer has serves no consumer and would keep
 				 * its control era fenced forever. */
-				if (generations != NULL)
+				if (exact_generations)
 					for (uint32_t i = first; i < end; i++)
 						if (keep[i - first] && order[i].version.lsn != 0 &&
 							order[i].version.lsn < floor &&
-							!artifact_generation_needed(order[i].version.lsn,
-														generations, ngenerations,
-														floor, fences, nfences,
-														klass == PS_KLASS_SLRU))
+							!artifact_generation_required(obj_required,
+														  obj_nrequired,
+														  order[i].version.lsn))
 							keep[i - first] = 0;
 				/* zero-version (WAL-less) state is latest-only: its newest
 				 * admission stays whatever the plan says, every older
@@ -2846,6 +2907,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(selected);
 				free(dropped);
 				free(obj_generations);
+				free(obj_required);
 				free(fences);
 				free(control_fences);
 				return -1;
@@ -2893,6 +2955,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	}
 	memcpy(recs, selected, (size_t) out * sizeof(*recs));
 	free(obj_generations);
+	free(obj_required);
 	free(order);
 	free(versions);
 	free(keep);
@@ -3450,7 +3513,8 @@ static void artifact_fence_reset(void);
 static void artifact_fence_note(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_reserve(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_release(uint32_t timeline, uint64_t lsn);
-static void artifact_fence_forget_version(uint32_t timeline, uint64_t lsn);
+static void artifact_fence_forget_versions(uint32_t timeline, uint64_t lsn,
+										   uint32_t versions);
 static void artifact_fence_forget(uint32_t timeline);
 
 static void
@@ -4544,6 +4608,12 @@ static void
 page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 							   uint32_t nrec)
 {
+	/* the cutoff of every retired artifact version, at most one per dropped
+	 * record; the fences they back are settled once each below */
+	uint64_t   *retired = nrec != 0
+		? malloc((size_t) nrec * sizeof(*retired)) : NULL;
+	uint32_t	nretired = 0;
+
 	for (uint32_t r = 0; r < nrec;)
 	{
 		uint32_t	end = r + 1;
@@ -4587,7 +4657,12 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 				e->vers[out++] = *v;
 			else if (e->key.klass == PS_KLASS_SLRU ||
 					 e->key.klass == PS_KLASS_READER_SNAPSHOT)
-				artifact_fence_forget_version(timeline, v->lsn);
+			{
+				if (retired != NULL)
+					retired[nretired++] = v->lsn;
+				else
+					artifact_fence_forget_versions(timeline, v->lsn, 1);
+			}
 		}
 		e->nver = out;
 		r = end;
@@ -4599,6 +4674,28 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 	 * every superseded admission of the same page, under both the shard and
 	 * map write locks.
 	 */
+	/*
+	 * One fence entry backs every page of a snapshot generation, and a
+	 * released pin can retire several generations at once, so the versions
+	 * retired at one cutoff arrive together.  Settling them one at a time
+	 * searched the fence table from the start for each, under the shard and
+	 * map write locks; count them per cutoff and search once.
+	 */
+	if (retired != NULL)
+	{
+		qsort(retired, nretired, sizeof(*retired), cmp_u64);
+		for (uint32_t i = 0; i < nretired;)
+		{
+			uint32_t	j = i + 1;
+
+			while (j < nretired && retired[j] == retired[i])
+				j++;
+			artifact_fence_forget_versions(timeline, retired[i], j - i);
+			i = j;
+		}
+		free(retired);
+	}
+
 	const PsKey *last_wal_less = NULL;
 
 	for (uint32_t r = 0; r < nrec; r++)
@@ -14964,12 +15061,15 @@ artifact_fence_note(uint32_t timeline, uint64_t lsn)
 	pthread_mutex_unlock(&artifact_fence_lock);
 }
 
-/* One artifact version at this cutoff was retired by compaction.  The last
- * one releases the fence, so the control era it named can be retired too. */
+/* Artifact versions at this cutoff were retired by compaction.  The last one
+ * releases the fence, so the control era it named can be retired too.  One
+ * fence backs every page of a snapshot and every generation a released pin
+ * retires, so the count comes in at once and the table is searched once. */
 static void
-artifact_fence_forget_version(uint32_t timeline, uint64_t lsn)
+artifact_fence_forget_versions(uint32_t timeline, uint64_t lsn,
+							   uint32_t versions)
 {
-	if (lsn == 0)
+	if (lsn == 0 || versions == 0)
 		return;
 	pthread_mutex_lock(&artifact_fence_lock);
 	if (nartifact_fences != UINT32_MAX)
@@ -14977,9 +15077,10 @@ artifact_fence_forget_version(uint32_t timeline, uint64_t lsn)
 			if (artifact_fences[i].timeline == timeline &&
 				artifact_fences[i].lsn == lsn)
 			{
-				if (artifact_fences[i].versions != 0 &&
-					artifact_fences[i].versions != UINT32_MAX)
-					artifact_fences[i].versions--;
+				if (artifact_fences[i].versions != UINT32_MAX)
+					artifact_fences[i].versions -=
+						versions < artifact_fences[i].versions
+						? versions : artifact_fences[i].versions;
 				if (artifact_fences[i].versions == 0 &&
 					artifact_fences[i].pending == 0)
 				{
