@@ -438,7 +438,15 @@ fence).  The live mirror, tombstones, and watermark are read at the newest
 horizon by their consumer and at the fork point by a branch, so they keep
 only the newest version and the newest at or below each fence.  Retried
 copies collapse to one, and a retired artifact releases the control era it
-fenced (`pagestore_control_prune_test`).
+fenced (`pagestore_control_prune_test`).  One limitation is deliberate and
+documented: a generation is defined by the pages that carry its LSN, and
+nothing marks a publication complete, so a publication that appends some
+pages and then fails is indistinguishable from an object that shrank.  Such a
+partial generation supersedes the complete one below it, and a consumer at
+that cutoff then fails to reconstruct rather than silently reading a stale
+page from the older generation.  Making the newer generation wait for a
+durable completion marker is part of the artifact-publication protocol, not
+of retention.
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):

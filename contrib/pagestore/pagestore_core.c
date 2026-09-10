@@ -2629,6 +2629,9 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint32_t	nfences = 0;
 	PsPruneFence *control_fences = NULL;
 	uint32_t	ncontrol_fences = 0;
+	uint64_t   *obj_generations = NULL;
+	uint32_t	obj_ngenerations = 0;
+	uint32_t	obj_hi = 0;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
@@ -2643,13 +2646,15 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	keep = malloc(*nrec);
 	selected = malloc((size_t) *nrec * sizeof(*selected));
 	dropped = malloc((size_t) *nrec * sizeof(*dropped));
-	if (!order || !versions || !keep || !selected || !dropped)
+	obj_generations = malloc((size_t) *nrec * sizeof(*obj_generations));
+	if (!order || !versions || !keep || !selected || !dropped || !obj_generations)
 	{
 		free(order);
 		free(versions);
 		free(keep);
 		free(selected);
 		free(dropped);
+		free(obj_generations);
 		free(fences);
 		free(control_fences);
 		return -1;
@@ -2691,7 +2696,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			if (floor != 0 && (exact_generations || latest_state))
 			{
 				PsPruneFence plan_floor = {floor, UINT64_MAX};
-				uint64_t   *generations = NULL;
+				const uint64_t *generations = NULL;
 				uint32_t	ngenerations = 0;
 
 				/* The live mirror, tombstones, and watermark are read at the
@@ -2706,27 +2711,40 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 							plan_floor.lsn = order[i].version.lsn;
 				if (exact_generations)
 				{
-					uint32_t	lo = first;
-					uint32_t	hi = end;
+					/* Every page of this object is contiguous in the sorted
+					 * order; its generations are their distinct version LSNs.
+					 * Compaction holds the shard and map write locks, so the
+					 * set is built once for the whole object and reused by
+					 * each of its page groups rather than rebuilt per page. */
+					if (first >= obj_hi)
+					{
+						uint32_t	lo = first;
 
-					/* every page of this object is contiguous in the sorted
-					 * order; its generations are their distinct version LSNs */
-					while (lo > 0 && key_eq(&order[lo - 1].key, &order[first].key))
-						lo--;
-					while (hi < *nrec && key_eq(&order[hi].key, &order[first].key))
-						hi++;
-					generations = malloc((size_t) (hi - lo) * sizeof(*generations));
-					if (generations != NULL)
-						for (uint32_t i = lo; i < hi; i++)
+						while (lo > 0 && key_eq(&order[lo - 1].key, &order[first].key))
+							lo--;
+						obj_hi = end;
+						while (obj_hi < *nrec &&
+							   key_eq(&order[obj_hi].key, &order[first].key))
+							obj_hi++;
+						obj_ngenerations = 0;
+						for (uint32_t i = lo; i < obj_hi; i++)
 						{
 							uint64_t	g = order[i].version.lsn;
-							int			seen = 0;
+							uint32_t	j;
 
-							for (uint32_t j = 0; j < ngenerations && !seen; j++)
-								seen = generations[j] == g;
-							if (!seen)
-								generations[ngenerations++] = g;
+							/* copies of one version are adjacent, and pages
+							 * of one generation share its LSN */
+							if (i > lo && order[i - 1].version.lsn == g)
+								continue;
+							for (j = 0; j < obj_ngenerations; j++)
+								if (obj_generations[j] == g)
+									break;
+							if (j == obj_ngenerations)
+								obj_generations[obj_ngenerations++] = g;
 						}
+					}
+					generations = obj_generations;
+					ngenerations = obj_ngenerations;
 				}
 				/* SLRU-class objects and reader artifacts are consumed as-of
 				 * a horizon their consumer pinned first (a reader, a branch
@@ -2759,7 +2777,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 														generations, ngenerations,
 														floor, fences, nfences))
 							keep[i - first] = 0;
-				free(generations);
 				/* zero-version (WAL-less) state is latest-only: its newest
 				 * admission stays whatever the plan says, every older
 				 * zero-version admission is superseded and goes */
@@ -2802,6 +2819,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(keep);
 				free(selected);
 				free(dropped);
+				free(obj_generations);
 				free(fences);
 				free(control_fences);
 				return -1;
@@ -2848,6 +2866,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		first = end;
 	}
 	memcpy(recs, selected, (size_t) out * sizeof(*recs));
+	free(obj_generations);
 	free(order);
 	free(versions);
 	free(keep);
