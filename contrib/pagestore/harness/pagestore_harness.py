@@ -2730,6 +2730,120 @@ def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
     }
 
 
+FORKMETA_CUTOFF_LSN = 3500          # the workload's sole proven page frontier
+FORKMETA_SEED_FIRST_REL = 5000      # the gc client's oracle relations ...
+FORKMETA_SEED_RELS = 32             # ... and their count
+FORKMETA_SET_KIND = 1
+
+
+def _forkmeta_source_records(store: Path) -> list[dict[str, Any]] | None:
+    """Every record of the shared forkmeta log, or None when the log is
+    absent or not a whole number of well-formed V2 records."""
+    try:
+        data = (store / "forkmeta").read_bytes()
+    except OSError:
+        return None
+    if len(data) % FORKMETA_RECORD_BYTES != 0:
+        return None
+    records = []
+    for offset in range(0, len(data), FORKMETA_RECORD_BYTES):
+        record = data[offset:offset + FORKMETA_RECORD_BYTES]
+        magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
+        if magic != FORKMETA_V2_MAGIC or rec_len != FORKMETA_RECORD_BYTES:
+            return None
+        lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
+        records.append({
+            "timeline": timeline, "key": struct.unpack_from("=IIIiI", record, 12),
+            "lsn": lsn, "admission_seq": admission_seq, "order_id": order_id,
+            "nblocks": struct.unpack_from("=I", record, 56)[0], "kind": record[60],
+        })
+    return records
+
+
+def _forkmeta_seeded_truncates_missing(records: list[dict[str, Any]], above_lsn: int) -> list[str]:
+    """The seeded truncate events (one per oracle relation, at a known LSN)
+    above the given LSN that the log no longer carries."""
+    present = {
+        (r["key"][2], r["lsn"]) for r in records
+        if r["timeline"] == 0 and r["kind"] == FORKMETA_SET_KIND
+    }
+    missing = []
+    for index in range(FORKMETA_SEED_RELS):
+        lsn = 2500 + index if index % 2 == 0 else 4500 + index
+        rel = FORKMETA_SEED_FIRST_REL + index
+        if lsn > above_lsn and (rel, lsn) not in present:
+            missing.append(f"rel {rel} truncate@{lsn}")
+    return missing
+
+
+def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> list[dict[str, Any]]:
+    """The fork-size records of one immutable snapshot part (after its
+    80-byte payload header); empty when the part cannot be read."""
+    path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    records = []
+    for offset in range(80, len(data) - FORKMETA_RECORD_BYTES + 1, FORKMETA_RECORD_BYTES):
+        chunk = data[offset:offset + FORKMETA_RECORD_BYTES]
+        records.append({
+            "timeline": struct.unpack_from("=I", chunk, 8)[0],
+            "key": struct.unpack_from("=IIIiI", chunk, 12),
+            "lsn": struct.unpack_from("=Q", chunk, 32)[0], "kind": chunk[60],
+        })
+    return records
+
+
+def _forkmeta_generation_incomplete(store: Path, record: dict[str, Any]) -> str | None:
+    """Why a staged or selected generation does not carry the seeded
+    history: its tail must hold every seeded truncate above the cutoff and
+    its checkpoint a size for every seeded relation."""
+    missing = _forkmeta_seeded_truncates_missing(
+        _forkmeta_part_records(store, record, "tail"), record["cutoff_lsn"])
+    if missing:
+        return f"tail of generation {record['generation']} lacks {missing!r}"
+    checkpointed = {
+        r["key"][2] for r in _forkmeta_part_records(store, record, "checkpoint")
+        if r["timeline"] == 0
+    }
+    absent = [
+        rel for rel in range(FORKMETA_SEED_FIRST_REL, FORKMETA_SEED_FIRST_REL + FORKMETA_SEED_RELS)
+        if rel not in checkpointed
+    ]
+    if absent:
+        return f"checkpoint of generation {record['generation']} lacks relations {absent!r}"
+    return None
+
+
+def _forkmeta_old_epoch_intact(store: Path, selected: dict[str, Any]) -> str | None:
+    """Why the source is not the complete epoch that preceded the selected
+    generation: it must be a well-formed log that starts with the previous
+    generation's marker (or, for the first generation, with no marker at
+    all), names the selected generation nowhere, and still carries every
+    seeded truncate event that epoch is responsible for."""
+    records = _forkmeta_source_records(store)
+    if not records:
+        return "source absent, empty or malformed"
+    head = records[0]
+    previous = selected["generation"] - 1
+    if previous == 0:
+        if head["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND:
+            return f"first generation's source starts with a marker {head!r}"
+        floor = 0
+    elif head["kind"] != FORKMETA_SNAPSHOT_BASE_KIND or head["order_id"] != previous:
+        return f"source does not start with generation {previous}'s marker: {head!r}"
+    else:
+        floor = head["lsn"]
+    if any(r["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND and
+           r["order_id"] == selected["generation"] for r in records):
+        return "source already names the selected generation"
+    missing = _forkmeta_seeded_truncates_missing(records, floor)
+    if missing:
+        return f"source lost seeded events of the old epoch: {missing!r}"
+    return None
+
+
 def _forkmeta_marker_matches(store: Path, selected: dict[str, Any]) -> bool:
     """True when the source epoch starts with the selected generation's exact
     snapshot-base marker, the same test startup applies before it preserves
@@ -2768,25 +2882,61 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
                 f"after_prepare crash staged generation {prepared['generation']} "
                 f"with incomplete parts {broken!r}"
             )
+        if prepared["cutoff_lsn"] != FORKMETA_CUTOFF_LSN:
+            raise OracleMismatch(
+                f"after_prepare crash staged cutoff {prepared['cutoff_lsn']}, "
+                f"expected the proven frontier {FORKMETA_CUTOFF_LSN}"
+            )
+        incomplete = _forkmeta_generation_incomplete(store, prepared)
+        if incomplete is not None:
+            raise OracleMismatch(f"after_prepare crash: {incomplete}")
         return
     if selected is None:
         raise OracleMismatch(f"after_{stage} crash left no valid selected forkmeta manifest")
+    if prepared is not None or (store / FORKMETA_PREPARED).exists():
+        # the commit consumes the intent; a leftover would be re-committed or
+        # aborted by startup, which hides an incomplete commit
+        raise OracleMismatch(
+            f"after_{stage} crash left a prepared intent behind the selected "
+            f"generation {selected['generation']}: {prepared!r}"
+        )
     broken = _forkmeta_parts_valid(store, selected)
     if broken:
         raise OracleMismatch(
             f"after_{stage} crash selected generation {selected['generation']} "
             f"with invalid parts {broken!r}"
         )
+    if selected["cutoff_lsn"] != FORKMETA_CUTOFF_LSN:
+        raise OracleMismatch(
+            f"after_{stage} crash selected cutoff {selected['cutoff_lsn']}, "
+            f"expected the proven frontier {FORKMETA_CUTOFF_LSN}"
+        )
+    incomplete = _forkmeta_generation_incomplete(store, selected)
+    if incomplete is not None:
+        raise OracleMismatch(f"after_{stage} crash: {incomplete}")
     matches = _forkmeta_marker_matches(store, selected)
-    if stage == "forkmeta_manifest_commit" and matches:
-        raise OracleMismatch(
-            "after_manifest_commit crash already rewrote the forkmeta source"
-        )
-    if stage == "forkmeta_source_rewrite" and not matches:
-        raise OracleMismatch(
-            "after_source_rewrite crash left the forkmeta source without the "
-            f"selected generation's exact marker: {_forkmeta_source_head(store)!r}"
-        )
+    if stage == "forkmeta_manifest_commit":
+        # the complete old epoch is still the source behind the new manifest
+        stale = _forkmeta_old_epoch_intact(store, selected)
+        if stale is not None:
+            raise OracleMismatch(f"after_manifest_commit crash: {stale}")
+    if stage == "forkmeta_source_rewrite":
+        if not matches:
+            raise OracleMismatch(
+                "after_source_rewrite crash left the forkmeta source without the "
+                f"selected generation's exact marker: {_forkmeta_source_head(store)!r}"
+            )
+        # the rewritten source is the marker plus whatever was appended
+        # after the freeze; the seeded history lives in the parts, checked
+        # above, so the source only has to be well-formed and marker-only
+        # before the first post-freeze append
+        records = _forkmeta_source_records(store)
+        if records is None or any(
+                r["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND for r in records[1:]):
+            raise OracleMismatch(
+                "after_source_rewrite crash left a malformed rewritten source "
+                f"or a second marker: {records!r}"
+            )
     if stage == "forkmeta_snapshot_gc":
         expected = sorted(
             _forkmeta_part_name(selected["generation"], part)
@@ -2799,10 +2949,11 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
             )
 
 
-def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> None:
+def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> dict[str, Any]:
     """Recovery selects one durable generation whose parts are valid, finishes
     any staged or retired file cleanup, and serves the source behind that
-    generation's exact marker."""
+    generation's exact marker.  Returns the settled generation record so the
+    clean restart can be held to the same one."""
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -2815,7 +2966,12 @@ def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> None:
                     _forkmeta_part_name(selected["generation"], part)
                     for part in ("checkpoint", "tail")
                 ) and _forkmeta_marker_matches(store, selected):
-            return
+            if selected["cutoff_lsn"] != FORKMETA_CUTOFF_LSN:
+                raise OracleMismatch(
+                    f"after_{stage} recovery selected cutoff {selected['cutoff_lsn']}, "
+                    f"expected the proven frontier {FORKMETA_CUTOFF_LSN}"
+                )
+            return selected
         now = time.monotonic()
         if now >= deadline:
             raise HarnessTimeout(
@@ -3590,7 +3746,8 @@ def _check_gc_recovery(
             f"{timeline.get('retained_horizon')!r}, expected {expected_horizon}"
         )
     if workload == "forkmeta":
-        _check_forkmeta_recovery(store, stage, timeout)
+        return _check_forkmeta_recovery(store, stage, timeout)
+    return None
 
 
 def _gc_converged_state(store: Path) -> dict[str, Any]:
@@ -4292,9 +4449,11 @@ def run_daemon_fault_recovery(
             # nothing mutates the store between the two starts, so a restart
             # that republishes a generation is not idempotent
             if restarted_state != recovered_state:
+                # nothing changed between the two starts, so a restart that
+                # publishes a new generation is not idempotent
                 raise OracleMismatch(
-                    f"clean restart changed the settled state from "
-                    f"{recovered_state!r} to {restarted_state!r}"
+                    f"clean restart changed the settled state from {recovered_state!r} "
+                    f"to {restarted_state!r}"
                 )
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
