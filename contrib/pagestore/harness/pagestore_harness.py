@@ -995,10 +995,21 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 f"runtime daemon_fault_smoke requires {seed_actions[0]['op']} before the named fault"
             )
         fault = named[0]
-        if seed_actions and seed_actions[0]["op"] == "layer_seed" and fault["fault"] not in {
+        # The seeds are the only workloads this runtime runs, so a fault that
+        # only their state can reach needs the seed that creates it: without
+        # one the plan is accepted and then deterministically expires as
+        # FaultNotReached against an empty store.
+        layer_faults = {
             "image_layer.after_create", "image_layer.after_write",
             "image_layer.after_seal", "image_layer.after_manifest_add",
-        }:
+        }
+        gc_workload = next(
+            (name for name, faults in GC_WORKLOAD_FAULTS.items()
+             if fault["fault"] in faults),
+            None,
+        )
+        if seed_actions and seed_actions[0]["op"] == "layer_seed" and \
+                fault["fault"] not in layer_faults:
             raise PlanError(
                 "runtime daemon_fault_smoke layer_seed requires an H1 image-layer fault"
             )
@@ -1018,6 +1029,19 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     f"{seed_actions[0].get('workload')!r}, plan asks for hit "
                     f"{fault.get('hit')}"
                 )
+        if fault["fault"] in layer_faults and not (
+                seed_actions and seed_actions[0]["op"] == "layer_seed"):
+            raise PlanError(
+                f"runtime daemon_fault_smoke fault {fault['fault']!r} requires a "
+                "layer_seed"
+            )
+        if gc_workload is not None and not (
+                seed_actions and seed_actions[0]["op"] == "gc_seed" and
+                seed_actions[0].get("workload") == gc_workload):
+            raise PlanError(
+                f"runtime daemon_fault_smoke fault {fault['fault']!r} requires a "
+                f"gc_seed with workload {gc_workload!r}"
+            )
         releases = [
             action for action in plan.actions
             if action["op"] == "release_fault" and action["fault"] == fault["fault"]

@@ -572,6 +572,46 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "gc_seed requires an H1 page-pruning fault"):
             MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
+    def test_page_pruning_fault_requires_its_gc_seed(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "unseeded-gc-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "requires a gc_seed with workload 'page_prune'"
+        ):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_image_layer_fault_requires_its_layer_seed(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "unseeded-layer-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "image_layer.after_create",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "requires a layer_seed"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
     def test_gc_seed_cannot_follow_named_fault(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
