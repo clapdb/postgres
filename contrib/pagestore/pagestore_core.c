@@ -7503,14 +7503,15 @@ load_fork_meta(void)
 		if (fork_meta_magic_v2_family(first))
 		{
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
-			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
-				break;
+			if (nread != (int) sizeof(rec))
+				break;			/* a short read is the unacknowledged crash tail */
 			if (!fork_meta_rec_wire_valid(&rec))
 			{
-				/* A complete record with a bad checksum is corruption, not a
-				 * torn tail; never replay or truncate past it. */
+				/* A complete record with a bad checksum, or a checksummed
+				 * length that does not match, is corruption, not a torn
+				 * tail; never replay or truncate past it. */
 				fprintf(stderr, "pagestore: forkmeta record at %llu fails its "
-						"checksum\n", (unsigned long long) off);
+						"checksum or length\n", (unsigned long long) off);
 				return -1;
 			}
 			rec_size = sizeof(rec);
@@ -7523,6 +7524,14 @@ load_fork_meta(void)
 		{
 			ForkMetaRecV1 old;
 
+			/* only a plausible legacy timeline id may select the legacy
+			 * parser; an unknown record magic fails closed */
+			if (first >= MAX_TIMELINES)
+			{
+				fprintf(stderr, "pagestore: unsupported forkmeta record magic 0x%08x "
+						"at %llu\n", first, (unsigned long long) off);
+				return -1;
+			}
 			nread = ps_storage->fork_meta_read(off, &old, sizeof(old));
 			if (nread != (int) sizeof(old))
 				break;
@@ -8018,6 +8027,16 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			ForkMetaRecV1 old;
 			ForkMetaRecV1 idrec;
 
+			/* A legacy record starts with its timeline id.  Any other first
+			 * word is a record magic this daemon does not know (a newer
+			 * layout): fail closed instead of misreading it as a legacy
+			 * record and skipping through the log at the wrong size. */
+			if (magic >= MAX_TIMELINES)
+			{
+				fprintf(stderr, "pagestore: unsupported forkmeta record magic 0x%08x "
+						"at %llu\n", magic, (unsigned long long) off);
+				return -1;
+			}
 			nread = ps_storage->fork_meta_read(off, &old, sizeof(old));
 			if (nread != (int) sizeof(old))
 				return -1;
@@ -11538,6 +11557,8 @@ fork_meta_source_has_timeline(uint32_t target)
 		{
 			ForkMetaRecV1 rec;
 
+			if (first >= MAX_TIMELINES)
+				return -1;		/* an unknown record magic, not a legacy record */
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
 			if (nread != (int) sizeof(rec) || rec.timeline >= MAX_TIMELINES ||
 				rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
