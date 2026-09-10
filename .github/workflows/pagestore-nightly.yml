@@ -42,12 +42,23 @@ jobs:
         run: |
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
           import json, os
+          # The soak parses rounds as a C int and the seed as a uint64; values
+          # outside those ranges would silently become a different experiment,
+          # and a repeated seed would upload the same artifact name twice.
           seeds = [s.strip() for s in (os.environ.get("INPUT_SEEDS") or "20260909,7,4242").split(",") if s.strip()]
           rounds = (os.environ.get("INPUT_ROUNDS") or "8000").strip()
-          if not seeds or not all(s.isdigit() for s in seeds) or not rounds.isdigit() or int(rounds) <= 0:
+          if not seeds or not all(s.isdigit() for s in seeds) or not rounds.isdigit():
               raise SystemExit(f"invalid seeds {seeds!r} or rounds {rounds!r}")
+          if not 1 <= int(rounds) <= 2147483647:
+              raise SystemExit(f"rounds {rounds!r} is outside the harness range 1..2147483647")
+          for seed in seeds:
+              if int(seed) > 18446744073709551615:
+                  raise SystemExit(f"seed {seed!r} exceeds the harness range 0..18446744073709551615")
+          seeds = [str(int(s)) for s in seeds]
+          if len(set(seeds)) != len(seeds):
+              raise SystemExit(f"seeds {seeds!r} repeat a value; each seed uploads its own artifact")
           print("seeds=" + json.dumps(seeds))
-          print("rounds=" + rounds)
+          print("rounds=" + str(int(rounds)))
           PY
           cat "$GITHUB_OUTPUT"
 
