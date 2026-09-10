@@ -294,6 +294,76 @@ def walidx_magics(store: Path) -> set[int]:
     return magics
 
 
+# Where a persisted family's identity is readable from the archived bytes:
+# the glob that finds a representative, and how to read (magic, version) from
+# it.  "u32" is a 32-bit magic followed by a 32-bit version, "u32-u16" a
+# 32-bit magic followed by a 16-bit version, and "u32-recordlen" a self-sized
+# record log whose magic alone is the identity.
+ARCHIVED_IDENTITIES: dict[str, tuple[str, str]] = {
+    "page-prune.frontiers": ("page_frontier", "u32"),
+    "walidx-prune.frontiers": ("walidx_frontier", "u32"),
+    "retention.state": ("retention", "u32"),
+    "retention.meta": ("retention", "u32"),
+    "timelines": ("timelines", "u32-recordlen"),
+    "layers.manifest": ("manifest", "u32"),
+    "forkmeta": ("forkmeta", "u32-recordlen"),
+    "forkmeta_snapshots/forkmeta_manifest_v1": ("forkmeta_snapshot", "u32"),
+    "forkmeta_snapshots/forkmeta_checkpoint_v1_*": ("forkmeta_snapshot", "u32-u16"),
+    "walidx_snapshots_0/walidx_manifest_v1": ("walidx_snapshot", "u32"),
+    "walidx_snapshots_0/walidxg1_*": ("walidx_snapshot", "u32-u16"),
+    "wal_segments_0/wal_store_identity_v1": ("wal_store", "u32"),
+    "wal_segments_0/walv1_*": ("wal_segment", "u32"),
+}
+
+
+def archived_identity(store: Path, pattern: str, layout: str) -> tuple[int, int | None] | None:
+    """The (magic, version) the archived representative of one family carries,
+    or None when the archive has no such file."""
+    matches = sorted(store.glob(pattern))
+    if not matches:
+        return None
+    head = matches[0].read_bytes()[:8]
+    if len(head) < 8:
+        return None
+    if layout == "u32":
+        magic, version = struct.unpack_from("=II", head, 0)
+        return magic, version
+    if layout == "u32-u16":
+        magic, version = struct.unpack_from("=IH", head, 0)
+        return magic, version
+    return struct.unpack_from("=I", head, 0)[0], None
+
+
+def check_archived_identities(store: Path, identities: list[dict[str, Any]]) -> None:
+    """The archive's own bytes must carry the identities format.json records.
+    Updating the metadata alone would otherwise pass while the archive still
+    holds the superseded format, and the reopen would succeed through the very
+    reader the new fixture is supposed to retire."""
+    advertised: dict[str, set[tuple[int, Any]]] = {}
+    for item in identities:
+        advertised.setdefault(item["family"], set()).add(
+            (int(item["magic"], 16), item["version"])
+        )
+    for pattern, (family, layout) in ARCHIVED_IDENTITIES.items():
+        found = archived_identity(store, pattern, layout)
+        if found is None:
+            raise FixtureError(f"the fixture has no {family} artifact matching {pattern}")
+        magic, version = found
+        known = advertised.get(family, set())
+        if version is None:
+            if not any(magic == item_magic for item_magic, _ in known):
+                raise FixtureError(
+                    f"{pattern} carries magic {magic:#x}, which no {family} identity "
+                    f"advertises ({sorted(hex(m) for m, _ in known)})"
+                )
+            continue
+        if (magic, version) not in known:
+            raise FixtureError(
+                f"{pattern} carries ({magic:#x}, {version}), which the {family} "
+                f"identities do not advertise ({sorted(known)})"
+            )
+
+
 def check_segment_formats(store: Path, identities: list[dict[str, Any]]) -> None:
     """Every page-segment format the identity table advertises must have an
     instance in the fixture, or a regression in its reader cannot be caught."""
@@ -500,6 +570,7 @@ def capture(args: argparse.Namespace) -> int:
             raise FixtureError(f"daemon did not stop cleanly: status {code}")
         identities = format_identities(args.format_tool)
         check_segment_formats(store, identities)
+        check_archived_identities(store, identities)
         canonicalize_manifest(store)
         names = deterministic_tar(store, fixture / STORE_TAR)
     (fixture / FORMAT_JSON).write_text(json.dumps(identities, indent=2) + "\n", encoding="utf-8")
@@ -519,7 +590,9 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                  metadata: dict[str, Any], identities: list[dict[str, Any]]) -> None:
     store = root / "reopen"
     extract(fixture, store)
-    check_segment_formats(store, identities)
+    if identities is not None:
+        check_segment_formats(store, identities)
+        check_archived_identities(store, identities)
     log = root / "reopen-daemon.log"
     for generation in range(2):
         shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_{generation}"

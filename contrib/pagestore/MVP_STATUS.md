@@ -634,7 +634,9 @@ writes (an ordinary versioned record, a below-floor copy clamped to the branch
 point, and a zero-version WAL-less record), and a deleted branch.
 `harness/pagestore_fixture.py
 --check` fails when the compiled identities differ from the fixture (a
-format change without a fixture update), reopens the fixture and runs its
+format change without a fixture update) and when the archive's own bytes do
+not carry the identities its metadata records (metadata edited without a new
+capture), reopens the fixture and runs its
 oracle across a restart, and applies forty mutations (unknown newer
 version, checksum corruption, truncation) across the WAL store identity,
 sealed WAL segments, retention state and records, page and WAL-index
