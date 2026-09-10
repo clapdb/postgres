@@ -2736,17 +2736,21 @@ FORKMETA_SEED_RELS = 32             # ... and their count
 FORKMETA_SET_KIND = 1
 
 
-def _forkmeta_source_records(store: Path) -> list[dict[str, Any]] | None:
+def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[str, Any]] | None:
     """Every record of the shared forkmeta log, or None when the log is
     absent or not a whole number of well-formed V2 records."""
     try:
         data = (store / "forkmeta").read_bytes()
     except OSError:
         return None
-    # A crash can land while a record is being appended, and recovery drops
-    # exactly that unacknowledged tail, so one partial final record is part
-    # of a valid crash image; everything before it must be well formed.
+    # The publication boundaries hold the admission write lock and every
+    # shard lock, so no foreground append is in flight at those probes and a
+    # partial record there is real damage.  The trickle workload does append
+    # between them, so a crash image taken elsewhere may end mid-record and
+    # recovery drops exactly that unacknowledged tail.
     complete = len(data) - len(data) % FORKMETA_RECORD_BYTES
+    if aligned and complete != len(data):
+        return None
     records = []
     for offset in range(0, complete, FORKMETA_RECORD_BYTES):
         record = data[offset:offset + FORKMETA_RECORD_BYTES]
@@ -3170,11 +3174,13 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
                 f"after_{stage} crash left the forkmeta source without the "
                 f"selected generation's exact marker: {_forkmeta_source_head(store)!r}"
             )
-        # the rewritten source is the marker plus whatever was appended
+        # The rewritten source is the marker plus whatever was appended
         # after the freeze; the seeded history lives in the parts, checked
-        # above, so the source only has to be well-formed and marker-only
-        # before the first post-freeze append
-        records = _forkmeta_source_records(store)
+        # above, so the source only has to be well formed and marker-only
+        # before the first post-freeze append.  These probes fire with the
+        # admission and shard write locks held, so no append is in flight
+        # and a partial record is damage rather than a crash tail.
+        records = _forkmeta_source_records(store, aligned=True)
         if records is None or any(
                 r["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND for r in records[1:]):
             raise OracleMismatch(
