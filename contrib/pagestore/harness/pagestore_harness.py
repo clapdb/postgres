@@ -1002,13 +1002,22 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             raise PlanError(
                 "runtime daemon_fault_smoke layer_seed requires an H1 image-layer fault"
             )
-        if seed_actions and seed_actions[0]["op"] == "gc_seed" and fault["fault"] not in (
-            GC_WORKLOAD_FAULTS.get(seed_actions[0].get("workload"), set())
-        ):
-            raise PlanError(
-                "runtime daemon_fault_smoke gc_seed requires an H1 page-pruning fault "
-                "matching its workload"
-            )
+        if seed_actions and seed_actions[0]["op"] == "gc_seed":
+            if fault["fault"] not in (
+                GC_WORKLOAD_FAULTS.get(seed_actions[0].get("workload"), set())
+            ):
+                raise PlanError(
+                    "runtime daemon_fault_smoke gc_seed requires an H1 page-pruning fault "
+                    "matching its workload"
+                )
+            reachable = GC_FAULT_MAX_HITS.get(fault["fault"], GC_FAULT_DEFAULT_MAX_HIT)
+            if fault.get("hit", 1) > reachable:
+                raise PlanError(
+                    f"runtime daemon_fault_smoke gc_seed fault {fault['fault']!r} is "
+                    f"reachable {reachable} time(s) in workload "
+                    f"{seed_actions[0].get('workload')!r}, plan asks for hit "
+                    f"{fault.get('hit')}"
+                )
         releases = [
             action for action in plan.actions
             if action["op"] == "release_fault" and action["fault"] == fault["fault"]
@@ -2246,6 +2255,11 @@ GC_WORKLOAD_FAULTS = {
         "page_prune.after_frontier",
     },
 }
+# Each gc_seed workload installs its condition once, so its faults are
+# reachable exactly once per run; a plan asking for a later hit would wait
+# for work the seed never creates again and expire as FaultNotReached.
+GC_FAULT_MAX_HITS: dict[str, int] = {}
+GC_FAULT_DEFAULT_MAX_HIT = 1
 GC_STAGES = {
     "page_compaction.after_publish": "publish",
     "page_gc.after_mark_delete": "mark_delete",
@@ -2331,6 +2345,20 @@ def _manifest_names_layer(records: list[tuple[int, bytes]], kind: int, layer_id:
     return any(k == kind and needle in payload for k, payload in records)
 
 
+def _manifest_marks_after_add(records: list[tuple[int, bytes]], layer_id: int) -> int:
+    """Tombstones the log records after the given layer's ADD, whether or not
+    their layer files are still on disk."""
+    needle = struct.pack("=Q", layer_id)
+    after = False
+    marks = 0
+    for kind, payload in records:
+        if kind == MANIFEST_ADD_LAYER and needle in payload:
+            after = True
+        elif after and kind == MANIFEST_MARK_DELETE:
+            marks += 1
+    return marks
+
+
 def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
     """Check the stage-specific durable state before recovery mutates the store.
 
@@ -2365,11 +2393,13 @@ def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
             raise OracleMismatch(
                 "after_frontier did not leave a valid durable page-prune frontier"
             )
-        if not any(incarnation != 0 and lsn == GC_RETAINED_HORIZON
+        # this store defines timeline 0 with the first incarnation, so the
+        # cutoff must be published for that one, not merely for some slot
+        if not any(incarnation == 1 and lsn == GC_RETAINED_HORIZON
                    for incarnation, lsn, _seq in fences):
             raise OracleMismatch(
                 f"after_frontier published timeline 0 fences {fences!r}, expected the "
-                f"configured cutoff {GC_RETAINED_HORIZON}"
+                f"configured cutoff {GC_RETAINED_HORIZON} in incarnation 1"
             )
         if published:
             raise OracleMismatch(
@@ -2380,9 +2410,14 @@ def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
             raise OracleMismatch(
                 f"after_publish crash did not publish replacement layer {replacement:#x}"
             )
-        if tombstones:
+        # a source may already have been unlinked by an earlier pass, so
+        # count what the log records after this pass's ADD instead of what
+        # still has a file
+        late = _manifest_marks_after_add(records, replacement)
+        if late:
             raise OracleMismatch(
-                f"after_publish crash already wrote {tombstones} source tombstone(s)"
+                f"after_publish crash already wrote {late} source tombstone(s) "
+                "after the replacement's ADD"
             )
     elif stage == "mark_delete":
         if not published or tombstones == 0:
