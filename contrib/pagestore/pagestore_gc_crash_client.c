@@ -1075,6 +1075,10 @@ delete_verify(void)
 
 /* ---- fixture workload -------------------------------------------------- */
 
+static void check_pin_identity(uint32_t timeline, uint32_t owner_kind,
+							   uint64_t owner_id, uint32_t resource,
+							   uint64_t lsn, const char *missing,
+							   const char *changed);
 static void walidx_pin_reader(uint64_t base);
 static void walidx_batch_and_commit(uint64_t base, uint64_t end_lsn);
 static void walidx_check(uint64_t base, uint64_t end);
@@ -1238,6 +1242,19 @@ fixture_verify(void)
 	if (execute()->status != PS_STATUS_OK || ch->result != 2)
 		die("fixture lost the fork-size events appended after the snapshot cutover");
 	walidx_check(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
+	/* Both seeded pins must still belong to the owners that took them.  The
+	 * horizon checks above and the retain-floor check below hold for a pin
+	 * whose owner metadata a format migration rewrote, and that pin can no
+	 * longer be advanced or dropped by its real owner. */
+	check_pin_identity(0, PS_RETENTION_OWNER_READER, WALIDX_READER,
+					   PS_RETENTION_RESOURCE_WAL_INDEX,
+					   FIXTURE_WAL_REDO + WALIDX_READER_LSN,
+					   "fixture lost the archived WAL-index reader's pin",
+					   "fixture changed the archived WAL-index reader's identity");
+	check_pin_identity(0, PS_RETENTION_OWNER_CONFIGURED, TEST_OWNER,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, TEST_CUTOFF,
+					   "fixture lost the archived page-history owner's pin",
+					   "fixture changed the archived page-history owner's identity");
 	set_relation(ch);
 	ch->opcode = PS_OP_WAL_SIZE;
 	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_END)
@@ -1251,6 +1268,26 @@ fixture_verify(void)
 	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
 		incarnation == 0)
 		die("fixture branch is not live");
+	/* The persisted ancestry is part of the format too.  A migration that
+	 * keeps the branch live but decodes a different fork point moves every
+	 * as-of boundary a compute already holds, and rejects the exact
+	 * PS_OP_REQUIRE_BRANCH it would issue -- while the pages that remain
+	 * visible below read exactly as before. */
+	{
+		uint64_t	parent_incarnation = 0;
+
+		if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE ||
+			parent_incarnation == 0)
+			die("fixture parent timeline is not live");
+		set_relation(ch);
+		set_timeline(ch, FIXTURE_BRANCH, incarnation);
+		ch->opcode = PS_OP_TIMELINE_INFO;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1)
+			die("fixture branch lost its persisted ancestry");
+		if (ch->parent_timeline != 0 || ch->req_lsn != FIXTURE_FORK_LSN ||
+			ch->req_seq != parent_incarnation)
+			die("fixture branch changed its persisted fork identity");
+	}
 	set_relation(ch);
 	set_timeline(ch, FIXTURE_BRANCH, incarnation);
 	ch->opcode = PS_OP_READV;
@@ -1536,29 +1573,42 @@ walidx_check(uint64_t base, uint64_t end)
 		die("recovery resurrected a WAL-index point below the durable frontier");
 }
 
+/*
+ * A retained pin must still be the owner that took it.  Every horizon check
+ * passes just as well for a pin that kept its LSN and resources but lost its
+ * owner identity, and that pin can no longer be advanced or dropped by the
+ * owner it belongs to.
+ */
 static void
-walidx_verify(void)
+check_pin_identity(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				   uint32_t resource, uint64_t lsn, const char *missing,
+				   const char *changed)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
 
-	walidx_check(0, WALIDX_WAL_BYTES);
-	/* The retained pin must still be the seeded reader itself.  A pin that
-	 * kept the horizon but lost its owner identity leaves the real owner
-	 * unable to advance or drop it, and nothing else here would notice.
-	 * Only this workload seeds that reader, so the check lives here rather
-	 * than in the shared chain oracle. */
 	set_relation(ch);
-	ch->timeline = 0;
+	ch->timeline = timeline;
 	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
-	ch->blocknum = PS_RETENTION_OWNER_READER;
-	ch->req_seq = WALIDX_READER;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
 	if (execute()->status != PS_STATUS_OK || ch->result != 1)
-		die("recovery lost the seeded WAL-index reader's pin");
-	if (ch->timeline != 0 || ch->blocknum != PS_RETENTION_OWNER_READER ||
-		ch->req_seq != WALIDX_READER || ch->old_nblocks != 1 ||
-		ch->parent_timeline != PS_RETENTION_RESOURCE_WAL_INDEX ||
-		ch->req_lsn != WALIDX_READER_LSN)
-		die("recovery changed the seeded WAL-index reader's identity");
+		die(missing);
+	if (ch->timeline != timeline || ch->blocknum != owner_kind ||
+		ch->req_seq != owner_id || ch->old_nblocks != 1 ||
+		ch->parent_timeline != resource || ch->req_lsn != lsn)
+		die(changed);
+}
+
+static void
+walidx_verify(void)
+{
+	walidx_check(0, WALIDX_WAL_BYTES);
+	/* only this workload seeds that reader, so the check lives here rather
+	 * than in the shared chain oracle */
+	check_pin_identity(0, PS_RETENTION_OWNER_READER, WALIDX_READER,
+					   PS_RETENTION_RESOURCE_WAL_INDEX, WALIDX_READER_LSN,
+					   "recovery lost the seeded WAL-index reader's pin",
+					   "recovery changed the seeded WAL-index reader's identity");
 }
 
 static uint64_t

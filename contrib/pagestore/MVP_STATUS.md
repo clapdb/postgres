@@ -637,7 +637,11 @@ point, and a zero-version WAL-less record), and a deleted branch.
 format change without a fixture update) and when the archive's own bytes do
 not carry the identities its metadata records (metadata edited without a new
 capture), reopens the fixture and runs its
-oracle across a restart, and applies forty mutations (unknown newer
+oracle across a restart -- including the identities the archive's own
+metadata carries: both seeded retention pins are looked up by owner and must
+still name that owner, its resources and its horizon, and the live branch
+must still record the parent and fork point it was created at, neither of
+which is visible in the horizons or the pages a read returns -- and applies forty mutations (unknown newer
 version, checksum corruption, truncation) across the WAL store identity,
 sealed WAL segments, retention state and records, page and WAL-index
 frontiers, forkmeta and WAL-index snapshot manifests and payloads, the
