@@ -2577,6 +2577,19 @@ def _manifest_removed_layers(records: list[tuple[int, bytes]]) -> dict[int, int]
     return removed
 
 
+def _branch_sealed_wal_segments(store: Path, timeline: int) -> list[str]:
+    """The sealed immutable WAL segment files of one timeline.  The directory
+    itself appears on the first aligned append, before any segment is sealed,
+    so it says nothing about immutable-WAL cleanup on its own."""
+    directory = store / f"wal_segments_{timeline}"
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.is_file() and entry.name.startswith("walv1_")
+    )
+
+
 def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
     """Private WAL and WAL-index artifacts of one timeline, plus the layer
     files the manifest still attributes to it.  Layer file names carry the
@@ -2631,8 +2644,8 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
                 ("private WAL", f"wal_{DELETE_BRANCH}" in wal),
                 ("WAL-index epoch", any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in wal)),
                 ("owner layer", any(n.startswith("layer_") for n in artifacts)),
-                ("immutable WAL segment",
-                 f"wal_segments_{DELETE_BRANCH}" in wal),
+                ("sealed immutable WAL segment",
+                 bool(_branch_sealed_wal_segments(store, DELETE_BRANCH))),
                 ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
             ) if not present
         ]
@@ -2691,7 +2704,8 @@ def _check_delete_abort_recovery(store: Path) -> None:
             ("private WAL", f"wal_{DELETE_BRANCH}" in artifacts),
             ("WAL-index epoch",
              any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in artifacts)),
-            ("immutable WAL segment", f"wal_segments_{DELETE_BRANCH}" in artifacts),
+            ("sealed immutable WAL segment",
+             bool(_branch_sealed_wal_segments(store, DELETE_BRANCH))),
             # both halves of the layer must still be there: a manifest entry
             # whose file was unlinked, or a file whose entry was removed, is
             # half a retirement the aborted deletion must not have started
