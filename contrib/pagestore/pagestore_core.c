@@ -12122,7 +12122,12 @@ walidx_plan_bases_build(uint32_t tl)
 		}
 		/* A materializer horizon is protected by its own derived cutoff,
 		 * unless another WAL-index-only owner shares the LSN: that owner
-		 * would keep standing there after the materializer advanced. */
+		 * would keep standing there after the materializer advanced.  The
+		 * durable WAL-index frontier and the shipper's progress are such
+		 * standing horizons even when no owner holds them right now: a new
+		 * WAL-index-only owner is admitted at exactly that LSN, and it would
+		 * arrive after the materializer advanced and page compaction retired
+		 * the base, with no chain left to read. */
 		for (uint32_t i = 0; i < npins; i++)
 		{
 			int			present = 0;
@@ -12132,6 +12137,9 @@ walidx_plan_bases_build(uint32_t tl)
 				pins[i].owner_kind != PS_RETENTION_OWNER_MATERIALIZER ||
 				(pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0 ||
 				pins[i].lsn == 0)
+				continue;
+			if (pins[i].lsn == walidx_frontier_current(tl) ||
+				pins[i].lsn == walidx_progress_read(tl))
 				continue;
 			for (uint32_t k = 0; k < npins && !shared; k++)
 			{
