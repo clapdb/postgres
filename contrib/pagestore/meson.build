@@ -717,6 +717,7 @@ foreach prune_fault_scenario : [
   'timeline_delete_after_wal_cleanup',
   'timeline_delete_after_segment_rewrite',
   'timeline_delete_after_deleted',
+  'timeline_delete_before_deleting',
 ]
   test('pagestore_harness_' + prune_fault_scenario,
     pagestore_harness_python,

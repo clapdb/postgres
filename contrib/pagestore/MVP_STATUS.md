@@ -547,7 +547,12 @@ to compare across nights.
 
 The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
 reclaim, and timeline deletion slices are now covered by the declarative
-harness.  Other crash boundaries remain outside them.  Before declaring the
+harness.  The deletion slice crashes on both sides of its first transition:
+before the DELETING record is durable the request is lost and the branch must
+survive intact, and after each later boundary the cleanup must resume.  Its
+workload seeds a live sibling branch with the same kind of private state, so
+cleanup that reached past its owner would be caught.  Other crash boundaries
+remain outside them.  Before declaring the
 MVP repeatable, add process-level fault scenarios around manifest
 replacement, plus a persisted-format fixture for restart/upgrade
 compatibility.

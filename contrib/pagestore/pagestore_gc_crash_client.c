@@ -77,7 +77,11 @@
 /* timeline_delete workload: a branch of timeline 0 with its own shipped WAL,
  * WAL-index interval, and flushed relation pages, then BEGIN_DELETE. */
 #define DELETE_BRANCH 1u
-#define DELETE_FORK_LSN UINT64_C(65536)
+/* aligned to the immutable segment size so the branch's shipped WAL seals a
+ * complete wal_segments_<tl> segment the deletion has to reclaim too */
+#define DELETE_FORK_LSN RECLAIM_SEGMENT
+#define DELETE_WAL_SEGMENT_CHUNKS 16u
+#define DELETE_SURVIVOR_BRANCH 2u
 #define DELETE_WAL_BYTES 65536u
 #define DELETE_PAGES 24u
 /* a fresh branch of a fresh store gets its first incarnation token; the
@@ -383,6 +387,9 @@ walidx_seed(void)
 static void read_latest(unsigned char *page, uint32_t block);
 static void die_page(const char *message, uint32_t block,
 					 const unsigned char *page);
+static void delete_seed_survivor(unsigned char *page);
+static void delete_verify_survivor(unsigned char *page);
+static void delete_verify_live(void);
 
 static uint64_t branch_incarnation;
 
@@ -469,8 +476,11 @@ delete_seed(void)
 	branch_incarnation = ch->incarnation;
 	if (branch_incarnation != DELETE_INCARNATION)
 		die("branch did not receive its expected first incarnation token");
-	/* private shipped WAL plus a committed WAL-index interval */
-	delete_wal_append(DELETE_BRANCH, branch_incarnation, DELETE_FORK_LSN);
+	/* private shipped WAL, a complete immutable segment of it, plus a
+	 * committed WAL-index interval */
+	for (uint32_t chunk = 0; chunk < DELETE_WAL_SEGMENT_CHUNKS; chunk++)
+		delete_wal_append(DELETE_BRANCH, branch_incarnation,
+						  DELETE_FORK_LSN + (uint64_t) chunk * DELETE_WAL_BYTES);
 	set_relation(ch);
 	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
 	{
@@ -494,6 +504,10 @@ delete_seed(void)
 	ch->req_seq = DELETE_FORK_LSN + DELETE_WAL_BYTES;
 	if (execute()->status != PS_STATUS_OK)
 		die("branch WAL-index progress commit failed");
+	/* A live sibling with the same kind of private state: owner-scoped
+	 * cleanup that reached past its owner would take these with it, and no
+	 * scenario would notice while the root has none of them. */
+	delete_seed_survivor(page);
 	/* enough branch pages in shared segments that maintenance flushes an
 	 * owner layer and the deletion must rewrite segments and retire a layer */
 	for (uint32_t block = 0; block < DELETE_PAGES; block++)
@@ -525,6 +539,148 @@ delete_seed(void)
 	if (execute()->status != PS_STATUS_OK)
 		die("BEGIN_DELETE failed");
 	wait_forever();
+}
+
+/* The sibling branch: private shipped WAL, a committed WAL-index interval,
+ * and one page of its own, none of which the deletion may touch. */
+static void
+delete_seed_survivor(unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	parent_incarnation = 0;
+	uint64_t	incarnation;
+
+	if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE)
+		die("timeline 0 is not live");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, 0);
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->parent_timeline = 0;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = parent_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("survivor branch create failed");
+	incarnation = ch->incarnation;
+	delete_wal_append(DELETE_SURVIVOR_BRANCH, incarnation, DELETE_FORK_LSN);
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	{
+		PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+		entries[0].key = ch->key;
+		entries[0].block = 0;
+		entries[0].flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+		entries[0].lsn = DELETE_FORK_LSN + 16;
+		entries[0].end_lsn = DELETE_FORK_LSN + 17;
+	}
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = 1;
+	ch->datalen = sizeof(PsWalIndexEntry);
+	if (execute()->status != PS_STATUS_OK)
+		die("survivor WAL-index add failed");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = DELETE_FORK_LSN + DELETE_WAL_BYTES;
+	if (execute()->status != PS_STATUS_OK)
+		die("survivor WAL-index progress commit failed");
+	delete_write_block(page, DELETE_SURVIVOR_BRANCH, incarnation, 0,
+					   DELETE_FORK_LSN + 3000, 0x5A);
+}
+
+/* The sibling is untouched by its neighbour's deletion. */
+static void
+delete_verify_survivor(unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	incarnation = 0;
+
+	if (timeline_state(DELETE_SURVIVOR_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation == 0)
+		die("deletion did not leave the sibling branch live");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("sibling branch read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x5A))
+		die_page("deletion damaged the sibling's own page", 0, page);
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != DELETE_FORK_LSN + DELETE_WAL_BYTES)
+		die("deletion changed the sibling's WAL end");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK || ch->result != 64)
+		die("deletion damaged the sibling's shipped WAL");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != (unsigned char) (DELETE_SURVIVOR_BRANCH + 1))
+			die("deletion corrupted the sibling's shipped WAL bytes");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	/* 0/0 reads the committed progress back as req_lsn */
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != DELETE_FORK_LSN + DELETE_WAL_BYTES)
+		die("deletion dropped the sibling's WAL-index progress");
+}
+
+/* The crash landed before the DELETING record was durable, so the request is
+ * lost: the branch is still live, still serves its own pages, and keeps every
+ * artifact the deletion would have reclaimed. */
+static void
+delete_verify_live(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	if (timeline_state(DELETE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation != DELETE_INCARNATION)
+		die("a deletion that never became durable did not leave the branch live");
+	for (uint32_t block = 0; block < DELETE_PAGES; block++)
+	{
+		set_relation(ch);
+		set_timeline(ch, DELETE_BRANCH, incarnation);
+		ch->opcode = PS_OP_READV;
+		ch->blocknum = block;
+		ch->nblocks = 1;
+		if (execute()->status != PS_STATUS_OK)
+			die("the surviving branch does not serve its own page");
+		memcpy(page, ch->data, page_size);
+		if (!page_has_tag(page, (unsigned char) (0x40 + block)))
+			die_page("the surviving branch lost its own page", block, page);
+	}
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, incarnation);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != DELETE_PAGES + 1)
+		die("the surviving branch lost its zero-extended size");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK || ch->result != 64)
+		die("the surviving branch lost its shipped WAL");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != (unsigned char) (DELETE_BRANCH + 1))
+			die("the surviving branch's shipped WAL is corrupt");
+	delete_verify_survivor(page);
+	free(page);
 }
 
 static void
@@ -592,6 +748,7 @@ delete_verify(void)
 	ch->nblocks = 1;
 	if (execute()->status == PS_STATUS_OK)
 		die("a DELETED branch still serves reads");
+	delete_verify_survivor(page);
 	free(page);
 }
 
@@ -928,18 +1085,19 @@ main(int argc, char **argv)
 			cutoff_seq_file = argv[++i];
 		else
 			die("usage: --shm NAME --mode seed|verify "
-				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete] "
-				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete"
+				"|timeline_delete_abort] [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0) ||
 		(strcmp(workload, "page_prune") != 0 &&
 		 strcmp(workload, "wal_index") != 0 &&
 		 strcmp(workload, "wal_reclaim") != 0 &&
-		 strcmp(workload, "timeline_delete") != 0))
+		 strcmp(workload, "timeline_delete") != 0 &&
+		 strcmp(workload, "timeline_delete_abort") != 0))
 		die("usage: --shm NAME --mode seed|verify "
-			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete] "
-			"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete"
+			"|timeline_delete_abort] [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
 	if (strcmp(workload, "timeline_delete") == 0)
 	{
@@ -947,6 +1105,13 @@ main(int argc, char **argv)
 			delete_seed();
 		else
 			delete_verify();
+	}
+	else if (strcmp(workload, "timeline_delete_abort") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			delete_seed();
+		else
+			delete_verify_live();
 	}
 	else if (strcmp(workload, "wal_reclaim") == 0)
 	{

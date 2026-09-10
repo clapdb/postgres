@@ -672,7 +672,8 @@ RUNTIME_CONSTRAINTS = {
         "set_fault": {},
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
-        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim", "timeline_delete"]},
+        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim",
+                                                      "timeline_delete", "timeline_delete_abort"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -2321,6 +2322,14 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
                         "--segment-gc", "0"],
         "retained_horizon": None,
     },
+    # the same seed, crashed on the old-state side of the first transition:
+    # the request is lost and the branch must survive intact
+    "timeline_delete_abort": {
+        "faults": {"timeline_delete.before_deleting"},
+        "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
+                        "--segment-gc", "0"],
+        "retained_horizon": None,
+    },
 }
 DELETE_BRANCH = 1
 WAL_RECLAIM_SEGMENTS = 3
@@ -2354,6 +2363,7 @@ GC_STAGES = {
     "timeline_delete.after_wal_cleanup": "delete_wal_cleanup",
     "timeline_delete.after_segment_rewrite": "delete_segment_rewrite",
     "timeline_delete.after_deleted": "delete_deleted",
+    "timeline_delete.before_deleting": "delete_before_deleting",
 }
 WALIDX_SNAPSHOT_MAGIC = 0x4D534957          # "WISM"
 WALIDX_SNAPSHOT_VERSION = 1
@@ -2454,10 +2464,10 @@ def _manifest_layers(records: list[tuple[int, bytes]]) -> dict[int, dict[str, An
     layers: dict[int, dict[str, Any]] = {}
     for kind, payload in records:
         if kind == MANIFEST_ADD_LAYER and len(payload) >= 16:
-            layer_id, _layer_kind, timeline = struct.unpack_from("<QII", payload, 0)
+            layer_id, _layer_kind, timeline = struct.unpack_from("=QII", payload, 0)
             layers[layer_id] = {"timeline": timeline, "deleting": False}
         elif kind in (MANIFEST_MARK_DELETE, MANIFEST_REMOVE_LAYER) and len(payload) >= 8:
-            layer_id = struct.unpack_from("<Q", payload, 0)[0]
+            layer_id = struct.unpack_from("=Q", payload, 0)[0]
             if kind == MANIFEST_REMOVE_LAYER:
                 layers.pop(layer_id, None)
             elif layer_id in layers:
@@ -2549,6 +2559,24 @@ def _forkmeta_timelines(store: Path) -> set[int]:
     return owners
 
 
+def _manifest_removed_layers(records: list[tuple[int, bytes]]) -> dict[int, int]:
+    """For every layer id the log removed and did not add again, the timeline
+    that owned it when it went.  A file left behind by such a layer is an
+    orphan of that timeline, not of whoever reuses the id later."""
+    owner: dict[int, int] = {}
+    removed: dict[int, int] = {}
+    for kind, payload in records:
+        if kind == MANIFEST_ADD_LAYER and len(payload) >= 16:
+            layer_id, _layer_kind, timeline = struct.unpack_from("=QII", payload, 0)
+            owner[layer_id] = timeline
+            removed.pop(layer_id, None)
+        elif kind == MANIFEST_REMOVE_LAYER and len(payload) >= 8:
+            layer_id = struct.unpack_from("=Q", payload, 0)[0]
+            if layer_id in owner:
+                removed[layer_id] = owner.pop(layer_id)
+    return removed
+
+
 def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
     """Private WAL and WAL-index artifacts of one timeline, plus the layer
     files the manifest still attributes to it.  Layer file names carry the
@@ -2561,18 +2589,32 @@ def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
         if name == f"wal_{timeline}" or name.startswith(f"wal_{timeline}.") or \
                 any(name.startswith(prefix) for prefix in prefixes):
             names.append(name)
+    records = _manifest_records(store)
     owned = {
-        layer_id for layer_id, layer in _manifest_layers(_manifest_records(store)).items()
+        layer_id for layer_id, layer in _manifest_layers(records).items()
         if layer["timeline"] == timeline
     }
     on_disk = {int(path.name.rsplit("_", 1)[1], 16) for path in _canonical_layer_files(store)}
-    # a layer the manifest still attributes to the owner is an artifact
-    # whether or not its file is still there: publishing DELETED before the
-    # manifest REMOVE would otherwise look artifact-free after an unlink
-    for layer_id in sorted(owned):
-        names.append(f"layer_{layer_id:#x} (manifest layer of timeline {timeline}, "
-                     f"{'on disk' if layer_id in on_disk else 'file gone'})")
+    # A layer the manifest still attributes to the owner is an artifact
+    # whether or not its file is still there (publishing DELETED before the
+    # manifest REMOVE would otherwise look artifact-free after an unlink),
+    # and so is a file left behind by a layer the manifest has already
+    # removed but whose unlink failed or was skipped.
+    orphaned = {
+        layer_id for layer_id, layer_timeline in _manifest_removed_layers(records).items()
+        if layer_timeline == timeline
+    }
+    for layer_id in sorted(owned | (orphaned & on_disk)):
+        names.append(f"layer_{layer_id:#x} (layer of timeline {timeline}, "
+                     f"{'on disk' if layer_id in on_disk else 'file gone'}, "
+                     f"{'in the manifest' if layer_id in owned else 'orphaned'})")
     return names
+
+
+def _check_delete_abort_crash_snapshot(store: Path) -> None:
+    """Before the DELETING record is durable nothing of the branch has
+    changed: no lifecycle record, and every seeded artifact present."""
+    _check_delete_abort_recovery(store)
 
 
 def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
@@ -2589,6 +2631,8 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
                 ("private WAL", f"wal_{DELETE_BRANCH}" in wal),
                 ("WAL-index epoch", any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in wal)),
                 ("owner layer", any(n.startswith("layer_") for n in artifacts)),
+                ("immutable WAL segment",
+                 f"wal_segments_{DELETE_BRANCH}" in wal),
                 ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
             ) if not present
         ]
@@ -2630,6 +2674,34 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
             )
 
 
+def _check_delete_abort_recovery(store: Path) -> None:
+    """A deletion whose DELETING record never became durable leaves nothing
+    behind: the branch keeps its lifecycle, and every artifact it owned is
+    still there (the verify client already read its pages back)."""
+    events = [e for e in _timeline_events(store) if e["id"] == DELETE_BRANCH]
+    lifecycle = [e for e in events if e["kind"] == TIMELINE_EVENT_STATE]
+    if lifecycle:
+        raise OracleMismatch(
+            "a deletion that never became durable left lifecycle records "
+            f"{lifecycle!r}"
+        )
+    artifacts = _branch_private_artifacts(store, DELETE_BRANCH)
+    missing = [
+        what for what, present in (
+            ("private WAL", f"wal_{DELETE_BRANCH}" in artifacts),
+            ("WAL-index epoch",
+             any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in artifacts)),
+            ("immutable WAL segment", f"wal_segments_{DELETE_BRANCH}" in artifacts),
+            ("owner layer", any(n.startswith("layer_") for n in artifacts)),
+            ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
+        ) if not present
+    ]
+    if missing:
+        raise OracleMismatch(
+            f"a deletion that never became durable lost {missing!r}: {artifacts!r}"
+        )
+
+
 def _check_delete_recovery(
     inspector: Path,
     shm: str,
@@ -2650,9 +2722,13 @@ def _check_delete_recovery(
                 f"after_{stage} recovery reported manifest_poisoned="
                 f"{manifest.get('manifest_poisoned')!r}"
             )
+        owning_segments = [
+            path.name for path in sorted(store.glob("seg_*"))
+            if DELETE_BRANCH in _segment_record_timelines(path)
+        ]
         settled = not artifacts and manifest.get("deleting_layers") == 0 and \
             manifest.get("layer_count") == manifest.get("local_layers") and \
-            DELETE_BRANCH not in _forkmeta_timelines(store)
+            DELETE_BRANCH not in _forkmeta_timelines(store) and not owning_segments
         if settled:
             break
         now = time.monotonic()
@@ -2660,6 +2736,7 @@ def _check_delete_recovery(
             raise HarnessTimeout(
                 f"after_{stage} recovery left artifacts {artifacts!r} manifest "
                 f"{manifest!r} forkmeta owners {sorted(_forkmeta_timelines(store))!r} "
+                f"segments still holding the owner's records {owning_segments!r} "
                 f"after {poll_timeout:.3f}s"
             )
         time.sleep(min(0.05, deadline - now))
@@ -2830,6 +2907,9 @@ def _check_gc_crash_snapshot(
     """
     if stage.startswith("reclaim_"):
         _check_wal_reclaim_crash_snapshot(store, stage, hit)
+        return
+    if stage == "delete_before_deleting":
+        _check_delete_abort_crash_snapshot(store)
         return
     if stage.startswith("delete_"):
         _check_delete_crash_snapshot(store, stage)
@@ -3053,6 +3133,9 @@ def _check_gc_recovery(
         )
     if workload == "timeline_delete":
         _check_delete_recovery(inspector, shm, inspection_schema, store, stage, timeout)
+        return
+    if workload == "timeline_delete_abort":
+        _check_delete_abort_recovery(store)
         return
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout

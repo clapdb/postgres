@@ -16667,6 +16667,10 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 	if (state != PS_TIMELINE_LIVE || timeline_has_live_descendant(timeline) ||
 		timeline_has_active_owner(timeline))
 		return -1;
+	/* The old-state side of the transition: nothing of the branch may have
+	 * changed while the request is not yet durable. */
+	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_BEFORE_DELETING) != 0)
+		return -1;
 	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
 										incarnation) != 0)
 		return -1;

@@ -156,7 +156,8 @@ jobs:
             timeline_delete_after_deleting \
             timeline_delete_after_wal_cleanup \
             timeline_delete_after_segment_rewrite \
-            timeline_delete_after_deleted; do
+            timeline_delete_after_deleted \
+            timeline_delete_before_deleting; do
             python3 harness/pagestore_harness.py \
               --capabilities harness/capabilities.json \
               --daemon-fault-recovery "harness/scenarios/${scenario}.jsonl" \
