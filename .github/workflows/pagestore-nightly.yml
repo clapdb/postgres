@@ -49,14 +49,19 @@ jobs:
           rounds = (os.environ.get("INPUT_ROUNDS") or "8000").strip()
           if not seeds or not all(s.isdigit() for s in seeds) or not rounds.isdigit():
               raise SystemExit(f"invalid seeds {seeds!r} or rounds {rounds!r}")
-          if not 1 <= int(rounds) <= 2147483647:
-              raise SystemExit(f"rounds {rounds!r} is outside the harness range 1..2147483647")
+          # the soak samples its during-run footprint every 20 rounds, so
+          # fewer rounds would report a bound it never measured
+          if not 20 <= int(rounds) <= 2147483647:
+              raise SystemExit(f"rounds {rounds!r} is outside the harness range 20..2147483647")
           for seed in seeds:
-              if int(seed) > 18446744073709551615:
-                  raise SystemExit(f"seed {seed!r} exceeds the harness range 0..18446744073709551615")
+              # the generator maps seed 0 onto seed 1, so 0 is not an experiment of its own
+              if not 1 <= int(seed) <= 18446744073709551615:
+                  raise SystemExit(f"seed {seed!r} is outside the harness range 1..18446744073709551615")
           seeds = [str(int(s)) for s in seeds]
           if len(set(seeds)) != len(seeds):
               raise SystemExit(f"seeds {seeds!r} repeat a value; each seed uploads its own artifact")
+          if len(seeds) > 256:
+              raise SystemExit(f"{len(seeds)} seeds exceed the 256-job matrix limit; dispatch in batches")
           print("seeds=" + json.dumps(seeds))
           print("rounds=" + str(int(rounds)))
           PY
