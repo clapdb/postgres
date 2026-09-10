@@ -129,11 +129,15 @@ commits WAL-index progress through that end so the whole sealed prefix is
 reclaimable.  Three named store-lock probes crash after the durable physical
 frontier and before the first unlink, after each authorized segment unlink,
 and after the last unlink but before the directory fsync that retires the
-residual prefix.  The crash snapshot must keep the shipped-WAL identity and
-exactly the expected number of sealed segments; recovery must finish the
-unlink retry, refuse reads below the frontier, keep the WAL end and the
-retain floor at the shipped end, clear the reclaimer's physical debt, and
-leave no retention owner; a second restart proves idempotence.  Timeline
+residual prefix.  The crash snapshot must carry the durable store
+metadata with the directory start and retained base already at the shipped
+end -- before the first unlink that frontier is the only thing separating the
+crash image from the state before publication -- and exactly the expected
+number of sealed segments; recovery must finish the unlink retry, refuse
+reads below the frontier, keep the WAL end and the retain floor at the
+shipped end, clear the reclaimer's physical debt, and leave no retention
+owner; a second restart must then reproduce that settled shipped-WAL state,
+metadata and files alike.  Timeline
 deletion, manifest replacement, and compute-restart combinations remain
 outside the harness.
 

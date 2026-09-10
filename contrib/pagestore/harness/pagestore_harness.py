@@ -2310,6 +2310,11 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
     },
 }
 WAL_RECLAIM_SEGMENTS = 3
+WAL_RECLAIM_SEGMENT_BYTES = 1024 * 1024
+WAL_RECLAIM_TOTAL = WAL_RECLAIM_SEGMENTS * WAL_RECLAIM_SEGMENT_BYTES
+WAL_STORE_METADATA_MAGIC = 0x4D535732        # "MSW2"
+WAL_STORE_METADATA_VERSION = 2
+WAL_STORE_METADATA_BYTES = 64
 WAL_RECLAIM_SEGMENT_DIR = Path("wal_segments_0")
 WAL_RECLAIM_SEGMENT_PREFIX = "walv1_1_"
 WAL_RECLAIM_IDENTITY = WAL_RECLAIM_SEGMENT_DIR / "wal_store_identity_v1"
@@ -2398,6 +2403,33 @@ def _wal_segment_files(store: Path) -> list[str]:
     )
 
 
+def _wal_store_metadata(store: Path) -> dict[str, Any] | None:
+    """The shipped-WAL store's durable metadata: which prefix the directory
+    starts at, the base it retains, and how far it has been written.  None
+    when the record is missing or does not validate."""
+    try:
+        data = (store / WAL_RECLAIM_IDENTITY).read_bytes()
+    except OSError:
+        return None
+    if len(data) != WAL_STORE_METADATA_BYTES:
+        return None
+    # the daemon writes this record little-endian, not in host order
+    magic, version, record_bytes, reserved = struct.unpack_from("<IIII", data, 0)
+    timeline, segment_size = struct.unpack_from("<II", data, 16)
+    directory_start, retained_base, end = struct.unpack_from("<QQQ", data, 24)
+    crc = struct.unpack_from("<I", data, 48)[0]
+    if magic != WAL_STORE_METADATA_MAGIC or \
+            version != WAL_STORE_METADATA_VERSION or \
+            record_bytes != WAL_STORE_METADATA_BYTES or reserved != 0 or \
+            _fnv1a32(data[:48] + b"\x00" * 4 + data[52:]) != crc:
+        return None
+    return {
+        "timeline": timeline, "segment_size": segment_size,
+        "directory_start_lsn": directory_start,
+        "retained_base_lsn": retained_base, "end_lsn": end,
+    }
+
+
 def _check_wal_reclaim_crash_snapshot(store: Path, stage: str, hit: int) -> None:
     """The physical frontier is durable at every stage; the number of sealed
     segments still on disk tells the stage apart: none unlinked before the
@@ -2408,8 +2440,22 @@ def _check_wal_reclaim_crash_snapshot(store: Path, stage: str, hit: int) -> None
         "reclaim_after_unlink": WAL_RECLAIM_SEGMENTS - hit,
         "reclaim_before_dir_fsync": 0,
     }[stage]
-    if not (store / WAL_RECLAIM_IDENTITY).exists():
-        raise OracleMismatch(f"after_{stage} crash left no shipped-WAL identity")
+    metadata = _wal_store_metadata(store)
+    if metadata is None:
+        raise OracleMismatch(
+            f"after_{stage} crash left no valid shipped-WAL store metadata"
+        )
+    # The physical frontier is what these boundaries are about, and before the
+    # first unlink it is the only thing that distinguishes the crash image
+    # from the state before publication: the files are all still there either
+    # way, and restart maintenance would publish the frontier and reclaim them
+    # before the recovery checks ran.
+    if metadata["directory_start_lsn"] != WAL_RECLAIM_TOTAL or \
+            metadata["retained_base_lsn"] != WAL_RECLAIM_TOTAL:
+        raise OracleMismatch(
+            f"after_{stage} crash published {metadata!r}, expected the "
+            f"directory to start and retain at {WAL_RECLAIM_TOTAL}"
+        )
     files = _wal_segment_files(store)
     if len(files) != expected:
         raise OracleMismatch(
@@ -2425,7 +2471,7 @@ def _check_wal_reclaim_recovery(
     store: Path,
     stage: str,
     timeout: float,
-) -> None:
+) -> dict[str, Any] | None:
     """The verify client already waited for the prefix reads to be refused;
     the segment files must be gone, the identity kept, and the reclaimer
     must have released its physical debt."""
@@ -2457,6 +2503,14 @@ def _check_wal_reclaim_recovery(
         raise OracleMismatch(
             f"after_{stage} recovery reported owners={owners!r}, expected none"
         )
+    metadata = _wal_store_metadata(store)
+    if metadata is None:
+        raise OracleMismatch(
+            f"after_{stage} recovery left no valid shipped-WAL store metadata"
+        )
+    # the settled shipped-WAL state, so the clean restart has to adopt what
+    # recovery reclaimed instead of moving the directory or its files again
+    return {"metadata": metadata, "files": _wal_segment_files(store)}
 
 
 
@@ -2748,10 +2802,9 @@ def _check_gc_recovery(
         return _check_walidx_recovery(inspector, shm, inspection_schema, store,
                                       stage, crash_state)
     if workload == "wal_reclaim":
-        _check_wal_reclaim_recovery(
+        return _check_wal_reclaim_recovery(
             inspector, shm, inspection_schema, store, stage, timeout
         )
-        return
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
