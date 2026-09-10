@@ -102,7 +102,13 @@ stage, a non-empty manifest and at least two local layers otherwise), and
 recovery must serve the published newest block and the retained history at the
 cutoff, refuse the retired pre-cutoff version, reconcile the manifest to the
 local layer set with no pending deletions, and republish the configured
-horizon; a second restart proves idempotence.  WAL reclaim, WAL-index
+horizon; a second restart proves idempotence, and idempotence now means the
+durable state itself -- the layer files, the layers the manifest publishes,
+and the prune frontiers -- is unchanged by that restart, not merely that it
+passes the same checks.  Compaction accordingly leaves a converged shard
+alone: a single source with nothing to prune is already its own compacted
+result, so it is no longer rewritten into a fresh layer by the pruning pass
+each startup marks due.  WAL reclaim, WAL-index
 compaction, timeline deletion, manifest replacement, and compute-restart
 combinations remain outside the harness.
 

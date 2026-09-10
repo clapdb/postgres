@@ -2498,6 +2498,48 @@ def _check_gc_recovery(
         )
 
 
+def _gc_converged_state(store: Path) -> dict[str, Any]:
+    """The durable state a converged store must not change on a further boot.
+
+    Every per-boot oracle is satisfied by a recovery that recompacts the sole
+    surviving layer into a fresh replacement each time it starts, so the
+    idempotence contract needs the state that such churn moves: which layer
+    files exist, which layers the manifest still publishes, and the durable
+    page-prune frontiers.
+    """
+    records = _manifest_records(store)
+    live: set[int] = set()
+    for kind, payload in records:
+        layer_id = _manifest_record_layer_id(payload)
+        if layer_id is None:
+            continue
+        if kind == MANIFEST_ADD_LAYER:
+            live.add(layer_id)
+        elif kind == MANIFEST_MARK_DELETE:
+            live.discard(layer_id)
+    return {
+        "layer_files": sorted(path.name for path in _canonical_layer_files(store)),
+        "published_layers": sorted(live),
+        "frontiers": sorted(_page_frontier_fences(store, 0)),
+    }
+
+
+def _check_gc_restart_idempotent(
+    store: Path, converged: dict[str, Any], stage: str
+) -> None:
+    """The extra clean restart must converge on the state the first recovery
+    already reached, not merely on a state that passes the same checks."""
+    current = _gc_converged_state(store)
+    if current != converged:
+        differing = sorted(
+            key for key in converged if current.get(key) != converged.get(key)
+        )
+        raise OracleMismatch(
+            f"after_{stage} the extra restart changed durable state "
+            f"{differing!r}: {converged!r} became {current!r}"
+        )
+
+
 def _layer_fault_stage(fault_name: str) -> str | None:
     stages = {
         "image_layer.after_create": "create",
@@ -3092,6 +3134,9 @@ def run_daemon_fault_recovery(
              returncode=process.returncode)
         remove_shm(shm)
         process = None
+        # the first recovery has converged and its daemon is down, so this is
+        # the durable state the additional restart has to leave alone
+        converged = _gc_converged_state(store) if gc_seed_actions else None
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
         if layer_seed_actions:
@@ -3102,6 +3147,7 @@ def run_daemon_fault_recovery(
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
             _check_gc_recovery(inspector, shm, inspection_schema, store, gc_stage, timeout)
+            _check_gc_restart_idempotent(store, converged, gc_stage)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         emit("run_pass")

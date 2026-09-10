@@ -3127,6 +3127,19 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	 * drop/recreate churn would keep every such layer alive forever. */
 	if (nrec == 0 && ndropped == 0)
 		goto cleanup;
+	/* A single source with nothing to drop is already the compacted result.
+	 * Publishing an identical replacement and retiring the source rewrites
+	 * the whole layer and churns the manifest on every pass that finds
+	 * pruning due -- including the pass each startup marks, so a converged
+	 * store would move to a fresh layer id at every boot.  The pass is
+	 * complete, not skipped: there is nothing to prune and nothing to merge.
+	 * A legacy shard-zero source is left alone here: its rewrite is governed
+	 * by the legacy compaction path, not by this merge. */
+	if (nold == 1 && ndropped == 0 && !old[0].legacy_shard_zero)
+	{
+		rc = 1;
+		goto cleanup;
+	}
 	frontier_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (frontier_seq != 0)
 		frontier_seq--;
