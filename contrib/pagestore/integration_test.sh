@@ -1894,6 +1894,11 @@ assert "$(grep -c 'reader catalog provenance.*invalid identity' "$BADREADER/serv
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
+# The advancing reader moves its own pin off R, which lets control-image
+# pruning retire the image this data directory boots from; hold a second
+# owner at R so the restart below can still restore it.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8002,1,7,'$readerR');")" "0" \
+	"a second owner holds the advancing reader's boot control image at R"
 ADVANCINGDATA=$(mktemp -d)/reader
 cp -a "$READERDATA" "$ADVANCINGDATA"
 if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1; then
@@ -2067,6 +2072,8 @@ assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerAutoR'::pg_lsn;")" "t" \
 	"advancing reader restart does not regress its durable pin"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,8002,1);")" "0" \
+	"the boot-image owner releases R once the restart is proven"
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 rm -rf "$(dirname "$READERDATA")" "$(dirname "$ADVANCINGDATA")"
 READERDATA=
