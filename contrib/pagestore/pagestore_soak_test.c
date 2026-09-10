@@ -405,7 +405,15 @@ wait_ready(void)
 	{
 		int			fd = shm_open(shm_name, O_RDWR, 0600);
 		int			status;
+		struct stat st;
 
+		/* the object exists before the daemon sizes it; a mapping of the
+		 * empty object faults, so wait for the size as well */
+		if (fd >= 0 && (fstat(fd, &st) != 0 || st.st_size < (off_t) PS_SHM_SIZE))
+		{
+			close(fd);
+			fd = -1;
+		}
 		if (fd >= 0)
 		{
 			PsShmHeader *h = mmap(NULL, sizeof(PsShmHeader), PROT_READ,

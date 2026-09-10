@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -798,6 +799,19 @@ main(int argc, char **argv)
 	{
 		perror("pagestore_inspect: shm_open");
 		return 1;
+	}
+	{
+		struct stat st;
+
+		/* The daemon creates the object before sizing it.  A mapping of the
+		 * still-empty object faults on first access, so report "not ready"
+		 * instead, which every caller already retries. */
+		if (fstat(fd, &st) != 0 || st.st_size < (off_t) PS_SHM_SIZE)
+		{
+			fprintf(stderr, "pagestore_inspect: shared memory is not sized yet\n");
+			close(fd);
+			return 1;
+		}
 	}
 	if (relation_operation)
 	{

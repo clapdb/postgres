@@ -1917,7 +1917,15 @@ wait_ready(const char *shm, uint32_t page_size)
 	for (int i = 0; i < 500; i++)	/* up to ~5s */
 	{
 		int			fd = shm_open(shm, O_RDWR, 0600);
+		struct stat st;
 
+		/* The daemon creates the object before sizing it; touching a mapping
+		 * of a still-empty object raises SIGBUS, so wait for the size too. */
+		if (fd >= 0 && (fstat(fd, &st) != 0 || st.st_size < (off_t) PS_SHM_SIZE))
+		{
+			close(fd);
+			fd = -1;
+		}
 		if (fd >= 0)
 		{
 			PsShmHeader *h = mmap(NULL, sizeof(PsShmHeader), PROT_READ,
