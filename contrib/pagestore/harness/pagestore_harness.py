@@ -2465,6 +2465,90 @@ def _manifest_layers(records: list[tuple[int, bytes]]) -> dict[int, dict[str, An
     return layers
 
 
+SEG_HEADER_BYTES = {
+    0x53454732: 48, 0x53454730: 48, 0x53454731: 48, 0x53454733: 48,   # SEG2/0/1/3
+    0x53454734: 56, 0x53454735: 56, 0x53454736: 56,                   # SEG4/5 bound, SEG6 admission
+    0x53454737: 64, 0x53454738: 64,                                   # SEG7/8 bound + admission
+}
+TIMELINE_META_MAGIC = 0x324D4C54
+TIMELINE_EVENT_STATE = 2
+FORKMETA_PAYLOAD_MAGIC = 0x31534D46
+
+
+def _segment_record_timelines(path: Path) -> list[int]:
+    """The owning timeline of every complete page record in one segment
+    file, decoded in host byte order; the scan stops at the first byte
+    pattern that is not a record magic (the unused tail)."""
+    data = path.read_bytes()
+    timelines: list[int] = []
+    offset = 0
+    while offset + 48 <= len(data):
+        magic, timeline = struct.unpack_from("=II", data, offset)
+        header = SEG_HEADER_BYTES.get(magic)
+        if header is None:
+            break
+        length = struct.unpack_from("=I", data, offset + 40)[0]
+        if offset + header + length > len(data):
+            break
+        timelines.append(timeline)
+        offset += header + length
+    return timelines
+
+
+def _timeline_events(store: Path) -> list[dict[str, int]]:
+    """Every lifecycle record of the timelines log (create records carry no
+    state), decoded in host byte order."""
+    try:
+        data = (store / "timelines").read_bytes()
+    except OSError:
+        return []
+    events: list[dict[str, int]] = []
+    offset = 0
+    while offset + 8 <= len(data):
+        magic, rec_len = struct.unpack_from("=II", data, offset)
+        if magic != TIMELINE_META_MAGIC or rec_len < 8 or offset + rec_len > len(data):
+            break
+        if rec_len == 56:
+            kind, ident, _parent, state = struct.unpack_from("=IIiI", data, offset + 8)
+            incarnation = struct.unpack_from("=Q", data, offset + 32)[0]
+            events.append({"kind": kind, "id": ident, "state": state, "incarnation": incarnation})
+        elif rec_len == 32:
+            events.append({"kind": 0, "id": struct.unpack_from("=I", data, offset + 8)[0],
+                           "state": 0, "incarnation": 0})
+        offset += rec_len
+    return events
+
+
+def _forkmeta_timelines(store: Path) -> set[int]:
+    """Timelines named by fork-size events in the shared forkmeta source and
+    in every snapshot payload part on disk (markers carry no owner)."""
+    owners: set[int] = set()
+
+    def scan(data: bytes, offset: int) -> None:
+        while offset + 64 <= len(data):
+            magic, rec_len, timeline = struct.unpack_from("=III", data, offset)
+            if rec_len != 64 or magic & 0x00FFFFFF != 0x4D4B46:   # "FKM?" family
+                break
+            kind = data[offset + 60]
+            if kind < 10:                                        # not a snapshot marker
+                owners.add(timeline)
+            offset += rec_len
+
+    try:
+        scan((store / "forkmeta").read_bytes(), 0)
+    except OSError:
+        pass
+    snapshots = store / "forkmeta_snapshots"
+    if snapshots.is_dir():
+        for part in snapshots.iterdir():
+            if not part.name.startswith(("forkmeta_checkpoint_v1_", "forkmeta_tail_v1_")):
+                continue
+            data = part.read_bytes()
+            if len(data) >= 80 and struct.unpack_from("=I", data, 0)[0] == FORKMETA_PAYLOAD_MAGIC:
+                scan(data, 80)
+    return owners
+
+
 def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
     """Private WAL and WAL-index artifacts of one timeline, plus the layer
     files the manifest still attributes to it.  Layer file names carry the
@@ -2481,9 +2565,13 @@ def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
         layer_id for layer_id, layer in _manifest_layers(_manifest_records(store)).items()
         if layer["timeline"] == timeline
     }
-    for path in _canonical_layer_files(store):
-        if int(path.name.rsplit("_", 1)[1], 16) in owned:
-            names.append(f"{path.name} (manifest layer of timeline {timeline})")
+    on_disk = {int(path.name.rsplit("_", 1)[1], 16) for path in _canonical_layer_files(store)}
+    # a layer the manifest still attributes to the owner is an artifact
+    # whether or not its file is still there: publishing DELETED before the
+    # manifest REMOVE would otherwise look artifact-free after an unlink
+    for layer_id in sorted(owned):
+        names.append(f"layer_{layer_id:#x} (manifest layer of timeline {timeline}, "
+                     f"{'on disk' if layer_id in on_disk else 'file gone'})")
     return names
 
 
@@ -2501,6 +2589,7 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
                 ("private WAL", f"wal_{DELETE_BRANCH}" in wal),
                 ("WAL-index epoch", any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in wal)),
                 ("owner layer", any(n.startswith("layer_") for n in artifacts)),
+                ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
             ) if not present
         ]
         if missing:
@@ -2513,10 +2602,32 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
         raise OracleMismatch(
             f"after_{stage} crash left private WAL artifacts {wal!r}"
         )
-    if stage == "delete_deleted" and artifacts:
-        raise OracleMismatch(
-            f"after_deleted crash left owner artifacts {artifacts!r}"
-        )
+    if stage == "delete_segment_rewrite":
+        # the probe fires after one shared segment was atomically rewritten
+        # without the owner's records: some segment must now hold survivors
+        # of timeline 0 and nothing of the deleted owner
+        rewritten = [
+            path.name for path in sorted(store.glob("seg_*"))
+            for owners in [_segment_record_timelines(path)]
+            if owners and DELETE_BRANCH not in owners
+        ]
+        if not rewritten:
+            raise OracleMismatch(
+                "after_segment_rewrite crash left no shared segment rewritten "
+                "without the deleted owner's records"
+            )
+    if stage == "delete_deleted":
+        if artifacts:
+            raise OracleMismatch(
+                f"after_deleted crash left owner artifacts {artifacts!r}"
+            )
+        events = [e for e in _timeline_events(store) if e["id"] == DELETE_BRANCH]
+        if not events or events[-1]["kind"] != TIMELINE_EVENT_STATE or \
+                events[-1]["state"] != 3 or events[-1]["incarnation"] != 1:
+            raise OracleMismatch(
+                "after_deleted crash did not leave a durable DELETED event with the "
+                f"seeded incarnation as the branch's latest record: {events[-1:]!r}"
+            )
 
 
 def _check_delete_recovery(
@@ -2540,14 +2651,16 @@ def _check_delete_recovery(
                 f"{manifest.get('manifest_poisoned')!r}"
             )
         settled = not artifacts and manifest.get("deleting_layers") == 0 and \
-            manifest.get("layer_count") == manifest.get("local_layers")
+            manifest.get("layer_count") == manifest.get("local_layers") and \
+            DELETE_BRANCH not in _forkmeta_timelines(store)
         if settled:
             break
         now = time.monotonic()
         if now >= deadline:
             raise HarnessTimeout(
                 f"after_{stage} recovery left artifacts {artifacts!r} manifest "
-                f"{manifest!r} after {poll_timeout:.3f}s"
+                f"{manifest!r} forkmeta owners {sorted(_forkmeta_timelines(store))!r} "
+                f"after {poll_timeout:.3f}s"
             )
         time.sleep(min(0.05, deadline - now))
     timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)

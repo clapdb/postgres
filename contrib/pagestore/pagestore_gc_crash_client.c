@@ -500,6 +500,22 @@ delete_seed(void)
 		delete_write_block(page, DELETE_BRANCH, branch_incarnation, block,
 						   DELETE_FORK_LSN + 1000 + block,
 						   (unsigned char) (0x40 + block));
+	/* a zero-extend is the one growth with no page record, so it leaves an
+	 * owner-scoped fork-size event the deletion must settle while the
+	 * parent's own fork metadata stays untouched */
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_ZEROEXTEND;
+	ch->blocknum = DELETE_PAGES;
+	ch->nblocks = 1;
+	ch->req_lsn = DELETE_FORK_LSN + 2000;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch zero-extend failed");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != DELETE_PAGES + 1)
+		die("branch zero-extend did not grow the relation");
 	free(page);
 	arm_fault();
 	set_relation(ch);
@@ -560,6 +576,15 @@ delete_verify(void)
 	for (uint32_t i = 0; i < 64; i++)
 		if (ch->data[i] != 1)
 			die("deletion corrupted the parent's shipped WAL bytes");
+	/* the parent's fork metadata survives the owner-scoped filtering */
+	set_relation(ch);
+	ch->opcode = PS_OP_EXISTS;
+	if (execute()->status != PS_STATUS_OK || ch->result == 0)
+		die("deletion dropped the parent's relation from its fork metadata");
+	set_relation(ch);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != 1)
+		die("deletion changed the parent's relation size");
 	set_relation(ch);
 	set_timeline(ch, DELETE_BRANCH, incarnation);
 	ch->opcode = PS_OP_READV;
