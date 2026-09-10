@@ -2069,7 +2069,10 @@ advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log
 }
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 	"advancing reader restart adopts its durable owner horizon before serving"
-assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerAutoR'::pg_lsn;")" "t" \
+# The reader keeps advancing: its artifact launcher can publish a newer view
+# while this section runs, and the restarted reader adopts it.  What the
+# restart must not do is move the pin backwards.
+assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) >= '$readerAutoR'::pg_lsn;")" "t" \
 	"advancing reader restart does not regress its durable pin"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT pagestore_retention_drop(0,1,8002,1);")" "0" \
