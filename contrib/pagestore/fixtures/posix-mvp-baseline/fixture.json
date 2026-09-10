@@ -20,7 +20,7 @@
     "--wal-catch-up-bytes",
     "1",
     "--walidx-snapshot-bytes",
-    "1"
+    "1048576"
   ],
   "daemon_env": {
     "PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES": "1024"
@@ -32,9 +32,8 @@
     "forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
     "forkmeta_snapshots/forkmeta_manifest_v1",
     "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001",
-    "layer_0_0000000000000007",
-    "layer_0_0000000000000008",
-    "layer_0_0000000000000009",
+    "layer_0_000000000000000a",
+    "layer_0_000000000000000b",
     "layers.manifest",
     "page-prune.frontiers",
     "retention.initialized",
@@ -47,12 +46,14 @@
     "seg_00000004",
     "timelines",
     "wal_0",
+    "wal_1",
     "wal_segments_0",
     "wal_segments_0/wal_store_identity_v1",
     "wal_segments_0/walv1_1_00000000000000000000",
     "walidx-prune.frontiers",
     "walidx_0_0_e00000000000000000001",
     "walidx_0_0_e00000000000000000001.size",
+    "walidx_1_0",
     "walidx_snapshots_0",
     "walidx_snapshots_0/walidx_manifest_v1",
     "walidx_snapshots_0/walidxg1_00000000000000000001_000"

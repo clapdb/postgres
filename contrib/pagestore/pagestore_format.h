@@ -19,7 +19,7 @@ typedef struct PsFormatIdentity
 {
 	const char *family;			/* fixture family, e.g. "manifest" */
 	const char *artifact;		/* file or record the identity guards */
-	uint32_t	magic;
+	uint64_t	magic;			/* some formats key on a 64-bit magic */
 	uint32_t	version;
 } PsFormatIdentity;
 
@@ -30,5 +30,6 @@ extern size_t ps_wal_store_format_identities(const PsFormatIdentity **out);
 extern size_t ps_forkmeta_snapshot_format_identities(const PsFormatIdentity **out);
 extern size_t ps_walidx_snapshot_format_identities(const PsFormatIdentity **out);
 extern size_t ps_core_format_identities(const PsFormatIdentity **out);
+extern size_t ps_storage_posix_format_identities(const PsFormatIdentity **out);
 
 #endif							/* PAGESTORE_FORMAT_H */

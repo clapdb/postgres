@@ -602,6 +602,8 @@ static void delete_seed_survivor(unsigned char *page);
 static void delete_verify_survivor(unsigned char *page);
 static void delete_verify_live(void);
 static uint64_t page_lsn(const unsigned char *page);
+static int walidx_get(uint64_t lsn_max, PsWalRec *out, uint32_t max_out, int *count);
+
 
 
 static unsigned char
@@ -1137,6 +1139,9 @@ fixture_seed(void)
 	incarnation = fixture_create_branch(FIXTURE_BRANCH);
 	delete_write_block(page, FIXTURE_BRANCH, incarnation, 0,
 					   FIXTURE_BRANCH_LSN, 0x77);
+	/* the branch's own shipped WAL; its WAL-index interval is added by the
+	 * extension, after the snapshot cutover has emptied the epoch logs */
+	delete_wal_append(FIXTURE_BRANCH, incarnation, FIXTURE_FORK_LSN);
 	/* One record of every page-segment format the daemon writes today: an
 	 * ordinary versioned record above, a below-floor copy whose record is
 	 * clamped to the branch point, and a zero-version (WAL-less) record. */
@@ -1159,7 +1164,39 @@ fixture_seed(void)
 static void
 fixture_extend(void)
 {
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	incarnation = 0;
+
 	forkmeta_create_grow(FIXTURE_TAIL_REL, FIXTURE_TAIL_LSN, 2);
+	/* The cutover leaves every epoch log empty, so the records of the
+	 * WAL-index log format itself are appended afterwards, on the branch
+	 * whose WAL the extension phase no longer snapshots. */
+	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation == 0)
+		die("fixture branch is not live for its WAL-index interval");
+	{
+		PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+		set_relation(ch);
+		set_timeline(ch, FIXTURE_BRANCH, incarnation);
+		entries[0].key = ch->key;
+		entries[0].block = 0;
+		entries[0].flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+		entries[0].lsn = FIXTURE_FORK_LSN + 16;
+		entries[0].end_lsn = FIXTURE_FORK_LSN + 17;
+		ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+		ch->nblocks = 1;
+		ch->datalen = sizeof(*entries);
+		if (execute()->status != PS_STATUS_OK)
+			die("fixture branch WAL-index add failed");
+	}
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = FIXTURE_FORK_LSN;
+	ch->req_seq = FIXTURE_FORK_LSN + DELETE_WAL_BYTES;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch WAL-index progress commit failed");
 }
 
 /* The seed wrote each 64 KiB chunk full of a byte derived from its position,
@@ -1256,6 +1293,14 @@ fixture_verify(void)
 	if (!page_has_tag(page, 0x66))
 		die_page("fixture branch lost its WAL-less page version",
 				 FIXTURE_WALLESS_BLOCK, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != FIXTURE_FORK_LSN + DELETE_WAL_BYTES)
+		die("fixture branch lost its WAL-index progress");
 	if (timeline_state(FIXTURE_DELETED_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
 		die("fixture deleted branch is not DELETED");
 	free(page);

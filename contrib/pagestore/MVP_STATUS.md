@@ -635,17 +635,21 @@ point, and a zero-version WAL-less record), and a deleted branch.
 `harness/pagestore_fixture.py
 --check` fails when the compiled identities differ from the fixture (a
 format change without a fixture update), reopens the fixture and runs its
-oracle across a restart, and applies thirty-seven mutations (unknown newer
+oracle across a restart, and applies thirty-nine mutations (unknown newer
 version, checksum corruption, truncation) across the WAL store identity,
 sealed WAL segments, retention state and records, page and WAL-index
 frontiers, forkmeta and WAL-index snapshot manifests and payloads, the
-timelines log, the forkmeta source epoch, the layer manifest, and image
-layers.  Each is rejected at open except the documented torn-tail repairs of
+WAL-index epoch watermark, the timelines log, the forkmeta source epoch, the
+layer manifest, and image layers.  Each is rejected at open except the documented torn-tail repairs of
 the timelines and layer manifest logs; a daemon that dies of a signal or
 exits under use is reported as a crash, never as a rejection.  The identity
 table also covers the page-segment (versioned, WAL-less, and clamped),
-flat-WAL, and WAL-index source-log record magics the daemon writes, and the
-check requires the fixture to carry a record of each of them; it does not
+flat-WAL, WAL-index source-log, and POSIX WAL-index watermark formats the
+daemon writes, and the check requires the fixture to carry a record of every
+advertised page-segment and WAL-index log format; the capture therefore runs
+in two phases, seeding under the trigger that publishes a WAL-index snapshot
+and then extending under the one the archive records, so the records appended
+after the cutover stay in the live epoch; it does not
 advertise delta layers, which no maintenance path produces yet.  Captures run
 in a private directory and canonicalize the absolute layer locations the
 manifest persists, so repeated captures produce byte-identical archives, and

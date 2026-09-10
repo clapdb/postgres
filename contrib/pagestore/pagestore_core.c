@@ -8037,7 +8037,10 @@ fork_meta_snapshot_sort_cmp(const void *a, const void *b)
 		x->rec->admission_seq != 0 && y->rec->admission_seq != 0)
 		return x->rec->admission_seq < y->rec->admission_seq ? -1 : 1;
 	/* Equal position: keep the physical order the part was built in.  Legacy
-	 * sequence-zero markers are ordered by it and nothing else. */
+	 * sequence-zero markers are ordered by it and nothing else.  An element
+	 * compared with itself must compare equal, which qsort is allowed to do. */
+	if (x->index == y->index)
+		return 0;
 	return x->index < y->index ? -1 : 1;
 }
 

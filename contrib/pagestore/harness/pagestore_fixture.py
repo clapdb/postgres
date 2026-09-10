@@ -37,6 +37,15 @@ DAEMON_ARGS = [
     "--walidx-snapshot-bytes", "1",
 ]
 DAEMON_ENV = {"PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES": "1024"}
+# The seeding phase snapshots the WAL index as soon as it has bytes, which
+# empties the epoch logs; the extension phase raises the trigger so the
+# records appended after the cutover stay in the live epoch, and that is the
+# configuration the archive is read back with.
+SEED_ARGS = DAEMON_ARGS
+DAEMON_ARGS = [
+    arg if previous != "--walidx-snapshot-bytes" else "1048576"
+    for previous, arg in zip([""] + SEED_ARGS, SEED_ARGS)
+]
 EXCLUDED = {".pagestore.lock"}
 MANIFEST_NAME = "layers.manifest"
 MANIFEST_MAGIC = 0x504D414E
@@ -46,6 +55,8 @@ FNV_INIT = 2166136261
 # directory no longer exists, so the archive records the leaves under a path
 # that cannot exist rather than under whichever directory captured them.
 FIXTURE_LAYER_ROOT = "/nonexistent/pagestore-fixture/layers"
+WALIDX_MAGICS = {0x57494458, 0x57495047}      # "WIDX" records, "WIPG" progress
+WATERMARK_SUFFIX = ".size"
 SEG_HEADER_BYTES = {
     0x53454732: 48, 0x53454730: 48, 0x53454731: 48, 0x53454733: 48,
     0x53454734: 56, 0x53454735: 56, 0x53454736: 56,
@@ -148,6 +159,12 @@ MUTATIONS = [
              lambda p: flip_byte(p, 16), OPEN_REJECTED),
     mutation("walidx_snapshot.shard.crc", "walidx_snapshots_0/walidxg1_*",
              lambda p: flip_byte(p, -1), OPEN_REJECTED),
+    # the epoch watermark is the acknowledged length of its log; a damaged
+    # one cannot be told from a lost suffix, so the store fails closed
+    mutation("walidx_watermark.crc", "walidx_0_0_e*.size",
+             lambda p: flip_byte(p, 8), OPEN_REJECTED),
+    mutation("walidx_watermark.truncated", "walidx_0_0_e*.size",
+             lambda p: truncate_to(p, 16), OPEN_REJECTED),
     mutation("timelines.unknown_magic", "timelines",
              lambda p: bump_le32(p, 0), OPEN_REJECTED),
     mutation("timelines.crc", "timelines",
@@ -256,6 +273,24 @@ def segment_magics(store: Path) -> set[int]:
     return magics
 
 
+def walidx_magics(store: Path) -> set[int]:
+    """The record magics present in the live WAL-index epoch logs.  Records
+    are self-sized, so they are walked rather than searched for."""
+    magics: set[int] = set()
+    for path in sorted(store.glob("walidx_*")):
+        if path.name.endswith(WATERMARK_SUFFIX) or not path.is_file():
+            continue
+        data = path.read_bytes()
+        offset = 0
+        while offset + 8 <= len(data):
+            magic, rec_len = struct.unpack_from("=II", data, offset)
+            if magic not in WALIDX_MAGICS or rec_len < 8 or offset + rec_len > len(data):
+                break
+            magics.add(magic)
+            offset += rec_len
+    return magics
+
+
 def check_segment_formats(store: Path, identities: list[dict[str, Any]]) -> None:
     """Every page-segment format the identity table advertises must have an
     instance in the fixture, or a regression in its reader cannot be caught."""
@@ -269,6 +304,16 @@ def check_segment_formats(store: Path, identities: list[dict[str, Any]]) -> None
         raise FixtureError(
             "the fixture carries no record of advertised page-segment formats "
             + ", ".join(f"{magic:#x}" for magic in missing)
+        )
+    advertised_log = {
+        int(item["magic"], 16) for item in identities
+        if item["family"] == "walidx_log"
+    }
+    missing_log = sorted(advertised_log - walidx_magics(store))
+    if missing_log:
+        raise FixtureError(
+            "the fixture carries no record of advertised WAL-index log formats "
+            + ", ".join(f"{magic:#x}" for magic in missing_log)
         )
 
 
@@ -413,7 +458,7 @@ def capture(args: argparse.Namespace) -> int:
         store.mkdir()
         log = root / "daemon.log"
         shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}"
-        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log)
+        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log, SEED_ARGS)
         try:
             if daemon.start() != "ready":
                 raise FixtureError(f"daemon refused a fresh store; see {log}")
@@ -429,9 +474,20 @@ def capture(args: argparse.Namespace) -> int:
             # settled, and the extension then lands in the settled source tail
             verify_until(args.client_binary, shm, root / "client.log", 60.0, expect_tail=False)
             wait_for_forkmeta_cutover(store, 60.0)
+        finally:
+            code = daemon.stop()
+        if code != 0:
+            raise FixtureError(f"seeding daemon did not stop cleanly: status {code}")
+        # the extension phase runs under the configuration the fixture records
+        shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_x"
+        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log)
+        try:
+            if daemon.start() != "ready":
+                raise FixtureError(f"daemon refused the seeded store; see {log}")
             extend = run_client(args.client_binary, shm, "extend", root / "client.log")
             if extend.returncode != 0:
-                raise FixtureError(f"fixture extension failed; see {root / 'client.log'}")
+                tail = (root / "client.log").read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
+                raise FixtureError(f"fixture extension failed: {tail!r}")
             verify_until(args.client_binary, shm, root / "client.log", 30.0)
             time.sleep(1.0)
             verify_until(args.client_binary, shm, root / "client.log", 10.0)
@@ -529,21 +585,24 @@ def check(args: argparse.Namespace) -> int:
     metadata = fixture_metadata(fixture)
     expected = json.loads((fixture / FORMAT_JSON).read_text(encoding="utf-8"))
     current = format_identities(args.format_tool)
-    if current != expected:
-        print("FAIL - compiled persisted-format identities differ from the fixture:")
-        for item in current:
-            if item not in expected:
-                print(f"  new or changed: {item}")
-        for item in expected:
-            if item not in current:
-                print(f"  missing or changed: {item}")
-        print(f"  a persisted-format change must add or update a fixture ({fixture})")
-        return 1
-    print("ok   - compiled persisted-format identities match the fixture")
     failures = 0
     with tempfile.TemporaryDirectory(prefix="pagestore-fixture-check-") as temp:
         root = Path(temp)
+        # Reopening comes first: an archive whose identities the binary has
+        # moved past is exactly the upgrade path a fixture exists to prove,
+        # and it must still open before the identity table is judged.
         check_reopen(args, root, fixture, metadata, current)
+        if current != expected:
+            print("FAIL - compiled persisted-format identities differ from the fixture:")
+            for item in current:
+                if item not in expected:
+                    print(f"  new or changed: {item}")
+            for item in expected:
+                if item not in current:
+                    print(f"  missing or changed: {item}")
+            print(f"  a persisted-format change must add or update a fixture ({fixture})")
+            return 1
+        print("ok   - compiled persisted-format identities match the fixture")
         (root / "mutations").mkdir()
         for case in MUTATIONS:
             if args.only and case["name"] not in args.only:

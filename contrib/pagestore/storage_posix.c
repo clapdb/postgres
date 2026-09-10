@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "pagestore_storage.h"
+#include "pagestore_format.h"
 #include "pagestore_ipc.h"
 #include "pagestore_store_owner.h"
 #include "pagestore_wal_store.h"
@@ -2849,3 +2850,20 @@ const PsStorage PsStoragePosix = {
 	.fork_meta_size = posix_fork_meta_size,
 	.fork_meta_rewrite = posix_fork_meta_rewrite,
 };
+
+/*
+ * The epoch watermark is the one persisted format this provider owns: the
+ * durable length of a WAL-index epoch log, written beside it so a torn tail
+ * is trimmed on open.
+ */
+size_t
+ps_storage_posix_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"walidx_watermark", "walidx_<tl>_<shard>_e<epoch>.size",
+		 POSIX_WALIDX_WATERMARK_MAGIC, 1},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
+}

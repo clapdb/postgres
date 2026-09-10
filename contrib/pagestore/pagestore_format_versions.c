@@ -45,6 +45,7 @@ main(void)
 		ps_manifest_format_identities, ps_retention_format_identities,
 		ps_wal_store_format_identities, ps_forkmeta_snapshot_format_identities,
 		ps_walidx_snapshot_format_identities, ps_core_format_identities,
+		ps_storage_posix_format_identities,
 	};
 	PsFormatIdentity all[64];
 	size_t		n = 0;
@@ -69,9 +70,10 @@ main(void)
 	qsort(all, n, sizeof(all[0]), compare);
 	printf("[\n");
 	for (size_t i = 0; i < n; i++)
-		printf("  {\"family\": \"%s\", \"artifact\": \"%s\", \"magic\": \"0x%08x\", "
+		printf("  {\"family\": \"%s\", \"artifact\": \"%s\", \"magic\": \"0x%08llx\", "
 			   "\"version\": %u}%s\n", all[i].family, all[i].artifact,
-			   all[i].magic, all[i].version, i + 1 < n ? "," : "");
+			   (unsigned long long) all[i].magic, all[i].version,
+			   i + 1 < n ? "," : "");
 	printf("]\n");
 	return 0;
 }
