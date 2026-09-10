@@ -4557,17 +4557,19 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 	 * every superseded admission of the same page, under both the shard and
 	 * map write locks.
 	 */
+	const PsKey *last_wal_less = NULL;
+
 	for (uint32_t r = 0; r < nrec; r++)
 	{
 		ForkEnt    *fork;
-		int			seen = 0;
 
 		if (recs[r].lsn != 0)
 			continue;
-		for (uint32_t prev = 0; prev < r && !seen; prev++)
-			seen = recs[prev].lsn == 0 && key_eq(&recs[prev].key, &recs[r].key);
-		if (seen)
+		/* the dropped identities are key-sorted, so one comparison with the
+		 * previous zero-version key is the whole deduplication */
+		if (last_wal_less != NULL && key_eq(last_wal_less, &recs[r].key))
 			continue;
+		last_wal_less = &recs[r].key;
 		fork = fork_find(timeline, &recs[r].key);
 		if (fork == NULL)
 			continue;
@@ -14977,6 +14979,8 @@ artifact_fence_reserve(uint32_t timeline, uint64_t lsn)
 static void
 artifact_fence_release(uint32_t timeline, uint64_t lsn)
 {
+	int			reschedule = 0;
+
 	if (lsn == 0)
 		return;
 	pthread_mutex_lock(&artifact_fence_lock);
@@ -14991,11 +14995,16 @@ artifact_fence_release(uint32_t timeline, uint64_t lsn)
 					artifact_fences[i].versions == 0)
 				{
 					artifact_fences[i] = artifact_fences[--nartifact_fences];
-					page_prune_mark_all_due_locked();
+					reschedule = 1;
 				}
 				break;
 			}
 	pthread_mutex_unlock(&artifact_fence_lock);
+	/* Marking every timeline due reads the timeline table, which a
+	 * concurrent branch creation publishes under the map lock; take that
+	 * lock here rather than under the fence lock the caller holds. */
+	if (reschedule)
+		page_prune_mark_all_due();
 }
 
 /* A deleted (or reused) timeline's artifacts are purged with its pages. */
