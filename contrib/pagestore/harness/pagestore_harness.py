@@ -4377,6 +4377,25 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                     restart_data, restart_log = reader_data_dirs[action["target"]], trace / "reader.log"
                 else:
                     raise PlanError(f"restart {action['id']} targets unavailable compute {action['target']!r}")
+
+                def compute_instance(what: Path) -> dict[str, Any]:
+                    """The postmaster this data directory is running, as a
+                    PID with its start time: a replacement handed the same PID
+                    is a different process, and the trace has to be able to
+                    show that the named compute was in fact replaced."""
+                    try:
+                        pid = int(
+                            (what / "postmaster.pid").read_text(encoding="utf-8")
+                            .splitlines()[0]
+                        )
+                    except (OSError, ValueError, IndexError) as error:
+                        raise PlanError(
+                            f"restart {action['id']} cannot read the postmaster pid "
+                            f"of {what}: {error}"
+                        ) from error
+                    return {"pid": pid, "starttime": read_process_starttime(pid)}
+
+                previous_instance = compute_instance(restart_data)
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(restart_data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 if action["target"] in reader_data_dirs:
                     assert control_restore is not None
@@ -4428,7 +4447,13 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                             f"unhealthy: {health_sql} returned {health!r}"
                         )
                     time.sleep(.1)
-                events.emit("restart", id=action["id"], target=action["target"], mode="fast", data=str(restart_data), restored_control=restored_control, health=health)
+                instance = compute_instance(restart_data)
+                if instance == previous_instance:
+                    raise OracleMismatch(
+                        f"restart {action['id']} left the {action['target']} "
+                        f"instance {previous_instance!r} in place"
+                    )
+                events.emit("restart", id=action["id"], target=action["target"], mode="fast", data=str(restart_data), restored_control=restored_control, health=health, previous_instance=previous_instance, instance=instance)
                 continue
             elif action["op"] == "capture":
                 ref = action["horizon"]
@@ -4949,19 +4974,25 @@ def run_materializer_smoke(
             )
             events.emit("process_start", target="writer", reason=reason)
 
-        def restart_instance(target: str) -> int:
+        def process_instance(pid: int) -> dict[str, Any]:
+            """A process identity a replacement cannot accidentally repeat:
+            the PID together with its start time, since the OS is free to
+            hand the old PID to the new process."""
+            return {"pid": pid, "starttime": read_process_starttime(pid)}
+
+        def restart_instance(target: str) -> dict[str, Any]:
             """What a restart of this target actually replaces: the writer's
             and the store's own process, and the materializer's worker
             generation.  A restart event that reported the materializer's
             generation for every target could not distinguish a writer or
             store that came back from one that never went down."""
             if target == "writer":
-                return compute_postmaster_pid(writer_data, "writer")
+                return process_instance(compute_postmaster_pid(writer_data, "writer"))
             if target == "materializer":
-                return materializer_generation
+                return {"generation": materializer_generation}
             if dproc is None:
                 raise PlanError("store restart has no daemon process")
-            return dproc.pid
+            return process_instance(dproc.pid)
 
         def stop_writer(reason: str) -> None:
             subprocess.run(
@@ -5642,7 +5673,10 @@ def run_materializer_smoke(
                     stop_writer(action["id"])
                     assert dproc is not None
                     dproc.terminate()
-                    dproc.wait(timeout=30)
+                    # the daemon's own clean-stop bound: draining maintenance
+                    # and flushing persistent state is allowed to take this
+                    # long, and a slower shutdown is not a failed one
+                    dproc.wait(timeout=60)
                     if dproc.returncode != 0:
                         raise UnexpectedExit(
                             f"daemon did not stop cleanly for {action['id']}: "

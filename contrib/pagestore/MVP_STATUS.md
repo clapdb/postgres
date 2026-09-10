@@ -190,9 +190,10 @@ prepared transaction across its restart and the writer's -- including
 after that transaction commits -- and the materializer to serve the last
 durable boundary as soon as its replacement is up, then each boundary
 after a writer restart, a worker restart, and a store restart with zero
-lag at the end.  Each restart event records the instance the restart
-actually replaced (the writer's or daemon's process, the materializer's
-worker generation) and fails if it is unchanged, and a writer restart
+lag at the end.  Each restart event in both runtimes records the instance the
+restart actually replaced -- the writer's, reader's or daemon's process as a
+PID with its start time, since the OS may hand the replacement the same PID,
+or the materializer's worker generation -- and fails if it is unchanged, and a writer restart
 invalidates the declared checkpoint, so a later reader base or capture
 must declare a new one.  Remaining outside
 the harness: branch-compute restarts, which the golden scenario covers.
