@@ -630,7 +630,15 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
             return f"{CRASHED} ({status} at open)"
         if status != "ready":
             return OPEN_REJECTED
-        result = run_client(args.client_binary, shm, "verify", root / "mutations" / f"{case['name']}.client.log")
+        client_log = root / "mutations" / f"{case['name']}.client.log"
+        result = run_client(args.client_binary, shm, "verify", client_log)
+        # A mutation the store repairs (a torn append-only tail) resumes the
+        # transition it interrupted asynchronously, so the oracle is retried
+        # while that can still land; a rejection stays a rejection.
+        deadline = time.monotonic() + (30.0 if case["expect"] == ACCEPTED else 0.0)
+        while result.returncode != 0 and time.monotonic() < deadline and daemon.alive():
+            time.sleep(0.5)
+            result = run_client(args.client_binary, shm, "verify", client_log)
         if not daemon.alive():
             code = daemon.process.returncode if daemon.process else None
             return f"{CRASHED} (daemon exited {code} under use)"
