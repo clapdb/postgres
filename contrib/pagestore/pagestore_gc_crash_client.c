@@ -118,7 +118,14 @@
 #define FIXTURE_WAL_REDO (RECLAIM_SEGMENT / 2)
 #define FIXTURE_BRANCH 1u
 #define FIXTURE_DELETED_BRANCH 2u
-#define FIXTURE_FORK_LSN UINT64_C(65536)
+/* Above the WAL end: maintenance may publish the parent's WAL-index frontier
+ * at any point up to FIXTURE_WAL_END before the branches are created, and a
+ * fork below a published frontier is refused. */
+#define FIXTURE_FORK_LSN (FIXTURE_WAL_END + UINT64_C(65536))
+#define FIXTURE_BRANCH_LSN (FIXTURE_FORK_LSN + UINT64_C(4000))
+#define FIXTURE_CLAMPED_LSN (FIXTURE_FORK_LSN - UINT64_C(4000))
+#define FIXTURE_CLAMPED_BLOCK 3u
+#define FIXTURE_WALLESS_BLOCK 4u
 #define FIXTURE_TAIL_REL 8000u
 #define FIXTURE_TAIL_LSN UINT64_C(9000)
 
@@ -1128,7 +1135,15 @@ fixture_seed(void)
 	walidx_batch_and_commit(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
 	/* a live branch with its own page version, and a deleted branch */
 	incarnation = fixture_create_branch(FIXTURE_BRANCH);
-	delete_write_block(page, FIXTURE_BRANCH, incarnation, 0, 70000, 0x77);
+	delete_write_block(page, FIXTURE_BRANCH, incarnation, 0,
+					   FIXTURE_BRANCH_LSN, 0x77);
+	/* One record of every page-segment format the daemon writes today: an
+	 * ordinary versioned record above, a below-floor copy whose record is
+	 * clamped to the branch point, and a zero-version (WAL-less) record. */
+	delete_write_block(page, FIXTURE_BRANCH, incarnation, FIXTURE_CLAMPED_BLOCK,
+					   FIXTURE_CLAMPED_LSN, 0x55);
+	delete_write_block(page, FIXTURE_BRANCH, incarnation, FIXTURE_WALLESS_BLOCK,
+					   0, 0x66);
 	incarnation = fixture_create_branch(FIXTURE_DELETED_BRANCH);
 	set_relation(ch);
 	set_timeline(ch, FIXTURE_DELETED_BRANCH, incarnation);
@@ -1145,6 +1160,28 @@ static void
 fixture_extend(void)
 {
 	forkmeta_create_grow(FIXTURE_TAIL_REL, FIXTURE_TAIL_LSN, 2);
+}
+
+/* The seed wrote each 64 KiB chunk full of a byte derived from its position,
+ * so a compatibility regression that shifts or truncates the persisted WAL is
+ * visible in the bytes, not only in the request status. */
+static void
+fixture_wal_check(uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char expected = (unsigned char) (1 + lsn / RECLAIM_SEGMENT);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = lsn;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture shipped WAL is not readable");
+	if (ch->result != 64)
+		die("fixture shipped WAL returned a short read");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != expected)
+			die("fixture shipped WAL returned the wrong bytes");
 }
 
 static void
@@ -1172,9 +1209,8 @@ fixture_verify(void)
 	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
 	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_REDO)
 		die("fixture WAL retain floor changed");
-	if (wal_read_status(0) != PS_STATUS_OK ||
-		wal_read_status(RECLAIM_SEGMENT) != PS_STATUS_OK)
-		die("fixture shipped WAL is not readable");
+	fixture_wal_check(0);
+	fixture_wal_check(RECLAIM_SEGMENT);
 	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
 		incarnation == 0)
 		die("fixture branch is not live");
@@ -1198,6 +1234,28 @@ fixture_verify(void)
 	memcpy(page, ch->data, page_size);
 	if (!page_has_tag(page, 1))
 		die_page("fixture branch lost its inherited page", 1, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = FIXTURE_CLAMPED_BLOCK;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch clamped read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x55))
+		die_page("fixture branch lost its clamped page version",
+				 FIXTURE_CLAMPED_BLOCK, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = FIXTURE_WALLESS_BLOCK;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch WAL-less read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x66))
+		die_page("fixture branch lost its WAL-less page version",
+				 FIXTURE_WALLESS_BLOCK, page);
 	if (timeline_state(FIXTURE_DELETED_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
 		die("fixture deleted branch is not DELETED");
 	free(page);

@@ -7275,7 +7275,20 @@ fork_meta_source_conflicts_with_snapshot(void)
 		int			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
 
 		if (nread == 0)
+		{
+			/* The cutover rewrites the source atomically, so it never
+			 * produces an empty log.  Treating one as the captured
+			 * pre-cutover epoch would replace it with a marker-only epoch
+			 * and silently discard acknowledged post-cutover events. */
+			if (off == 0)
+			{
+				fprintf(stderr, "pagestore: forkmeta source is empty while snapshot "
+						"generation %llu is selected\n",
+						(unsigned long long) fork_meta_snapshot_generation);
+				return 1;
+			}
 			return 0;
+		}
 		if (nread < 0)
 			return 1;
 		if (nread != (int) sizeof(rec))
@@ -8000,6 +8013,79 @@ fork_meta_migration_marker_valid(const ForkMetaRecV2 *rec)
 		rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
 }
 
+typedef struct ForkMetaSnapshotSortRef
+{
+	const ForkMetaRecV2 *rec;
+	uint64_t	index;
+} ForkMetaSnapshotSortRef;
+
+static int
+fork_meta_snapshot_sort_cmp(const void *a, const void *b)
+{
+	const ForkMetaSnapshotSortRef *x = a;
+	const ForkMetaSnapshotSortRef *y = b;
+	int			c;
+
+	if (x->rec->timeline != y->rec->timeline)
+		return x->rec->timeline < y->rec->timeline ? -1 : 1;
+	c = memcmp(&x->rec->key, &y->rec->key, sizeof(x->rec->key));
+	if (c != 0)
+		return c;
+	if (x->rec->lsn != y->rec->lsn)
+		return x->rec->lsn < y->rec->lsn ? -1 : 1;
+	if (x->rec->admission_seq != y->rec->admission_seq &&
+		x->rec->admission_seq != 0 && y->rec->admission_seq != 0)
+		return x->rec->admission_seq < y->rec->admission_seq ? -1 : 1;
+	/* Equal position: keep the physical order the part was built in.  Legacy
+	 * sequence-zero markers are ordered by it and nothing else. */
+	return x->index < y->index ? -1 : 1;
+}
+
+/*
+ * A part is loaded back under a per-fork ordering invariant: records of one
+ * fork must not step backwards in (lsn, admission_seq).  The per-entry pass
+ * emits each fork's in-memory events in order, but ordered markers that live
+ * only in the source log are appended afterwards, so a fork whose in-memory
+ * events reach past such a marker would be written in an order the loader
+ * refuses -- a snapshot the daemon publishes and then cannot open.  Sort each
+ * part into per-fork order before it is wrapped, keeping equal positions in
+ * their original physical order.
+ */
+static int
+fork_meta_snapshot_sort_part(ForkMetaByteVec *part)
+{
+	uint64_t	nrecords = part->len / sizeof(ForkMetaRecV2);
+	ForkMetaSnapshotSortRef *refs;
+	unsigned char *sorted;
+
+	if (nrecords < 2)
+		return 0;
+	if (nrecords > SIZE_MAX / sizeof(*refs))
+		return -1;
+	refs = malloc((size_t) nrecords * sizeof(*refs));
+	sorted = malloc(part->len);
+	if (refs == NULL || sorted == NULL)
+	{
+		free(refs);
+		free(sorted);
+		return -1;
+	}
+	for (uint64_t i = 0; i < nrecords; i++)
+	{
+		refs[i].rec = (const ForkMetaRecV2 *)
+			(part->data + i * sizeof(ForkMetaRecV2));
+		refs[i].index = i;
+	}
+	qsort(refs, (size_t) nrecords, sizeof(*refs), fork_meta_snapshot_sort_cmp);
+	for (uint64_t i = 0; i < nrecords; i++)
+		memcpy(sorted + i * sizeof(ForkMetaRecV2), refs[i].rec,
+			   sizeof(ForkMetaRecV2));
+	memcpy(part->data, sorted, part->len);
+	free(refs);
+	free(sorted);
+	return 0;
+}
+
 static int
 fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						  ForkMetaByteVec *source, PsPruneFence cutoff,
@@ -8206,6 +8292,9 @@ fail_entry:
 	if (fork_meta_snapshot_append_source_markers(checkpoint, tail, cutoff,
 											 filter_deleting,
 											 preserve_survivors) != 0)
+		return -1;
+	if (fork_meta_snapshot_sort_part(checkpoint) != 0 ||
+		fork_meta_snapshot_sort_part(tail) != 0)
 		return -1;
 	{
 		ForkMetaSnapshotPayloadHeader headers[2];
@@ -13984,6 +14073,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	ps_unlock_map();
 
+	/* The header is persisted whole, so its alignment padding is persisted
+	 * too; zero it so equivalent stores hold identical bytes. */
+	memset(&hdr, 0, sizeof(hdr));
+	memset(&admission_hdr, 0, sizeof(admission_hdr));
+	memset(&bound_hdr, 0, sizeof(bound_hdr));
 	hdr.magic = SEG_ADMISSION_MAGIC;
 	hdr.timeline = timeline;
 	hdr.key = *key;
@@ -19276,6 +19370,8 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		{"page_segment", "seg_* record (versioned page)", SEG_ADMISSION_MAGIC, 0},
 		{"page_segment", "seg_* record (WAL-less page)",
 		 SEG_WALLESS_ADMISSION_MAGIC, 0},
+		{"page_segment", "seg_* record (clamped below-floor page)",
+		 SEG_CLAMPED_ADMISSION_MAGIC, 0},
 		{"wal_log", "wal_<tl> record", WAL_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> record", WALIDX_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> progress record",

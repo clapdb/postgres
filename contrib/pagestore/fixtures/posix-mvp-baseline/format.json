@@ -49,6 +49,12 @@
   },
   {
     "family": "page_segment",
+    "artifact": "seg_* record (clamped below-floor page)",
+    "magic": "0x53454738",
+    "version": 0
+  },
+  {
+    "family": "page_segment",
     "artifact": "seg_* record (versioned page)",
     "magic": "0x53454736",
     "version": 0

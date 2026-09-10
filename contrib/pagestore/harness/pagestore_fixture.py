@@ -38,6 +38,19 @@ DAEMON_ARGS = [
 ]
 DAEMON_ENV = {"PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES": "1024"}
 EXCLUDED = {".pagestore.lock"}
+MANIFEST_NAME = "layers.manifest"
+MANIFEST_MAGIC = 0x504D414E
+MANIFEST_HEADER_BYTES = 20
+FNV_INIT = 2166136261
+# A relocated store rebases a local layer location whose recorded parent
+# directory no longer exists, so the archive records the leaves under a path
+# that cannot exist rather than under whichever directory captured them.
+FIXTURE_LAYER_ROOT = "/nonexistent/pagestore-fixture/layers"
+SEG_HEADER_BYTES = {
+    0x53454732: 48, 0x53454730: 48, 0x53454731: 48, 0x53454733: 48,
+    0x53454734: 56, 0x53454735: 56, 0x53454736: 56,
+    0x53454737: 64, 0x53454738: 64,
+}
 FORKMETA_RECORD_BYTES = 64
 INSPECTION_SCHEMA = harness.read_json(Path(__file__).resolve().parent / "inspection_schema.json")
 STORE_TAR = "store.tar.gz"
@@ -159,6 +172,10 @@ MUTATIONS = [
     # oracle notices because the fixture's event was in fact acknowledged
     mutation("forkmeta.tail.torn", "forkmeta",
              lambda p: truncate_to(p, -8), USE_REJECTED),
+    # the cutover rewrites the source atomically, so an empty source behind a
+    # selected snapshot is damage: accepting it would discard the epoch
+    mutation("forkmeta.source.emptied", "forkmeta",
+             lambda p: truncate_to(p, 0), OPEN_REJECTED),
     mutation("manifest.newer_version", "layers.manifest",
              lambda p: bump_le32(p, 4), OPEN_REJECTED),
     mutation("manifest.record.crc", "layers.manifest",
@@ -176,6 +193,83 @@ MUTATIONS = [
     mutation("image_layer.truncated", "layer_0_*",
              lambda p: truncate_to(p, -8), OPEN_REJECTED),
 ]
+
+
+def fnv1a(data: bytes, crc: int = FNV_INIT) -> int:
+    for byte in data:
+        crc ^= byte
+        crc = (crc * 16777619) & 0xFFFFFFFF
+    return crc
+
+
+def canonicalize_manifest(store: Path) -> None:
+    """Rewrite the absolute layer locations the manifest persists so that the
+    archive does not depend on the directory that captured it, recomputing
+    each record's checksum over the rewritten payload."""
+    path = store / MANIFEST_NAME
+    if not path.exists():
+        return
+    data = path.read_bytes()
+    prefix = str(store).encode() + b"/"
+    out = bytearray()
+    offset = 0
+    while offset + MANIFEST_HEADER_BYTES <= len(data):
+        magic, _version, _type, length, _crc = struct.unpack_from("=IIIII", data, offset)
+        if magic != MANIFEST_MAGIC or offset + MANIFEST_HEADER_BYTES + length > len(data):
+            break                       # a torn tail travels as it is
+        header = bytearray(data[offset:offset + MANIFEST_HEADER_BYTES])
+        payload = bytearray(
+            data[offset + MANIFEST_HEADER_BYTES:offset + MANIFEST_HEADER_BYTES + length])
+        at = payload.find(prefix)
+        while at >= 0:
+            end = payload.index(b"\0", at)
+            replacement = FIXTURE_LAYER_ROOT.encode() + b"/" + payload[at + len(prefix):end]
+            if len(replacement) > end - at:
+                raise FixtureError(f"canonical layer path does not fit in {payload[at:end]!r}")
+            payload[at:end] = replacement + b"\0" * (end - at - len(replacement))
+            at = payload.find(prefix, at + 1)
+        struct.pack_into("=I", header, 16,
+                         fnv1a(bytes(header[:16]) + bytes(payload)))
+        out += header + payload
+        offset += MANIFEST_HEADER_BYTES + length
+    out += data[offset:]
+    path.write_bytes(bytes(out))
+
+
+def segment_magics(store: Path) -> set[int]:
+    """Every page-segment record magic present in the store, walking the
+    records at their own header sizes."""
+    magics: set[int] = set()
+    for path in sorted(store.glob("seg_*")):
+        data = path.read_bytes()
+        offset = 0
+        while offset + 48 <= len(data):
+            magic = struct.unpack_from("=I", data, offset)[0]
+            header = SEG_HEADER_BYTES.get(magic)
+            if header is None:
+                break
+            length = struct.unpack_from("=I", data, offset + 40)[0]
+            if offset + header + length > len(data):
+                break
+            magics.add(magic)
+            offset += header + length
+    return magics
+
+
+def check_segment_formats(store: Path, identities: list[dict[str, Any]]) -> None:
+    """Every page-segment format the identity table advertises must have an
+    instance in the fixture, or a regression in its reader cannot be caught."""
+    advertised = {
+        int(item["magic"], 16) for item in identities
+        if item["family"] == "page_segment"
+    }
+    present = segment_magics(store)
+    missing = sorted(advertised - present)
+    if missing:
+        raise FixtureError(
+            "the fixture carries no record of advertised page-segment formats "
+            + ", ".join(f"{magic:#x}" for magic in missing)
+        )
 
 
 def format_identities(tool: Path) -> list[dict[str, Any]]:
@@ -213,11 +307,16 @@ def extract(fixture: Path, store: Path) -> None:
 
 
 class Daemon:
-    def __init__(self, binary: Path, inspector: Path, store: Path, shm: str, log: Path):
+    def __init__(self, binary: Path, inspector: Path, store: Path, shm: str, log: Path,
+                 daemon_args: list[str] | None = None,
+                 daemon_env: dict[str, str] | None = None):
         self.binary, self.inspector, self.store, self.shm, self.log = binary, inspector, store, shm, log
         self.process: subprocess.Popen[str] | None = None
+        # the fixture's own recorded configuration, so an archive is always
+        # read back under the parameters that produced it
+        self.args = list(DAEMON_ARGS if daemon_args is None else daemon_args)
         self.env = harness.private_environment()
-        self.env.update(DAEMON_ENV)
+        self.env.update(DAEMON_ENV if daemon_env is None else daemon_env)
 
     def start(self, timeout: float = 10.0) -> str:
         """Return "ready", "exit N" when the daemon refuses the store, or
@@ -225,7 +324,7 @@ class Daemon:
         harness.remove_shm(self.shm)
         with self.log.open("a", encoding="utf-8") as log:
             self.process = subprocess.Popen(
-                [str(self.binary), "--shm", self.shm, "--store", str(self.store), *DAEMON_ARGS],
+                [str(self.binary), "--shm", self.shm, "--store", str(self.store), *self.args],
                 stdout=log, stderr=subprocess.STDOUT, text=True, env=self.env,
             )
         deadline = time.monotonic() + timeout
@@ -307,12 +406,10 @@ def capture(args: argparse.Namespace) -> int:
     fixture.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pagestore-fixture-") as temp:
         root = Path(temp)
-        # layers.manifest persists the store's absolute path in its layer
-        # locations, so the store lives at a fixed path (not the random temp
-        # root) for the archive bytes to be reproducible across captures
-        store = Path(tempfile.gettempdir()) / "pagestore-fixture-capture-store"
-        if store.exists():
-            shutil.rmtree(store)
+        # The capture directory is private to this process, so concurrent or
+        # stale captures cannot destroy each other's store; the absolute paths
+        # layers.manifest persists are canonicalized before archiving instead.
+        store = root / "store"
         store.mkdir()
         log = root / "daemon.log"
         shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}"
@@ -342,9 +439,10 @@ def capture(args: argparse.Namespace) -> int:
             code = daemon.stop()
         if code != 0:
             raise FixtureError(f"daemon did not stop cleanly: status {code}")
+        identities = format_identities(args.format_tool)
+        check_segment_formats(store, identities)
+        canonicalize_manifest(store)
         names = deterministic_tar(store, fixture / STORE_TAR)
-        shutil.rmtree(store)
-    identities = format_identities(args.format_tool)
     (fixture / FORMAT_JSON).write_text(json.dumps(identities, indent=2) + "\n", encoding="utf-8")
     (fixture / FIXTURE_JSON).write_text(json.dumps({
         "schema": 1,
@@ -358,13 +456,16 @@ def capture(args: argparse.Namespace) -> int:
     return 0
 
 
-def check_reopen(args: argparse.Namespace, root: Path, fixture: Path) -> None:
+def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
+                 metadata: dict[str, Any], identities: list[dict[str, Any]]) -> None:
     store = root / "reopen"
     extract(fixture, store)
+    check_segment_formats(store, identities)
     log = root / "reopen-daemon.log"
     for generation in range(2):
         shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_{generation}"
-        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log)
+        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log,
+                        metadata["daemon_args"], metadata["daemon_env"])
         try:
             status = daemon.start()
             if status != "ready":
@@ -382,13 +483,15 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path) -> None:
     print("ok   - fixture reopens and its oracle holds across a restart")
 
 
-def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict[str, Any]) -> str:
+def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict[str, Any],
+                 metadata: dict[str, Any]) -> str:
     store = root / "mutations" / case["name"]
     extract(fixture, store)
     case["apply"](first_match(store, case["pattern"]))
     log = root / "mutations" / f"{case['name']}.daemon.log"
     shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_m"
-    daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log)
+    daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log,
+                    metadata["daemon_args"], metadata["daemon_env"])
     try:
         status = daemon.start()
         if status.startswith("signal"):
@@ -404,8 +507,26 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
         daemon.stop()
 
 
+def fixture_metadata(fixture: Path) -> dict[str, Any]:
+    """The archive's own configuration.  A later slice may change the capture
+    parameters, and an older archive must still be read back under the ones it
+    was captured with rather than under today's defaults."""
+    metadata = json.loads((fixture / FIXTURE_JSON).read_text(encoding="utf-8"))
+    if metadata.get("schema") != 1 or metadata.get("name") != fixture.name:
+        raise FixtureError(f"{fixture / FIXTURE_JSON} does not describe {fixture.name}")
+    daemon_args = metadata.get("daemon_args")
+    daemon_env = metadata.get("daemon_env")
+    if not isinstance(daemon_args, list) or not all(isinstance(a, str) for a in daemon_args) or \
+            not isinstance(daemon_env, dict) or \
+            not all(isinstance(k, str) and isinstance(v, str) for k, v in daemon_env.items()):
+        raise FixtureError(f"{fixture / FIXTURE_JSON} has no usable daemon configuration")
+    metadata["daemon_args"], metadata["daemon_env"] = daemon_args, daemon_env
+    return metadata
+
+
 def check(args: argparse.Namespace) -> int:
     fixture = args.check
+    metadata = fixture_metadata(fixture)
     expected = json.loads((fixture / FORMAT_JSON).read_text(encoding="utf-8"))
     current = format_identities(args.format_tool)
     if current != expected:
@@ -422,13 +543,13 @@ def check(args: argparse.Namespace) -> int:
     failures = 0
     with tempfile.TemporaryDirectory(prefix="pagestore-fixture-check-") as temp:
         root = Path(temp)
-        check_reopen(args, root, fixture)
+        check_reopen(args, root, fixture, metadata, current)
         (root / "mutations").mkdir()
         for case in MUTATIONS:
             if args.only and case["name"] not in args.only:
                 continue
             try:
-                outcome = run_mutation(args, root, fixture, case)
+                outcome = run_mutation(args, root, fixture, case, metadata)
             except FixtureError as error:
                 outcome = f"error: {error}"
             if outcome == case["expect"]:

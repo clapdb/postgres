@@ -629,10 +629,13 @@ daemon-side format reports its compiled magic and version through
 store carrying page history and its cutoff, fork-size events on both sides of
 the cutoff plus a post-cutover source tail, a sealed shipped-WAL segment
 with a control note inside it, a compacted WAL-index interval with a fixed
-reader, a live branch, and a deleted branch.  `harness/pagestore_fixture.py
+reader, a live branch with one record of every page-segment format the daemon
+writes (an ordinary versioned record, a below-floor copy clamped to the branch
+point, and a zero-version WAL-less record), and a deleted branch.
+`harness/pagestore_fixture.py
 --check` fails when the compiled identities differ from the fixture (a
 format change without a fixture update), reopens the fixture and runs its
-oracle across a restart, and applies thirty-six mutations (unknown newer
+oracle across a restart, and applies thirty-seven mutations (unknown newer
 version, checksum corruption, truncation) across the WAL store identity,
 sealed WAL segments, retention state and records, page and WAL-index
 frontiers, forkmeta and WAL-index snapshot manifests and payloads, the
@@ -640,16 +643,26 @@ timelines log, the forkmeta source epoch, the layer manifest, and image
 layers.  Each is rejected at open except the documented torn-tail repairs of
 the timelines and layer manifest logs; a daemon that dies of a signal or
 exits under use is reported as a crash, never as a rejection.  The identity
-table also covers the page-segment, flat-WAL, and WAL-index source-log
-record magics the daemon writes, and does not advertise delta layers,
-which no maintenance path produces yet.  Captures place the store at a
-fixed path so the archive bytes are reproducible.  Two findings were fixed on the way:
-a store reopened at a new path was refused because layer locations recorded
-their absolute parent directory (a missing parent now rebases onto the
-store's own leaf; a foreign existing parent is still rejected), and a
-damaged forkmeta snapshot marker silently discarded acknowledged
-post-cutover events (a source epoch that conflicts with the selected
-snapshot now refuses to open).  One gap remains documented in the check:
+table also covers the page-segment (versioned, WAL-less, and clamped),
+flat-WAL, and WAL-index source-log record magics the daemon writes, and the
+check requires the fixture to carry a record of each of them; it does not
+advertise delta layers, which no maintenance path produces yet.  Captures run
+in a private directory and canonicalize the absolute layer locations the
+manifest persists, so repeated captures produce byte-identical archives, and
+the check starts every daemon with the configuration the archive records
+rather than today's defaults.  Four findings were fixed on the way: a store
+reopened at a new path was refused because layer locations recorded their
+absolute parent directory (a missing parent now rebases onto the store's own
+leaf; a foreign existing parent is still rejected); a damaged forkmeta
+snapshot marker silently discarded acknowledged post-cutover events (a source
+epoch that conflicts with the selected snapshot, an emptied source included,
+now refuses to open); a segment record header persisted its alignment padding
+uninitialized; and a fork-metadata snapshot part could be published in an
+order its own loader refuses, because ordered markers that live only in the
+source log were appended after the in-memory events of the same fork -- a
+below-floor copy followed by a higher-LSN write on the same relation
+published a snapshot the daemon then could not open, so each part is now
+sorted into per-fork order before it is written.  One gap remains documented in the check:
 forkmeta source records carry no checksum, so corruption inside a record is
 caught only by the oracle.  Backend-side artifacts (reader manifests, branch
 bootstrap, materializer markers, the writer checkpoint block) and older
