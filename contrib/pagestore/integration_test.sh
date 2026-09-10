@@ -2027,11 +2027,12 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 # is restored at that horizon.  A start that fails here reports both horizons
 # and the manifest beside them: the postmaster refuses to start when the
 # restored image's checkpoint redo is not the one the manifest requires.
-if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
-	--timeline 0 --incarnation 1 --lsn "$readerR" "$ADVANCINGDATA" >/dev/null; then
+advancingRestore=$("$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
+	--timeline 0 --incarnation 1 --lsn "$readerR" "$ADVANCINGDATA" 2>&1) || {
 	echo "FAIL - advancing reader restart could not restore its boot control image"
+	printf '%s\n' "$advancingRestore"
 	exit 1
-fi
+}
 # pg_ctl reports why it could not start on its own output, which used to be
 # discarded, leaving a start failure indistinguishable from a slow one.  Keep
 # that output.  A start that times out leaves its postmaster running, so wait
@@ -2051,6 +2052,11 @@ advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log
 		echo "FAIL - advancing reader did not restart at its durable owner horizon"
 		printf '%s\n' "$advancingStart"
 		echo "readerR=$readerR readerAutoR=$readerAutoR"
+		printf 'restore: %s\n' "$advancingRestore"
+		# the redo the restored image actually carries is what the manifest
+		# is compared against, so name it rather than leaving it to be guessed
+		"$BIN/pg_controldata" "$ADVANCINGDATA" 2>/dev/null |
+			grep -E "REDO location|checkpoint location" || true
 		cat "$ADVANCINGDATA/pagestore_reader.manifest" 2>/dev/null || true
 		tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
 		exit 1
