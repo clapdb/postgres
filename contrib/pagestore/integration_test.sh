@@ -2023,12 +2023,12 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
 	"advancing readers cannot re-enable parallel plans with session settings"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
-# The reader has adopted the newer published view by now, so its manifest
-# requires that checkpoint; restoring the boot control image at its original
-# horizon makes the postmaster refuse to start ("pg_control does not match
-# pagestore_reader.manifest") whenever the adoption has landed.
+# The manifest names the checkpoint the reader boots at, so the control image
+# is restored at that horizon.  A start that fails here reports both horizons
+# and the manifest beside them: the postmaster refuses to start when the
+# restored image's checkpoint redo is not the one the manifest requires.
 if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
-	--timeline 0 --incarnation 1 --lsn "$readerAutoR" "$ADVANCINGDATA" >/dev/null; then
+	--timeline 0 --incarnation 1 --lsn "$readerR" "$ADVANCINGDATA" >/dev/null; then
 	echo "FAIL - advancing reader restart could not restore its boot control image"
 	exit 1
 fi
@@ -2050,6 +2050,8 @@ advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log
 	if [ "$advancingReady" -ne 1 ]; then
 		echo "FAIL - advancing reader did not restart at its durable owner horizon"
 		printf '%s\n' "$advancingStart"
+		echo "readerR=$readerR readerAutoR=$readerAutoR"
+		cat "$ADVANCINGDATA/pagestore_reader.manifest" 2>/dev/null || true
 		tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
 		exit 1
 	fi
