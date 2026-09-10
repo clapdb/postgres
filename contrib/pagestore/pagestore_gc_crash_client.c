@@ -1522,14 +1522,15 @@ walidx_check(uint64_t base, uint64_t end)
 				exit(1);
 			}
 	}
-	if (walidx_get(WALIDX_READER_LSN, out, 8, &count) != PS_STATUS_OK ||
-		count != 2 || out[0].lsn != 10 || out[1].lsn != 30 ||
-		out[0].end_lsn != 11 || out[1].end_lsn != 31 ||
+	/* the fixed reader's retained chain, in full: an end position, a flag or
+	 * a source timeline lost here sends WAL replay to the wrong range */
+	if (walidx_get(base + WALIDX_READER_LSN, out, 8, &count) != PS_STATUS_OK ||
+		count != 2 ||
+		out[0].lsn != base + 10 || out[1].lsn != base + 30 ||
+		out[0].end_lsn != base + 11 || out[1].end_lsn != base + 31 ||
 		out[0].flags != (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) ||
 		out[1].flags != PS_WAL_INDEX_FLAG_KNOWN ||
 		out[0].timeline != 0 || out[1].timeline != 0)
-	if (walidx_get(base + WALIDX_READER_LSN, out, 8, &count) != PS_STATUS_OK ||
-		count != 2 || out[0].lsn != base + 10 || out[1].lsn != base + 30)
 		die("recovery lost the fixed reader's retained WAL-index chain");
 	if (walidx_get(base + WALIDX_DROPPED_LSN, out, 8, &count) == PS_STATUS_OK)
 		die("recovery resurrected a WAL-index point below the durable frontier");
