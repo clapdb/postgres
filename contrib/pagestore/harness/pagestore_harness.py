@@ -2692,7 +2692,12 @@ def _check_delete_abort_recovery(store: Path) -> None:
             ("WAL-index epoch",
              any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in artifacts)),
             ("immutable WAL segment", f"wal_segments_{DELETE_BRANCH}" in artifacts),
-            ("owner layer", any(n.startswith("layer_") for n in artifacts)),
+            # both halves of the layer must still be there: a manifest entry
+            # whose file was unlinked, or a file whose entry was removed, is
+            # half a retirement the aborted deletion must not have started
+            ("owner layer in the manifest and on disk",
+             any(n.startswith("layer_") and "on disk" in n and "in the manifest" in n
+                 for n in artifacts)),
             ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
         ) if not present
     ]

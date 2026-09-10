@@ -634,6 +634,30 @@ delete_verify_survivor(unsigned char *page)
 	if (execute()->status != PS_STATUS_OK ||
 		ch->req_lsn != DELETE_FORK_LSN + DELETE_WAL_BYTES)
 		die("deletion dropped the sibling's WAL-index progress");
+	/* the progress record alone says nothing about the indexed entry */
+	{
+		PsWalRec	out[4];
+		int			count = 0;
+
+		set_relation(ch);
+		set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+		ch->opcode = PS_OP_WAL_INDEX_GET;
+		ch->blocknum = 0;
+		ch->nblocks = 0;
+		ch->req_lsn = DELETE_FORK_LSN + DELETE_WAL_BYTES;
+		ch->pad1 = 0;
+		if (execute()->status != PS_STATUS_OK)
+			die("deletion dropped the sibling's WAL-index entry");
+		count = (int) ch->result;
+		if (count < 1)
+			die("deletion left the sibling's WAL-index chain empty");
+		memcpy(out, ch->data, sizeof(*out));
+		if (out[0].lsn != DELETE_FORK_LSN + 16 ||
+			out[0].end_lsn != DELETE_FORK_LSN + 17 ||
+			(out[0].flags & (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI)) !=
+			(PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI))
+			die("deletion damaged the sibling's WAL-index entry");
+	}
 }
 
 /* The crash landed before the DELETING record was durable, so the request is
@@ -671,14 +695,26 @@ delete_verify_live(void)
 		die("the surviving branch lost its zero-extended size");
 	set_relation(ch);
 	set_timeline(ch, DELETE_BRANCH, incarnation);
-	ch->opcode = PS_OP_WAL_READ;
-	ch->req_lsn = DELETE_FORK_LSN;
-	ch->datalen = 64;
-	if (execute()->status != PS_STATUS_OK || ch->result != 64)
-		die("the surviving branch lost its shipped WAL");
-	for (uint32_t i = 0; i < 64; i++)
-		if (ch->data[i] != (unsigned char) (DELETE_BRANCH + 1))
-			die("the surviving branch's shipped WAL is corrupt");
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != DELETE_FORK_LSN +
+		(uint64_t) DELETE_WAL_SEGMENT_CHUNKS * DELETE_WAL_BYTES)
+		die("the surviving branch lost part of its shipped WAL extent");
+	/* the whole extent, not only its first bytes: a truncation that keeps
+	 * the prefix and the artifact names would otherwise pass */
+	for (uint32_t chunk = 0; chunk < DELETE_WAL_SEGMENT_CHUNKS; chunk++)
+	{
+		set_relation(ch);
+		set_timeline(ch, DELETE_BRANCH, incarnation);
+		ch->opcode = PS_OP_WAL_READ;
+		ch->req_lsn = DELETE_FORK_LSN + (uint64_t) chunk * DELETE_WAL_BYTES;
+		ch->datalen = 64;
+		if (execute()->status != PS_STATUS_OK || ch->result != 64)
+			die("the surviving branch lost its shipped WAL");
+		for (uint32_t i = 0; i < 64; i++)
+			if (ch->data[i] != (unsigned char) (DELETE_BRANCH + 1))
+				die("the surviving branch's shipped WAL is corrupt");
+	}
 	delete_verify_survivor(page);
 	free(page);
 }
