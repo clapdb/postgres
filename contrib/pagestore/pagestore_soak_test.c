@@ -127,7 +127,11 @@ typedef struct Bounds
 static const Bounds during_bound = {
 	.page = PAGE_HIGH_WATER + 2u * NSHARDS * SEGMENT_SIZE + FLUSH_PAGES * PAGE_SIZE * NSHARDS + 4u * NSHARDS * SEGMENT_SIZE,
 	.layers = (COMPACT_LAYERS + 2) * (LIVE_BYTES_MAX + INTERVAL_PAGE_BYTES * 2) * 2,
-	.wal = WAL_HIGH_WATER + 2u * 1024u * 1024u + INTERVAL_WAL_BYTES * 2,
+	/* A materializer pins WAL and the WAL index but no page history, so
+	 * stored pages cannot replace the FPI-led chains at its horizon and the
+	 * raw WAL they name stays until the horizon advances: allow two more
+	 * publication intervals beyond the reclaimer's high water. */
+	.wal = WAL_HIGH_WATER + 2u * 1024u * 1024u + INTERVAL_WAL_BYTES * 4,
 	.walidx = WALIDX_HIGH_WATER * 4,
 	.forkmeta = FORKMETA_HIGH_WATER * 4,
 	.retention = 256u * 1024u,
@@ -401,7 +405,15 @@ wait_ready(void)
 	{
 		int			fd = shm_open(shm_name, O_RDWR, 0600);
 		int			status;
+		struct stat st;
 
+		/* the object exists before the daemon sizes it; a mapping of the
+		 * empty object faults, so wait for the size as well */
+		if (fd >= 0 && (fstat(fd, &st) != 0 || st.st_size < (off_t) PS_SHM_SIZE))
+		{
+			close(fd);
+			fd = -1;
+		}
 		if (fd >= 0)
 		{
 			PsShmHeader *h = mmap(NULL, sizeof(PsShmHeader), PROT_READ,
@@ -1484,6 +1496,14 @@ materialize(void)
 		  "materializer writes control note at %llu", (unsigned long long) lsn);
 	check(op_write_control(0, image, lsn) == PS_STATUS_OK,
 		  "materializer writes control image at %llu", (unsigned long long) lsn);
+	/* Durable progress marker (control block 3), as the real materializer
+	 * publishes after its relation pages are durable: the daemon derives the
+	 * page-history cutoff from it, since the materializer pins no history. */
+	memset(image, 0x3d, sizeof(image));
+	memcpy(image, &lsn, sizeof(lsn));
+	check(op_write_control(3, image, lsn) == PS_STATUS_OK,
+		  "materializer writes its progress marker at %llu",
+		  (unsigned long long) lsn);
 	/* Durable index progress for the shipped prefix. */
 	if (op_walidx_progress(0, 0, g_progress, lsn) != PS_STATUS_OK)
 	{
@@ -1506,10 +1526,14 @@ materialize(void)
 	}
 	else
 		g_progress = lsn;
-	/* Exact durable (LSN, admission_seq) cutoff for every resource. */
+	/* Exact durable (LSN, admission_seq) cutoff for WAL and the WAL index,
+	 * the resources the real materializer pins; page history follows its
+	 * marker instead. */
 	{
 		int			rc = op_retention_reserve(0, PS_RETENTION_OWNER_MATERIALIZER,
-											 1, 1, PS_RETENTION_RESOURCE_ALL,
+											 1, 1,
+											 PS_RETENTION_RESOURCE_WAL |
+											 PS_RETENTION_RESOURCE_WAL_INDEX,
 											 lsn, &seq);
 
 		check(rc == PS_STATUS_OK && seq != 0,

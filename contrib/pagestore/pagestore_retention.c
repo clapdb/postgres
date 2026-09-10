@@ -1627,3 +1627,23 @@ done:
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }
+
+int
+ps_retention_generation_stale(uint32_t timeline, uint32_t owner_kind,
+							  uint64_t owner_id, uint32_t generation)
+{
+	int			rc = 0;
+	int			idx;
+
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		rc = -1;
+	else if ((idx = retention_find(timeline, owner_kind, owner_id)) >= 0 &&
+			 ((generation < retention_pins[idx].generation) ||
+			  (generation == retention_pins[idx].generation &&
+			   generation != 0 &&
+			   !retention_pin_active(&retention_pins[idx]))))
+		rc = 1;
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}

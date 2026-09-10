@@ -762,17 +762,20 @@ Acceptance:
   owners;
 - retained SQL-visible state remains correct throughout the run.
 
+The operational cutoff is now derived from what the writing compute already
+publishes (the materializer's WAL/WAL-index pin at its restart redo, or the
+newest checkpoint note's redo for a direct-write compute), so a materializer-only or
+branch-compute topology prunes page history and control images without a
+page-history owner; the branch controller's base pin carries page history
+while a branch is prepared, and a kept checkpoint image retains its
+exact-redo twin.
+
 Remaining before the gate closes:
 
-- no owner establishes the durable operational cutoff that controllers
-  respect: the real materializer pins WAL and the WAL index but not page
-  history, and a branch compute pins nothing, so in that topology page
-  history and control images are never pruned, WAL-index compaction cannot
-  substitute stored images for FPI chains (a stored base is only trusted at a
-  page-history fence), and shipped WAL stays pinned by cold pages.  The
-  checkpoint admission fence those computes already mirror is the intended
-  cutoff, but branch/reader preparation must select and pin its horizon
-  before that cutoff can pass it;
+- a WAL-index-only owner's horizon is not page-protected, so stored pages
+  cannot replace its FPI-led chains and cold pages pin shipped WAL until it
+  advances (bounded by the owner's publication interval, and accounted for in
+  the soak's declared WAL bound);
 - SLRU-class object versions need their dedicated retention protocol;
 - a longer soak configuration (nightly).
 
@@ -1096,6 +1099,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Derived the operational page-history cutoff from the writing compute (the materializer's restart-redo pin, or the newest checkpoint note's redo), kept the exact-redo twin of every retained checkpoint image, gave the branch controller's base pin page history, and modeled the real materializer mask plus progress marker in the soak | Control-prune cases for marker and note cutoffs with refusal below the frontier and restart; lifecycle/reclaim/standalone suites; integration lane with pruning active in the golden and branch-boot flows; 2400/8000-round soaks |
 | 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
 | 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |

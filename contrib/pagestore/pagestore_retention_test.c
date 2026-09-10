@@ -259,6 +259,20 @@ main(void)
 	pin.lsn = 169;
 	check(ps_retention_set(&pin) == PS_RETENTION_OK,
 		  "a newer generation can replace a durable tombstone");
+	/* The staleness verdict is available before a reservation is attempted,
+	 * so a request path can answer STALE ahead of any frontier admission. */
+	check(ps_retention_generation_stale(pin.timeline, pin.owner_kind,
+										pin.owner_id, 1) == 1,
+		  "a superseded generation is stale before any reservation");
+	check(ps_retention_generation_stale(pin.timeline, pin.owner_kind,
+										pin.owner_id, 2) == 0,
+		  "the current active generation is not stale");
+	check(ps_retention_generation_stale(pin.timeline, pin.owner_kind,
+										pin.owner_id, 3) == 0,
+		  "a newer generation is not stale");
+	check(ps_retention_generation_stale(pin.timeline, pin.owner_kind,
+										4242, 1) == 0,
+		  "an unknown owner has no stale generation");
 	check(copy_file(path, backup) == 0, "save a same-sized valid old registry");
 	for (uint64_t i = 0; i < 70; i++)
 	{

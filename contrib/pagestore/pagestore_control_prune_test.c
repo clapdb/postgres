@@ -112,6 +112,61 @@ write_note(uint32_t timeline, uint64_t version, uint64_t redo)
 	return rc == 0 && ps_storage->sync() == 0;
 }
 
+/* One checkpoint-completing control publication as the compute mirrors it:
+ * the exact-redo pair (note, image) at the checkpoint redo, the admission
+ * fence at the redo, then the pair and the fence again at the update LSN. */
+static int
+write_checkpoint(uint32_t timeline, uint64_t redo, uint64_t update)
+{
+	PsKey key = control_key();
+	unsigned char page[8192];
+	PsAdmissionFence fence;
+	int rc = 0;
+
+	memset(&fence, 0, sizeof(fence));
+	fence.magic = 0x50534146;
+	fence.version = 1;
+	fence.redo_lsn = redo;
+	fence.admission_seq = 1;
+	ps_lock_shard_wr(ps_shard_of(&key));
+	memset(page, 0, sizeof(page));
+	memcpy(page, &redo, sizeof(redo));
+	rc |= append_page(timeline, &key, 1, page, redo, NULL);
+	memset(page, 0xC3, sizeof(page));
+	memcpy(page, &redo, sizeof(redo));
+	rc |= append_page(timeline, &key, 0, page, redo, NULL);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &fence, sizeof(fence));
+	rc |= append_page(timeline, &key, 2, page, redo, NULL);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &redo, sizeof(redo));
+	rc |= append_page(timeline, &key, 1, page, update, NULL);
+	memset(page, 0xC3, sizeof(page));
+	memcpy(page, &update, sizeof(update));
+	rc |= append_page(timeline, &key, 0, page, update, NULL);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &fence, sizeof(fence));
+	rc |= append_page(timeline, &key, 2, page, update, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
+/* The materializer's durable progress marker (control block 3). */
+static int
+write_marker(uint32_t timeline, uint64_t lsn)
+{
+	PsKey key = control_key();
+	unsigned char page[8192];
+	int rc;
+
+	memset(page, 0x3d, sizeof(page));
+	memcpy(page, &lsn, sizeof(lsn));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(timeline, &key, 3, page, lsn, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
 static int
 write_relation(uint32_t timeline, uint32_t block, uint64_t lsn)
 {
@@ -669,6 +724,113 @@ test_failed_artifact_append_releases_its_fence(void)
 	remove_tree(store);
 }
 
+/* A materializer pins WAL and the WAL index but no page history, at the redo
+ * of its last durable restartpoint.  That pin is the operational page-history
+ * cutoff: relation history and control checkpoints below it are retired with
+ * no page-history owner at all, the newest checkpoint keeps its exact-redo
+ * twin, later pins are refused below the frontier, and the cutoff survives a
+ * restart. */
+static void
+test_materializer_pin_is_the_page_cutoff(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-marker-XXXXXX";
+	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
+	uint64_t version = 0;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the materializer cutoff test");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 500),
+		  "the materializer registers at its first restart redo");
+	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
+		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
+		  write_relation(0, 0, 2900) && write_checkpoint(0, 2800, 3000),
+		  "three checkpoints with exact-redo twins and relation history");
+	run_maintenance(16);
+	check(ps_test_page_version_count(0, &rel, 0) == 3 &&
+		  read_control_at(0, 0, 1000, &version) && version == 1000,
+		  "nothing is pruned while the materializer's restart redo is below it");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 3400) &&
+		  write_marker(0, 3450),
+		  "the materializer advances its pin to a newer restart redo");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &rel, 0) == 1,
+		  "relation history below the pin is retired without a page owner");
+	check(read_control_at(0, 0, 3000, &version) && version == 3000 &&
+		  read_control_at(0, 0, 2800, &version) && version == 2800,
+		  "the newest checkpoint keeps both its update image and its exact-redo twin");
+	check(!read_control_at(0, 0, 2000, &version),
+		  "older checkpoints are retired");
+	check(wal_floor(0) == 2800, "the WAL floor follows the retained checkpoint");
+	check(!reserve_pin(0, PS_RETENTION_OWNER_READER, 9, 1,
+					   PS_RETENTION_RESOURCE_ALL, 1500),
+		  "a page-history pin below the derived frontier is refused");
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 9, 2,
+					  PS_RETENTION_RESOURCE_ALL, 3450),
+		  "a page-history pin above the derived frontier is admitted");
+	close_store();
+	configure_core(1);
+	check(ps_core_open(store) == 0, "reopen the store");
+	run_maintenance(16);
+	check(read_control_at(0, 0, 2800, &version) && version == 2800 &&
+		  !read_control_at(0, 0, 2000, &version) && wal_floor(0) == 2800,
+		  "the derived cutoff and the retained twin survive restart");
+	close_store();
+	remove_tree(store);
+}
+
+/* A direct-write compute pins nothing: the redo of its newest durable
+ * checkpoint note is the cutoff, and a writer's notes are ignored while a
+ * materializer owns the timeline. */
+static void
+test_checkpoint_note_is_the_page_cutoff(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-note-XXXXXX";
+	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
+	uint64_t version = 0;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the note cutoff test");
+	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
+		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
+		  write_relation(0, 0, 2900) && write_checkpoint(0, 2800, 3000),
+		  "three checkpoints from a direct-write compute");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &rel, 0) == 2,
+		  "history below the newest checkpoint redo is retired, the rest kept");
+	check(read_control_at(0, 0, 2800, &version) && version == 2800 &&
+		  read_control_at(0, 0, 3000, &version) && version == 3000 &&
+		  !read_control_at(0, 0, 2000, &version),
+		  "the newest checkpoint and its twin survive, older ones are retired");
+	check(wal_floor(0) == 2800, "the WAL floor follows the newest checkpoint");
+	close_store();
+	remove_tree(store);
+
+	/* With a materializer owner present, the writer's newer checkpoint notes
+	 * do not move the cutoff ahead of materialization. */
+	configure_core(1);
+	strcpy(store, "/tmp/pagestore-control-prune-note-XXXXXX");
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the materializer-owned note test");
+	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
+		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_WAL |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 1500),
+		  "a materializer owns the timeline while the writer checkpoints ahead");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &rel, 0) == 2 &&
+		  read_control_at(0, 0, 1000, &version) && version == 1000,
+		  "writer checkpoint notes establish no cutoff on a materializer-fed timeline");
+	close_store();
+	remove_tree(store);
+}
+
 /* Independently versioned control blocks (materializer marker, checkpoints)
  * keep their own newest visible version, whether or not their LSNs coincide
  * with image versions the pair plan drops. */
@@ -729,6 +891,8 @@ main(void)
 	test_slru_seed_keeps_its_control_image();
 	test_late_artifact_below_frontier_is_refused();
 	test_failed_artifact_append_releases_its_fence();
+	test_materializer_pin_is_the_page_cutoff();
+	test_checkpoint_note_is_the_page_cutoff();
 	test_independent_blocks_keep_their_newest();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;

@@ -405,17 +405,28 @@ size, or death the daemon cannot answer fails single-page redo closed
 (the SPDK frontend reports a failed page read as an error, never as an
 absent version); and the soak measures allocated blocks rather than
 logical length and bounds the file count.  With that, 8000-round soaks keep every
-category, forkmeta included, within bound.  Still required for the gate:
+category, forkmeta included, within bound.  The operational cutoff no longer needs a
+page-history owner: the compute that writes a timeline's pages mirrors it
+already, and the daemon derives the page-history floor from that mirror
+(`control_checkpoint_cutoff`): the materializer's own WAL/WAL-index pin,
+which it advances to the redo of each durable restartpoint, while a
+materializer owns the timeline (the writer's own checkpoint notes run ahead
+of materialization and are ignored there), otherwise the redo of the newest
+durable checkpoint note of a direct-write compute.  Explicit pins
+still win when lower, later pins are refused below the derived frontier as
+before, and the branch controller's temporary base pin now carries page
+history so the base is an explicit fence while the branch is prepared.  The
+exact-redo twin of a kept checkpoint image is retained with it, which is what
+an earlier attempt at this floor had missed
+(`pagestore_control_prune_test`; the soak now models the materializer with
+its real WAL/WAL-index mask and a progress marker).  Still required for the
+gate:
 
-- no owner establishes the durable operational cutoff that controllers
-  respect: the real materializer pins WAL and the WAL index but not page
-  history, and a branch compute pins nothing, so in that topology page
-  history and control images are never pruned, WAL-index compaction cannot
-  substitute stored images for FPI chains (a stored base is only trusted at a
-  page-history fence), and shipped WAL stays pinned by cold pages.  The
-  checkpoint admission fence those computes already mirror is the intended
-  cutoff, but branch/reader preparation must select and pin its horizon
-  before that cutoff can pass it;
+- a WAL-index-only owner's horizon (the materializer's) is not page-protected,
+  so stored pages cannot replace the FPI-led chains it keeps and cold pages
+  pin shipped WAL until the horizon advances; treating the derived cutoff as
+  that owner's page fence needs the owner to advance its pin before its
+  marker, so a standing horizon can never lose its base;
 - SLRU-class object versions are still retained without a dedicated protocol;
 - a nightly long-run soak configuration.
 
