@@ -2317,7 +2317,11 @@ GC_WORKLOAD_FAULTS = {name: spec["faults"] for name, spec in GC_WORKLOADS.items(
 # Each gc_seed workload installs its condition once, so its faults are
 # reachable exactly once per run; a plan asking for a later hit would wait
 # for work the seed never creates again and expire as FaultNotReached.
-GC_FAULT_MAX_HITS: dict[str, int] = {}
+GC_FAULT_MAX_HITS: dict[str, int] = {
+    # the reclaim workload unlinks three sealed segments, and the snapshot
+    # oracle reads hit N as the Nth unlink
+    "wal_reclaim.after_unlink": 3,
+}
 GC_FAULT_DEFAULT_MAX_HIT = 1
 GC_STAGES = {
     "page_compaction.after_publish": "publish",

@@ -1084,6 +1084,11 @@ unlink_residual_prefix(PsWalStore *store, uint64_t target_lsn,
 				goto cleanup;
 			store->residual_prefix_start_lsn += store->segment_size;
 			(*unlink_count)++;
+			/* The probe fires after every authorized unlink, including the
+			 * ones a retry discovers: a store reopened behind a published
+			 * frontier reclaims only through this path. */
+			if (ps_fault_probe(PS_FAULT_POINT_WAL_RECLAIM_AFTER_UNLINK) != 0)
+				goto cleanup;
 		}
 	}
 	else
