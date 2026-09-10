@@ -118,9 +118,10 @@ fixed WAL-index reader at 40 below FPI-led chains at 10/30, 50/70, and
 90/110, published under a one-byte `--walidx-snapshot-bytes` trigger so the
 first committed interval is a compaction candidate.  The process abort after
 the durable frontier must leave the frontier file and the staged, uncommitted
-generation; recovery must retry and commit that generation, serve the
-reader's exact chain and the newest chain while refusing the dropped middle
-point, and keep the WAL-index owner; a second restart proves idempotence.
+generation, whose identity the oracle records; recovery must commit that same
+generation -- not an equivalent one rebuilt under a new number, which the
+frontier was never published for -- and must serve the reader's exact chain
+and the newest chain while refusing the dropped middle point, and keep the WAL-index owner; a second restart proves idempotence.
 WAL reclaim, timeline deletion, manifest replacement, and compute-restart
 combinations remain outside the harness.
 

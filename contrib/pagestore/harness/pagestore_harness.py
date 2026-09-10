@@ -2309,6 +2309,10 @@ GC_STAGES = {
     "page_prune.after_frontier": "frontier",
     "wal_index.after_frontier": "walidx_frontier",
 }
+WALIDX_SNAPSHOT_MAGIC = 0x4D534957          # "WISM"
+WALIDX_SNAPSHOT_VERSION = 1
+WALIDX_SNAPSHOT_HEADER_BYTES = 64
+WALIDX_SNAPSHOT_ENTRY_BYTES = 16
 WALIDX_PREPARED = Path("walidx_snapshots_0") / "walidx_prepared_v1"
 WALIDX_MANIFEST = Path("walidx_snapshots_0") / "walidx_manifest_v1"
 
@@ -2418,7 +2422,9 @@ def _gc_granted_cutoff_seq(control: Path) -> int | None:
         return None
 
 
-def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
+def _check_gc_crash_snapshot(
+    store: Path, stage: str, control: Path
+) -> dict[str, Any] | None:
     """Check the stage-specific durable state before recovery mutates the store.
 
     The replacement layer file is sealed before the frontier advances, its
@@ -2444,7 +2450,15 @@ def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
                 "after_walidx_frontier committed the WAL-index generation "
                 "before the probe"
             )
-        return
+        prepared = _walidx_snapshot_record(store / WALIDX_PREPARED)
+        if prepared is None:
+            raise OracleMismatch(
+                "after_walidx_frontier staged a WAL-index generation the "
+                "harness cannot read"
+            )
+        # the frontier already covers this generation, so recovery has to
+        # retry it rather than build an equivalent one under a new number
+        return {"walidx_prepared": prepared}
     files = _canonical_layer_files(store)
     if len(files) < 2:
         raise OracleMismatch(
@@ -2517,6 +2531,41 @@ def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
                 "after_mark_delete crash retired a source before publishing the "
                 f"replacement layer {replacement:#x}"
             )
+    return None
+
+
+def _walidx_snapshot_record(path: Path) -> dict[str, Any] | None:
+    """The identity of one WAL-index snapshot generation, as the staged and
+    the committed file both carry it: the generation, the interval it covers,
+    and the shard payloads it names."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < WALIDX_SNAPSHOT_HEADER_BYTES:
+        return None
+    # the daemon writes this header little-endian, not in host order
+    magic, version, header_bytes, entry_bytes, timeline, nshards = \
+        struct.unpack_from("<IIIIII", data, 0)
+    generation, start_lsn, end_lsn = struct.unpack_from("<QQQ", data, 24)
+    if magic != WALIDX_SNAPSHOT_MAGIC or version != WALIDX_SNAPSHOT_VERSION or \
+            header_bytes != WALIDX_SNAPSHOT_HEADER_BYTES or \
+            entry_bytes != WALIDX_SNAPSHOT_ENTRY_BYTES:
+        return None
+    if len(data) != header_bytes + nshards * entry_bytes:
+        return None
+    shards = []
+    for shard in range(nshards):
+        index, crc, length = struct.unpack_from(
+            "<IIQ", data, header_bytes + shard * entry_bytes
+        )
+        if index != shard:
+            return None
+        shards.append((crc, length))
+    return {
+        "timeline": timeline, "generation": generation,
+        "start_lsn": start_lsn, "end_lsn": end_lsn, "shards": shards,
+    }
 
 
 def _walidx_generation_files(store: Path) -> list[str]:
@@ -2534,6 +2583,7 @@ def _check_walidx_recovery(
     inspection_schema: dict[str, Any],
     store: Path,
     stage: str,
+    crash_state: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """The verify client already waited for the compacted chains, so the
     retried generation is committed: the staged copy is gone, the committed
@@ -2549,6 +2599,23 @@ def _check_walidx_recovery(
         )
     if not (store / "walidx-prune.frontiers").exists():
         raise OracleMismatch(f"after_{stage} recovery lost the WAL-index frontier")
+    committed = _walidx_snapshot_record(store / WALIDX_MANIFEST)
+    if committed is None:
+        raise OracleMismatch(
+            f"after_{stage} recovery committed a WAL-index generation the "
+            "harness cannot read"
+        )
+    # The staged generation was already covered by the durable frontier, so
+    # recovery has to retry that one.  Rebuilding an equivalent snapshot under
+    # a new generation would satisfy every later check -- the restart
+    # comparison starts from whatever this recovery settled on -- while
+    # abandoning the generation the frontier was published for.
+    prepared = (crash_state or {}).get("walidx_prepared")
+    if prepared is not None and committed != prepared:
+        raise OracleMismatch(
+            f"after_{stage} recovery committed {committed!r} instead of the "
+            f"staged generation {prepared!r}"
+        )
     owners = inspect_store(inspector, shm, "owners", inspection_schema)
     if owners.get("retention_poisoned") is not False or \
             owners.get("wal_index_owners") != 1 or \
@@ -2573,12 +2640,14 @@ def _check_gc_recovery(
     workload: str,
     stage: str,
     timeout: float,
+    crash_state: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """After recovery the manifest is sane, the retired sources are gone once
     cleanup has resumed (only the replacement remains, in the manifest and on
     disk), and the retained horizon is the configured cutoff."""
     if workload == "wal_index":
-        return _check_walidx_recovery(inspector, shm, inspection_schema, store, stage)
+        return _check_walidx_recovery(inspector, shm, inspection_schema, store,
+                                      stage, crash_state)
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -2881,6 +2950,7 @@ def run_daemon_fault_recovery(
     if gc_seed_actions and gc_client is None:
         raise PlanError("gc_seed requires --gc-client-binary")
     gc_stage = _gc_fault_stage(action["fault"]) if gc_seed_actions else None
+    crash_state: dict[str, Any] | None = None
     gc_workload = gc_seed_actions[0]["workload"] if gc_seed_actions else None
     # Both seeds drive the same one-client workload protocol; the layer and
     # page-pruning slices differ only in the binary, daemon flags, and oracles.
@@ -3119,7 +3189,10 @@ def run_daemon_fault_recovery(
             if layer_stage is not None:
                 _check_layer_crash_snapshot(store, layer_stage)
             if gc_stage is not None:
-                _check_gc_crash_snapshot(store, gc_stage, control)
+                # what the crash left behind, for the recovery oracles that
+                # must prove recovery settled on it rather than on an
+                # equivalent state of its own making
+                crash_state = _check_gc_crash_snapshot(store, gc_stage, control)
             if layer_client_process is not None and layer_client_process.poll() is None:
                 layer_client_process.kill()
                 layer_client_process.wait(timeout=5)
@@ -3253,7 +3326,8 @@ def run_daemon_fault_recovery(
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
                                  workload=gc_workload)
             recovered_state = _check_gc_recovery(inspector, shm, inspection_schema,
-                                                 store, gc_workload, gc_stage, timeout)
+                                                 store, gc_workload, gc_stage, timeout,
+                                                 crash_state)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
