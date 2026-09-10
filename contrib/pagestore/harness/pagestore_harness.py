@@ -2577,16 +2577,32 @@ def _manifest_removed_layers(records: list[tuple[int, bytes]]) -> dict[int, int]
     return removed
 
 
+# A sealed segment is named walv1_<store>_<segment number, 20 digits>; the
+# publication writes a "...tmp.<suffix>" file first, which is not one.
+SEALED_WAL_SEGMENT = re.compile(r"^walv1_[0-9]+_([0-9]{20})$")
+DELETE_WAL_SEGMENT_NUMBER = 1          # the branch's WAL starts at 1 MiB
+
+
 def _branch_sealed_wal_segments(store: Path, timeline: int) -> list[str]:
-    """The sealed immutable WAL segment files of one timeline.  The directory
-    itself appears on the first aligned append, before any segment is sealed,
-    so it says nothing about immutable-WAL cleanup on its own."""
+    """The canonical sealed immutable WAL segment files of one timeline.  The
+    directory itself appears on the first aligned append, before any segment
+    is sealed, and a staging file is not a sealed segment either, so neither
+    says anything about immutable-WAL cleanup on its own."""
     directory = store / f"wal_segments_{timeline}"
     if not directory.is_dir():
         return []
     return sorted(
         entry.name for entry in directory.iterdir()
-        if entry.is_file() and entry.name.startswith("walv1_")
+        if entry.is_file() and SEALED_WAL_SEGMENT.fullmatch(entry.name)
+    )
+
+
+def _branch_seeded_wal_segment(store: Path, timeline: int) -> bool:
+    """Whether the segment the seed's aligned WAL fills is sealed under its
+    canonical name."""
+    return any(
+        int(SEALED_WAL_SEGMENT.fullmatch(name).group(1)) == DELETE_WAL_SEGMENT_NUMBER
+        for name in _branch_sealed_wal_segments(store, timeline)
     )
 
 
@@ -2645,7 +2661,7 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
                 ("WAL-index epoch", any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in wal)),
                 ("owner layer", any(n.startswith("layer_") for n in artifacts)),
                 ("sealed immutable WAL segment",
-                 bool(_branch_sealed_wal_segments(store, DELETE_BRANCH))),
+                 _branch_seeded_wal_segment(store, DELETE_BRANCH)),
                 ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
             ) if not present
         ]
@@ -2705,7 +2721,7 @@ def _check_delete_abort_recovery(store: Path) -> None:
             ("WAL-index epoch",
              any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in artifacts)),
             ("sealed immutable WAL segment",
-             bool(_branch_sealed_wal_segments(store, DELETE_BRANCH))),
+             _branch_seeded_wal_segment(store, DELETE_BRANCH)),
             # both halves of the layer must still be there: a manifest entry
             # whose file was unlinked, or a file whose entry was removed, is
             # half a retirement the aborted deletion must not have started
