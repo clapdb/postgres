@@ -2633,6 +2633,68 @@ def _manifest_removed_layers(records: list[tuple[int, bytes]]) -> dict[int, int]
             if layer_id in owner:
                 removed[layer_id] = owner.pop(layer_id)
     return removed
+
+FORKMETA_RECORD_BYTES = 64
+FORKMETA_SNAPSHOT_MAGIC = 0x4D534946
+FORKMETA_SNAPSHOT_VERSION = 1
+FORKMETA_SNAPSHOT_RECORD_BYTES = 80
+
+
+def _fnv1a(data: bytes, crc: int = 2166136261) -> int:
+    for byte in data:
+        crc ^= byte
+        crc = (crc * 16777619) & 0xFFFFFFFF
+    return crc
+
+
+def _forkmeta_snapshot_record(path: Path) -> dict[str, Any] | None:
+    """The selected (manifest) or staged (prepared) generation record: its
+    generation, cutoff, and the length and checksum of each immutable part.
+    None when the file is absent, malformed, or fails its header checksum."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) != FORKMETA_SNAPSHOT_RECORD_BYTES:
+        return None
+    magic, version, header_bytes = struct.unpack_from("<III", data, 0)
+    if magic != FORKMETA_SNAPSHOT_MAGIC or version != FORKMETA_SNAPSHOT_VERSION or \
+            header_bytes != FORKMETA_SNAPSHOT_RECORD_BYTES:
+        return None
+    crc = struct.unpack_from("<I", data, 64)[0]
+    if _fnv1a(data[:64] + b"\0\0\0\0" + data[68:]) != crc:
+        return None
+    generation, cutoff_lsn, cutoff_seq, checkpoint_len = struct.unpack_from("<QQQQ", data, 16)
+    checkpoint_crc = struct.unpack_from("<I", data, 48)[0]
+    tail_len = struct.unpack_from("<Q", data, 52)[0]
+    tail_crc = struct.unpack_from("<I", data, 60)[0]
+    return {
+        "generation": generation, "cutoff_lsn": cutoff_lsn, "cutoff_seq": cutoff_seq,
+        "checkpoint": (checkpoint_len, checkpoint_crc), "tail": (tail_len, tail_crc),
+    }
+
+
+def _forkmeta_part_name(generation: int, part: str) -> str:
+    return f"forkmeta_{part}_v1_{generation:020d}"
+
+
+def _forkmeta_parts_valid(store: Path, record: dict[str, Any]) -> list[str]:
+    """Names of the record's parts that are missing, mis-sized, or fail the
+    checksum the record carries for them."""
+    broken = []
+    for part in ("checkpoint", "tail"):
+        length, crc = record[part]
+        path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+        try:
+            data = path.read_bytes()
+        except OSError:
+            broken.append(f"{path.name} (absent)")
+            continue
+        if len(data) != length or _fnv1a(data) != crc:
+            broken.append(f"{path.name} (len {len(data)} vs {length}, checksum mismatch)")
+    return broken
+
+
 def _forkmeta_generation_files(store: Path) -> list[str]:
     directory = store / FORKMETA_SNAPSHOTS
     if not directory.is_dir():
@@ -2643,73 +2705,123 @@ def _forkmeta_generation_files(store: Path) -> list[str]:
     )
 
 
-def _forkmeta_source_starts_with_marker(store: Path) -> bool:
-    """True when the shared forkmeta log's first record is a snapshot-base
-    marker, i.e. the source epoch has been rewritten behind a snapshot."""
+def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
+    """The first record of the shared forkmeta log, decoded in the host's
+    byte order (the daemon persists the C struct directly)."""
     source = store / "forkmeta"
     try:
         with source.open("rb") as handle:
-            head = handle.read(8)
-            if len(head) < 8:
-                return False
-            magic, rec_len = struct.unpack("<II", head)
-            if magic != FORKMETA_V2_MAGIC or rec_len < 12:
-                return False
-            handle.seek(0)
-            record = handle.read(rec_len)
+            record = handle.read(FORKMETA_RECORD_BYTES)
     except OSError:
-        return False
-    return len(record) == rec_len and record[rec_len - 4] == FORKMETA_SNAPSHOT_BASE_KIND
+        return None
+    if len(record) != FORKMETA_RECORD_BYTES:
+        return None
+    magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
+    key = struct.unpack_from("=IIIiI", record, 12)
+    lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
+    nblocks = struct.unpack_from("=I", record, 56)[0]
+    kind = record[60]
+    pad = record[61:64]
+    if magic != FORKMETA_V2_MAGIC or rec_len != FORKMETA_RECORD_BYTES:
+        return None
+    return {
+        "timeline": timeline, "key": key, "lsn": lsn, "admission_seq": admission_seq,
+        "order_id": order_id, "nblocks": nblocks, "kind": kind, "pad": pad,
+    }
+
+
+def _forkmeta_marker_matches(store: Path, selected: dict[str, Any]) -> bool:
+    """True when the source epoch starts with the selected generation's exact
+    snapshot-base marker, the same test startup applies before it preserves
+    the epoch's suffix."""
+    head = _forkmeta_source_head(store)
+    return head is not None and head["kind"] == FORKMETA_SNAPSHOT_BASE_KIND and \
+        head["timeline"] == 0 and not any(head["key"]) and \
+        head["lsn"] == selected["cutoff_lsn"] and \
+        head["admission_seq"] == selected["cutoff_seq"] and \
+        head["order_id"] == selected["generation"] and head["nblocks"] == 0 and \
+        head["pad"] == b"\0\0\0"
+
+
+def _forkmeta_source_starts_with_marker(store: Path) -> bool:
+    selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
+    return selected is not None and _forkmeta_marker_matches(store, selected)
 
 
 def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
-    """Prepare leaves the staged generation without a selected manifest;
-    commit selects it while the source still names the old epoch; the
-    rewrite puts the snapshot-base marker at the head of the source; GC
-    leaves exactly the selected generation's files."""
-    prepared = (store / FORKMETA_PREPARED).exists()
-    manifest = (store / FORKMETA_MANIFEST).exists()
-    marker = _forkmeta_source_starts_with_marker(store)
+    """Prepare leaves a staged generation whose two parts are complete and
+    checksum-valid, without a selected manifest; commit selects it while the
+    source still names the old epoch; the rewrite puts the selected
+    generation's exact marker at the head of the source; GC leaves exactly
+    the selected second generation's valid pair."""
+    prepared = _forkmeta_snapshot_record(store / FORKMETA_PREPARED)
+    selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
     files = _forkmeta_generation_files(store)
     if stage == "forkmeta_prepare":
-        if not prepared or manifest:
+        if prepared is None or selected is not None:
             raise OracleMismatch(
-                f"after_prepare crash left prepared={prepared} manifest={manifest}"
+                f"after_prepare crash left prepared={prepared!r} selected={selected!r}"
+            )
+        broken = _forkmeta_parts_valid(store, prepared)
+        if broken:
+            raise OracleMismatch(
+                f"after_prepare crash staged generation {prepared['generation']} "
+                f"with incomplete parts {broken!r}"
             )
         return
-    if not manifest:
-        raise OracleMismatch(f"after_{stage} crash left no selected forkmeta manifest")
-    if stage == "forkmeta_manifest_commit" and marker:
+    if selected is None:
+        raise OracleMismatch(f"after_{stage} crash left no valid selected forkmeta manifest")
+    broken = _forkmeta_parts_valid(store, selected)
+    if broken:
+        raise OracleMismatch(
+            f"after_{stage} crash selected generation {selected['generation']} "
+            f"with invalid parts {broken!r}"
+        )
+    matches = _forkmeta_marker_matches(store, selected)
+    if stage == "forkmeta_manifest_commit" and matches:
         raise OracleMismatch(
             "after_manifest_commit crash already rewrote the forkmeta source"
         )
-    if stage == "forkmeta_source_rewrite" and not marker:
+    if stage == "forkmeta_source_rewrite" and not matches:
         raise OracleMismatch(
-            "after_source_rewrite crash left the forkmeta source without its marker"
+            "after_source_rewrite crash left the forkmeta source without the "
+            f"selected generation's exact marker: {_forkmeta_source_head(store)!r}"
         )
-    if stage == "forkmeta_snapshot_gc" and len(files) != 2:
-        raise OracleMismatch(
-            f"after_snapshot_gc crash left generation files {files!r}, expected one pair"
+    if stage == "forkmeta_snapshot_gc":
+        expected = sorted(
+            _forkmeta_part_name(selected["generation"], part)
+            for part in ("checkpoint", "tail")
         )
+        if selected["generation"] != 2 or files != expected:
+            raise OracleMismatch(
+                f"after_snapshot_gc crash selected generation {selected['generation']} "
+                f"and left {files!r}, expected exactly {expected!r}"
+            )
 
 
 def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> None:
-    """Recovery selects one durable generation, finishes any staged or retired
-    file cleanup, and serves the source behind its marker."""
+    """Recovery selects one durable generation whose parts are valid, finishes
+    any staged or retired file cleanup, and serves the source behind that
+    generation's exact marker."""
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
+        selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
         files = _forkmeta_generation_files(store)
         prepared = (store / FORKMETA_PREPARED).exists()
-        if (store / FORKMETA_MANIFEST).exists() and not prepared and \
-                len(files) == 2 and _forkmeta_source_starts_with_marker(store):
+        if selected is not None and not prepared and \
+                not _forkmeta_parts_valid(store, selected) and \
+                files == sorted(
+                    _forkmeta_part_name(selected["generation"], part)
+                    for part in ("checkpoint", "tail")
+                ) and _forkmeta_marker_matches(store, selected):
             return
         now = time.monotonic()
         if now >= deadline:
             raise HarnessTimeout(
                 f"after_{stage} recovery did not settle the forkmeta snapshot: "
-                f"prepared={prepared} files={files!r} "
-                f"marker={_forkmeta_source_starts_with_marker(store)}"
+                f"selected={selected!r} prepared={prepared} files={files!r} "
+                f"head={_forkmeta_source_head(store)!r}"
             )
         time.sleep(min(0.05, deadline - now))
 

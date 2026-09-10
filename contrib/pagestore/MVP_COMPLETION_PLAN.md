@@ -508,11 +508,16 @@ Expected scope: one or two PRs.
 ### R4b. Compact and reclaim fork metadata
 
 Status: **runtime implementation, the POSIX crash matrix, and the composed
-H1 publication scenarios are implemented; the acceptance matrix is covered
-for the POSIX MVP boundary** (per-horizon existence/size equivalence across
-compaction by the R6 soak's reader and branch verifications, crash and
-concurrent-append coverage by the matrix, and every publication boundary by
-the composed daemon scenarios; SPDK remains outside the claim).
+H1 publication scenarios are implemented; the acceptance matrix remains
+incomplete on its concurrency clause**.  Per-horizon existence/size
+equivalence across compaction is exercised by the R6 soak's reader and
+branch verifications, every publication boundary by the composed daemon
+scenarios, and crash recovery by the matrix; but acknowledged concurrent
+mutations are verified exactly-once only at the source-rewrite boundary
+(the matrix's deterministic concurrent appender), while the composed
+workload's post-cutoff trickle is untracked by its oracle.  Prepare,
+manifest-commit, and snapshot-GC still need a concurrent-append oracle;
+SPDK remains outside the claim.
 
 The pure forkmeta keep-planner and exhaustive unit/property coverage now define
 the event visibility, exact-fence base retention, legacy sequence handling, and
@@ -538,7 +543,9 @@ fault report and exit 88, and covers deterministic concurrent append overlap
 plus four configured POSIX shards. This work does not claim coverage of every
 internal unlink/fsync instruction, SPDK hardware, or the remaining composed H1
 crash scenarios at the time it landed; the composed `forkmeta` daemon
-scenarios now cover those boundaries, and SPDK stays outside the claim.
+scenarios now cover those boundaries (without a concurrent-append oracle
+at prepare, manifest commit, and snapshot GC), and SPDK stays outside the
+claim.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
@@ -988,8 +995,11 @@ The fork-metadata slice composes the existing `forkmeta.*` probes on the
 daemon through a `forkmeta` gc_seed workload: the page-pruning history and
 cutoff pin prove the cutoff, thirty-two relations carry persisted fork-size
 events on both sides of it, and a post-cutoff trickle publishes the second
-generation that retires the first.  This closes the R4b acceptance item that
-H1 exercise each publication boundary in a composed process-crash scenario.
+generation that retires the first.  This covers the R4b acceptance item that
+H1 exercise each publication boundary in a composed process-crash scenario;
+the concurrent-mutation clause stays open at the prepare, manifest-commit,
+and snapshot-GC boundaries because the trickle relations are not in the
+oracle.
 
 Acceptance:
 
