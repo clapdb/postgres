@@ -1533,31 +1533,31 @@ walidx_check(uint64_t base, uint64_t end)
 		die("recovery lost the fixed reader's retained WAL-index chain");
 	if (walidx_get(base + WALIDX_DROPPED_LSN, out, 8, &count) == PS_STATUS_OK)
 		die("recovery resurrected a WAL-index point below the durable frontier");
-	/* The retained pin must still be the seeded reader itself.  A pin that
-	 * kept the horizon but lost its owner identity leaves the real owner
-	 * unable to advance or drop it, and nothing else here would notice. */
-	{
-		PsChannel  *ch = ps_channel(shm_base, channel);
-
-		set_relation(ch);
-		ch->timeline = 0;
-		ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
-		ch->blocknum = PS_RETENTION_OWNER_READER;
-		ch->req_seq = WALIDX_READER;
-		if (execute()->status != PS_STATUS_OK || ch->result != 1)
-			die("recovery lost the seeded WAL-index reader's pin");
-		if (ch->timeline != 0 || ch->blocknum != PS_RETENTION_OWNER_READER ||
-			ch->req_seq != WALIDX_READER || ch->old_nblocks != 1 ||
-			ch->parent_timeline != PS_RETENTION_RESOURCE_WAL_INDEX ||
-			ch->req_lsn != WALIDX_READER_LSN)
-			die("recovery changed the seeded WAL-index reader's identity");
-	}
 }
 
 static void
 walidx_verify(void)
 {
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
 	walidx_check(0, WALIDX_WAL_BYTES);
+	/* The retained pin must still be the seeded reader itself.  A pin that
+	 * kept the horizon but lost its owner identity leaves the real owner
+	 * unable to advance or drop it, and nothing else here would notice.
+	 * Only this workload seeds that reader, so the check lives here rather
+	 * than in the shared chain oracle. */
+	set_relation(ch);
+	ch->timeline = 0;
+	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+	ch->blocknum = PS_RETENTION_OWNER_READER;
+	ch->req_seq = WALIDX_READER;
+	if (execute()->status != PS_STATUS_OK || ch->result != 1)
+		die("recovery lost the seeded WAL-index reader's pin");
+	if (ch->timeline != 0 || ch->blocknum != PS_RETENTION_OWNER_READER ||
+		ch->req_seq != WALIDX_READER || ch->old_nblocks != 1 ||
+		ch->parent_timeline != PS_RETENTION_RESOURCE_WAL_INDEX ||
+		ch->req_lsn != WALIDX_READER_LSN)
+		die("recovery changed the seeded WAL-index reader's identity");
 }
 
 static uint64_t

@@ -608,8 +608,10 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                 raise FixtureError(f"fixture reopen {generation} refused: {status}; daemon: {tail!r}")
             result = run_client(args.client_binary, shm, "verify", root / "reopen-client.log")
             if result.returncode != 0:
+                tail = (root / "reopen-client.log").read_text(
+                    encoding="utf-8", errors="replace").splitlines()[-3:]
                 raise FixtureError(
-                    f"fixture oracle failed after reopen {generation}; see {root / 'reopen-client.log'}"
+                    f"fixture oracle failed after reopen {generation}: {tail!r}"
                 )
         finally:
             code = daemon.stop()
