@@ -5031,13 +5031,23 @@ def run_materializer_smoke(
         def start_supervisor(log_name: str) -> None:
             nonlocal supervisor_proc, supervisor_starts
             supervisor_starts += 1
+            # Once the named fault has fired and been recovered its control
+            # directory is gone; a supervisor started after that must not
+            # inherit the fault configuration, or its worker would refuse the
+            # missing directory instead of restarting.
+            env = supervisor_env
+            if materializer_recovered:
+                env = {
+                    key: value for key, value in supervisor_env.items()
+                    if not key.startswith("PAGESTORE_TEST_FAULT_")
+                }
             with (trace / log_name).open("w", encoding="utf-8") as log:
                 supervisor_proc = subprocess.Popen(
                     [
                         sys.executable, str(supervisor),
                         "--config", str(supervisor_config),
                     ],
-                    stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
+                    stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
                 )
 
         def wait_materializer_role(context: str) -> None:
