@@ -450,6 +450,14 @@ Before declaring the MVP repeatable, add process-level fault scenarios around
 manifest replacement and retention/reclaim/GC, plus
 a persisted-format fixture for restart/upgrade compatibility.
 
+An advancing reader's data directory boots from the checkpoint its manifest
+names, and the reader moves its own retention pin above that horizon as it
+adopts newer published views.  Nothing then keeps the boot control image
+alive, so a restart of that data directory cannot restore it once pruning has
+run.  Until an adopted horizon is written back into the reader manifest, the
+controller owns that image's lifetime and must hold a page-history horizon at
+it; the integration test models exactly that.
+
 ## Recommended sequence
 
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP

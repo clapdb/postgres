@@ -1894,11 +1894,14 @@ assert "$(grep -c 'reader catalog provenance.*invalid identity' "$BADREADER/serv
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
-# The advancing reader moves its own pin off R, which lets control-image
-# pruning retire the image this data directory boots from; hold a second
-# owner at R so the restart below can still restore it.
-assert "$($P -c "SELECT pagestore_retention_set(0,1,8002,1,7,'$readerR');")" "0" \
-	"a second owner holds the advancing reader's boot control image at R"
+# A reader's manifest names the checkpoint its data directory boots from, and
+# an advancing reader moves its own pin above that horizon, so nothing keeps
+# the boot control image alive and a restart cannot restore it.  Until the
+# adopted horizon is written back into the manifest, the controller owns that
+# image's lifetime; this stands in for it with a page-history owner, the
+# resource control images are fenced by.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8002,1,1,'$readerR');")" "0" \
+	"the controller holds the advancing reader's boot control image at R"
 ADVANCINGDATA=$(mktemp -d)/reader
 cp -a "$READERDATA" "$ADVANCINGDATA"
 if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1; then
