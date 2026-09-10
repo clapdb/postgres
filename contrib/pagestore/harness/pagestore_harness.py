@@ -3111,7 +3111,9 @@ def _forkmeta_cutoff_mismatch(store: Path, record: dict[str, Any]) -> str | None
     return None
 
 
-def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
+def _check_forkmeta_crash_snapshot(
+    store: Path, stage: str
+) -> dict[str, Any] | None:
     """Prepare leaves a staged generation whose two parts are complete and
     checksum-valid, without a selected manifest; commit selects it while the
     source still names the old epoch; the rewrite puts the selected
@@ -3137,7 +3139,9 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
         incomplete = _forkmeta_generation_incomplete(store, prepared)
         if incomplete is not None:
             raise OracleMismatch(f"after_prepare crash: {incomplete}")
-        return
+        # nothing is selected yet, so recovery is free to publish whatever
+        # generation it settles on
+        return None
     if selected is None:
         raise OracleMismatch(f"after_{stage} crash left no valid selected forkmeta manifest")
     if prepared is not None or (store / FORKMETA_PREPARED).exists():
@@ -3204,9 +3208,13 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
             f"and left {files!r}, expected exactly generation "
             f"{expected_generation}'s {expected!r}"
         )
+    return selected
 
 
-def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> dict[str, Any]:
+def _check_forkmeta_recovery(
+    store: Path, stage: str, timeout: float,
+    crash_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Recovery selects one durable generation whose parts are valid, finishes
     any staged or retired file cleanup, and serves the source behind that
     generation's exact marker.  Returns the settled generation record so the
@@ -3226,6 +3234,17 @@ def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> dict[st
             stale = _forkmeta_cutoff_mismatch(store, selected)
             if stale is not None:
                 raise OracleMismatch(f"after_{stage} recovery {stale}")
+            # The crash had already selected a generation, and the probe holds
+            # the locks that would let an acknowledged write land, so recovery
+            # has nothing new to publish.  Accepting whatever it settles on
+            # would let one unnecessary republication through, since the clean
+            # restart is then compared with that.
+            crash_selected = (crash_state or {}).get("forkmeta_selected")
+            if crash_selected is not None and selected != crash_selected:
+                raise OracleMismatch(
+                    f"after_{stage} recovery settled on {selected!r} instead of "
+                    f"the generation the crash had selected, {crash_selected!r}"
+                )
             return selected
         now = time.monotonic()
         if now >= deadline:
@@ -3751,8 +3770,10 @@ def _check_gc_crash_snapshot(
                 f"after_{stage} crash published timeline 0 fences {fences!r}, "
                 f"expected the proven frontier {FORKMETA_CUTOFF_LSN} in incarnation 1"
             )
-        _check_forkmeta_crash_snapshot(store, stage)
-        return
+        selected = _check_forkmeta_crash_snapshot(store, stage)
+        # the generation the crash had already selected, so recovery can be
+        # held to it instead of to whatever it settles on
+        return {"forkmeta_selected": selected} if selected is not None else None
     if stage == "walidx_frontier":
         if not (store / "walidx-prune.frontiers").exists():
             raise OracleMismatch(
@@ -4010,7 +4031,7 @@ def _check_gc_recovery(
             f"{timeline.get('retained_horizon')!r}, expected {expected_horizon}"
         )
     if workload == "forkmeta":
-        return _check_forkmeta_recovery(store, stage, timeout)
+        return _check_forkmeta_recovery(store, stage, timeout, crash_state)
     return None
 
 

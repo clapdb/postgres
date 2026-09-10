@@ -211,7 +211,9 @@ selected generation's two files -- the first generation's at the commit and
 the rewrite, the second's after GC -- because startup schedules snapshot GC
 unconditionally, so an orphan generation left by a faulty publication would
 be swept away before recovery is inspected;
-recovery must settle on one selected generation behind its marker, serve
+recovery must settle on the generation the crash had already selected --
+these probes hold the locks that would let an acknowledged write land, so
+there is nothing new to publish -- behind its marker, and serve
 every relation's current size and its retained size history above the
 cutoff, refuse size queries below the cutoff, keep the page-pruning
 guarantees, and republish the configured horizon.
