@@ -130,5 +130,11 @@
     "artifact": "walidx_snapshots_<tl>/walidx_manifest_v1",
     "magic": "0x4d534957",
     "version": 1
+  },
+  {
+    "family": "walidx_watermark",
+    "artifact": "walidx_<tl>_<shard>_e<epoch>.size",
+    "magic": "0x31524b4d58444957",
+    "version": 1
   }
 ]
