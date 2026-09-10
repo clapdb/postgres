@@ -104,6 +104,13 @@ jobs:
         seed: ${{ fromJSON(needs.plan.outputs.seeds) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The soak lives on `pagestore`, while GitHub offers schedules and
+          # workflow_dispatch only from the default branch, so a run started
+          # there checks the soak's own branch out explicitly.
+          ref: >-
+            ${{ github.ref_name == github.event.repository.default_branch
+                && 'pagestore' || github.ref_name }}
 
       - name: Compile daemon and soak harness
         working-directory: contrib/pagestore
@@ -117,7 +124,11 @@ jobs:
           PAGESTORE_SOAK_ROUNDS: ${{ needs.plan.outputs.rounds }}
           PAGESTORE_SOAK_SEED: ${{ matrix.seed }}
           PAGESTORE_SOAK_REPORT: soak-report-${{ matrix.seed }}.json
-        run: ./pagestore_soak_test ./pagestore_daemon
+        run: |
+          ./pagestore_soak_test ./pagestore_daemon
+          # the report is the run's product: a soak that could not write it
+          # has nothing to compare across nights
+          test -s "soak-report-${{ matrix.seed }}.json"
 
       - name: Summarize the report
         if: always()
@@ -147,5 +158,5 @@ jobs:
           # uploaded would fail on the duplicate name
           name: pagestore-soak-report-${{ matrix.seed }}-attempt-${{ github.run_attempt }}
           path: contrib/pagestore/soak-report-${{ matrix.seed }}.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30

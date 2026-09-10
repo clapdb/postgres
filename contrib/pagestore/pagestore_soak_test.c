@@ -2220,12 +2220,14 @@ main(int argc, char **argv)
 	{
 		FILE	   *f = fopen(env, "w");
 
-		if (f != NULL)
-		{
-			write_report(f, rounds, seed, &max, &quiescent, &m, catch_up_seconds,
-						 during_ok, quiescent_ok);
-			fclose(f);
-		}
+		/* The report is what a nightly run is for; a run that cannot write
+		 * it fails rather than passing with nothing to compare. */
+		if (f == NULL)
+			fatal("cannot open the report file %s", env);
+		write_report(f, rounds, seed, &max, &quiescent, &m, catch_up_seconds,
+					 during_ok, quiescent_ok);
+		if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0)
+			fatal("cannot write the report file %s", env);
 	}
 	if (!keep_store)
 		remove_tree(store_dir);

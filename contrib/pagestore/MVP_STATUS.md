@@ -437,8 +437,10 @@ and kept as a 30-day artifact.  Each job takes the time its rounds need
 instead of a fixed limit, and a dispatch too large to finish inside the
 hosted-runner limit is refused rather than killed before it reports.  GitHub fires scheduled and dispatchable
 workflows only from the repository's default branch, so the daily lane starts
-once this file reaches it; until then the same configuration is run on
-demand.
+once this file reaches it, and a run started there checks the soak's own
+branch out explicitly; until then the same configuration is run on demand.  A
+run that cannot write its JSON report fails rather than passing with nothing
+to compare across nights.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 
