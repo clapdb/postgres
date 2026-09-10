@@ -4399,11 +4399,13 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                     health_sql = "SELECT NOT pg_is_in_recovery()"
                 else:
                     health_socket, health_port = reader_clients[action["target"]]
-                    # compare as LSNs, not as text: the horizon is a string
-                    # GUC and the reader is free to echo it back in its own
-                    # spelling
+                    # A pinned reader is an ordinary instance held at a
+                    # horizon by its own GUC, not a standby, so what it owes
+                    # after a restart is that horizon.  Compare as LSNs, not
+                    # as text: the value is a string GUC and the reader is
+                    # free to echo it back in its own spelling.
                     health_sql = (
-                        "SELECT pg_is_in_recovery() AND "
+                        "SELECT NOT pg_is_in_recovery() AND "
                         "current_setting('pagestore.read_lsn')::pg_lsn = '"
                         + reader_lsns[action["target"]].replace("'", "''")
                         + "'::pg_lsn"

@@ -175,8 +175,8 @@ log on open, and register no owner; a second restart proves idempotence.
 Compute-restart combinations are composed through a `restart` operation in
 the writer and materializer runtimes.  The writer runtime restarts the writer
 or an installed pinned reader with a fast shutdown and then asks the target
-itself whether it came back as itself -- the writer out of recovery, the
-reader in recovery and still at its own horizon -- because `pg_ctl -w`
+itself whether it came back as itself -- out of recovery, and, for a pinned
+reader, still at the horizon its own GUC pins it to -- because `pg_ctl -w`
 establishes only that the PID file says connections are accepted; a pinned reader's
 shutdown checkpoint rewrites its `pg_control`, so its restart restores the
 boot control image at its immutable identity before starting, as the
