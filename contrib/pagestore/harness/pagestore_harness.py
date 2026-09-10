@@ -2266,6 +2266,44 @@ MANIFEST_MAGIC = 0x504D414E
 MANIFEST_VERSION = 3
 MANIFEST_ADD_LAYER = 1
 MANIFEST_MARK_DELETE = 4
+PAGE_FRONTIER_MAGIC = 0x46504750
+PAGE_FRONTIER_VERSION = 3
+PAGE_FRONTIER_TIMELINES = 1024
+PAGE_FRONTIER_SLOTS = 2
+PAGE_FRONTIER_ENTRY_BYTES = 24        # incarnation, fence LSN, fence admission sequence
+
+
+def _fnv1a32(data: bytes) -> int:
+    crc = 2166136261
+    for byte in data:
+        crc ^= byte
+        crc = (crc * 16777619) & 0xFFFFFFFF
+    return crc
+
+
+def _page_frontier_fences(store: Path, timeline: int) -> list[tuple[int, int, int]]:
+    """(incarnation, fence LSN, fence admission sequence) of every slot the
+    durable page-prune frontier file holds for the timeline, after checking
+    the file's magic, version, and checksum.  Empty when the file is absent
+    or invalid."""
+    path = store / "page-prune.frontiers"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    body = 8 + PAGE_FRONTIER_TIMELINES * PAGE_FRONTIER_SLOTS * PAGE_FRONTIER_ENTRY_BYTES
+    if len(data) < body + 4:
+        return []
+    magic, version = struct.unpack_from("=II", data, 0)
+    crc = struct.unpack_from("=I", data, body)[0]
+    if magic != PAGE_FRONTIER_MAGIC or version != PAGE_FRONTIER_VERSION or \
+            _fnv1a32(data[:body]) != crc:
+        return []
+    fences = []
+    for slot in range(PAGE_FRONTIER_SLOTS):
+        offset = 8 + (timeline * PAGE_FRONTIER_SLOTS + slot) * PAGE_FRONTIER_ENTRY_BYTES
+        fences.append(struct.unpack_from("=QQQ", data, offset))
+    return fences
 
 
 def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
@@ -2277,7 +2315,8 @@ def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
     records: list[tuple[int, bytes]] = []
     offset = 0
     while offset + 20 <= len(data):
-        magic, version, kind, length, _crc = struct.unpack_from("<IIIII", data, offset)
+        # the daemon persists its C structs directly: decode in host byte order
+        magic, version, kind, length, _crc = struct.unpack_from("=IIIII", data, offset)
         if magic != MANIFEST_MAGIC or version != MANIFEST_VERSION:
             break
         if offset + 20 + length > len(data):
@@ -2288,7 +2327,7 @@ def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
 
 
 def _manifest_names_layer(records: list[tuple[int, bytes]], kind: int, layer_id: int) -> bool:
-    needle = struct.pack("<Q", layer_id)
+    needle = struct.pack("=Q", layer_id)
     return any(k == kind and needle in payload for k, payload in records)
 
 
@@ -2321,8 +2360,17 @@ def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
         _manifest_names_layer(records, MANIFEST_MARK_DELETE, layer_id)
     )
     if stage == "frontier":
-        if not (store / "page-prune.frontiers").exists():
-            raise OracleMismatch("after_frontier did not leave a durable page-prune frontier")
+        fences = _page_frontier_fences(store, 0)
+        if not fences:
+            raise OracleMismatch(
+                "after_frontier did not leave a valid durable page-prune frontier"
+            )
+        if not any(incarnation != 0 and lsn == GC_RETAINED_HORIZON
+                   for incarnation, lsn, _seq in fences):
+            raise OracleMismatch(
+                f"after_frontier published timeline 0 fences {fences!r}, expected the "
+                f"configured cutoff {GC_RETAINED_HORIZON}"
+            )
         if published:
             raise OracleMismatch(
                 "after_frontier crash already published the replacement layer"
