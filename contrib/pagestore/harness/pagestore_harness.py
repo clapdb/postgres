@@ -2907,12 +2907,11 @@ def _forkmeta_record_invalid(entry: dict[str, Any], part: str,
     kind = entry["kind"]
     ordered = FORKMETA_SEG_GROW_KIND <= kind <= FORKMETA_SEG_COMMIT_BOUND_KIND
     bound = kind in (FORKMETA_SEG_GROW_BOUND_KIND, FORKMETA_SEG_COMMIT_BOUND_KIND)
-    if entry["magic"] != FORKMETA_V2_MAGIC or entry["rec_len"] != FORKMETA_RECORD_BYTES:
-        return f"record magic {entry['magic']:#x} length {entry['rec_len']}"
+    if not _forkmeta_record_wire_valid(entry["raw"]):
+        return (f"record magic {entry['magic']:#x} length {entry['rec_len']} "
+                f"fails its version's checksum rule")
     if entry["timeline"] >= FORKMETA_MAX_TIMELINES or entry["key"][4] > FORKMETA_MAX_KLASS:
         return f"record timeline {entry['timeline']} class {entry['key'][4]}"
-    if entry["pad"] != b"\x00\x00\x00":
-        return f"record pad {entry['pad']!r}"
     if not ordered and (kind > FORKMETA_DEAD_KIND or entry["order_id"] != 0):
         return f"lifecycle record kind {kind} order {entry['order_id']}"
     if ordered and (entry["nblocks"] == 0 or
@@ -3009,7 +3008,7 @@ def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> li
         chunk = data[offset:offset + FORKMETA_RECORD_BYTES]
         magic, rec_len = struct.unpack_from("=II", chunk, 0)
         records.append({
-            "magic": magic, "rec_len": rec_len,
+            "magic": magic, "rec_len": rec_len, "raw": bytes(chunk),
             "timeline": struct.unpack_from("=I", chunk, 8)[0],
             "key": struct.unpack_from("=IIIiI", chunk, 12),
             "lsn": struct.unpack_from("=Q", chunk, 32)[0],
