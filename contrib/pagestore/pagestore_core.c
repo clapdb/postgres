@@ -2536,6 +2536,45 @@ compact_same_page(const CompactOrder *a, const CompactOrder *b)
 		a->key.forkNum == b->key.forkNum && a->key.klass == b->key.klass;
 }
 
+/*
+ * Emit one page's planned versions.  Sorted equal (LSN, admission sequence)
+ * identities are one logical version that may exist as several physical
+ * copies (a compaction that crashed after publishing its replacement leaves
+ * the sources beside it): retain one physical copy when any copy is kept,
+ * or record the identity as dropped exactly once, so page_idx removal and
+ * artifact fence accounting see each logical version once.
+ */
+static uint32_t
+compact_emit_grouped(const CompactOrder *order, uint32_t first, uint32_t end,
+					 const unsigned char *keep, const PsImgRec *recs,
+					 PsImgRec *selected, uint32_t out, PsImgRec *dropped,
+					 uint32_t *ndropped)
+{
+	for (uint32_t i = first; i < end;)
+	{
+		uint32_t next = i + 1;
+		int kept_source = -1;
+
+		while (next < end &&
+			   order[next].version.lsn == order[i].version.lsn &&
+			   order[next].version.admission_seq ==
+			   order[i].version.admission_seq)
+			next++;
+		for (uint32_t j = i; j < next; j++)
+			if (keep[j - first])
+			{
+				kept_source = (int) order[j].source;
+				break;
+			}
+		if (kept_source >= 0)
+			selected[out++] = recs[kept_source];
+		else
+			dropped[(*ndropped)++] = recs[order[i].source];
+		i = next;
+	}
+	return out;
+}
+
 static int
 prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 						 uint64_t floor,
@@ -2631,20 +2670,26 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 									   (PsPruneFence) {floor, UINT64_MAX},
 									   fences, nfences, keep) < 0)
 					memset(keep, 1, end - first);
-				/* zero-version (WAL-less) state is latest-only and stays */
-				for (uint32_t i = first; i < end; i++)
-					if (order[i].version.lsn == 0)
-						keep[i - first] = 1;
+				/* zero-version (WAL-less) state is latest-only: its newest
+				 * admission stays whatever the plan says, every older
+				 * zero-version admission is superseded and goes */
+				{
+					uint64_t	newest = 0;
+
+					for (uint32_t i = first; i < end; i++)
+						if (order[i].version.lsn == 0 &&
+							order[i].version.admission_seq >= newest)
+							newest = order[i].version.admission_seq;
+					for (uint32_t i = first; i < end; i++)
+						if (order[i].version.lsn == 0)
+							keep[i - first] =
+								order[i].version.admission_seq == newest;
+				}
 			}
 			else
 				memset(keep, 1, end - first);
-			for (uint32_t i = first; i < end; i++)
-			{
-				if (keep[i - first])
-					selected[out++] = recs[order[i].source];
-				else
-					dropped[ndropped++] = recs[order[i].source];
-			}
+			out = compact_emit_grouped(order, first, end, keep, recs,
+									   selected, out, dropped, &ndropped);
 			first = end;
 			continue;
 		}
@@ -2708,30 +2753,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 										  fences, nfences))
 					keep[i - first] = 0;
 		}
-		for (uint32_t i = first; i < end;)
-		{
-			uint32_t next = i + 1;
-			int kept_source = -1;
-
-			while (next < end &&
-				   order[next].version.lsn == order[i].version.lsn &&
-				   order[next].version.admission_seq ==
-				   order[i].version.admission_seq)
-				next++;
-			for (uint32_t j = i; j < next; j++)
-				if (keep[j - first])
-				{
-					kept_source = (int) order[j].source;
-					break;
-				}
-			/* Sorted equal identities are one logical version.  Retain one
-			 * physical copy, or remove the identity from page_idx exactly once. */
-			if (kept_source >= 0)
-				selected[out++] = recs[kept_source];
-			else
-				dropped[ndropped++] = recs[order[i].source];
-			i = next;
-		}
+		out = compact_emit_grouped(order, first, end, keep, recs, selected,
+								   out, dropped, &ndropped);
 		first = end;
 	}
 	memcpy(recs, selected, (size_t) out * sizeof(*recs));
@@ -14794,7 +14817,13 @@ artifact_fence_forget_version(uint32_t timeline, uint64_t lsn)
 					artifact_fences[i].versions--;
 				if (artifact_fences[i].versions == 0 &&
 					artifact_fences[i].pending == 0)
+				{
 					artifact_fences[i] = artifact_fences[--nartifact_fences];
+					/* the control era this fence kept alive may now be
+					 * reclaimable; the current pass already snapshotted the
+					 * fence, so make sure a later pass looks again */
+					page_prune_mark_all_due_locked();
+				}
 				break;
 			}
 	pthread_mutex_unlock(&artifact_fence_lock);
@@ -14839,7 +14868,10 @@ artifact_fence_release(uint32_t timeline, uint64_t lsn)
 					artifact_fences[i].pending--;
 				if (artifact_fences[i].pending == 0 &&
 					artifact_fences[i].versions == 0)
+				{
 					artifact_fences[i] = artifact_fences[--nartifact_fences];
+					page_prune_mark_all_due_locked();
+				}
 				break;
 			}
 	pthread_mutex_unlock(&artifact_fence_lock);
@@ -18055,10 +18087,17 @@ ps_core_maintenance_impl(void)
 				retention_effective_floor_internal(ftl,
 					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1) == 0)
 			{
-				/* Zero disables pruning but still permits a safe layer merge. */
+				int		was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh],
+													  0, __ATOMIC_ACQ_REL);
+
+				/* Consume the mark before the pass: anything the pass itself
+				 * makes due (a released artifact fence, a note that became
+				 * durable) is a fresh mark for the next pass, not one this
+				 * pass clears on its way out.  Zero disables pruning but
+				 * still permits a safe layer merge. */
 				did = compact_timeline(ftl, fsh, page_floor) > 0;
-				if (did)
-					__atomic_store_n(&page_prune_due[ftl][fsh], 0,
+				if (!did && was_due)
+					__atomic_store_n(&page_prune_due[ftl][fsh], 1,
 									 __ATOMIC_RELEASE);
 			}
 			ps_unlock_map();
