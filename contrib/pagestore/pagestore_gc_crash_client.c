@@ -399,6 +399,7 @@ static void die_page(const char *message, uint32_t block,
 static void delete_seed_survivor(unsigned char *page);
 static void delete_verify_survivor(unsigned char *page);
 static void delete_verify_live(void);
+static uint64_t page_lsn(const unsigned char *page);
 
 
 static unsigned char
@@ -427,8 +428,6 @@ manifest_seed(void)
 		write_block(page, block, 1000 + block, manifest_tag(block));
 	free(page);
 	arm_fault();
-	if (resume_file != NULL && unlink(resume_file) != 0)
-		die("cannot release the paused maintenance loop");
 	wait_forever();
 }
 
@@ -442,7 +441,10 @@ manifest_verify(void)
 	for (uint32_t block = 0; block < MANIFEST_PAGES; block++)
 	{
 		read_latest(page, block);
-		if (!page_has_tag(page, manifest_tag(block)))
+		/* the tag repeats every 256 blocks, so the page's unique LSN is what
+		 * proves this block is not an alias of another one */
+		if (!page_has_tag(page, manifest_tag(block)) ||
+			page_lsn(page) != 1000 + block)
 			die_page("recovery does not serve a page written before the "
 					 "manifest rewrite", block, page);
 	}

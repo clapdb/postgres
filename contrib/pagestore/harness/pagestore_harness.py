@@ -3604,9 +3604,6 @@ def run_daemon_fault_recovery(
     gc_stage = _gc_fault_stage(action["fault"]) if gc_seed_actions else None
     crash_state: dict[str, Any] | None = None
     gc_workload = gc_seed_actions[0]["workload"] if gc_seed_actions else None
-    gc_pauses_maintenance = bool(
-        gc_seed_actions and GC_WORKLOADS[gc_workload].get("pause_maintenance")
-    )
     # Both seeds drive the same one-client workload protocol; the layer and
     # page-pruning slices differ only in the binary, daemon flags, and oracles.
     seed_client = gc_client if gc_seed_actions else layer_client
@@ -3658,6 +3655,11 @@ def run_daemon_fault_recovery(
     # The seed installs the cutoff that makes pruning due and then arms the
     # fault; maintenance stays paused across both, so no pass can run against
     # the old floor and none can outrun arming either.
+    # Every gc workload starts its crash generation paused: the seed installs
+    # the cutoff that makes its work due and then arms the fault, and a pass
+    # in between would either be planned against the old floor or consume the
+    # only due work before the fault is armed.  A workload whose daemon_args
+    # name {pause} places the file itself; the rest get the flag added.
     gc_pauses_maintenance = bool(gc_seed_actions)
     failure: Exception | None = None
     current_action_id: str | None = None
