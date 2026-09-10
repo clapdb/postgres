@@ -2564,9 +2564,17 @@ artifact_generation_at(const uint64_t *generations, uint32_t ngenerations,
 static int
 artifact_generation_needed(uint64_t lsn, const uint64_t *generations,
 						   uint32_t ngenerations, uint64_t floor,
-						   const PsPruneFence *fences, uint32_t nfences)
+						   const PsPruneFence *fences, uint32_t nfences,
+						   int replay_base)
 {
-	if (artifact_generation_at(generations, ngenerations, floor) == lsn)
+	/* A seed is a replay base: a horizon above the floor is served by the
+	 * newest seed at or below it plus the WAL after it, so the newest
+	 * generation below the floor must survive.  A reader snapshot is not:
+	 * its consumer resolves it at exactly the horizon it was captured for,
+	 * so once no fence names that horizon nothing can ask for it, and
+	 * keeping it would pin its control era and WAL floor forever. */
+	if (replay_base &&
+		artifact_generation_at(generations, ngenerations, floor) == lsn)
 		return 1;
 	for (uint32_t f = 0; f < nfences; f++)
 		if (artifact_generation_at(generations, ngenerations, fences[f].lsn) == lsn)
@@ -2780,7 +2788,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 							order[i].version.lsn < floor &&
 							!artifact_generation_needed(order[i].version.lsn,
 														generations, ngenerations,
-														floor, fences, nfences))
+														floor, fences, nfences,
+														klass == PS_KLASS_SLRU))
 							keep[i - first] = 0;
 				/* zero-version (WAL-less) state is latest-only: its newest
 				 * admission stays whatever the plan says, every older

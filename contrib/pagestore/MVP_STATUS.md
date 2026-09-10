@@ -434,7 +434,11 @@ the newest generation at or below the horizon it pinned or forked at, so a
 page copy is kept only when it belongs to the newest generation at or below
 the floor or some fence (a copy from an older generation of a page the newer
 generation no longer has serves nobody and is retired with its control-era
-fence).  The live mirror, tombstones, and watermark are read at the newest
+fence).  Only a seed is a replay base, though: a horizon above the floor is
+served by the newest seed at or below it plus the WAL after it, while a
+reader snapshot resolves at exactly the horizon it was captured for, so a
+snapshot is kept only while a fence names that horizon and no longer pins its
+control era once its reader is gone.  The live mirror, tombstones, and watermark are read at the newest
 horizon by their consumer and at the fork point by a branch, so they keep
 only the newest version and the newest at or below each fence.  Retried
 copies collapse to one, and a retired artifact releases the control era it
