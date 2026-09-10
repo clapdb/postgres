@@ -12191,6 +12191,24 @@ walidx_plan_bases_build(uint32_t tl)
 			}
 			if (shared)
 				continue;
+			/* Record the grant before asking whether the horizon is already
+			 * protected: an LSN that a page fence protects today can still
+			 * become a standing WAL-index horizon before publication, and
+			 * the recheck can only withdraw what it knows about. */
+			{
+				uint64_t   *grown = realloc(walidx_plan_mat_protected,
+											(size_t) (walidx_plan_n_mat_protected + 1) *
+											sizeof(*walidx_plan_mat_protected));
+
+				if (grown == NULL)
+				{
+					free(pins);
+					free(fences);
+					return -1;
+				}
+				walidx_plan_mat_protected = grown;
+				walidx_plan_mat_protected[walidx_plan_n_mat_protected++] = pins[i].lsn;
+			}
 			for (uint32_t j = 0; j < walidx_plan_nprotected && !present; j++)
 				if (walidx_plan_protected[j] == pins[i].lsn)
 					present = 1;
@@ -12209,20 +12227,6 @@ walidx_plan_bases_build(uint32_t tl)
 				}
 				walidx_plan_protected = grown;
 				walidx_plan_protected[walidx_plan_nprotected++] = pins[i].lsn;
-			}
-			{
-				uint64_t   *grown = realloc(walidx_plan_mat_protected,
-											(size_t) (walidx_plan_n_mat_protected + 1) *
-											sizeof(*walidx_plan_mat_protected));
-
-				if (grown == NULL)
-				{
-					free(pins);
-					free(fences);
-					return -1;
-				}
-				walidx_plan_mat_protected = grown;
-				walidx_plan_mat_protected[walidx_plan_n_mat_protected++] = pins[i].lsn;
 			}
 		}
 		free(pins);
