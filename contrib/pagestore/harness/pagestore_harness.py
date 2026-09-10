@@ -2705,6 +2705,19 @@ def _forkmeta_generation_files(store: Path) -> list[str]:
     )
 
 
+def _forkmeta_temp_files(store: Path) -> list[str]:
+    """Publication debris in the snapshot directory.  Every part, prepared
+    intent and manifest is written to a `.tmp.` name and renamed into place,
+    so a temporary that outlives its publication is cleanup that did not
+    happen -- and startup's temp GC would sweep it away before the recovery
+    oracle could see it."""
+    directory = store / FORKMETA_SNAPSHOTS
+    if not directory.is_dir():
+        return []
+    return sorted(entry.name for entry in directory.iterdir()
+                  if ".tmp." in entry.name)
+
+
 def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
     """The first record of the shared forkmeta log, decoded in the host's
     byte order (the daemon persists the C struct directly)."""
@@ -3122,6 +3135,11 @@ def _check_forkmeta_crash_snapshot(
     prepared = _forkmeta_snapshot_record(store / FORKMETA_PREPARED)
     selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
     files = _forkmeta_generation_files(store)
+    debris = _forkmeta_temp_files(store)
+    if debris:
+        raise OracleMismatch(
+            f"after_{stage} crash left publication temporaries {debris!r}"
+        )
     if stage == "forkmeta_prepare":
         if prepared is None or selected is not None:
             raise OracleMismatch(
@@ -3225,7 +3243,8 @@ def _check_forkmeta_recovery(
         selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
         files = _forkmeta_generation_files(store)
         prepared = (store / FORKMETA_PREPARED).exists()
-        if selected is not None and not prepared and \
+        debris = _forkmeta_temp_files(store)
+        if selected is not None and not prepared and not debris and \
                 not _forkmeta_parts_valid(store, selected) and \
                 files == sorted(
                     _forkmeta_part_name(selected["generation"], part)
@@ -3251,7 +3270,7 @@ def _check_forkmeta_recovery(
             raise HarnessTimeout(
                 f"after_{stage} recovery did not settle the forkmeta snapshot: "
                 f"selected={selected!r} prepared={prepared} files={files!r} "
-                f"head={_forkmeta_source_head(store)!r}"
+                f"temporaries={debris!r} head={_forkmeta_source_head(store)!r}"
             )
         time.sleep(min(0.05, deadline - now))
 

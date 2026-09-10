@@ -207,7 +207,9 @@ the cutoff, and a trickle of further fork events after the cutoff drives the
 second generation that retires the first.  Snapshots check the staged
 generation without a selected manifest, and the selected manifest before and
 after the source-epoch marker; every crash image must hold exactly the
-selected generation's two files -- the first generation's at the commit and
+selected generation's two files and no publication temporary -- every part,
+prepared intent and manifest is renamed into place, and startup's temp GC
+would sweep any debris away before recovery could be inspected -- -- the first generation's at the commit and
 the rewrite, the second's after GC -- because startup schedules snapshot GC
 unconditionally, so an orphan generation left by a faulty publication would
 be swept away before recovery is inspected;
