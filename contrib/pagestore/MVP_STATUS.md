@@ -105,7 +105,9 @@ local layer set with no pending deletions, and republish the configured
 horizon; a second restart proves idempotence, and idempotence now means the
 durable state itself -- the layer files, the layers the manifest publishes,
 and the prune frontiers -- is unchanged by that restart, not merely that it
-passes the same checks.  Compaction accordingly leaves a converged shard
+passes the same checks.  Both snapshots are taken with the daemon stopped:
+readiness is published as soon as the maintenance thread exists, so a
+comparison made while it runs can precede the pass startup marked due.  Compaction accordingly leaves a converged shard
 alone: a single source with nothing to prune is already its own compacted
 result, so it is no longer rewritten into a fresh layer by the pruning pass
 each startup marks due.  WAL reclaim, WAL-index

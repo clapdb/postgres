@@ -3180,9 +3180,25 @@ def run_daemon_fault_recovery(
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout)
             _check_gc_recovery(inspector, shm, inspection_schema, store, gc_stage, timeout)
-            _check_gc_restart_idempotent(store, converged, gc_stage)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
+        if gc_seed_actions:
+            # Readiness is published as soon as the maintenance thread is
+            # created, so the pass that startup marks due may not have run
+            # yet: comparing while the daemon is up can see the state before
+            # a recompaction it is about to do.  Stop it first -- the same
+            # quiescent point the converged state was taken at.
+            stop_daemon()
+            if process.returncode != 0:
+                raise UnexpectedExit(
+                    "restarted daemon did not stop cleanly; status "
+                    f"{process.returncode}"
+                )
+            emit("process_stop", target="store", pid=process.pid,
+                 returncode=process.returncode)
+            remove_shm(shm)
+            process = None
+            _check_gc_restart_idempotent(store, converged, gc_stage)
         emit("run_pass")
     except Exception as error:
         failure = error
