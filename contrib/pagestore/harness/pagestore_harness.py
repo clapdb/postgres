@@ -2815,6 +2815,78 @@ def _forkmeta_seeded_truncates_missing(records: list[dict[str, Any]], above_lsn:
 FORKMETA_PAYLOAD_HEADER_BYTES = 80
 
 
+FORKMETA_MAX_TIMELINES = 1024
+FORKMETA_MAX_KLASS = 6                 # PS_KLASS_READER_SNAPSHOT
+FORKMETA_DEAD_KIND = 2
+FORKMETA_SEG_GROW_KIND = 5
+FORKMETA_SEG_COMMIT_KIND = 6
+FORKMETA_SEG_GROW_BOUND_KIND = 7
+FORKMETA_SEG_COMMIT_BOUND_KIND = 8
+
+
+def _forkmeta_payload_header(store: Path, record: dict[str, Any],
+                             part: str) -> dict[str, Any] | None:
+    """The payload header of one part, decoded; None when unreadable."""
+    path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < FORKMETA_PAYLOAD_HEADER_BYTES:
+        return None
+    magic, version, header_bytes = struct.unpack_from("=IHH", data, 0)
+    index, record_bytes = struct.unpack_from("=II", data, 8)
+    generation, cutoff_lsn, cutoff_seq, freeze_seq = struct.unpack_from("=QQQQ", data, 16)
+    checkpoint_records, tail_records, checkpoint_bytes, tail_bytes = \
+        struct.unpack_from("=QQQQ", data, 48)
+    return {
+        "magic": magic, "version": version, "header_bytes": header_bytes,
+        "part": index, "record_bytes": record_bytes, "generation": generation,
+        "cutoff_lsn": cutoff_lsn, "cutoff_seq": cutoff_seq, "freeze_seq": freeze_seq,
+        "checkpoint_records": checkpoint_records, "tail_records": tail_records,
+        "checkpoint_bytes": checkpoint_bytes, "tail_bytes": tail_bytes,
+        "body": len(data) - FORKMETA_PAYLOAD_HEADER_BYTES,
+    }
+
+
+def _forkmeta_event_future(lsn: int, seq: int, cutoff_lsn: int, cutoff_seq: int) -> bool:
+    """The loader's partition test: at the cutoff LSN a nonzero sequence
+    above the cutoff sequence still belongs to the tail."""
+    return lsn > cutoff_lsn or (lsn == cutoff_lsn and seq != 0 and seq > cutoff_seq)
+
+
+def _forkmeta_record_invalid(entry: dict[str, Any], part: str,
+                             cutoff_lsn: int, cutoff_seq: int) -> str | None:
+    """Why one staged record would be refused by the loader: its identity,
+    class, kind and order-id rules, its zero pad, and the partition it is
+    stored in."""
+    kind = entry["kind"]
+    ordered = FORKMETA_SEG_GROW_KIND <= kind <= FORKMETA_SEG_COMMIT_BOUND_KIND
+    bound = kind in (FORKMETA_SEG_GROW_BOUND_KIND, FORKMETA_SEG_COMMIT_BOUND_KIND)
+    if entry["magic"] != FORKMETA_V2_MAGIC or entry["rec_len"] != FORKMETA_RECORD_BYTES:
+        return f"record magic {entry['magic']:#x} length {entry['rec_len']}"
+    if entry["timeline"] >= FORKMETA_MAX_TIMELINES or entry["key"][4] > FORKMETA_MAX_KLASS:
+        return f"record timeline {entry['timeline']} class {entry['key'][4]}"
+    if entry["pad"] != b"\x00\x00\x00":
+        return f"record pad {entry['pad']!r}"
+    if not ordered and (kind > FORKMETA_DEAD_KIND or entry["order_id"] != 0):
+        return f"lifecycle record kind {kind} order {entry['order_id']}"
+    if ordered and (entry["nblocks"] == 0 or
+                    (bound and entry["order_id"] == 0) or
+                    (not bound and (entry["order_id"] != 0 or
+                                    entry["admission_seq"] != 0))):
+        return (f"ordered marker kind {kind} order {entry['order_id']} "
+                f"seq {entry['admission_seq']} nblocks {entry['nblocks']}")
+    if kind == FORKMETA_DEAD_KIND and entry["nblocks"] != 0:
+        return f"death record with {entry['nblocks']} blocks"
+    future = _forkmeta_event_future(entry["lsn"], entry["admission_seq"],
+                                    cutoff_lsn, cutoff_seq)
+    if (part == "checkpoint" and future) or (part == "tail" and not future):
+        return (f"{part} record at lsn {entry['lsn']} seq {entry['admission_seq']} "
+                f"is on the wrong side of the cutoff")
+    return None
+
+
 def _forkmeta_part_framing(store: Path, record: dict[str, Any], part: str) -> str | None:
     """Why a part does not satisfy the framing invariants the loader applies:
     its payload header must identify the part and the generation, its record
@@ -2827,27 +2899,56 @@ def _forkmeta_part_framing(store: Path, record: dict[str, Any], part: str) -> st
         return f"{path.name} is unreadable"
     if len(data) < FORKMETA_PAYLOAD_HEADER_BYTES:
         return f"{path.name} is shorter than its payload header"
-    magic, version, header_bytes = struct.unpack_from("=IHH", data, 0)
-    index, record_bytes = struct.unpack_from("=II", data, 8)
-    generation = struct.unpack_from("=Q", data, 16)[0]
-    counts = struct.unpack_from("=QQQQ", data, 48)
-    checkpoint_records, tail_records, checkpoint_bytes, tail_bytes = counts
+    header = _forkmeta_payload_header(store, record, part)
+    other = _forkmeta_payload_header(
+        store, record, "tail" if part == "checkpoint" else "checkpoint")
+    if header is None:
+        return f"{path.name} is shorter than its payload header"
     expected_index = 0 if part == "checkpoint" else 1
-    body = len(data) - FORKMETA_PAYLOAD_HEADER_BYTES
-    if magic != FORKMETA_PAYLOAD_MAGIC or version != 1 or \
-            header_bytes != FORKMETA_PAYLOAD_HEADER_BYTES or \
-            record_bytes != FORKMETA_RECORD_BYTES or index != expected_index or \
-            generation != record["generation"]:
-        return (f"{path.name} has payload header magic {magic:#x} version {version} "
-                f"header {header_bytes} record {record_bytes} part {index} "
-                f"generation {generation}")
+    if header["magic"] != FORKMETA_PAYLOAD_MAGIC or header["version"] != 1 or \
+            header["header_bytes"] != FORKMETA_PAYLOAD_HEADER_BYTES or \
+            header["record_bytes"] != FORKMETA_RECORD_BYTES or \
+            header["part"] != expected_index or \
+            header["generation"] != record["generation"]:
+        return (f"{path.name} has payload header magic {header['magic']:#x} version "
+                f"{header['version']} header {header['header_bytes']} record "
+                f"{header['record_bytes']} part {header['part']} generation "
+                f"{header['generation']}")
+    # the cutoff the header states is the one the record was selected with,
+    # and the freeze sequence that froze appends must be real
+    if header["cutoff_lsn"] != record["cutoff_lsn"] or \
+            header["cutoff_seq"] != record["cutoff_seq"] or header["freeze_seq"] == 0:
+        return (f"{path.name} states cutoff ({header['cutoff_lsn']}, "
+                f"{header['cutoff_seq']}) freeze {header['freeze_seq']}, record says "
+                f"({record['cutoff_lsn']}, {record['cutoff_seq']})")
+    if other is not None and any(header[field] != other[field] for field in (
+            "generation", "cutoff_lsn", "cutoff_seq", "freeze_seq",
+            "checkpoint_records", "tail_records", "checkpoint_bytes", "tail_bytes")):
+        return f"{path.name} disagrees with the other part's payload header"
+    body = header["body"]
     if body % FORKMETA_RECORD_BYTES != 0:
         return f"{path.name} ends with a partial record ({body} body bytes)"
-    stated = checkpoint_records if part == "checkpoint" else tail_records
-    stated_bytes = checkpoint_bytes if part == "checkpoint" else tail_bytes
+    stated = header["checkpoint_records"] if part == "checkpoint" else header["tail_records"]
+    stated_bytes = header["checkpoint_bytes"] if part == "checkpoint" else header["tail_bytes"]
     if stated * FORKMETA_RECORD_BYTES != body or stated_bytes != body:
         return (f"{path.name} holds {body // FORKMETA_RECORD_BYTES} records, "
                 f"header states {stated} ({stated_bytes} bytes)")
+    # every record, and the per-fork ordering the loader enforces
+    seen: dict[tuple[int, tuple[int, ...]], tuple[int, int]] = {}
+    for index, entry in enumerate(_forkmeta_part_records(store, record, part)):
+        invalid = _forkmeta_record_invalid(entry, part, record["cutoff_lsn"],
+                                           record["cutoff_seq"])
+        if invalid is not None:
+            return f"{path.name} index {index}: {invalid}"
+        previous = seen.get((entry["timeline"], entry["key"]))
+        position = (entry["lsn"], entry["admission_seq"])
+        if previous is not None and (
+                previous[0] > position[0] or
+                (previous[0] == position[0] and previous[1] != 0 and
+                 position[1] != 0 and previous[1] > position[1])):
+            return (f"{path.name} index {index} steps back from {previous} to "
+                    f"{position} for one fork")
+        seen[(entry["timeline"], entry["key"])] = position
     return None
 
 
@@ -2862,12 +2963,16 @@ def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> li
     records = []
     for offset in range(80, len(data) - FORKMETA_RECORD_BYTES + 1, FORKMETA_RECORD_BYTES):
         chunk = data[offset:offset + FORKMETA_RECORD_BYTES]
+        magic, rec_len = struct.unpack_from("=II", chunk, 0)
         records.append({
+            "magic": magic, "rec_len": rec_len,
             "timeline": struct.unpack_from("=I", chunk, 8)[0],
             "key": struct.unpack_from("=IIIiI", chunk, 12),
             "lsn": struct.unpack_from("=Q", chunk, 32)[0],
             "admission_seq": struct.unpack_from("=Q", chunk, 40)[0],
+            "order_id": struct.unpack_from("=Q", chunk, 48)[0],
             "nblocks": struct.unpack_from("=I", chunk, 56)[0], "kind": chunk[60],
+            "pad": chunk[61:64],
         })
     return records
 
@@ -2982,6 +3087,26 @@ def _forkmeta_source_starts_with_marker(store: Path) -> bool:
     return selected is not None and _forkmeta_marker_matches(store, selected)
 
 
+def _forkmeta_cutoff_mismatch(store: Path, record: dict[str, Any]) -> str | None:
+    """Why a generation's cutoff is not the durable page frontier: the
+    runtime selects the full (lsn, admission sequence) tuple the frontier
+    published, so a record that keeps the LSN and misstates the sequence is
+    a boundary error even though every functional query still passes."""
+    fences = _page_frontier_fences(store, 0)
+    proven = [
+        (lsn, seq) for incarnation, lsn, seq in fences
+        if incarnation == 1 and lsn == FORKMETA_CUTOFF_LSN
+    ]
+    if not proven:
+        return (f"has no durable timeline 0 frontier at {FORKMETA_CUTOFF_LSN}: "
+                f"{fences!r}")
+    if record["cutoff_lsn"] != FORKMETA_CUTOFF_LSN or \
+            all(record["cutoff_seq"] != seq for _lsn, seq in proven):
+        return (f"states cutoff ({record['cutoff_lsn']}, {record['cutoff_seq']}), "
+                f"expected the proven frontier {proven!r}")
+    return None
+
+
 def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
     """Prepare leaves a staged generation whose two parts are complete and
     checksum-valid, without a selected manifest; commit selects it while the
@@ -3002,11 +3127,9 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
                 f"after_prepare crash staged generation {prepared['generation']} "
                 f"with incomplete parts {broken!r}"
             )
-        if prepared["cutoff_lsn"] != FORKMETA_CUTOFF_LSN:
-            raise OracleMismatch(
-                f"after_prepare crash staged cutoff {prepared['cutoff_lsn']}, "
-                f"expected the proven frontier {FORKMETA_CUTOFF_LSN}"
-            )
+        stale = _forkmeta_cutoff_mismatch(store, prepared)
+        if stale is not None:
+            raise OracleMismatch(f"after_prepare crash {stale}")
         incomplete = _forkmeta_generation_incomplete(store, prepared)
         if incomplete is not None:
             raise OracleMismatch(f"after_prepare crash: {incomplete}")
@@ -3026,11 +3149,9 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
             f"after_{stage} crash selected generation {selected['generation']} "
             f"with invalid parts {broken!r}"
         )
-    if selected["cutoff_lsn"] != FORKMETA_CUTOFF_LSN:
-        raise OracleMismatch(
-            f"after_{stage} crash selected cutoff {selected['cutoff_lsn']}, "
-            f"expected the proven frontier {FORKMETA_CUTOFF_LSN}"
-        )
+    stale = _forkmeta_cutoff_mismatch(store, selected)
+    if stale is not None:
+        raise OracleMismatch(f"after_{stage} crash {stale}")
     incomplete = _forkmeta_generation_incomplete(store, selected)
     if incomplete is not None:
         raise OracleMismatch(f"after_{stage} crash: {incomplete}")
@@ -3089,11 +3210,9 @@ def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> dict[st
                     _forkmeta_part_name(selected["generation"], part)
                     for part in ("checkpoint", "tail")
                 ) and _forkmeta_marker_matches(store, selected):
-            if selected["cutoff_lsn"] != FORKMETA_CUTOFF_LSN:
-                raise OracleMismatch(
-                    f"after_{stage} recovery selected cutoff {selected['cutoff_lsn']}, "
-                    f"expected the proven frontier {FORKMETA_CUTOFF_LSN}"
-                )
+            stale = _forkmeta_cutoff_mismatch(store, selected)
+            if stale is not None:
+                raise OracleMismatch(f"after_{stage} recovery {stale}")
             return selected
         now = time.monotonic()
         if now >= deadline:
