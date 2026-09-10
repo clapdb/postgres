@@ -2028,11 +2028,20 @@ if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
 	echo "FAIL - advancing reader restart could not restore its boot control image"
 	exit 1
 fi
-if ! "$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null; then
-	echo "FAIL - advancing reader did not restart at its durable owner horizon"
-	tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
-	exit 1
-fi
+# pg_ctl reports why it could not start on its own output, which used to be
+# discarded, leaving a start failure indistinguishable from a slow one.  Keep
+# that output, and retry once: a stale postmaster.pid from the stop above is
+# transient, while a store or control image the reader cannot accept is not.
+advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1) || {
+	sleep 2
+	advancingStart="$advancingStart
+retry: $("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1)" || {
+		echo "FAIL - advancing reader did not restart at its durable owner horizon"
+		printf '%s\n' "$advancingStart"
+		tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
+		exit 1
+	}
+}
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 	"advancing reader restart adopts its durable owner horizon before serving"
 assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerAutoR'::pg_lsn;")" "t" \
