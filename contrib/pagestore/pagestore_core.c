@@ -10444,6 +10444,11 @@ static int walidx_plan_bases_valid;
  * caps).  Only such a horizon may rely on a stored image as its replacement
  * base; any other horizon keeps its FPI-led chain. */
 static uint64_t *walidx_plan_protected;
+/* The subset of the protected horizons that the materializer exception
+ * granted: their protection depends on no standing horizon sitting at the
+ * same LSN, which publication itself can change. */
+static uint64_t *walidx_plan_mat_protected;
+static uint32_t walidx_plan_n_mat_protected;
 static uint32_t walidx_plan_nprotected;
 
 static int
@@ -10484,6 +10489,36 @@ walidx_plan_bases_free(void)
 	free(walidx_plan_protected);
 	walidx_plan_protected = NULL;
 	walidx_plan_nprotected = 0;
+	free(walidx_plan_mat_protected);
+	walidx_plan_mat_protected = NULL;
+	walidx_plan_n_mat_protected = 0;
+}
+
+/*
+ * The plan is built before publication is excluded, and walidx_commit() can
+ * advance the shipper's progress in between.  A materializer horizon that has
+ * become equal to a standing horizon since then must lose its exception, or
+ * this publication would drop the FPI chain at an LSN a later WAL-index-only
+ * owner is still admitted at.  Called with the publish write lock held.
+ */
+static void
+walidx_plan_recheck_standing(uint32_t tl)
+{
+	uint64_t	frontier = walidx_frontier_current(tl);
+	uint64_t	progress = walidx_progress_read(tl);
+
+	for (uint32_t i = 0; i < walidx_plan_n_mat_protected; i++)
+	{
+		uint64_t	lsn = walidx_plan_mat_protected[i];
+		uint32_t	out = 0;
+
+		if (lsn != frontier && lsn != progress)
+			continue;
+		for (uint32_t j = 0; j < walidx_plan_nprotected; j++)
+			if (walidx_plan_protected[j] != lsn)
+				walidx_plan_protected[out++] = walidx_plan_protected[j];
+		walidx_plan_nprotected = out;
+	}
 }
 
 static int
@@ -12175,6 +12210,20 @@ walidx_plan_bases_build(uint32_t tl)
 				walidx_plan_protected = grown;
 				walidx_plan_protected[walidx_plan_nprotected++] = pins[i].lsn;
 			}
+			{
+				uint64_t   *grown = realloc(walidx_plan_mat_protected,
+											(size_t) (walidx_plan_n_mat_protected + 1) *
+											sizeof(*walidx_plan_mat_protected));
+
+				if (grown == NULL)
+				{
+					free(pins);
+					free(fences);
+					return -1;
+				}
+				walidx_plan_mat_protected = grown;
+				walidx_plan_mat_protected[walidx_plan_n_mat_protected++] = pins[i].lsn;
+			}
 		}
 		free(pins);
 	}
@@ -13043,6 +13092,7 @@ walidx_snapshot_publish_one(void)
 	for (uint32_t shard = ns; shard > 0; shard--)
 		ps_unlock_shard(shard - 1);
 	walidx_publish_wrlock();
+	walidx_plan_recheck_standing((uint32_t) candidate);
 	{
 		uint32_t tl = (uint32_t) candidate;
 		uint64_t generation;

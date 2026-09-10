@@ -428,7 +428,9 @@ declared bound.  That exception stops where the pin coincides with a standing
 horizon: the durable WAL-index frontier and the shipper's progress admit a new
 WAL-index-only owner at exactly their LSN, which would arrive after the
 materializer advanced and the base was retired, so a pin at either keeps its
-FPI-led chain.
+FPI-led chain.  The plan is built before publication is excluded and progress
+can advance in between, so the standing horizons are rechecked under the
+publication lock and an exception that has since become one is withdrawn.
 SLRU-class and reader-artifact versions now have their retention protocol.
 Seeds and reader snapshots are exact-generation artifacts: a consumer reads
 every page of the object at exactly the generation it captured, which is
