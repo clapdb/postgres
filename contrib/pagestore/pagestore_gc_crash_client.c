@@ -1225,6 +1225,28 @@ fixture_wal_check(uint64_t lsn)
 			die("fixture shipped WAL returned the wrong bytes");
 }
 
+/* The branch keeps its own shipped WAL, and the archived WAL-index entry
+ * points into that stream: corruption confined to the branch's WAL leaves
+ * timeline 0's bytes and the entry itself intact. */
+static void
+fixture_branch_wal_check(uint64_t incarnation)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = FIXTURE_FORK_LSN;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch WAL is not readable");
+	if (ch->result != 64)
+		die("fixture branch WAL returned a short read");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != (unsigned char) (FIXTURE_BRANCH + 1))
+			die("fixture branch WAL returned the wrong bytes");
+}
+
 static void
 fixture_verify(void)
 {
@@ -1241,6 +1263,48 @@ fixture_verify(void)
 	ch->opcode = PS_OP_NBLOCKS;
 	if (execute()->status != PS_STATUS_OK || ch->result != 2)
 		die("fixture lost the fork-size events appended after the snapshot cutover");
+	/* The create record's LSN is the acknowledged as-of boundary of this
+	 * relation's existence, and forkmeta source records carry no checksum of
+	 * their own: a byte flipped inside one is caught only by an oracle that
+	 * asks on both sides of the boundary the archive records.  The latest
+	 * size is the same either way. */
+	{
+		uint64_t	root_incarnation = 0;
+		/* an as-of horizon includes the events strictly below it, so each
+		 * boundary is pinned by the pair of answers around its LSN */
+		const struct
+		{
+			uint32_t	opcode;
+			uint64_t	lsn;
+			uint64_t	expected;
+			const char *complaint;
+		} boundaries[] = {
+			{PS_OP_EXISTS, FIXTURE_TAIL_LSN, 0,
+			 "fixture relation already exists at its create event"},
+			{PS_OP_EXISTS, FIXTURE_TAIL_LSN + 1, 1,
+			 "fixture relation does not exist above its create event"},
+			{PS_OP_NBLOCKS, FIXTURE_TAIL_LSN + 1000, 0,
+			 "fixture relation is already grown at its growth event"},
+			{PS_OP_NBLOCKS, FIXTURE_TAIL_LSN + 1001, 2,
+			 "fixture relation is not grown above its growth event"},
+		};
+
+		if (timeline_state(0, &root_incarnation) != PS_TIMELINE_LIVE ||
+			root_incarnation == 0)
+			die("fixture root timeline is not live");
+		for (unsigned i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++)
+		{
+			set_relation(ch);
+			ch->key.relNumber = FIXTURE_TAIL_REL;
+			ch->opcode = boundaries[i].opcode;
+			ch->req_lsn = boundaries[i].lsn;
+			ch->req_seq = root_incarnation;
+			if (execute()->status != PS_STATUS_OK ||
+				ch->result != boundaries[i].expected)
+				die(boundaries[i].complaint);
+		}
+	}
+	set_relation(ch);
 	walidx_check(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
 	/* Both seeded pins must still belong to the owners that took them.  The
 	 * horizon checks above and the retain-floor check below hold for a pin
@@ -1268,6 +1332,7 @@ fixture_verify(void)
 	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
 		incarnation == 0)
 		die("fixture branch is not live");
+	fixture_branch_wal_check(incarnation);
 	/* The persisted ancestry is part of the format too.  A migration that
 	 * keeps the branch live but decodes a different fork point moves every
 	 * as-of boundary a compute already holds, and rejects the exact
@@ -1353,8 +1418,12 @@ fixture_verify(void)
 		if (execute()->status != PS_STATUS_OK || (int) ch->result < 1)
 			die("fixture branch lost its WAL-index entry");
 		memcpy(out, ch->data, sizeof(*out));
+		/* The entry's source timeline is what directs replay to a WAL
+		 * stream; an entry that kept its LSNs and flags but moved to
+		 * timeline 0 would send the reader to the wrong shipped WAL. */
 		if (out[0].lsn != FIXTURE_FORK_LSN + 16 ||
 			out[0].end_lsn != FIXTURE_FORK_LSN + 17 ||
+			out[0].timeline != FIXTURE_BRANCH ||
 			(out[0].flags & (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI)) !=
 			(PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI))
 			die("fixture branch WAL-index entry changed");

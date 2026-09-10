@@ -62,6 +62,11 @@ SEG_HEADER_BYTES = {
     0x53454737: 64, 0x53454738: 64,
 }
 FORKMETA_RECORD_BYTES = 64
+# the relation the extension phase creates and grows: addressing its two
+# events by position would move with the archive
+FORKMETA_TAIL_REL = 8000
+FORKMETA_KIND_SET = 0
+FORKMETA_KIND_CREATE = 1
 INSPECTION_SCHEMA = harness.read_json(Path(__file__).resolve().parent / "inspection_schema.json")
 STORE_TAR = "store.tar.gz"
 FORMAT_JSON = "format.json"
@@ -105,6 +110,20 @@ def first_match(store: Path, pattern: str) -> Path:
     if not matches:
         raise FixtureError(f"fixture has no file matching {pattern!r}")
     return matches[0]
+
+
+def forkmeta_record_offset(path: Path, rel: int, kind: int) -> int:
+    """Where one fork-size event sits in the source log, found by the relation
+    and the event it records rather than by its position."""
+    data = path.read_bytes()
+    for offset in range(0, len(data) - FORKMETA_RECORD_BYTES + 1,
+                        FORKMETA_RECORD_BYTES):
+        record = data[offset:offset + FORKMETA_RECORD_BYTES]
+        if struct.unpack_from("=I", record, 20)[0] == rel and record[60] == kind:
+            return offset
+    raise FixtureError(
+        f"{path.name} carries no kind-{kind} record for relation {rel}"
+    )
 
 
 def mutation(name: str, pattern: str, apply: Callable[[Path], None], expect: str) -> dict[str, Any]:
@@ -185,9 +204,20 @@ MUTATIONS = [
     mutation("forkmeta.tail.unknown_magic", "forkmeta",
              lambda p: bump_le32(p, FORKMETA_RECORD_BYTES), OPEN_REJECTED),
     # KNOWN GAP: forkmeta source records carry no checksum, so a flipped byte
-    # inside a record is caught only by the oracle, not by the format
+    # inside a record is caught only by the oracle, not by the format.  The
+    # size and the event's own position are both exposed that way: a moved
+    # create LSN stays above the cutoff, so the store opens and the latest
+    # size is unchanged, and only the as-of boundary moves.
     mutation("forkmeta.tail.corrupt_nblocks", "forkmeta",
-             lambda p: flip_byte(p, 2 * FORKMETA_RECORD_BYTES + 56), USE_REJECTED),
+             lambda p: flip_byte(
+                 p,
+                 forkmeta_record_offset(p, FORKMETA_TAIL_REL, FORKMETA_KIND_SET) + 56,
+             ), USE_REJECTED),
+    mutation("forkmeta.tail.corrupt_event_lsn", "forkmeta",
+             lambda p: flip_byte(
+                 p,
+                 forkmeta_record_offset(p, FORKMETA_TAIL_REL, FORKMETA_KIND_CREATE) + 32,
+             ), USE_REJECTED),
     # a torn last record is the unacknowledged crash tail by contract; the
     # oracle notices because the fixture's event was in fact acknowledged
     mutation("forkmeta.tail.torn", "forkmeta",

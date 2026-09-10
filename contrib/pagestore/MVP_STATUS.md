@@ -639,9 +639,13 @@ not carry the identities its metadata records (metadata edited without a new
 capture), reopens the fixture and runs its
 oracle across a restart -- including the identities the archive's own
 metadata carries: both seeded retention pins are looked up by owner and must
-still name that owner, its resources and its horizon, and the live branch
-must still record the parent and fork point it was created at, neither of
-which is visible in the horizons or the pages a read returns -- and applies forty mutations (unknown newer
+still name that owner, its resources and its horizon; the live branch must
+still record the parent and fork point it was created at and serve its own
+shipped WAL bytes, and its WAL-index entry must still name the branch as its
+source timeline; and the relation the extension phase creates must still
+exist exactly above its create event and be grown exactly above its growth
+event, none of which is visible in the horizons, the latest sizes or the
+pages a read returns -- and applies forty mutations (unknown newer
 version, checksum corruption, truncation) across the WAL store identity,
 sealed WAL segments, retention state and records, page and WAL-index
 frontiers, forkmeta and WAL-index snapshot manifests and payloads, the
@@ -672,9 +676,17 @@ order its own loader refuses, because ordered markers that live only in the
 source log were appended after the in-memory events of the same fork -- a
 below-floor copy followed by a higher-LSN write on the same relation
 published a snapshot the daemon then could not open, so each part is now
-sorted into per-fork order before it is written.  One gap remains documented in the check:
-forkmeta source records carry no checksum, so corruption inside a record is
-caught only by the oracle.  Backend-side artifacts (reader manifests, branch
+sorted into per-fork order before it is written.  Two gaps remain documented in the check.  Forkmeta source records carry no
+checksum, so corruption inside a record is caught only by the oracle -- both
+the size it records and the position of the event, which the oracle now asks
+for on both sides of each boundary.  And a page-segment record can never be
+the only copy of a page: a cleanly stopped daemon flushes its memtable into a
+layer before it exits, so every archived page is also in a layer, and a read
+resolves there (`reads mem=0 layer=9 seg=0` on a reopened fixture).  The
+segment readers are still exercised -- every open replays the uncovered tail
+to rebuild the index, and a record whose framing is wrong fails that scan --
+but a mutation inside one cannot be observed through a read while the layer
+carries the same version.  Backend-side artifacts (reader manifests, branch
 bootstrap, materializer markers, the writer checkpoint block) and older
 format migrations remain for the next fixture slice.
 
