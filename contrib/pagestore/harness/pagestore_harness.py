@@ -4388,7 +4388,45 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                     )
                     restored_control = True
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(restart_data), "-l", str(restart_log), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-                events.emit("restart", id=action["id"], target=action["target"], mode="fast", data=str(restart_data), restored_control=restored_control)
+                # `pg_ctl -w start` establishes only that the PID file says
+                # the server accepts connections.  What the restart owes is
+                # that the target came back as itself: the writer out of
+                # recovery, a pinned reader in recovery and still at its own
+                # horizon.  Ask it here rather than leaving it to an
+                # assertion the plan may not have.
+                if action["target"] == "writer":
+                    health_socket, health_port = sockdir, port
+                    health_sql = "SELECT NOT pg_is_in_recovery()"
+                else:
+                    health_socket, health_port = reader_clients[action["target"]]
+                    # compare as LSNs, not as text: the horizon is a string
+                    # GUC and the reader is free to echo it back in its own
+                    # spelling
+                    health_sql = (
+                        "SELECT pg_is_in_recovery() AND "
+                        "current_setting('pagestore.read_lsn')::pg_lsn = '"
+                        + reader_lsns[action["target"]].replace("'", "''")
+                        + "'::pg_lsn"
+                    )
+                health_deadline = time.monotonic() + 40
+                health = ""
+                while True:
+                    probe = subprocess.run(
+                        [str(pg_bin / "psql"), "-h", str(health_socket),
+                         "-p", str(health_port), "-U", "postgres", "-tA",
+                         "-v", "ON_ERROR_STOP=1", "-c", health_sql],
+                        check=False, capture_output=True, encoding="utf-8", env=env,
+                    )
+                    health = (probe.stdout or probe.stderr or "").strip()
+                    if health == "t":
+                        break
+                    if time.monotonic() >= health_deadline:
+                        raise OracleMismatch(
+                            f"restart {action['id']} left {action['target']!r} "
+                            f"unhealthy: {health_sql} returned {health!r}"
+                        )
+                    time.sleep(.1)
+                events.emit("restart", id=action["id"], target=action["target"], mode="fast", data=str(restart_data), restored_control=restored_control, health=health)
                 continue
             elif action["op"] == "capture":
                 ref = action["horizon"]
