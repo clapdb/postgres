@@ -40,6 +40,7 @@ static int shm_fd = -1;
 static int channel = -1;
 static uint32_t page_size;
 static const char *arm_marker;
+static const char *resume_file;
 
 static void
 die(const char *message)
@@ -209,6 +210,11 @@ seed(void)
 			die("cannot arm the named fault marker");
 		close(fd);
 	}
+	/* Maintenance was paused across the cutoff and the arming, so the first
+	 * pass it runs is planned against the new floor and can reach the armed
+	 * probe.  Release it now. */
+	if (resume_file != NULL && unlink(resume_file) != 0)
+		die("cannot release the paused maintenance loop");
 	free(page);
 	/* The fault fires in daemon maintenance, not in this request stream.
 	 * Stay alive until the harness reaps this process, so a daemon that
@@ -320,12 +326,14 @@ main(int argc, char **argv)
 			mode = argv[++i];
 		else if (strcmp(argv[i], "--arm-marker") == 0 && i + 1 < argc)
 			arm_marker = argv[++i];
+		else if (strcmp(argv[i], "--resume-file") == 0 && i + 1 < argc)
+			resume_file = argv[++i];
 		else
-			die("usage: --shm NAME --mode seed|verify [--arm-marker PATH]");
+			die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0))
-		die("usage: --shm NAME --mode seed|verify [--arm-marker PATH]");
+		die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH]");
 	attach(shm);
 	if (strcmp(mode, "seed") == 0)
 		seed();

@@ -2590,10 +2590,13 @@ def _check_layer_manifest_after_restart(
 
 def _start_layer_client(
     client: Path, shm: str, mode: str, log: Path, arm_marker: Path | None = None,
+    resume_file: Path | None = None,
 ) -> subprocess.Popen[str]:
     command = [str(client.resolve()), "--shm", shm, "--mode", mode]
     if arm_marker is not None:
         command.extend(["--arm-marker", str(arm_marker)])
+    if resume_file is not None:
+        command.extend(["--resume-file", str(resume_file)])
     with log.open("a", encoding="utf-8") as output:
         return subprocess.Popen(
             command,
@@ -2730,6 +2733,11 @@ def run_daemon_fault_recovery(
     marker = control / "arm"
     report = control / "report.jsonl"
     release = control / "release"
+    pause_file = control / "maintenance-pause"
+    # The seed installs the cutoff that makes pruning due and then arms the
+    # fault; maintenance stays paused across both, so no pass can run against
+    # the old floor and none can outrun arming either.
+    gc_pauses_maintenance = bool(gc_seed_actions)
     failure: Exception | None = None
     current_action_id: str | None = None
 
@@ -2764,6 +2772,8 @@ def run_daemon_fault_recovery(
                             "--compact-layers", "1000"])
         if gc_seed_actions:
             command.extend(GC_DAEMON_ARGS)
+            if inject_fault and gc_pauses_maintenance:
+                command.extend(["--test-maintenance-pause-file", str(pause_file)])
         env = private_environment()
         if inject_fault:
             # Keep these names local and explicit: inherited PAGESTORE_* values
@@ -2849,12 +2859,17 @@ def run_daemon_fault_recovery(
             emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
                  armed_by="harness")
         workload_armed = not gc_seed_actions
+        # the crash generation starts paused; the workload releases it once
+        # the cutoff is durable and the fault armed.  Restarts never pause.
+        if gc_pauses_maintenance:
+            pause_file.touch()
         process = start_daemon(True, action["id"])
         if seed_actions:
             wait_ready(process)
             layer_client_process = _start_layer_client(
                 seed_client, shm, "seed", trace / "layer-client.log",
                 arm_marker=marker if gc_seed_actions else None,
+                resume_file=pause_file if gc_pauses_maintenance else None,
             )
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
