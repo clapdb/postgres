@@ -205,8 +205,12 @@ the page-pruning history proves the cutoff through its frontier, thirty-two
 relations carry create, zero-extend, and truncate events on both sides of
 the cutoff, and a trickle of further fork events after the cutoff drives the
 second generation that retires the first.  Snapshots check the staged
-generation without a selected manifest, the selected manifest before and
-after the source-epoch marker, and exactly one generation pair after GC;
+generation without a selected manifest, and the selected manifest before and
+after the source-epoch marker; every crash image must hold exactly the
+selected generation's two files -- the first generation's at the commit and
+the rewrite, the second's after GC -- because startup schedules snapshot GC
+unconditionally, so an orphan generation left by a faulty publication would
+be swept away before recovery is inspected;
 recovery must settle on one selected generation behind its marker, serve
 every relation's current size and its retained size history above the
 cutoff, refuse size queries below the cutoff, keep the page-pruning

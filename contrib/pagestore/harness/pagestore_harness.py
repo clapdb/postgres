@@ -3187,16 +3187,23 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
                 f"after_{stage} crash left a malformed rewritten source "
                 f"or a second marker: {records!r}"
             )
-    if stage == "forkmeta_snapshot_gc":
-        expected = sorted(
-            _forkmeta_part_name(selected["generation"], part)
-            for part in ("checkpoint", "tail")
+    # The seed starts from an empty store, so the commit and the rewrite
+    # publish its first generation and nothing else can be on disk, while
+    # snapshot GC retires that one and leaves the second.  Requiring the exact
+    # pair is what rejects an orphan generation left by a faulty first
+    # publication: startup schedules snapshot GC unconditionally, so the
+    # recovery oracle would see the leak already swept up.
+    expected_generation = 2 if stage == "forkmeta_snapshot_gc" else 1
+    expected = sorted(
+        _forkmeta_part_name(selected["generation"], part)
+        for part in ("checkpoint", "tail")
+    )
+    if selected["generation"] != expected_generation or files != expected:
+        raise OracleMismatch(
+            f"after_{stage} crash selected generation {selected['generation']} "
+            f"and left {files!r}, expected exactly generation "
+            f"{expected_generation}'s {expected!r}"
         )
-        if selected["generation"] != 2 or files != expected:
-            raise OracleMismatch(
-                f"after_snapshot_gc crash selected generation {selected['generation']} "
-                f"and left {files!r}, expected exactly {expected!r}"
-            )
 
 
 def _check_forkmeta_recovery(store: Path, stage: str, timeout: float) -> dict[str, Any]:
