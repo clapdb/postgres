@@ -2402,47 +2402,57 @@ def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
         if layer_id != replacement and
         _manifest_names_layer(records, MANIFEST_MARK_DELETE, layer_id)
     )
+    # The frontier is the prerequisite of both later boundaries: publishing a
+    # replacement or a tombstone before it is durable is an ordering error
+    # that recovery would otherwise repair before any later check runs.
+    fences = _page_frontier_fences(store, 0)
+    if not fences:
+        raise OracleMismatch(
+            f"after_{stage} did not leave a valid durable page-prune frontier"
+        )
+    # this store defines timeline 0 with the first incarnation, so the cutoff
+    # must be published for that one, not merely for some slot, and at the
+    # admission sequence the reservation was granted
+    granted = _gc_granted_cutoff_seq(control)
+    if not any(incarnation == 1 and lsn == GC_RETAINED_HORIZON and
+               (granted is None or seq == granted)
+               for incarnation, lsn, seq in fences):
+        raise OracleMismatch(
+            f"after_{stage} published timeline 0 fences {fences!r}, expected the "
+            f"configured cutoff {GC_RETAINED_HORIZON} in incarnation 1 at "
+            f"admission sequence {granted}"
+        )
     if stage == "frontier":
-        fences = _page_frontier_fences(store, 0)
-        if not fences:
-            raise OracleMismatch(
-                "after_frontier did not leave a valid durable page-prune frontier"
-            )
-        # this store defines timeline 0 with the first incarnation, so the
-        # cutoff must be published for that one, not merely for some slot,
-        # and at the admission sequence the reservation was granted
-        granted = _gc_granted_cutoff_seq(control)
-        if not any(incarnation == 1 and lsn == GC_RETAINED_HORIZON and
-                   (granted is None or seq == granted)
-                   for incarnation, lsn, seq in fences):
-            raise OracleMismatch(
-                f"after_frontier published timeline 0 fences {fences!r}, expected the "
-                f"configured cutoff {GC_RETAINED_HORIZON} in incarnation 1 at "
-                f"admission sequence {granted}"
-            )
         if published:
             raise OracleMismatch(
                 "after_frontier crash already published the replacement layer"
+            )
+        if tombstones:
+            raise OracleMismatch(
+                f"after_frontier crash already wrote {tombstones} source tombstone(s)"
             )
     elif stage == "publish":
         if not published:
             raise OracleMismatch(
                 f"after_publish crash did not publish replacement layer {replacement:#x}"
             )
-        # a source may already have been unlinked by an earlier pass, so
-        # count what the log records after this pass's ADD instead of what
-        # still has a file
-        late = _manifest_marks_after_add(records, replacement)
-        if late:
+        # No tombstone of this pass's sources at all, wherever the record
+        # sits: retirement ordered ahead of publication is the defect, and
+        # counting only records after the ADD would miss it.
+        if tombstones:
             raise OracleMismatch(
-                f"after_publish crash already wrote {late} source tombstone(s) "
-                "after the replacement's ADD"
+                f"after_publish crash already wrote {tombstones} source tombstone(s)"
             )
     elif stage == "mark_delete":
         if not published or tombstones == 0:
             raise OracleMismatch(
                 "after_mark_delete crash left no source tombstone behind the "
                 f"published replacement (published={published}, tombstones={tombstones})"
+            )
+        if not _manifest_marks_after_add(records, replacement):
+            raise OracleMismatch(
+                "after_mark_delete crash retired a source before publishing the "
+                f"replacement layer {replacement:#x}"
             )
 
 
