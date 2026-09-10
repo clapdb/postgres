@@ -2023,8 +2023,12 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
 	"advancing readers cannot re-enable parallel plans with session settings"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
+# The reader has adopted the newer published view by now, so its manifest
+# requires that checkpoint; restoring the boot control image at its original
+# horizon makes the postmaster refuse to start ("pg_control does not match
+# pagestore_reader.manifest") whenever the adoption has landed.
 if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
-	--timeline 0 --incarnation 1 --lsn "$readerR" "$ADVANCINGDATA" >/dev/null; then
+	--timeline 0 --incarnation 1 --lsn "$readerAutoR" "$ADVANCINGDATA" >/dev/null; then
 	echo "FAIL - advancing reader restart could not restore its boot control image"
 	exit 1
 fi
