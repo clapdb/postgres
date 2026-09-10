@@ -10444,10 +10444,18 @@ static int walidx_plan_bases_valid;
  * caps).  Only such a horizon may rely on a stored image as its replacement
  * base; any other horizon keeps its FPI-led chain. */
 static uint64_t *walidx_plan_protected;
-/* The subset of the protected horizons that the materializer exception
- * granted: their protection depends on no standing horizon sitting at the
- * same LSN, which publication itself can change. */
-static uint64_t *walidx_plan_mat_protected;
+/* The horizons the materializer exception granted: their protection depends
+ * on no standing horizon sitting at the same LSN, which publication itself
+ * can change.  `added` records whether the exception is what put the horizon
+ * into the protected set; a horizon an exact page fence protects on its own
+ * keeps that protection when the exception is withdrawn. */
+typedef struct WalIdxMatGrant
+{
+	uint64_t	lsn;
+	int			added;
+} WalIdxMatGrant;
+
+static WalIdxMatGrant *walidx_plan_mat_protected;
 static uint32_t walidx_plan_n_mat_protected;
 static uint32_t walidx_plan_nprotected;
 
@@ -10509,15 +10517,27 @@ walidx_plan_recheck_standing(uint32_t tl)
 
 	for (uint32_t i = 0; i < walidx_plan_n_mat_protected; i++)
 	{
-		uint64_t	lsn = walidx_plan_mat_protected[i];
+		uint64_t	lsn = walidx_plan_mat_protected[i].lsn;
 		uint32_t	out = 0;
+		int			dropped = 0;
 
 		if (lsn != frontier && lsn != progress)
 			continue;
+		/* Withdraw only what this exception added.  An exact page fence at
+		 * the same LSN protects that horizon in its own right, and the plan
+		 * keeps such a fence even when a standing WAL-index horizon shares
+		 * its LSN; removing every entry would withdraw the page owner's
+		 * protection too, and the publication would keep an FPI chain and
+		 * its raw WAL for a horizon whose base is already retained. */
+		if (!walidx_plan_mat_protected[i].added)
+			continue;
 		for (uint32_t j = 0; j < walidx_plan_nprotected; j++)
-			if (walidx_plan_protected[j] != lsn)
+			if (walidx_plan_protected[j] == lsn && !dropped)
+				dropped = 1;
+			else
 				walidx_plan_protected[out++] = walidx_plan_protected[j];
 		walidx_plan_nprotected = out;
+		walidx_plan_mat_protected[i].added = 0;
 	}
 }
 
@@ -12196,7 +12216,7 @@ walidx_plan_bases_build(uint32_t tl)
 			 * become a standing WAL-index horizon before publication, and
 			 * the recheck can only withdraw what it knows about. */
 			{
-				uint64_t   *grown = realloc(walidx_plan_mat_protected,
+				WalIdxMatGrant *grown = realloc(walidx_plan_mat_protected,
 											(size_t) (walidx_plan_n_mat_protected + 1) *
 											sizeof(*walidx_plan_mat_protected));
 
@@ -12207,13 +12227,15 @@ walidx_plan_bases_build(uint32_t tl)
 					return -1;
 				}
 				walidx_plan_mat_protected = grown;
-				walidx_plan_mat_protected[walidx_plan_n_mat_protected++] = pins[i].lsn;
+				walidx_plan_mat_protected[walidx_plan_n_mat_protected].lsn = pins[i].lsn;
+				walidx_plan_mat_protected[walidx_plan_n_mat_protected++].added = 0;
 			}
 			for (uint32_t j = 0; j < walidx_plan_nprotected && !present; j++)
 				if (walidx_plan_protected[j] == pins[i].lsn)
 					present = 1;
 			if (present)
 				continue;
+			walidx_plan_mat_protected[walidx_plan_n_mat_protected - 1].added = 1;
 			{
 				uint64_t   *grown = realloc(walidx_plan_protected,
 											(size_t) (walidx_plan_nprotected + 1) *
