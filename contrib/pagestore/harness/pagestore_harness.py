@@ -2790,29 +2790,67 @@ def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> li
         records.append({
             "timeline": struct.unpack_from("=I", chunk, 8)[0],
             "key": struct.unpack_from("=IIIiI", chunk, 12),
-            "lsn": struct.unpack_from("=Q", chunk, 32)[0], "kind": chunk[60],
+            "lsn": struct.unpack_from("=Q", chunk, 32)[0],
+            "admission_seq": struct.unpack_from("=Q", chunk, 40)[0],
+            "nblocks": struct.unpack_from("=I", chunk, 56)[0], "kind": chunk[60],
         })
     return records
 
 
+FORKMETA_GROW_KIND = 0
+
+
+def _forkmeta_size_asof(events: list[dict[str, Any]], horizon: int) -> int:
+    """The relation size the records reconstruct at one horizon: the newest
+    definitive size at or below it, raised by any growth after that."""
+    size = 0
+    for record in sorted(events, key=lambda r: (r["lsn"], r.get("admission_seq", 0))):
+        if record["lsn"] > horizon:
+            break
+        if record["kind"] == FORKMETA_SET_KIND:
+            size = record["nblocks"]
+        elif record["kind"] == FORKMETA_GROW_KIND:
+            size = max(size, record["nblocks"])
+    return size
+
+
 def _forkmeta_generation_incomplete(store: Path, record: dict[str, Any]) -> str | None:
-    """Why a staged or selected generation does not carry the seeded
-    history: its tail must hold every seeded truncate above the cutoff and
-    its checkpoint a size for every seeded relation."""
+    """Why a staged or selected generation does not carry the seeded history.
+    The seed grows every oracle relation to four blocks and then truncates it,
+    below the cutoff for even relations and above it for odd ones, so the
+    generation's records must reconstruct four blocks at the cutoff for an odd
+    relation and its truncated size for an even one, and the truncated size
+    for every relation at the newest horizon.  Sizes are compared rather than
+    a record list, because which records survive is the compaction plan's
+    business while the sizes are the contract."""
     missing = _forkmeta_seeded_truncates_missing(
         _forkmeta_part_records(store, record, "tail"), record["cutoff_lsn"])
     if missing:
         return f"tail of generation {record['generation']} lacks {missing!r}"
-    checkpointed = {
-        r["key"][2] for r in _forkmeta_part_records(store, record, "checkpoint")
-        if r["timeline"] == 0
-    }
-    absent = [
-        rel for rel in range(FORKMETA_SEED_FIRST_REL, FORKMETA_SEED_FIRST_REL + FORKMETA_SEED_RELS)
-        if rel not in checkpointed
-    ]
-    if absent:
-        return f"checkpoint of generation {record['generation']} lacks relations {absent!r}"
+    events: dict[int, list[dict[str, Any]]] = {}
+    for part in ("checkpoint", "tail"):
+        for entry in _forkmeta_part_records(store, record, part):
+            if entry["timeline"] == 0 and \
+                    entry["kind"] in (FORKMETA_SET_KIND, FORKMETA_GROW_KIND):
+                events.setdefault(entry["key"][2], []).append(entry)
+    wrong = []
+    for index in range(FORKMETA_SEED_RELS):
+        rel = FORKMETA_SEED_FIRST_REL + index
+        truncated = 2 if index % 2 == 0 else 3
+        at_cutoff = truncated if index % 2 == 0 else 4
+        entries = events.get(rel)
+        if not entries:
+            wrong.append(f"rel {rel} absent")
+            continue
+        cutoff_size = _forkmeta_size_asof(entries, record["cutoff_lsn"])
+        newest_size = _forkmeta_size_asof(entries, 2**64 - 1)
+        if cutoff_size != at_cutoff or newest_size != truncated:
+            wrong.append(
+                f"rel {rel} reconstructs {cutoff_size} blocks at the cutoff and "
+                f"{newest_size} at the newest horizon, expected {at_cutoff} and {truncated}"
+            )
+    if wrong:
+        return f"generation {record['generation']} misstates {wrong!r}"
     return None
 
 
@@ -2920,10 +2958,13 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
         stale = _forkmeta_old_epoch_intact(store, selected)
         if stale is not None:
             raise OracleMismatch(f"after_manifest_commit crash: {stale}")
-    if stage == "forkmeta_source_rewrite":
+    if stage in ("forkmeta_source_rewrite", "forkmeta_snapshot_gc"):
+        # the source belongs to the selected generation from the rewrite on,
+        # and snapshot GC touches only the retired files, so it must still
+        # carry that marker and nothing that contradicts it
         if not matches:
             raise OracleMismatch(
-                "after_source_rewrite crash left the forkmeta source without the "
+                f"after_{stage} crash left the forkmeta source without the "
                 f"selected generation's exact marker: {_forkmeta_source_head(store)!r}"
             )
         # the rewritten source is the marker plus whatever was appended
@@ -2934,7 +2975,7 @@ def _check_forkmeta_crash_snapshot(store: Path, stage: str) -> None:
         if records is None or any(
                 r["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND for r in records[1:]):
             raise OracleMismatch(
-                "after_source_rewrite crash left a malformed rewritten source "
+                f"after_{stage} crash left a malformed rewritten source "
                 f"or a second marker: {records!r}"
             )
     if stage == "forkmeta_snapshot_gc":
