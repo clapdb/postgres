@@ -164,7 +164,10 @@ records but layer compaction and the manifest rewrite wait; it then arms the
 fault and releases maintenance.  Two map-held probes crash after the
 compacted temp log is fsync'd and before the rename, and after the rename
 and before the directory fsync.  The crash snapshot must keep a non-empty
-live log with the temp file present before the rename and absent after it;
+live log with the temp file absent after the rename and, before it, present
+and already replaying to the same layers as the live log -- a temp file that
+had only been created would satisfy a presence check and then be discarded by
+recovery, which replays the intact live log and passes everything after it;
 recovery must replay either log to a sane manifest reconciled with the local
 layers, serve every page written before the rewrite, remove a crashed temp
 log on open, and register no owner; a second restart proves idempotence.

@@ -2603,8 +2603,21 @@ def _check_manifest_crash_snapshot(store: Path, stage: str) -> None:
     if not manifest.exists() or manifest.stat().st_size == 0:
         raise OracleMismatch(f"after_{stage} crash left no layers.manifest")
     tmp = store / MANIFEST_TMP
-    if stage == "manifest_tmp_sync" and not tmp.exists():
-        raise OracleMismatch("after_tmp_sync crash left no compacted temp manifest")
+    if stage == "manifest_tmp_sync":
+        if not tmp.exists():
+            raise OracleMismatch("after_tmp_sync crash left no compacted temp manifest")
+        # The boundary is a complete, fsynced rewrite.  A temp file that had
+        # only been created and truncated would satisfy a presence check, and
+        # recovery would then discard it, replay the intact live log, and
+        # satisfy every later check -- the scenario would pass while testing
+        # nothing.  Require the compacted log to replay to the live one.
+        compacted = _manifest_layers(_manifest_records_at(tmp))
+        live = _manifest_layers(_manifest_records(store))
+        if not compacted or compacted != live:
+            raise OracleMismatch(
+                f"after_tmp_sync crash left a temp manifest replaying to "
+                f"{compacted!r}, expected the live log's {live!r}"
+            )
     if stage == "manifest_rename" and tmp.exists():
         raise OracleMismatch("after_rename crash left the temp manifest after its rename")
 
@@ -3001,9 +3014,9 @@ def _check_wal_reclaim_recovery(
 
 
 
-def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
-    """(type, payload) of every complete layers.manifest record, in order."""
-    manifest = store / "layers.manifest"
+def _manifest_records_at(manifest: Path) -> list[tuple[int, bytes]]:
+    """(type, payload) of every complete record of one manifest log, in
+    order."""
     try:
         # compaction replaces the log by rename, so it can be absent for an
         # instant while a polling oracle reads it
@@ -3022,6 +3035,10 @@ def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
         records.append((kind, data[offset + 20:offset + 20 + length]))
         offset += 20 + length
     return records
+
+
+def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
+    return _manifest_records_at(store / "layers.manifest")
 
 
 def _manifest_record_layer_id(payload: bytes) -> int | None:
