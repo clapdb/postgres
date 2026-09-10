@@ -2277,6 +2277,9 @@ def _capture_fault_diagnostics(
 # that make the publication observable at the workload's scale, and the
 # retained page-history horizon recovery must republish (None when the
 # workload pins no page history).
+# the deleted branch and its live sibling both fork from the root here, so the
+# sibling keeps the root's history capped at this LSN after the target is gone
+DELETE_FORK_LSN = 1024 * 1024
 GC_WORKLOADS: dict[str, dict[str, Any]] = {
     "page_prune": {
         "faults": {
@@ -2320,7 +2323,7 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
         # and several shared segments for the deletion to filter
         "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
                         "--segment-gc", "0"],
-        "retained_horizon": None,
+        "retained_horizon": DELETE_FORK_LSN,
     },
     # the same seed, crashed on the old-state side of the first transition:
     # the request is lost and the branch must survive intact
@@ -2328,7 +2331,7 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
         "faults": {"timeline_delete.before_deleting"},
         "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
                         "--segment-gc", "0"],
-        "retained_horizon": None,
+        "retained_horizon": DELETE_FORK_LSN,
     },
 }
 DELETE_BRANCH = 1
@@ -2703,7 +2706,7 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
             )
 
 
-def _check_delete_abort_recovery(store: Path) -> None:
+def _check_delete_abort_recovery(store: Path) -> dict[str, Any]:
     """A deletion whose DELETING record never became durable leaves nothing
     behind: the branch keeps its lifecycle, and every artifact it owned is
     still there (the verify client already read its pages back)."""
@@ -2735,6 +2738,13 @@ def _check_delete_abort_recovery(store: Path) -> None:
         raise OracleMismatch(
             f"a deletion that never became durable lost {missing!r}: {artifacts!r}"
         )
+    # the same settled state the completed deletion reports, so the clean
+    # restart is held to what this recovery left behind
+    return {
+        "events": _timeline_events(store),
+        "artifacts": artifacts,
+        "forkmeta_owners": sorted(_forkmeta_timelines(store)),
+    }
 
 
 def _check_delete_recovery(
@@ -2744,9 +2754,11 @@ def _check_delete_recovery(
     store: Path,
     stage: str,
     timeout: float,
-) -> None:
+) -> dict[str, Any]:
     """The verify client already waited for DELETED; the owner's artifacts
-    must be gone, the manifest reconciled, and no owner registered."""
+    must be gone, the manifest reconciled, the root's history still capped by
+    the live sibling's fork point, and no owner registered.  Returns the
+    settled deletion state so the clean restart can be held to it."""
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
@@ -2778,11 +2790,29 @@ def _check_delete_recovery(
     timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
     if timeline.get("parent_timeline") != -1:
         raise OracleMismatch(f"after_{stage} recovery changed timeline 0: {timeline!r}")
+    # The live sibling forks from the root at the same LSN, so deleting its
+    # sibling must not lift the root's structural cap: cleanup that dropped it
+    # would let the ancestor history the sibling still reads be pruned, and
+    # the client only ever reads the parent's latest page.
+    if timeline.get("retained_horizon") != DELETE_FORK_LSN:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported retained_horizon="
+            f"{timeline.get('retained_horizon')!r}, expected the live sibling's "
+            f"fork point {DELETE_FORK_LSN}"
+        )
     owners = inspect_store(inspector, shm, "owners", inspection_schema)
     if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
         raise OracleMismatch(
             f"after_{stage} recovery reported owners={owners!r}, expected none"
         )
+    # The settled deletion state: a restart that re-appends a lifecycle event
+    # or rewrites the deletion's artifacts reaches the same predicates above
+    # while changing what is durable, which is what idempotence is about.
+    return {
+        "events": _timeline_events(store),
+        "artifacts": _branch_private_artifacts(store, DELETE_BRANCH),
+        "forkmeta_owners": sorted(_forkmeta_timelines(store)),
+    }
 
 
 def _check_wal_reclaim_crash_snapshot(store: Path, stage: str, hit: int) -> None:
@@ -3167,11 +3197,10 @@ def _check_gc_recovery(
             inspector, shm, inspection_schema, store, stage, timeout
         )
     if workload == "timeline_delete":
-        _check_delete_recovery(inspector, shm, inspection_schema, store, stage, timeout)
-        return
+        return _check_delete_recovery(inspector, shm, inspection_schema, store,
+                                      stage, timeout)
     if workload == "timeline_delete_abort":
-        _check_delete_abort_recovery(store)
-        return
+        return _check_delete_abort_recovery(store)
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
