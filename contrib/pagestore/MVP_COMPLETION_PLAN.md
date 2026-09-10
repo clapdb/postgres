@@ -780,7 +780,9 @@ Remaining before the gate closes:
 
 The nightly long-run configuration is `.github/workflows/pagestore-nightly.yml`
 (three seeds, 8000 rounds each, scheduled daily and dispatchable with chosen
-seeds/rounds; reports summarized per job and retained as artifacts).
+seeds/rounds; reports summarized per job and retained as artifacts).  The
+schedule fires only once the workflow file is on the repository's default
+branch, which GitHub requires for `schedule` and `workflow_dispatch`.
 
 Expected scope: one PR.  Passing it closes the retention MVP gate.
 

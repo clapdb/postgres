@@ -6,6 +6,12 @@
 # report as an artifact so a bound drift can be compared across nights.  The
 # soak is freestanding C (daemon plus harness, libc only), so no PostgreSQL
 # build is needed.
+#
+# GitHub delivers `schedule` events, and exposes `workflow_dispatch`, only for
+# workflow files on the repository's default branch.  While `pagestore` is not
+# the default branch this lane runs only after the file reaches that branch;
+# until then the long configuration is run on demand from a default-branch
+# checkout of `pagestore`.
 name: pagestore nightly soak
 
 on:

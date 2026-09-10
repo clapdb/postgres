@@ -2207,6 +2207,13 @@ main(int argc, char **argv)
 	quiescent_metrics.owner_count = m.owner_count;
 	quiescent_metrics.layer_count = m.layer_count;
 	m = quiescent_metrics;
+	dump_physical(stderr, "max", &max);
+	dump_physical(stderr, "quiescent", &quiescent);
+	dump_metrics(stderr, &m);
+
+	/* The final shutdown is itself a check.  Report only after it, so the
+	 * retained JSON cannot claim zero failures while the run fails. */
+	stop_daemon_clean();
 	write_report(stdout, rounds, seed, &max, &quiescent, &m, catch_up_seconds,
 				 during_ok, quiescent_ok);
 	if ((env = getenv("PAGESTORE_SOAK_REPORT")) != NULL)
@@ -2220,11 +2227,6 @@ main(int argc, char **argv)
 			fclose(f);
 		}
 	}
-	dump_physical(stderr, "max", &max);
-	dump_physical(stderr, "quiescent", &quiescent);
-	dump_metrics(stderr, &m);
-
-	stop_daemon_clean();
 	if (!keep_store)
 		remove_tree(store_dir);
 	else
