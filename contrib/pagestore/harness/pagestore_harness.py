@@ -2323,9 +2323,12 @@ def _page_frontier_fences(store: Path, timeline: int) -> list[tuple[int, int, in
 def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
     """(type, payload) of every complete layers.manifest record, in order."""
     manifest = store / "layers.manifest"
-    if not manifest.exists():
+    try:
+        # compaction replaces the log by rename, so it can be absent for an
+        # instant while a polling oracle reads it
+        data = manifest.read_bytes()
+    except OSError:
         return []
-    data = manifest.read_bytes()
     records: list[tuple[int, bytes]] = []
     offset = 0
     while offset + 20 <= len(data):
@@ -2556,7 +2559,13 @@ def _canonical_layer_files(store: Path) -> list[Path]:
     for path in sorted(store.iterdir()):
         if not pattern.fullmatch(path.name):
             continue
-        value = path.lstat()
+        try:
+            value = path.lstat()
+        except FileNotFoundError:
+            # a recovering daemon retires source layers while the oracles
+            # poll: a name listed a moment ago may already be unlinked, which
+            # is the state this listing is watching for, not an error
+            continue
         if stat.S_ISREG(value.st_mode):
             files.append(path)
     return files
