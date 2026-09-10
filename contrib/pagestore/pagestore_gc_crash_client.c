@@ -41,6 +41,9 @@ static int channel = -1;
 static uint32_t page_size;
 static const char *arm_marker;
 static const char *resume_file;
+/* where the seed records the admission sequence its reservation was granted,
+ * so the oracle can require the durable frontier to carry it */
+static const char *cutoff_seq_file;
 
 static void
 die(const char *message)
@@ -196,6 +199,27 @@ seed(void)
 	ch->req_lsn = TEST_CUTOFF;
 	if (execute()->status != PS_STATUS_OK)
 		die("page-history owner registration failed");
+	/* The reservation answers with the admission sequence it was granted;
+	 * the durable frontier the pruning pass publishes must carry exactly
+	 * that sequence at the cutoff, not merely the same LSN. */
+	if (ch->datalen != sizeof(uint64_t))
+		die("page-history owner registration did not report its sequence");
+	{
+		uint64_t	granted;
+
+		memcpy(&granted, ch->data, sizeof(granted));
+		if (granted == 0)
+			die("page-history owner registration reported sequence zero");
+		if (cutoff_seq_file != NULL)
+		{
+			FILE	   *out = fopen(cutoff_seq_file, "w");
+
+			if (out == NULL ||
+				fprintf(out, "%llu\n", (unsigned long long) granted) < 0 ||
+				fflush(out) != 0 || fsync(fileno(out)) != 0 || fclose(out) != 0)
+				die("cannot publish the granted admission sequence");
+		}
+	}
 	/* Arm the named fault only once the cutoff is durable: the probes also
 	 * run for the flush-driven compactions that had nothing to retire, so a
 	 * marker created earlier could be consumed by a pass planned against the
@@ -328,12 +352,14 @@ main(int argc, char **argv)
 			arm_marker = argv[++i];
 		else if (strcmp(argv[i], "--resume-file") == 0 && i + 1 < argc)
 			resume_file = argv[++i];
+		else if (strcmp(argv[i], "--cutoff-seq-file") == 0 && i + 1 < argc)
+			cutoff_seq_file = argv[++i];
 		else
-			die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH]");
+			die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0))
-		die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH]");
+		die("usage: --shm NAME --mode seed|verify [--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
 	attach(shm);
 	if (strcmp(mode, "seed") == 0)
 		seed();

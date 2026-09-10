@@ -2365,7 +2365,16 @@ def _manifest_marks_after_add(records: list[tuple[int, bytes]], layer_id: int) -
     return marks
 
 
-def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
+def _gc_granted_cutoff_seq(control: Path) -> int | None:
+    """The admission sequence the seed's reservation was granted, as the seed
+    recorded it; None when the seed has not reported one."""
+    try:
+        return int((control / "cutoff-seq").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _check_gc_crash_snapshot(store: Path, stage: str, control: Path) -> None:
     """Check the stage-specific durable state before recovery mutates the store.
 
     The replacement layer file is sealed before the frontier advances, its
@@ -2400,12 +2409,16 @@ def _check_gc_crash_snapshot(store: Path, stage: str) -> None:
                 "after_frontier did not leave a valid durable page-prune frontier"
             )
         # this store defines timeline 0 with the first incarnation, so the
-        # cutoff must be published for that one, not merely for some slot
-        if not any(incarnation == 1 and lsn == GC_RETAINED_HORIZON
-                   for incarnation, lsn, _seq in fences):
+        # cutoff must be published for that one, not merely for some slot,
+        # and at the admission sequence the reservation was granted
+        granted = _gc_granted_cutoff_seq(control)
+        if not any(incarnation == 1 and lsn == GC_RETAINED_HORIZON and
+                   (granted is None or seq == granted)
+                   for incarnation, lsn, seq in fences):
             raise OracleMismatch(
                 f"after_frontier published timeline 0 fences {fences!r}, expected the "
-                f"configured cutoff {GC_RETAINED_HORIZON} in incarnation 1"
+                f"configured cutoff {GC_RETAINED_HORIZON} in incarnation 1 at "
+                f"admission sequence {granted}"
             )
         if published:
             raise OracleMismatch(
@@ -2590,13 +2603,15 @@ def _check_layer_manifest_after_restart(
 
 def _start_layer_client(
     client: Path, shm: str, mode: str, log: Path, arm_marker: Path | None = None,
-    resume_file: Path | None = None,
+    resume_file: Path | None = None, cutoff_seq_file: Path | None = None,
 ) -> subprocess.Popen[str]:
     command = [str(client.resolve()), "--shm", shm, "--mode", mode]
     if arm_marker is not None:
         command.extend(["--arm-marker", str(arm_marker)])
     if resume_file is not None:
         command.extend(["--resume-file", str(resume_file)])
+    if cutoff_seq_file is not None:
+        command.extend(["--cutoff-seq-file", str(cutoff_seq_file)])
     with log.open("a", encoding="utf-8") as output:
         return subprocess.Popen(
             command,
@@ -2734,6 +2749,7 @@ def run_daemon_fault_recovery(
     report = control / "report.jsonl"
     release = control / "release"
     pause_file = control / "maintenance-pause"
+    cutoff_seq_file = control / "cutoff-seq"
     # The seed installs the cutoff that makes pruning due and then arms the
     # fault; maintenance stays paused across both, so no pass can run against
     # the old floor and none can outrun arming either.
@@ -2870,6 +2886,7 @@ def run_daemon_fault_recovery(
                 seed_client, shm, "seed", trace / "layer-client.log",
                 arm_marker=marker if gc_seed_actions else None,
                 resume_file=pause_file if gc_pauses_maintenance else None,
+                cutoff_seq_file=cutoff_seq_file if gc_seed_actions else None,
             )
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
@@ -2921,7 +2938,7 @@ def run_daemon_fault_recovery(
             if layer_stage is not None:
                 _check_layer_crash_snapshot(store, layer_stage)
             if gc_stage is not None:
-                _check_gc_crash_snapshot(store, gc_stage)
+                _check_gc_crash_snapshot(store, gc_stage, control)
             if layer_client_process is not None and layer_client_process.poll() is None:
                 layer_client_process.kill()
                 layer_client_process.wait(timeout=5)
