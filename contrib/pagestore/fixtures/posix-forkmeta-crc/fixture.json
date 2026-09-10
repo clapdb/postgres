@@ -1,6 +1,7 @@
 {
   "schema": 1,
-  "name": "posix-mvp-baseline",
+  "name": "posix-forkmeta-crc",
+  "role": "current",
   "workload": "fixture",
   "daemon_args": [
     "--page-size",
@@ -59,6 +60,5 @@
     "walidx_snapshots_0/walidxg1_00000000000000000001_000"
   ],
   "captured": "2026-09-10",
-  "description": "POSIX MVP format baseline: page history with a configured cutoff, fork-size events on both sides of the cutoff plus a post-cutover tail, one sealed shipped-WAL segment with a control note inside it, a compacted WAL-index interval with a fixed reader, a live branch, and a deleted branch. Records forkmeta source and snapshot payload records as FKM2 (no per-record checksum); kept as the legacy-format fixture that must keep reopening.",
-  "role": "legacy"
+  "description": "POSIX fixture with forkmeta source and snapshot payload records sealed as FKM3 (FKM2 layout plus a CRC-24 in the former pad bytes); the current fixture that pins the compiled identities and takes every mutation."
 }

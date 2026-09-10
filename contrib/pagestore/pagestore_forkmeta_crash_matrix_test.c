@@ -23,6 +23,8 @@
 #define MATRIX_SHARDS 4
 #define MATRIX_KEYS 24
 #define TEST_FORK_META_V2_MAGIC UINT32_C(0x324d4b46)
+#define TEST_FORK_META_V3_MAGIC UINT32_C(0x334d4b46)
+#define TEST_FORK_META_MAGIC_OK(m) ((m) == TEST_FORK_META_V2_MAGIC || (m) == TEST_FORK_META_V3_MAGIC)
 #define TEST_MAX_TIMELINES 1024
 #define TEST_FEV_SNAPSHOT_BASE 10
 #define TEST_FEV_GROW 0
@@ -659,7 +661,7 @@ source_epoch_valid(const char *store, uint64_t generation, int require_marker)
 			(void) close(fd);
 		return 0;
 	}
-	if (require_marker && (rec.magic != TEST_FORK_META_V2_MAGIC ||
+	if (require_marker && (!TEST_FORK_META_MAGIC_OK(rec.magic) ||
 			rec.rec_len != sizeof(rec) || rec.kind != TEST_FEV_SNAPSHOT_BASE ||
 			rec.order_id != generation || rec.admission_seq == 0))
 	{
@@ -668,7 +670,7 @@ source_epoch_valid(const char *store, uint64_t generation, int require_marker)
 	}
 	for (offset = 0; offset < st.st_size; offset += (off_t) sizeof(rec))
 		if (pread(fd, &rec, sizeof(rec), offset) != (ssize_t) sizeof(rec) ||
-			rec.magic != TEST_FORK_META_V2_MAGIC || rec.rec_len != sizeof(rec))
+			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec))
 		{
 			(void) close(fd);
 			return 0;
@@ -701,13 +703,12 @@ source_epoch_matches_selected(const char *store, const char *snapshots,
 		goto done;
 	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
 	if (fd < 0 || pread(fd, &rec, sizeof(rec), 0) != (ssize_t) sizeof(rec) ||
-		rec.magic != TEST_FORK_META_V2_MAGIC || rec.rec_len != sizeof(rec) ||
+		!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec) ||
 		rec.timeline != 0 || memcmp(&rec.key, &zero_key, sizeof(zero_key)) != 0 ||
 		rec.lsn != selected.cutoff_lsn ||
 		rec.admission_seq != selected.cutoff_admission_seq ||
 		rec.order_id != selected.generation || rec.nblocks != 0 ||
-		rec.kind != TEST_FEV_SNAPSHOT_BASE || rec.pad[0] != 0 ||
-		rec.pad[1] != 0 || rec.pad[2] != 0)
+		rec.kind != TEST_FEV_SNAPSHOT_BASE)
 		goto done;
 	for (offset = sizeof(rec); offset < (uint64_t) st.st_size;
 			offset += sizeof(rec))
@@ -716,11 +717,10 @@ source_epoch_matches_selected(const char *store, const char *snapshots,
 		int ordered_marker_valid = 0;
 
 		if (pread(fd, &rec, sizeof(rec), (off_t) offset) != (ssize_t) sizeof(rec) ||
-			rec.magic != TEST_FORK_META_V2_MAGIC || rec.rec_len != sizeof(rec) ||
+			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec) ||
 			rec.timeline >= TEST_MAX_TIMELINES ||
 			rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
-			rec.admission_seq == 0 || rec.pad[0] != 0 || rec.pad[1] != 0 ||
-			rec.pad[2] != 0 ||
+			rec.admission_seq == 0 ||
 			!(rec.lsn > selected.cutoff_lsn ||
 			 (rec.lsn == selected.cutoff_lsn &&
 			  rec.admission_seq > selected.cutoff_admission_seq)))

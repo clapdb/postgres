@@ -2381,6 +2381,7 @@ FORKMETA_SNAPSHOTS = Path("forkmeta_snapshots")
 FORKMETA_MANIFEST = FORKMETA_SNAPSHOTS / "forkmeta_manifest_v1"
 FORKMETA_PREPARED = FORKMETA_SNAPSHOTS / "forkmeta_prepared_v1"
 FORKMETA_V2_MAGIC = 0x324D4B46
+FORKMETA_V3_MAGIC = 0x334D4B46
 FORKMETA_SNAPSHOT_BASE_KIND = 10
 DELETE_BRANCH = 1
 MANIFEST_TMP = "layers.manifest.tmp"
@@ -2735,11 +2736,12 @@ def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
     nblocks = struct.unpack_from("=I", record, 56)[0]
     kind = record[60]
     pad = record[61:64]
-    if magic != FORKMETA_V2_MAGIC or rec_len != FORKMETA_RECORD_BYTES:
+    if not _forkmeta_record_wire_valid(record):
         return None
     return {
-        "timeline": timeline, "key": key, "lsn": lsn, "admission_seq": admission_seq,
-        "order_id": order_id, "nblocks": nblocks, "kind": kind, "pad": pad,
+        "magic": magic, "timeline": timeline, "key": key, "lsn": lsn,
+        "admission_seq": admission_seq, "order_id": order_id, "nblocks": nblocks,
+        "kind": kind, "pad": pad,
     }
 
 
@@ -2747,6 +2749,29 @@ FORKMETA_CUTOFF_LSN = 3500          # the workload's sole proven page frontier
 FORKMETA_SEED_FIRST_REL = 5000      # the gc client's oracle relations ...
 FORKMETA_SEED_RELS = 32             # ... and their count
 FORKMETA_SET_KIND = 1
+
+
+def _forkmeta_record_wire_valid(record: bytes) -> bool:
+    """A record's layout and checksum, the same test the daemon applies: a
+    legacy record carries a zero pad, a checksummed one carries the CRC-24
+    (OpenPGP polynomial) of every byte before that pad."""
+    magic, rec_len = struct.unpack_from("=II", record, 0)
+    if rec_len != FORKMETA_RECORD_BYTES:
+        return False
+    pad = record[61:64]
+    if magic == FORKMETA_V2_MAGIC:
+        return pad == b"\x00\x00\x00"
+    if magic != FORKMETA_V3_MAGIC:
+        return False
+    crc = 0xB704CE
+    for byte in record[:61]:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    crc &= 0xFFFFFF
+    return pad == bytes((crc >> 16, (crc >> 8) & 0xFF, crc & 0xFF))
 
 
 def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[str, Any]] | None:
@@ -2768,7 +2793,9 @@ def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[st
     for offset in range(0, complete, FORKMETA_RECORD_BYTES):
         record = data[offset:offset + FORKMETA_RECORD_BYTES]
         magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
-        if magic != FORKMETA_V2_MAGIC or rec_len != FORKMETA_RECORD_BYTES:
+        # both the checksummed current record and the legacy one it replaced,
+        # each held to the checksum rule of its own version
+        if not _forkmeta_record_wire_valid(record):
             return None
         lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
         records.append({
@@ -2880,12 +2907,11 @@ def _forkmeta_record_invalid(entry: dict[str, Any], part: str,
     kind = entry["kind"]
     ordered = FORKMETA_SEG_GROW_KIND <= kind <= FORKMETA_SEG_COMMIT_BOUND_KIND
     bound = kind in (FORKMETA_SEG_GROW_BOUND_KIND, FORKMETA_SEG_COMMIT_BOUND_KIND)
-    if entry["magic"] != FORKMETA_V2_MAGIC or entry["rec_len"] != FORKMETA_RECORD_BYTES:
-        return f"record magic {entry['magic']:#x} length {entry['rec_len']}"
+    if not _forkmeta_record_wire_valid(entry["raw"]):
+        return (f"record magic {entry['magic']:#x} length {entry['rec_len']} "
+                f"fails its version's checksum rule")
     if entry["timeline"] >= FORKMETA_MAX_TIMELINES or entry["key"][4] > FORKMETA_MAX_KLASS:
         return f"record timeline {entry['timeline']} class {entry['key'][4]}"
-    if entry["pad"] != b"\x00\x00\x00":
-        return f"record pad {entry['pad']!r}"
     if not ordered and (kind > FORKMETA_DEAD_KIND or entry["order_id"] != 0):
         return f"lifecycle record kind {kind} order {entry['order_id']}"
     if ordered and (entry["nblocks"] == 0 or
@@ -2982,7 +3008,7 @@ def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> li
         chunk = data[offset:offset + FORKMETA_RECORD_BYTES]
         magic, rec_len = struct.unpack_from("=II", chunk, 0)
         records.append({
-            "magic": magic, "rec_len": rec_len,
+            "magic": magic, "rec_len": rec_len, "raw": bytes(chunk),
             "timeline": struct.unpack_from("=I", chunk, 8)[0],
             "key": struct.unpack_from("=IIIiI", chunk, 12),
             "lsn": struct.unpack_from("=Q", chunk, 32)[0],
@@ -3096,7 +3122,7 @@ def _forkmeta_marker_matches(store: Path, selected: dict[str, Any]) -> bool:
         head["lsn"] == selected["cutoff_lsn"] and \
         head["admission_seq"] == selected["cutoff_seq"] and \
         head["order_id"] == selected["generation"] and head["nblocks"] == 0 and \
-        head["pad"] == b"\0\0\0"
+        (head["magic"] != FORKMETA_V2_MAGIC or head["pad"] == b"\0\0\0")
 
 
 def _forkmeta_source_starts_with_marker(store: Path) -> bool:
