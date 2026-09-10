@@ -433,7 +433,9 @@ The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):
 three seeds at 8000 rounds on a daily schedule and on demand with chosen
 seeds/rounds, one job per seed, with every JSON report summarized in the job
-and kept as a 30-day artifact.  GitHub fires scheduled and dispatchable
+and kept as a 30-day artifact.  Each job takes the time its rounds need
+instead of a fixed limit, and a dispatch too large to finish inside the
+hosted-runner limit is refused rather than killed before it reports.  GitHub fires scheduled and dispatchable
 workflows only from the repository's default branch, so the daily lane starts
 once this file reaches it; until then the same configuration is run on
 demand.
