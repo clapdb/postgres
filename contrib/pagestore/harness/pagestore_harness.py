@@ -2340,19 +2340,25 @@ def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
     return records
 
 
+def _manifest_record_layer_id(payload: bytes) -> int | None:
+    """The layer id a record names: the leading uint64 of every payload that
+    carries one.  Matching the raw bytes anywhere in the payload would also
+    match an unrelated block range or size that happens to look like it."""
+    return struct.unpack_from("=Q", payload, 0)[0] if len(payload) >= 8 else None
+
+
 def _manifest_names_layer(records: list[tuple[int, bytes]], kind: int, layer_id: int) -> bool:
-    needle = struct.pack("=Q", layer_id)
-    return any(k == kind and needle in payload for k, payload in records)
+    return any(k == kind and _manifest_record_layer_id(payload) == layer_id
+               for k, payload in records)
 
 
 def _manifest_marks_after_add(records: list[tuple[int, bytes]], layer_id: int) -> int:
     """Tombstones the log records after the given layer's ADD, whether or not
     their layer files are still on disk."""
-    needle = struct.pack("=Q", layer_id)
     after = False
     marks = 0
     for kind, payload in records:
-        if kind == MANIFEST_ADD_LAYER and needle in payload:
+        if kind == MANIFEST_ADD_LAYER and _manifest_record_layer_id(payload) == layer_id:
             after = True
         elif after and kind == MANIFEST_MARK_DELETE:
             marks += 1

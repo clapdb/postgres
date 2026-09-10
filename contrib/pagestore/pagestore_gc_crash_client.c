@@ -184,19 +184,6 @@ seed(void)
 		}
 	}
 	write_block(page, 0, 4000, 40);
-	/* Arm the named fault only now: the flush-driven compactions that ran
-	 * while the history was written have nothing to retire and would trip
-	 * the probe before the cutoff exists.  The registry reads the marker at
-	 * probe time, so arming after daemon start is the same protocol the
-	 * standalone crash cases use. */
-	if (arm_marker != NULL)
-	{
-		int			fd = open(arm_marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
-
-		if (fd < 0)
-			die("cannot arm the named fault marker");
-		close(fd);
-	}
 	/* the durable page cutoff that lets maintenance retire the history
 	 * below it */
 	set_relation(ch);
@@ -208,6 +195,20 @@ seed(void)
 	ch->req_lsn = TEST_CUTOFF;
 	if (execute()->status != PS_STATUS_OK)
 		die("page-history owner registration failed");
+	/* Arm the named fault only once the cutoff is durable: the probes also
+	 * run for the flush-driven compactions that had nothing to retire, so a
+	 * marker created earlier could be consumed by a pass planned against the
+	 * old floor and validate the wrong transition.  The registry reads the
+	 * marker at probe time, so arming after daemon start is the same
+	 * protocol the standalone crash cases use. */
+	if (arm_marker != NULL)
+	{
+		int			fd = open(arm_marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+		if (fd < 0)
+			die("cannot arm the named fault marker");
+		close(fd);
+	}
 	free(page);
 	/* The fault fires in daemon maintenance, not in this request stream.
 	 * Stay alive until the harness reaps this process, so a daemon that
