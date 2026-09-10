@@ -2352,6 +2352,10 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
         "pause_maintenance": True,
     },
 }
+# The supervisor's own pg_ctl stop and start are each bounded by its command
+# timeout (never below 60s), and a stop request cannot interrupt one.
+SUPERVISOR_COMMAND_TIMEOUT = 60
+SUPERVISOR_STOP_TIMEOUT = 2 * SUPERVISOR_COMMAND_TIMEOUT + 15
 DELETE_BRANCH = 1
 MANIFEST_TMP = "layers.manifest.tmp"
 WAL_RECLAIM_SEGMENTS = 3
@@ -4930,7 +4934,21 @@ def run_materializer_smoke(
             if supervisor_proc is None:
                 return
             supervisor_proc.terminate()
-            supervisor_proc.wait(timeout=5)
+            # SIGTERM only asks the supervisor to stop; it cannot leave a
+            # blocking pg_ctl stop/start, each bounded by its own command
+            # timeout, so the wait allows for both plus a margin.  If it still
+            # has not exited, escalate and stop the worker it was driving,
+            # rather than leaving a postmaster behind.
+            try:
+                supervisor_proc.wait(timeout=SUPERVISOR_STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                supervisor_proc.kill()
+                supervisor_proc.wait(timeout=30)
+                stop_materializer_worker(f"{reason} (supervisor escalation)")
+                raise PlanError(
+                    f"materializer supervisor did not stop within "
+                    f"{SUPERVISOR_STOP_TIMEOUT}s for {reason}"
+                )
             if supervisor_proc.returncode != 0:
                 raise PlanError(
                     f"materializer supervisor did not stop cleanly for {reason}: "
