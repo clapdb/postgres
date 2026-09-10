@@ -638,7 +638,12 @@ sealed WAL segments, retention state and records, page and WAL-index
 frontiers, forkmeta and WAL-index snapshot manifests and payloads, the
 timelines log, the forkmeta source epoch, the layer manifest, and image
 layers.  Each is rejected at open except the documented torn-tail repairs of
-the timelines and layer manifest logs.  Two findings were fixed on the way:
+the timelines and layer manifest logs; a daemon that dies of a signal or
+exits under use is reported as a crash, never as a rejection.  The identity
+table also covers the page-segment, flat-WAL, and WAL-index source-log
+record magics the daemon writes, and does not advertise delta layers,
+which no maintenance path produces yet.  Captures place the store at a
+fixed path so the archive bytes are reproducible.  Two findings were fixed on the way:
 a store reopened at a new path was refused because layer locations recorded
 their absolute parent directory (a missing parent now rebases onto the
 store's own leaf; a foreign existing parent is still rejected), and a

@@ -7280,10 +7280,36 @@ fork_meta_source_conflicts_with_snapshot(void)
 			return 1;
 		if (nread != (int) sizeof(rec))
 			return 0;			/* a torn tail is the unacknowledged crash tail */
-		if (rec.magic != FORK_META_V2_MAGIC || rec.rec_len != sizeof(rec))
+		if (rec.magic != FORK_META_V2_MAGIC)
 		{
-			fprintf(stderr, "pagestore: forkmeta source epoch record at %llu is not "
-					"a V2 record while snapshot generation %llu is selected\n",
+			/* A store migrated from the legacy layout can legitimately crash
+			 * after the manifest commit with its source still in that layout:
+			 * legacy records carry no admission sequence and predate every
+			 * snapshot, so they are never a conflict.  Walk them at their own
+			 * size (a bound marker carries a paired identity record) and only
+			 * refuse what is not a well-formed legacy record either. */
+			ForkMetaRecV1 old;
+			int			legacy_read = ps_storage->fork_meta_read(off, &old, sizeof(old));
+
+			if (legacy_read != (int) sizeof(old) || old.timeline >= MAX_TIMELINES ||
+				old.key.klass > PS_KLASS_READER_SNAPSHOT ||
+				old.kind > FEV_SEG_COMMIT_BOUND)
+			{
+				fprintf(stderr, "pagestore: forkmeta source epoch record at %llu is "
+						"neither a V2 nor a legacy record while snapshot generation "
+						"%llu is selected\n", (unsigned long long) off,
+						(unsigned long long) fork_meta_snapshot_generation);
+				return 1;
+			}
+			off += sizeof(old);
+			if (old.kind == FEV_SEG_GROW_BOUND || old.kind == FEV_SEG_COMMIT_BOUND)
+				off += sizeof(old);
+			continue;
+		}
+		if (rec.rec_len != sizeof(rec))
+		{
+			fprintf(stderr, "pagestore: forkmeta source epoch record at %llu has an "
+					"invalid length while snapshot generation %llu is selected\n",
 					(unsigned long long) off,
 					(unsigned long long) fork_meta_snapshot_generation);
 			return 1;
@@ -19244,6 +19270,16 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		 FORK_META_SNAPSHOT_PAYLOAD_MAGIC, FORK_META_SNAPSHOT_PAYLOAD_VERSION},
 		{"walidx_snapshot", "walidx snapshot shard payload",
 		 WALIDX_SNAPSHOT_PAYLOAD_MAGIC, WALIDX_SNAPSHOT_PAYLOAD_VERSION},
+		/* The source logs: their record magics are their versions.  Only the
+		 * magics the daemon writes today are reported; older ones stay
+		 * readable but are not identities a fixture pins. */
+		{"page_segment", "seg_* record (versioned page)", SEG_ADMISSION_MAGIC, 0},
+		{"page_segment", "seg_* record (WAL-less page)",
+		 SEG_WALLESS_ADMISSION_MAGIC, 0},
+		{"wal_log", "wal_<tl> record", WAL_MAGIC, 0},
+		{"walidx_log", "walidx_<tl>_<shard> record", WALIDX_MAGIC, 0},
+		{"walidx_log", "walidx_<tl>_<shard> progress record",
+		 WALIDX_PROGRESS_MAGIC, 0},
 	};
 
 	*out = identities;

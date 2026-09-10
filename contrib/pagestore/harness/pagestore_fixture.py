@@ -48,6 +48,7 @@ FIXTURE_JSON = "fixture.json"
 OPEN_REJECTED = "open_rejected"      # the daemon refuses to open the store
 USE_REJECTED = "use_rejected"        # it opens, but the oracle or inspection fails closed
 ACCEPTED = "accepted"                # it opens and the oracle passes
+CRASHED = "daemon_crashed"           # the daemon died of a signal or exited under use; never expected
 
 
 class FixtureError(Exception):
@@ -219,7 +220,8 @@ class Daemon:
         self.env.update(DAEMON_ENV)
 
     def start(self, timeout: float = 10.0) -> str:
-        """Return "ready" or the daemon's exit status text when it refuses."""
+        """Return "ready", "exit N" when the daemon refuses the store, or
+        "signal N" when it died of a signal (a crash, never a rejection)."""
         harness.remove_shm(self.shm)
         with self.log.open("a", encoding="utf-8") as log:
             self.process = subprocess.Popen(
@@ -229,7 +231,8 @@ class Daemon:
         deadline = time.monotonic() + timeout
         while True:
             if self.process.poll() is not None:
-                return f"exit {self.process.returncode}"
+                code = self.process.returncode
+                return f"signal {-code}" if code < 0 else f"exit {code}"
             try:
                 harness.inspect_store(self.inspector, self.shm, "health", INSPECTION_SCHEMA)
                 return "ready"
@@ -238,6 +241,9 @@ class Daemon:
                     self.stop()
                     raise FixtureError("daemon did not become ready")
                 time.sleep(0.05)
+
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
 
     def stop(self) -> int:
         if self.process is None:
@@ -301,7 +307,12 @@ def capture(args: argparse.Namespace) -> int:
     fixture.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pagestore-fixture-") as temp:
         root = Path(temp)
-        store = root / "store"
+        # layers.manifest persists the store's absolute path in its layer
+        # locations, so the store lives at a fixed path (not the random temp
+        # root) for the archive bytes to be reproducible across captures
+        store = Path(tempfile.gettempdir()) / "pagestore-fixture-capture-store"
+        if store.exists():
+            shutil.rmtree(store)
         store.mkdir()
         log = root / "daemon.log"
         shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}"
@@ -332,6 +343,7 @@ def capture(args: argparse.Namespace) -> int:
         if code != 0:
             raise FixtureError(f"daemon did not stop cleanly: status {code}")
         names = deterministic_tar(store, fixture / STORE_TAR)
+        shutil.rmtree(store)
     identities = format_identities(args.format_tool)
     (fixture / FORMAT_JSON).write_text(json.dumps(identities, indent=2) + "\n", encoding="utf-8")
     (fixture / FIXTURE_JSON).write_text(json.dumps({
@@ -379,9 +391,14 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
     daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log)
     try:
         status = daemon.start()
+        if status.startswith("signal"):
+            return f"{CRASHED} ({status} at open)"
         if status != "ready":
             return OPEN_REJECTED
         result = run_client(args.client_binary, shm, "verify", root / "mutations" / f"{case['name']}.client.log")
+        if not daemon.alive():
+            code = daemon.process.returncode if daemon.process else None
+            return f"{CRASHED} (daemon exited {code} under use)"
         return ACCEPTED if result.returncode == 0 else USE_REJECTED
     finally:
         daemon.stop()

@@ -6,12 +6,6 @@
     "version": 1
   },
   {
-    "family": "delta_layer",
-    "artifact": "delta layer footer",
-    "magic": "0x544c4450",
-    "version": 2
-  },
-  {
     "family": "forkmeta",
     "artifact": "forkmeta record",
     "magic": "0x324d4b46",
@@ -31,7 +25,7 @@
   },
   {
     "family": "image_layer",
-    "artifact": "layer_<tl>_<id> footer",
+    "artifact": "layer_<shard>_<id> footer",
     "magic": "0x47494d50",
     "version": 4
   },
@@ -46,6 +40,18 @@
     "artifact": "page-prune.frontiers",
     "magic": "0x46504750",
     "version": 3
+  },
+  {
+    "family": "page_segment",
+    "artifact": "seg_* record (WAL-less page)",
+    "magic": "0x53454737",
+    "version": 0
+  },
+  {
+    "family": "page_segment",
+    "artifact": "seg_* record (versioned page)",
+    "magic": "0x53454736",
+    "version": 0
   },
   {
     "family": "retention",
@@ -66,6 +72,12 @@
     "version": 2
   },
   {
+    "family": "wal_log",
+    "artifact": "wal_<tl> record",
+    "magic": "0x57414c52",
+    "version": 0
+  },
+  {
     "family": "wal_segment",
     "artifact": "wal_segments_<tl>/walv1_* header",
     "magic": "0x57534731",
@@ -82,6 +94,18 @@
     "artifact": "walidx-prune.frontiers",
     "magic": "0x46584957",
     "version": 2
+  },
+  {
+    "family": "walidx_log",
+    "artifact": "walidx_<tl>_<shard> progress record",
+    "magic": "0x57495047",
+    "version": 0
+  },
+  {
+    "family": "walidx_log",
+    "artifact": "walidx_<tl>_<shard> record",
+    "magic": "0x57494458",
+    "version": 0
   },
   {
     "family": "walidx_snapshot",

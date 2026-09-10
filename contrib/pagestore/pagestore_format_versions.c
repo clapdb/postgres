@@ -17,9 +17,11 @@
 
 typedef size_t (*IdentityProvider) (const PsFormatIdentity **out);
 
+/* Delta layers have a reader and writer in pagestore_layer.c but no
+ * maintenance path produces them yet, so their footer is not an identity a
+ * fixture can carry; add it here when a writer lands. */
 static const PsFormatIdentity header_identities[] = {
-	{"image_layer", "layer_<tl>_<id> footer", PS_IMG_MAGIC, PS_IMG_VERSION},
-	{"delta_layer", "delta layer footer", PS_DELTA_MAGIC, PS_DELTA_VERSION},
+	{"image_layer", "layer_<shard>_<id> footer", PS_IMG_MAGIC, PS_IMG_VERSION},
 	{"wal_segment", "wal_segments_<tl>/walv1_* header", PS_WAL_SEGMENT_MAGIC,
 	 PS_WAL_SEGMENT_VERSION},
 	{"control", "control object admission fence block", PS_ADMISSION_FENCE_MAGIC,
