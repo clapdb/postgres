@@ -40,7 +40,35 @@ jobs:
       seeds: ${{ steps.matrix.outputs.seeds }}
       rounds: ${{ steps.matrix.outputs.rounds }}
       timeout: ${{ steps.matrix.outputs.timeout }}
+      revision: ${{ steps.revision.outputs.sha }}
     steps:
+      - id: revision
+        shell: bash
+        env:
+          # the branch this run's soak lives on, resolved the same way the
+          # matrix jobs used to resolve it
+          SOAK_REF: >-
+            ${{ github.ref_name == github.event.repository.default_branch
+                && 'pagestore' || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Every seed of a run is one experiment, so they must all test one
+          # commit.  A matrix job that resolved the branch name itself would
+          # pick up whatever `pagestore` pointed at when that job started --
+          # or when a failed job was rerun days later -- while the run's
+          # metadata still named the workflow's own SHA.  Resolve it once.
+          sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SOAK_REF}" --jq .sha)
+          case "$sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+              ;;
+            *)
+              echo "could not resolve ${SOAK_REF} to a commit: ${sha:-<empty>}" >&2
+              exit 1
+              ;;
+          esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "soaking ${SOAK_REF} at $sha" >> "$GITHUB_STEP_SUMMARY"
+
       - id: matrix
         shell: bash
         env:
@@ -107,10 +135,10 @@ jobs:
         with:
           # The soak lives on `pagestore`, while GitHub offers schedules and
           # workflow_dispatch only from the default branch, so a run started
-          # there checks the soak's own branch out explicitly.
-          ref: >-
-            ${{ github.ref_name == github.event.repository.default_branch
-                && 'pagestore' || github.ref_name }}
+          # there checks the soak's own branch out explicitly -- as the commit
+          # the plan job resolved, so every seed tests the same revision no
+          # matter when its job starts or is rerun.
+          ref: ${{ needs.plan.outputs.revision }}
 
       - name: Compile daemon and soak harness
         working-directory: contrib/pagestore
@@ -137,11 +165,12 @@ jobs:
         run: |
           f="soak-report-${{ matrix.seed }}.json"
           [ -f "$f" ] || { echo "no report written" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
-          python3 - "$f" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          python3 - "$f" "${{ needs.plan.outputs.revision }}" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
           r = json.load(open(sys.argv[1]))
           res, mx, q = r["result"], r["physical_max"], r["physical_quiescent"]
           print(f"### seed {r['seed']}: {r['rounds']} rounds, {res['checks']} checks, {res['failures']} failures")
+          print(f"- revision: {sys.argv[2]}")
           print(f"- during bounds ok: {res['during_bounds_ok']}, quiescent bounds ok: {res['quiescent_bounds_ok']}")
           print(f"- write amplification {r['write_amplification']}, files max {mx['files']}")
           print("| category | max | quiescent | during bound | quiescent bound |")

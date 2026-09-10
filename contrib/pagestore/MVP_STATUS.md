@@ -438,7 +438,11 @@ instead of a fixed limit, and a dispatch too large to finish inside the
 hosted-runner limit is refused rather than killed before it reports.  GitHub fires scheduled and dispatchable
 workflows only from the repository's default branch, so the daily lane starts
 once this file reaches it, and a run started there checks the soak's own
-branch out explicitly; until then the same configuration is run on demand.  A
+branch out explicitly; until then the same configuration is run on demand.
+The branch is resolved to a commit once, before the seeds fan out, and every
+job checks that commit out, so a run's seeds stay one experiment even when
+the branch advances between jobs or a job is rerun later; the resolved
+revision is reported in each job summary.  A
 run that cannot write its JSON report fails rather than passing with nothing
 to compare across nights.
 
