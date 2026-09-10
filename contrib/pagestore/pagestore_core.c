@@ -399,6 +399,7 @@ static char page_frontier_dir[4096];
 static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS];
 static int page_frontier_load(const char *store_dir);
 static void page_prune_mark_all_due_locked(void);
+static int key_eq(const PsKey *a, const PsKey *b);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
 static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -2537,6 +2538,43 @@ compact_same_page(const CompactOrder *a, const CompactOrder *b)
 }
 
 /*
+ * The exact-generation artifact classes (SLRU seeds, reader snapshots) are
+ * consumed at exactly the LSN they were captured at; a consumer whose base
+ * is generation C reads every page of the object at exactly C, and a page
+ * that has no copy at C is absent there.  The newest generation at or below
+ * a retained horizon is therefore the only one that horizon can use, and an
+ * older copy of a page missing from that generation serves nobody.  The
+ * generations of an object are the distinct version LSNs of its pages in
+ * this compaction's input; a generation held only in layers outside the
+ * input is unknown here, which only ever keeps more.
+ */
+static uint64_t
+artifact_generation_at(const uint64_t *generations, uint32_t ngenerations,
+					   uint64_t horizon)
+{
+	uint64_t	best = 0;
+
+	for (uint32_t i = 0; i < ngenerations; i++)
+		if (generations[i] != 0 && generations[i] <= horizon &&
+			generations[i] > best)
+			best = generations[i];
+	return best;
+}
+
+static int
+artifact_generation_needed(uint64_t lsn, const uint64_t *generations,
+						   uint32_t ngenerations, uint64_t floor,
+						   const PsPruneFence *fences, uint32_t nfences)
+{
+	if (artifact_generation_at(generations, ngenerations, floor) == lsn)
+		return 1;
+	for (uint32_t f = 0; f < nfences; f++)
+		if (artifact_generation_at(generations, ngenerations, fences[f].lsn) == lsn)
+			return 1;
+	return 0;
+}
+
+/*
  * Emit one page's planned versions.  Sorted equal (LSN, admission sequence)
  * identities are one logical version that may exist as several physical
  * copies (a compaction that crashed after publishing its replacement leaves
@@ -2645,12 +2683,51 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			order[first].key.klass != PS_KLASS_CONTROL)
 		{
 			uint32_t	klass = order[first].key.klass;
+			int			exact_generations = klass == PS_KLASS_SLRU ||
+				klass == PS_KLASS_READER_SNAPSHOT;
+			int			latest_state = klass == PS_KLASS_SLRU_LIVE ||
+				klass == PS_KLASS_SLRU_TOMB || klass == PS_KLASS_SLRU_WM;
 
-			if (floor != 0 &&
-				(klass == PS_KLASS_SLRU || klass == PS_KLASS_READER_SNAPSHOT ||
-				 klass == PS_KLASS_SLRU_LIVE || klass == PS_KLASS_SLRU_TOMB ||
-				 klass == PS_KLASS_SLRU_WM))
+			if (floor != 0 && (exact_generations || latest_state))
 			{
+				PsPruneFence plan_floor = {floor, UINT64_MAX};
+				uint64_t   *generations = NULL;
+				uint32_t	ngenerations = 0;
+
+				/* The live mirror, tombstones, and watermark are read at the
+				 * newest horizon by their consumer, and by a branch at its
+				 * fork point: nothing above the newest version, and nothing
+				 * between a fence and the newest, is ever asked for.  Plan
+				 * them with the newest version as the floor so only that
+				 * version and the newest at or below each fence survive. */
+				if (latest_state)
+					for (uint32_t i = first; i < end; i++)
+						if (order[i].version.lsn > plan_floor.lsn)
+							plan_floor.lsn = order[i].version.lsn;
+				if (exact_generations)
+				{
+					uint32_t	lo = first;
+					uint32_t	hi = end;
+
+					/* every page of this object is contiguous in the sorted
+					 * order; its generations are their distinct version LSNs */
+					while (lo > 0 && key_eq(&order[lo - 1].key, &order[first].key))
+						lo--;
+					while (hi < *nrec && key_eq(&order[hi].key, &order[first].key))
+						hi++;
+					generations = malloc((size_t) (hi - lo) * sizeof(*generations));
+					if (generations != NULL)
+						for (uint32_t i = lo; i < hi; i++)
+						{
+							uint64_t	g = order[i].version.lsn;
+							int			seen = 0;
+
+							for (uint32_t j = 0; j < ngenerations && !seen; j++)
+								seen = generations[j] == g;
+							if (!seen)
+								generations[ngenerations++] = g;
+						}
+				}
 				/* SLRU-class objects and reader artifacts are consumed as-of
 				 * a horizon their consumer pinned first (a reader, a branch
 				 * being prepared) or that is a branch's fork point.  A seed
@@ -2666,10 +2743,23 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				 * version collapses to the newest tuple like any other. */
 				for (uint32_t i = first; i < end; i++)
 					versions[i - first] = order[i].version;
-				if (ps_page_prune_plan(versions, end - first,
-									   (PsPruneFence) {floor, UINT64_MAX},
+				if (ps_page_prune_plan(versions, end - first, plan_floor,
 									   fences, nfences, keep) < 0)
 					memset(keep, 1, end - first);
+				/* A page copy below the floor is kept only when it belongs to
+				 * the newest generation at or below some retained horizon;
+				 * a copy from an older generation of a page the newer
+				 * generation no longer has serves no consumer and would keep
+				 * its control era fenced forever. */
+				if (generations != NULL)
+					for (uint32_t i = first; i < end; i++)
+						if (keep[i - first] && order[i].version.lsn != 0 &&
+							order[i].version.lsn < floor &&
+							!artifact_generation_needed(order[i].version.lsn,
+														generations, ngenerations,
+														floor, fences, nfences))
+							keep[i - first] = 0;
+				free(generations);
 				/* zero-version (WAL-less) state is latest-only: its newest
 				 * admission stays whatever the plan says, every older
 				 * zero-version admission is superseded and goes */

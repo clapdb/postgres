@@ -926,21 +926,23 @@ test_stale_artifacts_are_retired(void)
 	check(drop_pin(0, PS_RETENTION_OWNER_READER, 9, 1),
 		  "the reader releases its pin");
 	run_maintenance(64);
-	/* Only the branch's fork point remains below the floor: the seed page
-	 * that has a newer version at the fork point and the reader snapshot are
-	 * retired at 1500, while the seed page whose newest base at or below the
-	 * fork point is still the 1500 one survives as that base. */
+	/* Only the branch's fork point remains below the floor.  A consumer at
+	 * that fork reads the seed at exactly the newest generation at or below
+	 * it, 2500; the object's 1500 generation serves nobody any more, so both
+	 * pages of it are retired, including the page that has no 2500 copy (it
+	 * is absent at 2500, and its 1500 copy cannot stand in), and only the
+	 * 2500 cutoff still fences control images. */
 	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 0 &&
 		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500) == 0,
 		  "a dropped pin retires the artifacts it protected below the floor");
-	check(object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 1500,
-		  "a seed page stays as the newest base below the branch's fork point");
+	check(object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 0,
+		  "a seed page missing from the newer generation at the fork is not kept");
 	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
 		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500) == 2500 &&
 		  ps_test_page_version_count(0, &seed7, 0) == 1,
 		  "artifacts at a live branch's fork point survive, one copy per cutoff");
-	check(ps_test_artifact_fence_count(0) == 2,
-		  "each cutoff with a surviving artifact still fences control images");
+	check(ps_test_artifact_fence_count(0) == 1,
+		  "only the cutoff with a surviving generation still fences control images");
 	check(ps_test_page_version_count(0, &rel, 0) == 2,
 		  "relation history keeps the branch's base and the newest version");
 	close_store();
@@ -948,8 +950,8 @@ test_stale_artifacts_are_retired(void)
 	check(ps_core_open(store) == 0, "reopen the store after artifact pruning");
 	check(object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 0 &&
 		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
-		  object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 1500 &&
-		  ps_test_artifact_fence_count(0) == 2,
+		  object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 0 &&
+		  ps_test_artifact_fence_count(0) == 1,
 		  "retired artifacts stay retired and the surviving bases persist across restart");
 	close_store();
 	remove_tree(store);

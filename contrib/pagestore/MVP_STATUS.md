@@ -427,14 +427,18 @@ gate:
   pin shipped WAL until the horizon advances; treating the derived cutoff as
   that owner's page fence needs the owner to advance its pin before its
   marker, so a standing horizon can never lose its base;
-SLRU-class and reader-artifact versions now have their retention protocol:
-they are consumed as-of a horizon their consumer pinned first or a branch
-forked at, and a seed is a replay base (a horizon is served by the newest
-seed at or below it plus the WAL after it), so all of them follow the
-relation plan: the newest version at or below the floor and every
-page-history fence, everything above the floor, retried copies collapsing to
-one.  A retired artifact releases the control era it fenced
-(`pagestore_control_prune_test`).
+SLRU-class and reader-artifact versions now have their retention protocol.
+Seeds and reader snapshots are exact-generation artifacts: a consumer reads
+every page of the object at exactly the generation it captured, which is
+the newest generation at or below the horizon it pinned or forked at, so a
+page copy is kept only when it belongs to the newest generation at or below
+the floor or some fence (a copy from an older generation of a page the newer
+generation no longer has serves nobody and is retired with its control-era
+fence).  The live mirror, tombstones, and watermark are read at the newest
+horizon by their consumer and at the fork point by a branch, so they keep
+only the newest version and the newest at or below each fence.  Retried
+copies collapse to one, and a retired artifact releases the control era it
+fenced (`pagestore_control_prune_test`).
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):
