@@ -930,7 +930,11 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             elif action["op"] == "bootstrap":
                 bootstrapped = True
                 writer_mutated_since_checkpoint = True
-            elif action["op"] in ("sql", "assert") and action["target"] == "writer":
+            elif action["op"] in ("sql", "assert", "restart") and \
+                    action["target"] == "writer":
+                # a restart runs recovery and writes its own checkpoint, so the
+                # declared checkpoint no longer describes the writer's data
+                # directory any more than a statement against it would
                 writer_mutated_since_checkpoint = True
     elif runtime == "materializer_smoke":
         required = {"writer", "materializer"}
@@ -4628,18 +4632,19 @@ def run_materializer_smoke(
             signal=stop.signal_method, wait=stop.wait_method,
         )
 
-    def postmaster_pid() -> int:
+    def compute_postmaster_pid(data: Path, role: str) -> int:
         try:
             value = int(
-                (materializer_data / "postmaster.pid")
-                .read_text(encoding="utf-8")
-                .splitlines()[0]
+                (data / "postmaster.pid").read_text(encoding="utf-8").splitlines()[0]
             )
         except (OSError, ValueError, IndexError) as error:
-            raise PlanError(f"materializer postmaster pid is unreadable: {error}") from error
+            raise PlanError(f"{role} postmaster pid is unreadable: {error}") from error
         if value <= 0:
-            raise PlanError(f"materializer postmaster pid is invalid: {value}")
+            raise PlanError(f"{role} postmaster pid is invalid: {value}")
         return value
+
+    def postmaster_pid() -> int:
+        return compute_postmaster_pid(materializer_data, "materializer")
 
     def lsn_value(value: str) -> int:
         try:
@@ -4903,6 +4908,20 @@ def run_materializer_smoke(
                 f"writer did not accept connections after {reason}",
             )
             events.emit("process_start", target="writer", reason=reason)
+
+        def restart_instance(target: str) -> int:
+            """What a restart of this target actually replaces: the writer's
+            and the store's own process, and the materializer's worker
+            generation.  A restart event that reported the materializer's
+            generation for every target could not distinguish a writer or
+            store that came back from one that never went down."""
+            if target == "writer":
+                return compute_postmaster_pid(writer_data, "writer")
+            if target == "materializer":
+                return materializer_generation
+            if dproc is None:
+                raise PlanError("store restart has no daemon process")
+            return dproc.pid
 
         def stop_writer(reason: str) -> None:
             subprocess.run(
@@ -5549,6 +5568,7 @@ def run_materializer_smoke(
             elif action["op"] == "restart":
                 restarted_generation = materializer_generation
                 restarted_retention_generation = materializer_retention_generation
+                previous_instance = restart_instance(action["target"])
                 if action["target"] == "writer":
                     stop_writer(action["id"])
                     start_writer(action["id"])
@@ -5610,10 +5630,21 @@ def run_materializer_smoke(
                     wait_materializer_role(
                         f"materializer did not recover after {action['id']}"
                     )
+                instance = restart_instance(action["target"])
+                if instance == previous_instance:
+                    raise OracleMismatch(
+                        f"restart {action['id']} left the {action['target']} "
+                        f"instance {previous_instance!r} in place"
+                    )
+                # The materializer's generation is the restarted instance only
+                # when the materializer is the target; for a writer or store
+                # restart it is unrelated context, and reporting it as the
+                # event's generation described a restart that never showed.
                 events.emit(
                     "restart", id=action["id"], target=action["target"],
-                    previous_generation=restarted_generation,
-                    generation=materializer_generation,
+                    previous_instance=previous_instance, instance=instance,
+                    previous_materializer_generation=restarted_generation,
+                    materializer_generation=materializer_generation,
                     health=health if action["target"] == "store" else None,
                 )
             elif action["op"] == "assert":

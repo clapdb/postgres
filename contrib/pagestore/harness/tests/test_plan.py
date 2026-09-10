@@ -1939,6 +1939,48 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "not an available compute"):
             MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
 
+    def test_writer_restart_invalidates_the_declared_checkpoint(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "restart-then-capture", "seed": 1,
+                "contracts": ["write_read"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "bootstrap", "id": "route-all", "target": "writer"},
+            {"op": "checkpoint", "id": "r0", "target": "writer", "name": "R"},
+            {"op": "restart", "id": "writer-restart", "target": "writer"},
+            {"op": "capture", "id": "copy", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "does not describe the current writer data directory"
+        ):
+            MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
+
+    def test_writer_restart_invalidates_a_reader_base(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "restart-then-reader-base", "seed": 1,
+                "contracts": ["write_read"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "bootstrap", "id": "route-all", "target": "writer"},
+            {"op": "checkpoint", "id": "r0", "target": "writer", "name": "R"},
+            {"op": "restart", "id": "writer-restart", "target": "writer"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R", "name": "C"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "does not describe the current unmodified writer"
+        ):
+            MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
+
     def test_materializer_restart_rejects_reader_targets(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([

@@ -7,6 +7,7 @@
 {"op":"sql","id":"second-write","target":"writer","sql":"UPDATE restart_t SET v='after-writer-restart' WHERE id=1"}
 {"op":"restart","id":"materializer-restart","target":"materializer"}
 {"op":"assert","id":"replacement-in-recovery","target":"materializer","oracle":"sql_scalar","sql":"SELECT pg_is_in_recovery() AND current_setting('pagestore.materializer')::boolean","expect":"t"}
+{"op":"assert","id":"replacement-serves-last-durable","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"before-restarts"}
 {"op":"checkpoint","id":"second-boundary","target":"writer","name":"R2"}
 {"op":"assert","id":"second-materialized","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM restart_t WHERE id=1","expect":"after-writer-restart"}
 {"op":"restart","id":"store-restart","target":"store"}

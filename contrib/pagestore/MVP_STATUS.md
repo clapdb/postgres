@@ -183,9 +183,15 @@ worker with a new generation), or the store, where the supervisor stops
 first, both computes shut down, the daemon restarts on the same shared
 memory name, and the writer and supervisor return.  The two scenarios
 require the pinned reader to keep its horizon and hide the in-flight
-prepared transaction across its restart and the writer's, and the
-materializer to serve each boundary after a writer restart, a worker
-restart, and a store restart with zero lag at the end.  Remaining outside
+prepared transaction across its restart and the writer's -- including
+after that transaction commits -- and the materializer to serve the last
+durable boundary as soon as its replacement is up, then each boundary
+after a writer restart, a worker restart, and a store restart with zero
+lag at the end.  Each restart event records the instance the restart
+actually replaced (the writer's or daemon's process, the materializer's
+worker generation) and fails if it is unchanged, and a writer restart
+invalidates the declared checkpoint, so a later reader base or capture
+must declare a new one.  Remaining outside
 the harness: branch-compute restarts, which the golden scenario covers.
 
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
