@@ -2743,10 +2743,12 @@ def _forkmeta_source_records(store: Path) -> list[dict[str, Any]] | None:
         data = (store / "forkmeta").read_bytes()
     except OSError:
         return None
-    if len(data) % FORKMETA_RECORD_BYTES != 0:
-        return None
+    # A crash can land while a record is being appended, and recovery drops
+    # exactly that unacknowledged tail, so one partial final record is part
+    # of a valid crash image; everything before it must be well formed.
+    complete = len(data) - len(data) % FORKMETA_RECORD_BYTES
     records = []
-    for offset in range(0, len(data), FORKMETA_RECORD_BYTES):
+    for offset in range(0, complete, FORKMETA_RECORD_BYTES):
         record = data[offset:offset + FORKMETA_RECORD_BYTES]
         magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
         if magic != FORKMETA_V2_MAGIC or rec_len != FORKMETA_RECORD_BYTES:
@@ -2758,6 +2760,40 @@ def _forkmeta_source_records(store: Path) -> list[dict[str, Any]] | None:
             "nblocks": struct.unpack_from("=I", record, 56)[0], "kind": record[60],
         })
     return records
+
+
+def _forkmeta_seeded_events(above_lsn: int = 0) -> list[tuple[int, int, int, int]]:
+    """Every event the gc client's forkmeta seed persists for its oracle
+    relations, as (relation, lsn, kind, nblocks), above the given LSN.  The
+    seed creates each relation, zero-extends it to four blocks, and truncates
+    it below the cutoff for even relations and above it for odd ones."""
+    events = []
+    for index in range(FORKMETA_SEED_RELS):
+        rel = FORKMETA_SEED_FIRST_REL + index
+        truncate_lsn = 2500 + index if index % 2 == 0 else 4500 + index
+        for lsn, kind, nblocks in (
+            (1000 + index, FORKMETA_SET_KIND, 0),
+            (2000 + index, FORKMETA_GROW_KIND, 4),
+            (truncate_lsn, FORKMETA_SET_KIND, 2 if index % 2 == 0 else 3),
+        ):
+            if lsn > above_lsn:
+                events.append((rel, lsn, kind, nblocks))
+    return events
+
+
+def _forkmeta_seeded_events_missing(records: list[dict[str, Any]],
+                                    above_lsn: int) -> list[str]:
+    """The seeded events above the given LSN that the log no longer carries
+    with the same size and kind."""
+    present = {
+        (r["key"][2], r["lsn"], r["kind"], r["nblocks"]) for r in records
+        if r["timeline"] == 0
+    }
+    return [
+        f"rel {rel} kind {kind} lsn {lsn} nblocks {nblocks}"
+        for rel, lsn, kind, nblocks in _forkmeta_seeded_events(above_lsn)
+        if (rel, lsn, kind, nblocks) not in present
+    ]
 
 
 def _forkmeta_seeded_truncates_missing(records: list[dict[str, Any]], above_lsn: int) -> list[str]:
@@ -2774,6 +2810,45 @@ def _forkmeta_seeded_truncates_missing(records: list[dict[str, Any]], above_lsn:
         if lsn > above_lsn and (rel, lsn) not in present:
             missing.append(f"rel {rel} truncate@{lsn}")
     return missing
+
+
+FORKMETA_PAYLOAD_HEADER_BYTES = 80
+
+
+def _forkmeta_part_framing(store: Path, record: dict[str, Any], part: str) -> str | None:
+    """Why a part does not satisfy the framing invariants the loader applies:
+    its payload header must identify the part and the generation, its record
+    size must be the record size, and its body must be a whole number of
+    records matching the count the header states."""
+    path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return f"{path.name} is unreadable"
+    if len(data) < FORKMETA_PAYLOAD_HEADER_BYTES:
+        return f"{path.name} is shorter than its payload header"
+    magic, version, header_bytes = struct.unpack_from("=IHH", data, 0)
+    index, record_bytes = struct.unpack_from("=II", data, 8)
+    generation = struct.unpack_from("=Q", data, 16)[0]
+    counts = struct.unpack_from("=QQQQ", data, 48)
+    checkpoint_records, tail_records, checkpoint_bytes, tail_bytes = counts
+    expected_index = 0 if part == "checkpoint" else 1
+    body = len(data) - FORKMETA_PAYLOAD_HEADER_BYTES
+    if magic != FORKMETA_PAYLOAD_MAGIC or version != 1 or \
+            header_bytes != FORKMETA_PAYLOAD_HEADER_BYTES or \
+            record_bytes != FORKMETA_RECORD_BYTES or index != expected_index or \
+            generation != record["generation"]:
+        return (f"{path.name} has payload header magic {magic:#x} version {version} "
+                f"header {header_bytes} record {record_bytes} part {index} "
+                f"generation {generation}")
+    if body % FORKMETA_RECORD_BYTES != 0:
+        return f"{path.name} ends with a partial record ({body} body bytes)"
+    stated = checkpoint_records if part == "checkpoint" else tail_records
+    stated_bytes = checkpoint_bytes if part == "checkpoint" else tail_bytes
+    if stated * FORKMETA_RECORD_BYTES != body or stated_bytes != body:
+        return (f"{path.name} holds {body // FORKMETA_RECORD_BYTES} records, "
+                f"header states {stated} ({stated_bytes} bytes)")
+    return None
 
 
 def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> list[dict[str, Any]]:
@@ -2823,6 +2898,10 @@ def _forkmeta_generation_incomplete(store: Path, record: dict[str, Any]) -> str 
     for every relation at the newest horizon.  Sizes are compared rather than
     a record list, because which records survive is the compaction plan's
     business while the sizes are the contract."""
+    for part in ("checkpoint", "tail"):
+        framing = _forkmeta_part_framing(store, record, part)
+        if framing is not None:
+            return framing
     missing = _forkmeta_seeded_truncates_missing(
         _forkmeta_part_records(store, record, "tail"), record["cutoff_lsn"])
     if missing:
@@ -2876,7 +2955,10 @@ def _forkmeta_old_epoch_intact(store: Path, selected: dict[str, Any]) -> str | N
     if any(r["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND and
            r["order_id"] == selected["generation"] for r in records):
         return "source already names the selected generation"
-    missing = _forkmeta_seeded_truncates_missing(records, floor)
+    # the complete epoch, not only its truncates: a premature rewrite that
+    # kept the truncates and dropped the creates and growths would otherwise
+    # look intact, because the selected snapshot supplies them after startup
+    missing = _forkmeta_seeded_events_missing(records, floor)
     if missing:
         return f"source lost seeded events of the old epoch: {missing!r}"
     return None
@@ -3528,6 +3610,15 @@ def _check_gc_crash_snapshot(
         _check_manifest_crash_snapshot(store, stage)
         return
     if stage.startswith("forkmeta_"):
+        # the cutoff a forkmeta generation carries is only meaningful if the
+        # page frontier that proves it is durable in the same crash image
+        fences = _page_frontier_fences(store, 0)
+        if not any(incarnation == 1 and lsn == FORKMETA_CUTOFF_LSN
+                   for incarnation, lsn, _seq in fences):
+            raise OracleMismatch(
+                f"after_{stage} crash published timeline 0 fences {fences!r}, "
+                f"expected the proven frontier {FORKMETA_CUTOFF_LSN} in incarnation 1"
+            )
         _check_forkmeta_crash_snapshot(store, stage)
         return
     if stage == "walidx_frontier":
