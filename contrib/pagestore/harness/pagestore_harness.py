@@ -2616,7 +2616,7 @@ def _check_manifest_recovery(
     store: Path,
     stage: str,
     timeout: float,
-) -> None:
+) -> dict[str, Any] | None:
     """Either log replays to the same layer map: the manifest is sane and
     reconciled with the local layers, and no crashed temp file leaks."""
     poll_timeout = max(0.0, min(10.0, timeout))
@@ -2647,6 +2647,16 @@ def _check_manifest_recovery(
         raise OracleMismatch(
             f"after_{stage} recovery reported owners={owners!r}, expected none"
         )
+    # the counts come from the replayed map, so they say nothing about files
+    # an interrupted retirement may have left behind
+    replayed = set(_manifest_layers(_manifest_records(store)))
+    on_disk = {int(path.name.rsplit("_", 1)[1], 16) for path in _canonical_layer_files(store)}
+    if replayed != on_disk:
+        raise OracleMismatch(
+            f"after_{stage} recovery left the manifest naming {sorted(replayed)!r} "
+            f"while the store holds {sorted(on_disk)!r}"
+        )
+    return None
 
 
 # A sealed segment is named walv1_<store>_<segment number, 20 digits>; the
@@ -3297,8 +3307,8 @@ def _check_gc_recovery(
         return _check_delete_abort_recovery(inspector, shm, inspection_schema,
                                             store)
     if workload == "manifest_compact":
-        return _check_manifest_recovery(inspector, shm, inspection_schema,
-                                        store, stage, timeout)
+        return _check_manifest_recovery(inspector, shm, inspection_schema, store,
+                                        stage, timeout)
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
