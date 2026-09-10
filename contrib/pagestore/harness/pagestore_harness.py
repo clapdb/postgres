@@ -2409,6 +2409,7 @@ def _page_frontier_fences(store: Path, timeline: int) -> list[tuple[int, int, in
         offset = 8 + (timeline * PAGE_FRONTIER_SLOTS + slot) * PAGE_FRONTIER_ENTRY_BYTES
         fences.append(struct.unpack_from("=QQQ", data, offset))
     return fences
+MANIFEST_REMOVE_LAYER = 5
 
 
 def _wal_segment_files(store: Path) -> list[str]:
@@ -2447,16 +2448,42 @@ def _wal_store_metadata(store: Path) -> dict[str, Any] | None:
         "retained_base_lsn": retained_base, "end_lsn": end,
     }
 
+def _manifest_layers(records: list[tuple[int, bytes]]) -> dict[int, dict[str, Any]]:
+    """Replay ADD/MARK_DELETE/REMOVE records to the layers the manifest still
+    names, keyed by layer id, with their owning timeline."""
+    layers: dict[int, dict[str, Any]] = {}
+    for kind, payload in records:
+        if kind == MANIFEST_ADD_LAYER and len(payload) >= 16:
+            layer_id, _layer_kind, timeline = struct.unpack_from("<QII", payload, 0)
+            layers[layer_id] = {"timeline": timeline, "deleting": False}
+        elif kind in (MANIFEST_MARK_DELETE, MANIFEST_REMOVE_LAYER) and len(payload) >= 8:
+            layer_id = struct.unpack_from("<Q", payload, 0)[0]
+            if kind == MANIFEST_REMOVE_LAYER:
+                layers.pop(layer_id, None)
+            elif layer_id in layers:
+                layers[layer_id]["deleting"] = True
+    return layers
+
+
 def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
-    """Private WAL, WAL-index, and owner-layer artifacts of one timeline."""
+    """Private WAL and WAL-index artifacts of one timeline, plus the layer
+    files the manifest still attributes to it.  Layer file names carry the
+    shard, not the owner, so ownership comes from the manifest's ADD records.
+    """
     names = []
-    prefixes = (f"wal_{timeline}", f"walidx_{timeline}_", f"wal_segments_{timeline}",
-                f"walidx_snapshots_{timeline}", f"layer_{timeline}_")
+    prefixes = (f"walidx_{timeline}_", f"wal_segments_{timeline}", f"walidx_snapshots_{timeline}")
     for entry in sorted(store.iterdir()):
         name = entry.name
         if name == f"wal_{timeline}" or name.startswith(f"wal_{timeline}.") or \
-                any(name.startswith(prefix) for prefix in prefixes[1:]):
+                any(name.startswith(prefix) for prefix in prefixes):
             names.append(name)
+    owned = {
+        layer_id for layer_id, layer in _manifest_layers(_manifest_records(store)).items()
+        if layer["timeline"] == timeline
+    }
+    for path in _canonical_layer_files(store):
+        if int(path.name.rsplit("_", 1)[1], 16) in owned:
+            names.append(f"{path.name} (manifest layer of timeline {timeline})")
     return names
 
 
@@ -2465,12 +2492,21 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
     survive the first boundary and are gone from the second on, and nothing
     of the owner remains once DELETED is durable."""
     artifacts = _branch_private_artifacts(store, DELETE_BRANCH)
-    wal = [name for name in artifacts if not name.startswith(f"layer_{DELETE_BRANCH}_")]
+    wal = [name for name in artifacts if not name.startswith("layer_")]
     if stage == "delete_deleting":
-        if f"wal_{DELETE_BRANCH}" not in wal:
+        # every consumer the later stages claim to clean up must exist now,
+        # or their absence afterwards proves nothing
+        missing = [
+            what for what, present in (
+                ("private WAL", f"wal_{DELETE_BRANCH}" in wal),
+                ("WAL-index epoch", any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in wal)),
+                ("owner layer", any(n.startswith("layer_") for n in artifacts)),
+            ) if not present
+        ]
+        if missing:
             raise OracleMismatch(
-                "after_deleting crash removed the branch's private WAL before "
-                f"cleanup could start: {artifacts!r}"
+                f"after_deleting crash found the branch without its seeded {missing!r}: "
+                f"{artifacts!r}"
             )
         return
     if wal:

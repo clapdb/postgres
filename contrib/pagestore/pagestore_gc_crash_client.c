@@ -80,6 +80,9 @@
 #define DELETE_FORK_LSN UINT64_C(65536)
 #define DELETE_WAL_BYTES 65536u
 #define DELETE_PAGES 24u
+/* a fresh branch of a fresh store gets its first incarnation token; the
+ * verify oracle compares recovery against that seeded value */
+#define DELETE_INCARNATION UINT64_C(1)
 
 static void *shm_base;
 static int shm_fd = -1;
@@ -464,6 +467,8 @@ delete_seed(void)
 	if (execute()->status != PS_STATUS_OK)
 		die("branch create failed");
 	branch_incarnation = ch->incarnation;
+	if (branch_incarnation != DELETE_INCARNATION)
+		die("branch did not receive its expected first incarnation token");
 	/* private shipped WAL plus a committed WAL-index interval */
 	delete_wal_append(DELETE_BRANCH, branch_incarnation, DELETE_FORK_LSN);
 	set_relation(ch);
@@ -530,12 +535,31 @@ delete_verify(void)
 				"(state %d)\n", state);
 		exit(1);
 	}
-	if (incarnation == 0)
-		die("DELETED branch lost its incarnation token");
-	/* the parent keeps serving its own page; the branch rejects reads */
+	if (incarnation != DELETE_INCARNATION)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: DELETED branch reports incarnation "
+				"%llu, seeded %llu\n", (unsigned long long) incarnation,
+				(unsigned long long) DELETE_INCARNATION);
+		exit(1);
+	}
+	/* the parent keeps serving its own page and its own shipped WAL; the
+	 * branch rejects reads */
 	read_latest(page, 0);
 	if (!page_has_tag(page, 7))
 		die_page("deletion damaged the parent's page", 0, page);
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != DELETE_WAL_BYTES)
+		die("deletion changed the parent's WAL end");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = 0;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK || ch->result != 64)
+		die("deletion damaged the parent's shipped WAL");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != 1)
+			die("deletion corrupted the parent's shipped WAL bytes");
 	set_relation(ch);
 	set_timeline(ch, DELETE_BRANCH, incarnation);
 	ch->opcode = PS_OP_READV;
