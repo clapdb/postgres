@@ -2770,7 +2770,9 @@ def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[st
     for offset in range(0, complete, FORKMETA_RECORD_BYTES):
         record = data[offset:offset + FORKMETA_RECORD_BYTES]
         magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
-        if magic != FORKMETA_V2_MAGIC or rec_len != FORKMETA_RECORD_BYTES:
+        # both the checksummed current record and the legacy one it replaced
+        if magic not in (FORKMETA_V2_MAGIC, FORKMETA_V3_MAGIC) or \
+                rec_len != FORKMETA_RECORD_BYTES:
             return None
         lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
         records.append({
