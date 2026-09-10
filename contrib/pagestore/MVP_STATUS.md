@@ -427,8 +427,24 @@ gate:
   pin shipped WAL until the horizon advances; treating the derived cutoff as
   that owner's page fence needs the owner to advance its pin before its
   marker, so a standing horizon can never lose its base;
-- SLRU-class object versions are still retained without a dedicated protocol;
-- a nightly long-run soak configuration.
+- SLRU-class object versions are still retained without a dedicated protocol.
+
+The long-run configuration the gate asks for is the
+`pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):
+three seeds at 8000 rounds on a daily schedule and on demand with chosen
+seeds/rounds, one job per seed, with every JSON report summarized in the job
+and kept as a 30-day artifact.  Each job takes the time its rounds need
+instead of a fixed limit, and a dispatch too large to finish inside the
+hosted-runner limit is refused rather than killed before it reports.  GitHub fires scheduled and dispatchable
+workflows only from the repository's default branch, so the daily lane starts
+once this file reaches it, and a run started there checks the soak's own
+branch out explicitly; until then the same configuration is run on demand.
+The branch is resolved to a commit once, before the seeds fan out, and every
+job checks that commit out, so a run's seeds stay one experiment even when
+the branch advances between jobs or a job is rerun later; the resolved
+revision is reported in each job summary.  A
+run that cannot write its JSON report fails rather than passing with nothing
+to compare across nights.
 
 ### 5. Composed crash and format-compatibility coverage -- partial
 
@@ -437,6 +453,14 @@ harness.  Other crash boundaries remain outside this slice.
 Before declaring the MVP repeatable, add process-level fault scenarios around
 manifest replacement and retention/reclaim/GC, plus
 a persisted-format fixture for restart/upgrade compatibility.
+
+An advancing reader's data directory boots from the checkpoint its manifest
+names, and the reader moves its own retention pin above that horizon as it
+adopts newer published views.  Nothing then keeps the boot control image
+alive, so a restart of that data directory cannot restore it once pruning has
+run.  Until an adopted horizon is written back into the reader manifest, the
+controller owns that image's lifetime and must hold a page-history horizon at
+it; the integration test models exactly that.
 
 ## Recommended sequence
 

@@ -33,6 +33,9 @@ fi
 BIN=$(dirname "$PGCTL")
 ROOT=$(dirname "$BIN")
 export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
+# A loaded CI runner can take longer than pg_ctl's one-minute default to
+# reach a ready postmaster; a slow start is not a failed one.
+export PGCTLTIMEOUT=${PGCTLTIMEOUT:-180}
 DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 
 SOCKROOT=$(mktemp -d /tmp/psint-sock.XXXXXX)
@@ -1891,6 +1894,14 @@ assert "$(grep -c 'reader catalog provenance.*invalid identity' "$BADREADER/serv
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
+# A reader's manifest names the checkpoint its data directory boots from, and
+# an advancing reader moves its own pin above that horizon, so nothing keeps
+# the boot control image alive and a restart cannot restore it.  Until the
+# adopted horizon is written back into the manifest, the controller owns that
+# image's lifetime; this stands in for it with a page-history owner, the
+# resource control images are fenced by.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8002,1,1,'$readerR');")" "0" \
+	"the controller holds the advancing reader's boot control image at R"
 ADVANCINGDATA=$(mktemp -d)/reader
 cp -a "$READERDATA" "$ADVANCINGDATA"
 if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1; then
@@ -2020,21 +2031,55 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
 	"advancing readers cannot re-enable parallel plans with session settings"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
-if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
-	--timeline 0 --incarnation 1 --lsn "$readerR" "$ADVANCINGDATA" >/dev/null; then
+# The manifest names the checkpoint the reader boots at, so the control image
+# is restored at that horizon.  A start that fails here reports both horizons
+# and the manifest beside them: the postmaster refuses to start when the
+# restored image's checkpoint redo is not the one the manifest requires.
+advancingRestore=$("$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
+	--timeline 0 --incarnation 1 --lsn "$readerR" "$ADVANCINGDATA" 2>&1) || {
 	echo "FAIL - advancing reader restart could not restore its boot control image"
+	printf '%s\n' "$advancingRestore"
 	exit 1
-fi
-if ! "$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null; then
-	echo "FAIL - advancing reader did not restart at its durable owner horizon"
-	tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
-	exit 1
-fi
+}
+# pg_ctl reports why it could not start on its own output, which used to be
+# discarded, leaving a start failure indistinguishable from a slow one.  Keep
+# that output.  A start that times out leaves its postmaster running, so wait
+# for that one to accept connections instead of launching a second server
+# that would collide on the data directory lock.
+advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1) || {
+	advancingReady=0
+	for _ in $(seq 60); do
+		if "$BIN/pg_ctl" -D "$ADVANCINGDATA" status >/dev/null 2>&1 &&
+			$PR -c "SELECT 1;" >/dev/null 2>&1; then
+			advancingReady=1
+			break
+		fi
+		sleep 1
+	done
+	if [ "$advancingReady" -ne 1 ]; then
+		echo "FAIL - advancing reader did not restart at its durable owner horizon"
+		printf '%s\n' "$advancingStart"
+		echo "readerR=$readerR readerAutoR=$readerAutoR"
+		printf 'restore: %s\n' "$advancingRestore"
+		# the redo the restored image actually carries is what the manifest
+		# is compared against, so name it rather than leaving it to be guessed
+		"$BIN/pg_controldata" "$ADVANCINGDATA" 2>/dev/null |
+			grep -E "REDO location|checkpoint location" || true
+		cat "$ADVANCINGDATA/pagestore_reader.manifest" 2>/dev/null || true
+		tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
+		exit 1
+	fi
+}
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 	"advancing reader restart adopts its durable owner horizon before serving"
-assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerAutoR'::pg_lsn;")" "t" \
+# The reader keeps advancing: its artifact launcher can publish a newer view
+# while this section runs, and the restarted reader adopts it.  What the
+# restart must not do is move the pin backwards.
+assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) >= '$readerAutoR'::pg_lsn;")" "t" \
 	"advancing reader restart does not regress its durable pin"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,8002,1);")" "0" \
+	"the boot-image owner releases R once the restart is proven"
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 rm -rf "$(dirname "$READERDATA")" "$(dirname "$ADVANCINGDATA")"
 READERDATA=
@@ -2059,9 +2104,17 @@ assert "$($P -c "SELECT pagestore_rel_exists_asof('asof_t', 0, '$preCREATE'::pg_
 	"the fork does not exist at a horizon below its creation"
 assert "$($P -c "SELECT $szR > 10;")" "t" "the shipped table has a real page count at R"
 $P -q -c "DELETE FROM asof_t WHERE id > 10;" >/dev/null
-$P -c "VACUUM asof_t;" >/dev/null	# trims trailing pages: an LSN-stamped store truncate
-$P -c "CHECKPOINT;" >/dev/null
-szNow=$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, pg_current_wal_lsn());")
+# VACUUM trims the trailing pages (an LSN-stamped store truncate), but it
+# abandons the truncation when another backend asks for a conflicting lock,
+# so retry until the size settles instead of reading one interrupted attempt.
+szNow=
+for _ in 1 2 3 4 5; do
+	$P -c "VACUUM asof_t;" >/dev/null
+	$P -c "CHECKPOINT;" >/dev/null
+	szNow=$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, pg_current_wal_lsn());")
+	[ "$szNow" = "1" ] && break
+	sleep 1
+done
 assert "$($P -c "SELECT $szNow < $szR;")" "t" "the newest horizon sees the vacuum-truncated size"
 assert "$szNow" "1" \
 	"the newest as-of size is the vacuum-truncated one page (rows 1-10 live in block 0)"
