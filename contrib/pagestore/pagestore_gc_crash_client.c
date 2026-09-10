@@ -675,6 +675,25 @@ delete_verify_live(void)
 	if (timeline_state(DELETE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
 		incarnation != DELETE_INCARNATION)
 		die("a deletion that never became durable did not leave the branch live");
+	/* Its ancestry is durable metadata of its own.  Every page this branch
+	 * serves below was seeded privately, so create metadata replaced with the
+	 * same id and incarnation but a different parent or fork point would pass
+	 * every other check here while moving the branch's as-of boundary. */
+	{
+		uint64_t	parent_incarnation = 0;
+
+		if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE ||
+			parent_incarnation == 0)
+			die("the parent timeline is not live after a lost deletion request");
+		set_relation(ch);
+		set_timeline(ch, DELETE_BRANCH, incarnation);
+		ch->opcode = PS_OP_TIMELINE_INFO;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1)
+			die("the surviving branch lost its persisted ancestry");
+		if (ch->parent_timeline != 0 || ch->req_lsn != DELETE_FORK_LSN ||
+			ch->req_seq != parent_incarnation)
+			die("the surviving branch changed its persisted fork identity");
+	}
 	for (uint32_t block = 0; block < DELETE_PAGES; block++)
 	{
 		set_relation(ch);

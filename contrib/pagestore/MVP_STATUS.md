@@ -150,9 +150,14 @@ its publication.  The crash snapshot must keep the private WAL at the first
 boundary, have removed it from the second on, and leave no owner artifact
 once DELETED is durable; recovery must reach DELETED with the incarnation
 token, keep serving the parent's page, reject branch reads, leave no owner
-artifact, reconcile the manifest, and register no owner; a second restart
-proves idempotence.  Manifest replacement and compute-restart combinations
-remain outside the harness.
+artifact, reconcile the manifest, keep the root's history capped at the live
+sibling's fork point, and register no owner; a second restart
+proves idempotence.  A fifth probe crashes on the old-state side of the
+first transition, where the request is lost: the branch must keep its
+lifecycle, its artifacts, and its persisted ancestry -- parent, fork point
+and parent token, none of which the pages it serves would reveal -- and the
+root must still carry the cap both live branches fork at.  Manifest
+replacement and compute-restart combinations remain outside the harness.
 
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer

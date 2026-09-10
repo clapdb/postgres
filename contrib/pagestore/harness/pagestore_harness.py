@@ -2646,7 +2646,29 @@ def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
 def _check_delete_abort_crash_snapshot(store: Path) -> None:
     """Before the DELETING record is durable nothing of the branch has
     changed: no lifecycle record, and every seeded artifact present."""
-    _check_delete_abort_recovery(store)
+    _check_delete_abort_state(store)
+
+
+def _check_delete_abort_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+) -> dict[str, Any]:
+    """The branch survived the lost request intact, and the root still
+    carries the cap both live branches fork at."""
+    state = _check_delete_abort_state(store)
+    # The client reads only pages each branch owns, so nothing else here would
+    # notice a cap recovery dropped -- and dropping it admits pruning of the
+    # ancestor history those branches read through.
+    timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
+    if timeline.get("retained_horizon") != DELETE_FORK_LSN:
+        raise OracleMismatch(
+            "a deletion that never became durable reported retained_horizon="
+            f"{timeline.get('retained_horizon')!r}, expected the branches' fork "
+            f"point {DELETE_FORK_LSN}"
+        )
+    return state
 
 
 def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
@@ -2706,7 +2728,7 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
             )
 
 
-def _check_delete_abort_recovery(store: Path) -> dict[str, Any]:
+def _check_delete_abort_state(store: Path) -> dict[str, Any]:
     """A deletion whose DELETING record never became durable leaves nothing
     behind: the branch keeps its lifecycle, and every artifact it owned is
     still there (the verify client already read its pages back)."""
@@ -3200,7 +3222,8 @@ def _check_gc_recovery(
         return _check_delete_recovery(inspector, shm, inspection_schema, store,
                                       stage, timeout)
     if workload == "timeline_delete_abort":
-        return _check_delete_abort_recovery(store)
+        return _check_delete_abort_recovery(inspector, shm, inspection_schema,
+                                            store)
     poll_timeout = max(0.0, min(10.0, timeout))
     deadline = time.monotonic() + poll_timeout
     while True:
