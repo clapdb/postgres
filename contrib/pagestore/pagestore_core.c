@@ -14518,6 +14518,9 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * Fail the plan closed and let a later pass retry. */
 			if (control_note_redo(timeline, key, note, tmp, &redo) != 0)
 			{
+				free(tmp);
+				free(plan->chain);
+				free(plan->kept);
 				free(plan->pending);
 				memset(plan, 0, sizeof(*plan));
 				return -1;
