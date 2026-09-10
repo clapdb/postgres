@@ -31,6 +31,11 @@ extern int ps_retention_get(uint32_t index, PsRetentionPin *pin_out,
 extern int ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
 										PsRetentionPin *pin_out,
 										uint32_t *count_out);
+/* 1 when registering this generation would be refused as stale (an older
+ * generation than the owner's current one, or the owner's released current
+ * generation), 0 when it may proceed, -1 when the registry is unusable. */
+extern int ps_retention_generation_stale(uint32_t timeline, uint32_t owner_kind,
+										 uint64_t owner_id, uint32_t generation);
 extern int ps_retention_lookup(uint32_t timeline, uint32_t owner_kind,
 									uint64_t owner_id, PsRetentionPin *pin_out);
 extern int ps_retention_page_fence_at(uint32_t timeline, uint64_t lsn);

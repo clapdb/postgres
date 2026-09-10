@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -397,6 +398,7 @@ static char page_frontier_path[4096];
 static char page_frontier_dir[4096];
 static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS];
 static int page_frontier_load(const char *store_dir);
+static void page_prune_mark_all_due_locked(void);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
 static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -1452,6 +1454,7 @@ typedef struct Shard
 	int			gc_storage_error;	/* sticky fail-closed storage observation */
 	int			gc_debt_unavailable;	/* coverage was intentionally not tracked */
 	int			flush_watermark_valid;
+	int			note_flush_pending;	/* a checkpoint note awaits durability */
 	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
 	uint64_t	rr_mem,			/* read-source counters */
@@ -1631,23 +1634,54 @@ account_page_gc_coverage(Shard *s, uint32_t old_boundary,
  */
 static pthread_rwlock_t shard_locks[MAX_SHARDS];
 static pthread_rwlock_t map_lock = PTHREAD_RWLOCK_INITIALIZER;
+/* Which shard locks this thread holds, so a reader of another shard's index
+ * can tell an already-held lock from one it must still take. */
+static __thread unsigned char shard_held_by_thread[MAX_SHARDS];
 
 void
 ps_lock_shard_rd(uint32_t shard)
 {
 	pthread_rwlock_rdlock(&shard_locks[shard]);
+	shard_held_by_thread[shard] = 1;
 }
 
 void
 ps_lock_shard_wr(uint32_t shard)
 {
 	pthread_rwlock_wrlock(&shard_locks[shard]);
+	shard_held_by_thread[shard] = 1;
 }
 
 void
 ps_unlock_shard(uint32_t shard)
 {
+	shard_held_by_thread[shard] = 0;
 	pthread_rwlock_unlock(&shard_locks[shard]);
+}
+
+/*
+ * Take a read lock on a shard this thread does not hold, for a short scan of
+ * that shard's index from a path that may already hold another shard's lock
+ * and map-wr.  Blocking would invert the lock order against a writer of that
+ * shard waiting for the map, so only try; a busy lock means the caller retries
+ * on a later pass.  Returns 1 when the lock was taken (release it), 0 when the
+ * thread already held it, -1 when it could not be taken.
+ */
+static int
+shard_try_scan_lock(uint32_t shard)
+{
+	if (shard_held_by_thread[shard])
+		return 0;
+	for (int attempt = 0; attempt < 1000; attempt++)
+	{
+		if (pthread_rwlock_tryrdlock(&shard_locks[shard]) == 0)
+		{
+			shard_held_by_thread[shard] = 1;
+			return 1;
+		}
+		sched_yield();
+	}
+	return -1;
 }
 
 uint64_t
@@ -2065,6 +2099,13 @@ flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 	s->flush_watermark.seg_id = seg_id;
 	s->flush_watermark.seg_off = seg_off;
 	s->flush_watermark_valid = 1;
+	if (s->note_flush_pending)
+	{
+		/* the checkpoint note staged earlier is durable now: the cutoff it
+		 * derives can move, so give pruning another pass */
+		s->note_flush_pending = 0;
+		page_prune_mark_all_due_locked();	/* advisory flags; callers hold map-wr */
+	}
 	return 0;
 }
 
@@ -4404,7 +4445,15 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * replays through here as well). */
 	if (key->klass == PS_KLASS_CONTROL && block == PS_CONTROL_NOTE_BLOCK &&
 		lsn != 0)
+	{
 		page_prune_mark_all_due_locked();
+		/* The cutoff only follows a durable note.  A note staged in the
+		 * memtable becomes durable at a later flush, possibly after
+		 * maintenance already consumed this due mark; remember to mark again
+		 * when that flush lands. */
+		if (seg >= 0)
+			s->note_flush_pending = 1;
+	}
 	if (lsn > fork->last_page_lsn ||
 		(lsn == fork->last_page_lsn && admission_seq > fork->last_page_seq))
 	{
@@ -14190,8 +14239,10 @@ control_checkpoint_cutoff(uint32_t timeline, uint64_t materializer_lsn,
 	PsKey		key;
 	PageEnt    *entry;
 	const PageVer *best = NULL;
+	PageVer		snapshot;
 	unsigned char *tmp;
 	uint64_t	redo = 0;
+	int			locked;
 
 	*cutoff_out = 0;
 	if (materializer_lsn != 0)
@@ -14201,21 +14252,32 @@ control_checkpoint_cutoff(uint32_t timeline, uint64_t materializer_lsn,
 	}
 	memset(&key, 0, sizeof(key));
 	key.klass = PS_KLASS_CONTROL;
+	/* The note chain belongs to the control key's shard; a caller compacting
+	 * another shard holds only that shard and map-wr, while a checkpoint
+	 * writer may be appending to (and reallocating) this chain under the
+	 * control shard alone.  Snapshot the newest durable note under the
+	 * control shard's lock, taken without blocking. */
+	locked = shard_try_scan_lock(ps_shard_of(&key));
+	if (locked < 0)
+		return -1;
 	entry = page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK);
-	if (entry == NULL)
-		return 0;
-	for (int i = 0; i < entry->nver; i++)
-		if (walidx_base_version_durable(&entry->vers[i]) &&
-			(best == NULL || entry->vers[i].lsn > best->lsn ||
-			 (entry->vers[i].lsn == best->lsn &&
-			  entry->vers[i].admission_seq > best->admission_seq)))
-			best = &entry->vers[i];
+	if (entry != NULL)
+		for (int i = 0; i < entry->nver; i++)
+			if (walidx_base_version_durable(&entry->vers[i]) &&
+				(best == NULL || entry->vers[i].lsn > best->lsn ||
+				 (entry->vers[i].lsn == best->lsn &&
+				  entry->vers[i].admission_seq > best->admission_seq)))
+				best = &entry->vers[i];
+	if (best != NULL)
+		snapshot = *best;
+	if (locked > 0)
+		ps_unlock_shard(ps_shard_of(&key));
 	if (best == NULL)
 		return 0;
 	tmp = malloc(page_size);
 	if (tmp == NULL)
 		return -1;
-	if (control_note_redo(timeline, &key, best, tmp, &redo) != 0)
+	if (control_note_redo(timeline, &key, &snapshot, tmp, &redo) != 0)
 	{
 		free(tmp);
 		return -1;
@@ -14449,9 +14511,18 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 					(note == NULL ||
 					 notes->vers[i].admission_seq > note->admission_seq))
 					note = &notes->vers[i];
-			if (note == NULL ||
-				control_note_redo(timeline, key, note, tmp, &redo) != 0 ||
-				redo == 0 || redo >= plan->kept[k].lsn)
+			if (note == NULL)
+				continue;
+			/* A note that cannot be read is not a note without a twin: planning
+			 * on without it could retire the exact-redo image the note names.
+			 * Fail the plan closed and let a later pass retry. */
+			if (control_note_redo(timeline, key, note, tmp, &redo) != 0)
+			{
+				free(plan->pending);
+				memset(plan, 0, sizeof(*plan));
+				return -1;
+			}
+			if (redo == 0 || redo >= plan->kept[k].lsn)
 				continue;
 			for (uint32_t j = 0; j < plan->nkept; j++)
 				if (plan->kept[j].lsn == redo)
@@ -16669,7 +16740,15 @@ ps_handle_meta(PsChannel *ch)
 				pin.admission_seq = seq;
 				pthread_rwlock_wrlock(&page_prune_lock);
 				pthread_rwlock_wrlock(&walidx_prune_lock);
-				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES)
+				/* An owner protocol error is answered as such: a released or
+				 * superseded generation is STALE whatever the frontiers say,
+				 * so the answer does not depend on whether maintenance has
+				 * already published a frontier above the requested LSN. */
+				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES &&
+					ps_retention_generation_stale(tl, pin.owner_kind, pin.owner_id,
+												  pin.generation) == 1)
+					ret = PS_RETENTION_STALE;
+				else if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES)
 				{
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
 						pin.owner_id, &old_pin);
