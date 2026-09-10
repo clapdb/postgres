@@ -2030,17 +2030,25 @@ if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
 fi
 # pg_ctl reports why it could not start on its own output, which used to be
 # discarded, leaving a start failure indistinguishable from a slow one.  Keep
-# that output, and retry once: a stale postmaster.pid from the stop above is
-# transient, while a store or control image the reader cannot accept is not.
+# that output.  A start that times out leaves its postmaster running, so wait
+# for that one to accept connections instead of launching a second server
+# that would collide on the data directory lock.
 advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1) || {
-	sleep 2
-	advancingStart="$advancingStart
-retry: $("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1)" || {
+	advancingReady=0
+	for _ in $(seq 60); do
+		if "$BIN/pg_ctl" -D "$ADVANCINGDATA" status >/dev/null 2>&1 &&
+			$PR -c "SELECT 1;" >/dev/null 2>&1; then
+			advancingReady=1
+			break
+		fi
+		sleep 1
+	done
+	if [ "$advancingReady" -ne 1 ]; then
 		echo "FAIL - advancing reader did not restart at its durable owner horizon"
 		printf '%s\n' "$advancingStart"
 		tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
 		exit 1
-	}
+	fi
 }
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 	"advancing reader restart adopts its durable owner horizon before serving"
