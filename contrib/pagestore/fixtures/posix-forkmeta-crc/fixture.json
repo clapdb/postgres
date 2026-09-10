@@ -33,9 +33,9 @@
     "forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
     "forkmeta_snapshots/forkmeta_manifest_v1",
     "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001",
+    "layer_0_0000000000000006",
     "layer_0_0000000000000007",
     "layer_0_0000000000000008",
-    "layer_0_0000000000000009",
     "layers.manifest",
     "page-prune.frontiers",
     "retention.initialized",
@@ -45,6 +45,7 @@
     "seg_00000001",
     "seg_00000002",
     "seg_00000003",
+    "seg_00000004",
     "timelines",
     "wal_0",
     "wal_segments_0",
@@ -58,5 +59,5 @@
     "walidx_snapshots_0/walidxg1_00000000000000000001_000"
   ],
   "captured": "2026-09-10",
-  "description": "Same store shape as posix-mvp-baseline, written by the daemon that seals forkmeta source and snapshot payload records as FKM3 (CRC-24 in the former pad bytes)."
+  "description": "POSIX fixture with forkmeta source and snapshot payload records sealed as FKM3 (FKM2 layout plus a CRC-24 in the former pad bytes); the current fixture that pins the compiled identities and takes every mutation."
 }
