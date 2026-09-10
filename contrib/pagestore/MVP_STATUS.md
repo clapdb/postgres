@@ -446,7 +446,12 @@ partial generation supersedes the complete one below it, and a consumer at
 that cutoff then fails to reconstruct rather than silently reading a stale
 page from the older generation.  Making the newer generation wait for a
 durable completion marker is part of the artifact-publication protocol, not
-of retention.
+of retention.  The same missing lifecycle shows at object granularity: the
+newest generation at or below the floor is the replay base for every horizon
+above it, so it is kept even when the object it describes is gone (a reader
+snapshot of a dropped database publishes no newer generation of that key).
+Retiring it needs a durable drop event for the artifact, which the
+publication protocol does not emit yet.
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):

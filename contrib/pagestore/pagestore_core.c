@@ -4550,25 +4550,37 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 		e->nver = out;
 		r = end;
 	}
+	/*
+	 * A dropped zero-version record may have been the fork's last WAL-less
+	 * page.  Recompute the flag once per affected fork, walking that fork's
+	 * own page list: doing it per record rescanned the whole page index for
+	 * every superseded admission of the same page, under both the shard and
+	 * map write locks.
+	 */
 	for (uint32_t r = 0; r < nrec; r++)
-		if (recs[r].lsn == 0)
-		{
-			ForkEnt    *fork = fork_find(timeline, &recs[r].key);
-			Shard	   *shard = shard_for(&recs[r].key);
-			int			found = 0;
+	{
+		ForkEnt    *fork;
+		int			seen = 0;
 
-			for (uint32_t b = 0; b < IDX_BUCKETS && !found; b++)
-				for (PageEnt *e = shard->page_idx[b]; e && !found; e = e->next)
-					if (e->timeline == timeline && key_eq(&e->key, &recs[r].key))
-						for (int i = 0; i < e->nver; i++)
-							if (e->vers[i].lsn == 0)
-							{
-								found = 1;
-								break;
-							}
-			if (fork != NULL)
-				fork->has_wal_less = found;
-		}
+		if (recs[r].lsn != 0)
+			continue;
+		for (uint32_t prev = 0; prev < r && !seen; prev++)
+			seen = recs[prev].lsn == 0 && key_eq(&recs[prev].key, &recs[r].key);
+		if (seen)
+			continue;
+		fork = fork_find(timeline, &recs[r].key);
+		if (fork == NULL)
+			continue;
+		fork->has_wal_less = 0;
+		for (PageEnt *e = fork->pages; e != NULL && !fork->has_wal_less;
+			 e = e->fork_next)
+			for (int i = 0; i < e->nver; i++)
+				if (e->vers[i].lsn == 0)
+				{
+					fork->has_wal_less = 1;
+					break;
+				}
+	}
 }
 
 /*
