@@ -364,7 +364,7 @@ watermark still cannot substitute for the proven capture API: its newest-image
 contract deliberately permits bytes newer than its completeness floor and is
 therefore unsafe as an exact branch seed.
 
-### 4. Retention-driven space reclamation -- page history bounded; other consumers remaining
+### 4. Retention-driven space reclamation -- implemented for local POSIX; dropped artifacts keep one generation
 
 Segment GC removes page-log segments covered by image layers, and image
 compaction now bounds retained page-version history.  `retention.meta` is the
@@ -435,8 +435,8 @@ residual-query suppression, pending-proof cleanup failure,
 metadata publication failure/backoff, and admission concurrency.
 
 This is a conservative R3b-3 policy integration.  It does not include sparse
-or discrete retained-base crossing, or a bounded fixed-reader soak.  Still
-required for the gate:
+or discrete retained-base crossing, or a bounded fixed-reader soak.  The
+consumers the gate still required at that point have since landed:
 
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
@@ -599,9 +599,12 @@ seeds/rounds, one job per seed, with every JSON report summarized in the job
 and kept as a 30-day artifact.  Each job takes the time its rounds need
 instead of a fixed limit, and a dispatch too large to finish inside the
 hosted-runner limit is refused rather than killed before it reports.  GitHub fires scheduled and dispatchable
-workflows only from the repository's default branch, so the daily lane starts
-once this file reaches it, and a run started there checks the soak's own
-branch out explicitly; until then the same configuration is run on demand.
+workflows only from the repository's default branch, and `master` is reserved
+for the upstream mirror, so `pagestore` is the repository's default branch and
+the lane runs from it directly; the schedule fires only in this repository or
+in a fork that sets `PAGESTORE_NIGHTLY_ENABLED=1`, while a manual dispatch is
+always honoured.  A 200-round dispatch proved the path against the #249
+roll-up (1426 checks, 0 failures).
 The branch is resolved to a commit once, before the seeds fan out, and every
 job checks that commit out, so a run's seeds stay one experiment even when
 the branch advances between jobs or a job is rerun later; the resolved
@@ -707,14 +710,18 @@ it; the integration test models exactly that.
 ## Recommended sequence
 
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
-acceptance contract.  The implementation sequence for the remaining gates is:
+acceptance contract.  Gates 1-4 are implemented for the local POSIX
+deployment, with the dropped-artifact limitation gate 4 documents above;
+gate 5 has its crash coverage composed and its daemon-side format fixtures,
+but is not complete.  What remains before the MVP is declared complete is:
 
-1. Integrate immutable WAL segments, compact the WAL index, then reclaim raw
-   WAL without crossing retained reconstruction bases.
-2. Compact fork metadata, add durable timeline deletion, and prove total-space
-   bounds with reclaimer backpressure.
-3. Promote the golden scenario into the declarative crash/compatibility harness
-   and add persisted-format fixtures.
+1. Keep the nightly bounded-space soak green across its first scheduled runs.
+2. Add the backend-side persisted-format fixtures (reader manifests, branch
+   bootstrap, materializer markers, the writer checkpoint block) and settle
+   the D5 support-window decision the daemon-side fixtures assume.
+3. Close the R4b concurrency clause: a concurrent-append oracle at the
+   prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
+   crash matrix already has at the source rewrite.
 
 Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit

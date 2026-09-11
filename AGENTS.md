@@ -6,7 +6,10 @@
   upstream; do **not** put clapdb work here.
 - **`pagestore`** is the development branch for the clapdb page-store work
   (the disaggregated copy-on-write page store under `contrib/pagestore/`).
-  It is kept rebased on top of `master`.
+  It is kept rebased on top of `master`, and it is the repository's
+  **default branch**: GitHub runs scheduled and manually dispatched
+  workflows only from the default branch, and `master` must stay a pure
+  upstream mirror, so the pagestore nightly soak lives here.
 - **`branchdb_13` … `branchdb_19`** are the per-PG-major-version release
   branches. Land work on a release by **cherry-picking from `pagestore`** to the
   relevant `branchdb_N` (do not develop directly on the release branches).
