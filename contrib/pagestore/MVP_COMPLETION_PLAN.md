@@ -1021,10 +1021,11 @@ Expected scope: two or three focused PRs.
 
 ### H2. Add persisted-format fixtures and compatibility CI
 
-Status: **daemon-side POSIX formats covered under the recommended D5 policy
-(flagged as an assumption while D5 stays open), including a legacy fixture
-exercised by the first format change; backend-side artifact fixtures
-remain**.
+Status: **daemon-side POSIX formats covered under D5 rules 2 and 3,
+including a legacy fixture exercised by the first format change;
+backend-side artifact fixtures (D5 rule 4), the PostgreSQL payload-version
+binding in envelopes (D5 rule 1), and the SPDK container identity (D5 rule
+3) remain**.
 
 The slice adds `pagestore_format.h` identities reported by every format-owning
 module, the `pagestore_format_versions` tool, the `fixture` workload of
@@ -1156,12 +1157,55 @@ implements this rule before durable transition publication.
 
 ### D5. Persisted-format support window
 
-Recommended: preserve fixtures for every format shipped on `pagestore` after the
-MVP format baseline; require explicit migration for supported older versions and
-fail closed otherwise.  Release branches can define a narrower cross-major
-policy separately.
+Decision: **accepted**, as the four rules below.  They separate what the page
+store owns (its envelopes and containers) from what PostgreSQL owns (the bytes
+inside them), because only the former can have a page-store support window.
 
-Decision: **open**.
+1. **PostgreSQL-native payloads are wrapped, never rewritten.**  Relation
+   pages (with their `pd_lsn`), the `ControlFileData` image, WAL segment
+   bytes, SLRU pages, and `pg_filenode.map` contents are stored as the bytes
+   PostgreSQL wrote and handed back to PostgreSQL code to load: pages to the
+   buffer manager through smgr, the control image through
+   `pagestore_control_restore`, WAL through the restore command, SLRUs and
+   relation maps by installing the files.  The page store does not interpret
+   a payload beyond the fields it needs to key and fence it (`pd_lsn`, the
+   checkpoint redo, the segment start).  A payload's version is therefore
+   PostgreSQL's (`PG_CONTROL_VERSION`, `CATALOG_VERSION_NO`,
+   `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, `PG_PAGE_LAYOUT_VERSION`), and
+   whether a payload can be loaded by a different PostgreSQL build is
+   PostgreSQL's question, not a page-store migration.  Envelopes record the
+   PostgreSQL version identity of their payload, loaders compare it with the
+   running build, and a mismatch fails closed naming the payload version
+   rather than the envelope.  The only page-store-defined payload is the
+   reader's running-transaction snapshot, which PostgreSQL has no stable
+   serialization for; it is versioned as an envelope.
+2. **Envelopes -- the daemon's record formats -- keep a fixture for every
+   version shipped on `pagestore` after the MVP baseline.**  A supported
+   older version is readable or has an explicit migration; anything newer,
+   unknown, checksum-corrupt, or illegally truncated fails closed with an
+   actionable error.  Every format change updates or adds a fixture, and the
+   compiled identities must match the committed fixture.  Release branches
+   may define a narrower cross-major window.
+3. **Containers are per provider and are registered separately from the
+   records they hold.**  A record format is provider-neutral and one fixture
+   proves it for every provider; a provider must not fork it.  Each provider
+   registers the identity of its own container format -- the POSIX store's
+   file naming and directory layout, the SPDK store's `spdk_super` (V1
+   legacy, V2 current) and its on-device segment extent layout -- so a
+   container change is caught by the identity check even where its fixture
+   cannot run in CI.  The SPDK container fixture itself follows the MVP:
+   it needs the device layout split from NVMe I/O behind a file-backed shim
+   before it can be captured and checked without hardware.
+4. **Backend-side artifacts follow rule 2 for their envelopes and rule 1
+   for their payloads.**  Reader and branch manifests, the branch bootstrap,
+   reader snapshot and catalog files, the reader's published snapshot
+   objects, and the materializer and writer control blocks are page-store
+   envelopes with a fixture and a support window of their own; the relation
+   maps, SLRU pages, and control image they carry are PostgreSQL payloads
+   whose version identity the envelope records and the loader checks.  A
+   fixture whose payload names a different PostgreSQL version reports
+   "payload needs PostgreSQL <version>" and is not treated as a broken
+   envelope.
 
 ### D6. MVP deployment boundary
 
@@ -1187,9 +1231,11 @@ The default sequence was:
 8. R6 bounded-space acceptance and final MVP status update -- soak and nightly lane done; the
    final status update follows the first scheduled nightly runs.
 
-What remains, in order: the backend-side H2 fixture slice with the D5
-decision, then the R4b concurrent-append oracle, then the final MVP status
-update once the nightly lane has a run history.
+What remains, in order: the backend-side H2 fixture slices under the D5
+decision (payload-version binding and provider container identities first,
+then the store-object families, then the PGDATA artifacts), then the R4b
+concurrent-append oracle, then the final MVP status update once the nightly
+lane has a run history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
@@ -1227,6 +1273,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-10 | Derived the operational page-history cutoff from the writing compute (the materializer's restart-redo pin, or the newest checkpoint note's redo), kept the exact-redo twin of every retained checkpoint image, gave the branch controller's base pin page history, and modeled the real materializer mask plus progress marker in the soak | Control-prune cases for marker and note cutoffs with refusal below the frontier and restart; lifecycle/reclaim/standalone suites; integration lane with pruning active in the golden and branch-boot flows; 2400/8000-round soaks |
 | 2026-09-11 | Rolled the merged #238-#248 stack (SLRU/reader retention, materializer horizon, the H1 page-prune/WAL-index/WAL-reclaim/timeline-delete/manifest/restart/forkmeta slices, the first H2 fixture slice, FKM3) onto `pagestore`; the stacked PRs had each merged into the PR below them, so their content had stopped on the top branch | PR #249, ancestry-only merge with the tree of the reviewed #248 head; pagestore CI green |
 | 2026-09-11 | Scheduled the nightly soak: GitHub runs schedules only from the default branch and `master` is reserved for the upstream mirror, so `pagestore` became the repository's default branch and the workflow gained a schedule guard (this repository or `PAGESTORE_NIGHTLY_ENABLED=1`; manual dispatch always); the interim copy on `master` (#250) is withdrawn | A 200-round dispatch resolved and checked out `pagestore` at the #249 merge, 1426 checks, 0 failures; after the default-branch change a 100-round dispatch ran from `pagestore` itself (run 34610482840, 978 checks, 0 failures) |
+| 2026-09-12 | Decided D5: PostgreSQL-native payloads are wrapped and never rewritten, with their PostgreSQL version identity recorded in the envelope and checked by the loader; daemon envelopes keep a fixture per shipped version with explicit migration or fail-closed; container formats are registered per provider (SPDK `spdk_super` and extent layout included, its fixture after the MVP); backend artifacts follow the same envelope/payload split | `MVP_COMPLETION_PLAN.md` D5; the H2 backend slices are sequenced against these rules |
 | 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
 | 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
