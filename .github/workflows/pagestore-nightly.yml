@@ -1,0 +1,191 @@
+# Nightly long-run bounded-space soak for contrib/pagestore.
+#
+# The pull-request lane runs the CI-sized soak (2400 rounds, one seed) on every
+# change.  This lane runs the long configuration the R6 gate asks for: several
+# seeds, 8000 rounds each, on a schedule and on demand, and keeps every JSON
+# report as an artifact so a bound drift can be compared across nights.  The
+# soak is freestanding C (daemon plus harness, libc only), so no PostgreSQL
+# build is needed.
+#
+# GitHub delivers `schedule` events, and exposes `workflow_dispatch`, only for
+# workflow files on the repository's default branch.  While `pagestore` is not
+# the default branch this lane runs only after the file reaches that branch;
+# until then the long configuration is run on demand from a default-branch
+# checkout of `pagestore`.
+name: pagestore nightly soak
+
+on:
+  schedule:
+    # 03:17 UTC daily; off the hour to avoid the shared-runner rush.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "workload rounds per seed"
+        required: false
+        default: "8000"
+      seeds:
+        description: "comma-separated PRNG seeds"
+        required: false
+        default: "20260909,7,4242"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: seed matrix
+    runs-on: ubuntu-latest
+    outputs:
+      seeds: ${{ steps.matrix.outputs.seeds }}
+      rounds: ${{ steps.matrix.outputs.rounds }}
+      timeout: ${{ steps.matrix.outputs.timeout }}
+      revision: ${{ steps.revision.outputs.sha }}
+    steps:
+      - id: revision
+        shell: bash
+        env:
+          # the branch this run's soak lives on, resolved the same way the
+          # matrix jobs used to resolve it
+          SOAK_REF: >-
+            ${{ github.ref_name == github.event.repository.default_branch
+                && 'pagestore' || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Every seed of a run is one experiment, so they must all test one
+          # commit.  A matrix job that resolved the branch name itself would
+          # pick up whatever `pagestore` pointed at when that job started --
+          # or when a failed job was rerun days later -- while the run's
+          # metadata still named the workflow's own SHA.  Resolve it once.
+          sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SOAK_REF}" --jq .sha)
+          case "$sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+              ;;
+            *)
+              echo "could not resolve ${SOAK_REF} to a commit: ${sha:-<empty>}" >&2
+              exit 1
+              ;;
+          esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "soaking ${SOAK_REF} at $sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - id: matrix
+        shell: bash
+        env:
+          INPUT_SEEDS: ${{ github.event.inputs.seeds }}
+          INPUT_ROUNDS: ${{ github.event.inputs.rounds }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os
+          # The soak parses rounds as a C int and the seed as a uint64; values
+          # outside those ranges would silently become a different experiment,
+          # and a repeated seed would upload the same artifact name twice.
+          seeds = [s.strip() for s in (os.environ.get("INPUT_SEEDS") or "20260909,7,4242").split(",") if s.strip()]
+          rounds = (os.environ.get("INPUT_ROUNDS") or "8000").strip()
+          if not seeds or not all(s.isdigit() for s in seeds) or not rounds.isdigit():
+              raise SystemExit(f"invalid seeds {seeds!r} or rounds {rounds!r}")
+          # A round is cheap (a few thousand per minute on a warm laptop), but
+          # a hosted runner is slower and the job is bounded, so the accepted
+          # range ends where the run can still write its report: the job gets
+          # the time its rounds need, capped below the six-hour hosted-runner
+          # limit, and a dispatch that would not fit is refused instead of
+          # being killed after producing nothing.
+          ROUNDS_PER_MINUTE = 1000
+          OVERHEAD_MINUTES = 15
+          MAX_TIMEOUT_MINUTES = 350
+          MIN_TIMEOUT_MINUTES = 30
+          max_rounds = (MAX_TIMEOUT_MINUTES - OVERHEAD_MINUTES) * ROUNDS_PER_MINUTE
+          # the soak samples its during-run footprint every 20 rounds, so
+          # fewer rounds would report a bound it never measured
+          if not 20 <= int(rounds) <= max_rounds:
+              raise SystemExit(
+                  f"rounds {rounds!r} is outside the range 20..{max_rounds} that fits "
+                  f"the {MAX_TIMEOUT_MINUTES}-minute job limit"
+              )
+          timeout = max(
+              MIN_TIMEOUT_MINUTES,
+              OVERHEAD_MINUTES + -(-int(rounds) // ROUNDS_PER_MINUTE),
+          )
+          for seed in seeds:
+              # the generator maps seed 0 onto seed 1, so 0 is not an experiment of its own
+              if not 1 <= int(seed) <= 18446744073709551615:
+                  raise SystemExit(f"seed {seed!r} is outside the harness range 1..18446744073709551615")
+          seeds = [str(int(s)) for s in seeds]
+          if len(set(seeds)) != len(seeds):
+              raise SystemExit(f"seeds {seeds!r} repeat a value; each seed uploads its own artifact")
+          if len(seeds) > 256:
+              raise SystemExit(f"{len(seeds)} seeds exceed the 256-job matrix limit; dispatch in batches")
+          print("seeds=" + json.dumps(seeds))
+          print("rounds=" + str(int(rounds)))
+          print("timeout=" + str(timeout))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  soak:
+    name: soak seed ${{ matrix.seed }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJSON(needs.plan.outputs.seeds) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The soak lives on `pagestore`, while GitHub offers schedules and
+          # workflow_dispatch only from the default branch, so a run started
+          # there checks the soak's own branch out explicitly -- as the commit
+          # the plan job resolved, so every seed tests the same revision no
+          # matter when its job starts or is rerun.
+          ref: ${{ needs.plan.outputs.revision }}
+
+      - name: Compile daemon and soak harness
+        working-directory: contrib/pagestore
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
+
+      - name: Run the long bounded-space soak
+        working-directory: contrib/pagestore
+        env:
+          PAGESTORE_SOAK_ROUNDS: ${{ needs.plan.outputs.rounds }}
+          PAGESTORE_SOAK_SEED: ${{ matrix.seed }}
+          PAGESTORE_SOAK_REPORT: soak-report-${{ matrix.seed }}.json
+        run: |
+          ./pagestore_soak_test ./pagestore_daemon
+          # the report is the run's product: a soak that could not write it
+          # has nothing to compare across nights
+          test -s "soak-report-${{ matrix.seed }}.json"
+
+      - name: Summarize the report
+        if: always()
+        working-directory: contrib/pagestore
+        shell: bash
+        run: |
+          f="soak-report-${{ matrix.seed }}.json"
+          [ -f "$f" ] || { echo "no report written" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          python3 - "$f" "${{ needs.plan.outputs.revision }}" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          res, mx, q = r["result"], r["physical_max"], r["physical_quiescent"]
+          print(f"### seed {r['seed']}: {r['rounds']} rounds, {res['checks']} checks, {res['failures']} failures")
+          print(f"- revision: {sys.argv[2]}")
+          print(f"- during bounds ok: {res['during_bounds_ok']}, quiescent bounds ok: {res['quiescent_bounds_ok']}")
+          print(f"- write amplification {r['write_amplification']}, files max {mx['files']}")
+          print("| category | max | quiescent | during bound | quiescent bound |")
+          print("|---|---|---|---|---|")
+          for k in ("page", "layers", "wal", "walidx", "forkmeta", "retention", "timelines", "other", "files"):
+              print(f"| {k} | {mx[k]} | {q[k]} | {r['bounds_during'][k]} | {r['bounds_quiescent'][k]} |")
+          PY
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # v4 artifacts are immutable, so a rerun of a job that already
+          # uploaded would fail on the duplicate name
+          name: pagestore-soak-report-${{ matrix.seed }}-attempt-${{ github.run_attempt }}
+          path: contrib/pagestore/soak-report-${{ matrix.seed }}.json
+          if-no-files-found: error
+          retention-days: 30
