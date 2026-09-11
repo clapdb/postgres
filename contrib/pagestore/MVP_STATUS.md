@@ -729,11 +729,13 @@ but is not complete.  What remains before the MVP is declared complete is:
    legacy SLRU seeding entrypoints and compare their output with
    independently recovered SLRUs, then add the backend-side
    persisted-format fixtures (the materializer and
-   writer control blocks and reader snapshot objects in the store; the reader
+   writer control blocks, the reader snapshot objects, and the raw
+   redo-note, SLRU watermark, and tombstone values in the store; the reader
    and branch manifests, branch bootstrap, reader snapshot/catalog files,
-   the branch controller's journal and authority files, the materializer
-   supervisor's configuration, status, and generation-authority file, and
-   the SLRU mirror continuity markers in PGDATA).
+   the reader-map intent marker, the branch controller's configuration,
+   journal, and authority files, the materializer supervisor's
+   configuration, status, and generation-authority file, and the SLRU
+   mirror continuity markers in PGDATA).
 3. Close the R4b concurrency clause: a concurrent-append oracle at the
    prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
    crash matrix already has at the source rewrite.

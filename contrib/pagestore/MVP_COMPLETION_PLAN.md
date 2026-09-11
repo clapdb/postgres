@@ -1246,10 +1246,17 @@ inside them), because only the former can have a page-store support window.
    check applies only to initialized pages; a new page carries no native
    identity and is bound by the control tuple alone.
    Loaders compare the tuple with the running build, and a mismatch fails
-   closed naming the payload identity rather than the envelope.  The only
-   page-store-defined payload is the
-   reader's running-transaction snapshot, which PostgreSQL has no stable
-   serialization for; it is versioned as an envelope.
+   closed naming the payload identity rather than the envelope.  Some
+   object payloads are page-store-defined rather than PostgreSQL's, and
+   those are versioned as envelopes: the reader's running-transaction
+   snapshot (PostgreSQL has no stable serialization for it) and, today
+   without any magic or version of their own, the raw values consumers
+   `memcpy` out of an object -- the checkpoint-redo `XLogRecPtr` in
+   control block 1 that the WAL retention floor derives from, the
+   `PS_KLASS_SLRU_WM` watermark and the `PS_KLASS_SLRU_TOMB` truncation
+   cutoff.  A layout change to one of those would be misread as a floor,
+   a watermark, or a cutoff, so H2's store-object slice classifies each,
+   gives it an identity, and keeps a fixture or migration for it.
 2. **Envelopes -- the daemon's record formats -- keep a fixture for every
    version shipped on `pagestore` after the MVP baseline.**  A supported
    older version is readable or has an explicit migration; anything newer,
@@ -1297,7 +1304,13 @@ inside them), because only the former can have a page-store support window.
    controller artifacts that recovery of an interrupted operation depends
    on -- the CRC-protected branch preparation journal
    (`pagestore_branch.prepare.json`), the branch retention-generation
-   authority file that fences owner-generation reuse, the materializer
+   authority file that fences owner-generation reuse, the branch
+   controller's configuration (loaded, schema-checked, and matched against
+   the journal's configuration identity before an interrupted operation
+   can be resumed), the reader-map intent marker
+   (`.pagestore-reader-map-pending`, whose exact name and raw `XLogRecPtr`
+   content restart recognizes to retry a relation-map installation that
+   crashed before the pin advanced), the materializer
    supervisor's configuration, status, and its own generation-authority
    file (`retention-owner-<id>.json`, read independently of the status and
    published before a new worker generation is registered), and the SLRU
@@ -1350,12 +1363,14 @@ newer, truncated, or corrupt metadata refuses the store instead of zeroing
 the segment counts) with durable, error-propagating superblock
 publication, control-tuple validation in the public and legacy SLRU
 seeding entrypoints, and the independent-recovery comparison for the SLRU
-appliers; then the store-object backend families; then the PGDATA
-artifacts -- the reader and branch manifests, branch bootstrap, reader
-snapshot and catalog files, the branch controller's journal and authority
-files, the materializer supervisor's configuration, status, and
-generation-authority file, and the SLRU mirror continuity markers with
-their migration semantics -- then the
+appliers; then the store-object backend families, the page-store-defined
+raw payloads (control block 1's redo note, the SLRU watermark and
+tombstone values) included; then the PGDATA artifacts -- the reader and
+branch manifests, branch bootstrap, reader snapshot and catalog files,
+the reader-map intent marker, the branch controller's configuration,
+journal, and authority files, the materializer supervisor's
+configuration, status, and generation-authority file, and the SLRU
+mirror continuity markers with their migration semantics -- then the
 R4b concurrent-append oracle, then the final MVP status update once the
 nightly lane has a run history.
 
