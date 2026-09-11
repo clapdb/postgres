@@ -1225,12 +1225,19 @@ inside them), because only the former can have a page-store support window.
    different `BLCKSZ`, `XLOG_BLCKSZ`, `RELSEG_SIZE`, `SLRU_PAGES_PER_SEGMENT`,
    `MAXALIGN`, `NAMEDATALEN`, `INDEX_MAX_KEYS`, `TOAST_MAX_CHUNK_SIZE`,
    `LOBLKSIZE`, or float format writes incompatible page, WAL, and SLRU
-   bytes under the same `PG_CONTROL_VERSION` and `CATALOG_VERSION_NO`.  The
-   tuple is therefore the version constants (`PG_CONTROL_VERSION`,
-   `CATALOG_VERSION_NO`, `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`,
-   `PG_PAGE_LAYOUT_VERSION`) together with the layout parameters
-   `ControlFileData` records and `pagestore_control_restore` already
-   compares one by one.  Envelopes record that tuple for their payload,
+   bytes under the same `PG_CONTROL_VERSION` and `CATALOG_VERSION_NO`, and
+   a cluster initialized with another `--wal-segsize` names a different
+   LSN range by the same segment file name.  The tuple is therefore the
+   version constants (`PG_CONTROL_VERSION`, `CATALOG_VERSION_NO`,
+   `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, `PG_PAGE_LAYOUT_VERSION`)
+   together with the layout parameters `ControlFileData` records --
+   those `pagestore_control_restore` already compares one by one, and
+   `xlog_seg_size`, which it only checks for legality today and which the
+   WAL restore path uses to turn a requested file name into an LSN range,
+   so the WAL segment envelope binds the control image's `xlog_seg_size`
+   and checks it against the `xlp_seg_size` of the long page header it
+   carries and against the requesting cluster, as `xlogreader` itself
+   rejects a mismatch.  Envelopes record that tuple for their payload,
    and a control-image reference covers only what `ControlFileData`
    contains: the control and catalog versions and the layout parameters.
    `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, and `PG_PAGE_LAYOUT_VERSION`
