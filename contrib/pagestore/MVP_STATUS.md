@@ -720,8 +720,10 @@ but is not complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
 2. Finish H2 under the decided D5 policy: bind the PostgreSQL payload
-   version into the envelopes and register the SPDK container identity,
-   then add the backend-side persisted-format fixtures (the materializer and
+   version into the envelopes, register the POSIX and SPDK container
+   identities, make an unknown or corrupt `spdk_super` fail the open instead
+   of zeroing the segment counts, then add the backend-side persisted-format
+   fixtures (the materializer and
    writer control blocks and reader snapshot objects in the store; the reader
    and branch manifests, branch bootstrap, and reader snapshot/catalog files
    in PGDATA).

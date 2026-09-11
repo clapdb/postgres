@@ -1021,11 +1021,12 @@ Expected scope: two or three focused PRs.
 
 ### H2. Add persisted-format fixtures and compatibility CI
 
-Status: **daemon-side POSIX formats covered under D5 rules 2 and 3,
+Status: **daemon-side POSIX record formats covered under D5 rule 2,
 including a legacy fixture exercised by the first format change;
 backend-side artifact fixtures (D5 rule 4), the PostgreSQL payload-version
-binding in envelopes (D5 rule 1), and the SPDK container identity (D5 rule
-3) remain**.
+binding in envelopes (D5 rule 1), and rule 3's container obligations --
+the POSIX and SPDK container identities, and a fail-closed SPDK superblock
+open -- remain**.
 
 The slice adds `pagestore_format.h` identities reported by every format-owning
 module, the `pagestore_format_versions` tool, the `fixture` workload of
@@ -1169,7 +1170,22 @@ inside them), because only the former can have a page-store support window.
    `pagestore_control_restore`, WAL through the restore command, SLRUs and
    relation maps by installing the files.  The page store does not interpret
    a payload beyond the fields it needs to key and fence it (`pd_lsn`, the
-   checkpoint redo, the segment start).  A payload's version is therefore
+   checkpoint redo, the segment start).  The rule binds the *persisted*
+   payload: what the store holds is byte-exact.  Where an install step must
+   derive a different PostgreSQL object from a stored one, that derivation
+   is an explicit, named transformation on PostgreSQL's own definitions and
+   never a second persisted format.  The one such step today is the
+   archive-bootstrap control install: after checking `pg_control_version`
+   and `catalog_version_no` against the running build,
+   `pagestore_control_restore --archive-bootstrap` copies the stored
+   `ControlFileData`, sets `minRecoveryPoint`/`minRecoveryPointTLI` to the
+   checkpoint redo and its timeline, clears the backup start/end fields,
+   recomputes the CRC with PostgreSQL's algorithm, and installs the result,
+   so a fresh skeleton enters archive recovery at the stored checkpoint
+   instead of trusting a foreign `initdb` state.  A fixture for that path
+   checks the stored image byte-exactly and the installed file against the
+   named transformation, not for byte equality with the image.  A payload's
+   version is therefore
    PostgreSQL's (`PG_CONTROL_VERSION`, `CATALOG_VERSION_NO`,
    `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, `PG_PAGE_LAYOUT_VERSION`), and
    whether a payload can be loaded by a different PostgreSQL build is
@@ -1193,9 +1209,19 @@ inside them), because only the former can have a page-store support window.
    file naming and directory layout, the SPDK store's `spdk_super` (V1
    legacy, V2 current) and its on-device segment extent layout -- so a
    container change is caught by the identity check even where its fixture
-   cannot run in CI.  The SPDK container fixture itself follows the MVP:
-   it needs the device layout split from NVMe I/O behind a file-backed shim
-   before it can be captured and checked without hardware.
+   cannot run in CI.  Registration is not the whole obligation: a container
+   whose metadata is unknown, newer, truncated, or corrupt must fail the
+   open, never degrade to a default that can overwrite existing data.  The
+   SPDK provider does not meet that today -- `super_read()` leaves every
+   per-shard segment count at zero when neither known `spdk_super` layout
+   matches and `spdk_open()` proceeds, so a later append would reuse
+   segment zero over live extents -- and closing that is part of the
+   remaining H2 work, ahead of the SPDK fixture.  Neither provider
+   registers its container identity yet: `ps_storage_posix_format_identities()`
+   reports only the WAL-index watermark record.  The SPDK container fixture
+   itself follows the MVP: it needs the device layout split from NVMe I/O
+   behind a file-backed shim before it can be captured and checked without
+   hardware.
 4. **Backend-side artifacts follow rule 2 for their envelopes and rule 1
    for their payloads.**  Reader and branch manifests, the branch bootstrap,
    reader snapshot and catalog files, the reader's published snapshot
@@ -1231,11 +1257,13 @@ The default sequence was:
 8. R6 bounded-space acceptance and final MVP status update -- soak and nightly lane done; the
    final status update follows the first scheduled nightly runs.
 
-What remains, in order: the backend-side H2 fixture slices under the D5
-decision (payload-version binding and provider container identities first,
-then the store-object families, then the PGDATA artifacts), then the R4b
-concurrent-append oracle, then the final MVP status update once the nightly
-lane has a run history.
+What remains, in order: the H2 slices under the D5 decision -- first the
+PostgreSQL payload-version binding in envelopes, the POSIX and SPDK
+container identities, and a fail-closed `spdk_super` open (unknown, newer,
+truncated, or corrupt metadata refuses the store instead of zeroing the
+segment counts); then the store-object backend families; then the PGDATA
+artifacts -- then the R4b concurrent-append oracle, then the final MVP
+status update once the nightly lane has a run history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
