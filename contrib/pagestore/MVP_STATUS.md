@@ -726,11 +726,12 @@ but is not complete.  What remains before the MVP is declared complete is:
    SPDK container identities, make an unknown or corrupt `spdk_super` fail
    the open instead of zeroing the segment counts and publish it durably
    with errors propagated, validate the control tuple in the public and
-   legacy SLRU seeding entrypoints, then add the backend-side
+   legacy SLRU seeding entrypoints and compare their output with
+   independently recovered SLRUs, then add the backend-side
    persisted-format fixtures (the materializer and
    writer control blocks and reader snapshot objects in the store; the reader
-   and branch manifests, branch bootstrap, and reader snapshot/catalog files
-   in PGDATA).
+   and branch manifests, branch bootstrap, reader snapshot/catalog files,
+   and the branch controller's journal and authority files in PGDATA).
 3. Close the R4b concurrency clause: a concurrent-append oracle at the
    prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
    crash matrix already has at the source rewrite.

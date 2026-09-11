@@ -1197,10 +1197,20 @@ inside them), because only the former can have a page-store support window.
      `clog_redo`, `CommitTsRedo`, and `multixact_redo` rather than calling
      them.  That mirror is page-store-owned transformation logic: it is
      versioned with the envelope, bound to the PostgreSQL version whose
-     redo it mirrors, and proven equivalent to actual recovery by the
-     golden scenario's recovery-produced SLRU base, not by a fixture that
-     would only compare the mirror with itself.  Refactoring the appliers
-     onto PostgreSQL's redo routines would retire that obligation.  The
+     redo it mirrors, and it must be proven equivalent to actual recovery
+     by an independent result, not by a fixture that would only compare
+     the mirror with itself.  That proof does not exist yet: the golden
+     scenario takes its seed base `C` from the materializer's recovery,
+     but it installs the seeded SLRUs before the branch starts, so
+     recovery never reconstructs `(C, R]` on its own for comparison, and
+     afterwards it checks a single `pg_xact` status and no commit-ts or
+     multixact content.  H2 therefore requires a comparison of the seeded
+     `pg_xact`, `pg_commit_ts`, and `pg_multixact` segments over the fork
+     horizon against the same segments produced by normal recovery of the
+     same WAL through `R` (the materializer's own files at that
+     restartpoint are such a result) before this obligation is treated as
+     covered.  Refactoring the appliers onto PostgreSQL's redo routines
+     would retire the obligation.  The
      transformation is version checked only where its inputs are resolved
      from a control image: the serialized branch controller path does so;
      the public `pagestore_seed_branch_slrus()` and legacy
@@ -1229,7 +1239,12 @@ inside them), because only the former can have a page-store support window.
    payloads to PostgreSQL binds or checks that native identity as well
    (the WAL segment envelope against the first page header it carries, the
    relation-map envelope against the map's own magic, the page path
-   against the page header) rather than relying on the control image.
+   against the page header) rather than relying on the control image.  A
+   relation block that is still uninitialized is legitimately all zero
+   (`PageIsNew()`: `pd_upper == 0`, `pd_pagesize_version == 0`), and the
+   zero-extension path serves unwritten blocks that way, so the page-header
+   check applies only to initialized pages; a new page carries no native
+   identity and is bound by the control tuple alone.
    Loaders compare the tuple with the running build, and a mismatch fails
    closed naming the payload identity rather than the envelope.  The only
    page-store-defined payload is the
@@ -1242,14 +1257,20 @@ inside them), because only the former can have a page-store support window.
    actionable error.  Every format change updates or adds a fixture, and the
    compiled identities must match the committed fixture.  Release branches
    may define a narrower cross-major window.
-3. **Containers are per provider and are registered separately from the
-   records they hold.**  A record format is provider-neutral and one fixture
-   proves it for every provider; a provider must not fork it.  Each provider
-   registers the identity of its own container format -- the POSIX store's
-   file naming and directory layout, the SPDK store's `spdk_super` (V1
-   legacy, V2 current) and its on-device segment extent layout -- so a
-   container change is caught by the identity check even where its fixture
-   cannot run in CI.  Registration is not the whole obligation.  A
+3. **Containers are per provider, are registered separately from the
+   records they hold, and carry the same support window as records.**  A
+   record format is provider-neutral and one fixture proves it for every
+   provider; a provider must not fork it.  Each provider registers the
+   identity of its own container format -- the POSIX store's file naming
+   and directory layout, the SPDK store's `spdk_super` (V1 legacy, V2
+   current) and its on-device segment extent layout -- so a container
+   change is caught by the identity check even where its fixture cannot
+   run in CI, and rule 2 applies to it: a container shipped after the MVP
+   baseline stays openable by a later release or migrates explicitly (as
+   the V1 superblock already does), a change that would strand an earlier
+   post-baseline store is not a compatible change, and the POSIX fixture
+   keeps the earlier layout as a legacy fixture rather than being
+   recaptured over it.  Registration is not the whole obligation.  A
    container whose metadata is unknown, newer, truncated, or corrupt must
    fail the open, never degrade to a default that can overwrite existing
    data; and the metadata a container depends on to place new data must be
@@ -1272,8 +1293,17 @@ inside them), because only the former can have a page-store support window.
 4. **Backend-side artifacts follow rule 2 for their envelopes and rule 1
    for their payloads.**  Reader and branch manifests, the branch bootstrap,
    reader snapshot and catalog files, the reader's published snapshot
-   objects, and the materializer and writer control blocks are page-store
-   envelopes with a fixture and a support window of their own; the relation
+   objects, the materializer and writer control blocks, and the durable
+   controller artifacts that recovery of an interrupted operation depends
+   on -- the CRC-protected branch preparation journal
+   (`pagestore_branch.prepare.json`), the branch retention-generation
+   authority file that fences owner-generation reuse, and the materializer
+   supervisor's configuration and status -- are page-store envelopes with
+   a fixture and a support window of their own (their readers enforce
+   exact schemas, so a schema change without a retained fixture and
+   migration could leave a controller unable to resume or clean up, with
+   the writer restricted, the materializer paused, or a pin stranded); the
+   relation
    maps, SLRU pages, and control image they carry are PostgreSQL payloads
    whose version identity the envelope records and the loader checks.  A
    fixture whose payload names a different PostgreSQL version reports
@@ -1310,10 +1340,12 @@ the native header identities the control image does not carry), the POSIX
 and SPDK container identities, a fail-closed `spdk_super` open (unknown,
 newer, truncated, or corrupt metadata refuses the store instead of zeroing
 the segment counts) with durable, error-propagating superblock
-publication, and control-tuple validation in the public and legacy SLRU
-seeding entrypoints; then the store-object backend families; then the
-PGDATA artifacts -- then the R4b concurrent-append oracle, then the final
-MVP status update once the nightly lane has a run history.
+publication, control-tuple validation in the public and legacy SLRU
+seeding entrypoints, and the independent-recovery comparison for the SLRU
+appliers; then the store-object backend families; then the PGDATA
+artifacts, the controller journal and authority files included -- then
+the R4b concurrent-append oracle, then the final MVP status update once
+the nightly lane has a run history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
