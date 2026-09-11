@@ -10,7 +10,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "pagestore_fault.h"
 #include "pagestore_wal_store.h"
+#include "pagestore_format.h"
 
 static int segment_name(const PsWalStore *store, uint64_t segment_no,
 						char *name, size_t name_len);
@@ -1083,6 +1085,11 @@ unlink_residual_prefix(PsWalStore *store, uint64_t target_lsn,
 				goto cleanup;
 			store->residual_prefix_start_lsn += store->segment_size;
 			(*unlink_count)++;
+			/* The probe fires after every authorized unlink, including the
+			 * ones a retry discovers: a store reopened behind a published
+			 * frontier reclaims only through this path. */
+			if (ps_fault_probe(PS_FAULT_POINT_WAL_RECLAIM_AFTER_UNLINK) != 0)
+				goto cleanup;
 		}
 	}
 	else
@@ -1863,7 +1870,8 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 	 * before the first unlink.  The next process can retry idempotently. */
 	if (getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK") != NULL)
 		_exit(91);
-	if (getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK") != NULL)
+	if (getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK") != NULL ||
+		ps_fault_probe(PS_FAULT_POINT_WAL_RECLAIM_BEFORE_UNLINK) != 0)
 		goto done_reclaim;
 
 	segment_no = store->start_lsn / store->segment_size;
@@ -1889,11 +1897,16 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 				"PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO",
 				segment_no))
 			_exit(92);
+		if (ps_fault_probe(PS_FAULT_POINT_WAL_RECLAIM_AFTER_UNLINK) != 0)
+			goto done_reclaim;
 		segment_no++;
 	}
 	if (store->start_lsn != target_lsn)
 		goto done_reclaim;
 	if (unlink_residual_prefix(store, target_lsn, &unlink_count) != 0)
+		goto done_reclaim;
+	if (store->residual_prefix_pending &&
+		ps_fault_probe(PS_FAULT_POINT_WAL_RECLAIM_BEFORE_DIR_FSYNC) != 0)
 		goto done_reclaim;
 	if (store->residual_prefix_pending &&
 		(getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_DIR_FSYNC") != NULL ||
@@ -1940,4 +1953,16 @@ ps_wal_store_close(PsWalStore *store)
 	}
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
+}
+
+size_t
+ps_wal_store_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"wal_store", "wal_store_identity_v1", PS_WAL_STORE_METADATA_MAGIC,
+		 PS_WAL_STORE_METADATA_VERSION},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
 }

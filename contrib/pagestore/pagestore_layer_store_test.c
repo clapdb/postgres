@@ -331,11 +331,13 @@ main(void)
 			snprintf(legacy.layers[0].locations[0].uri,
 					 sizeof(legacy.layers[0].locations[0].uri), "%s/./%s", alias_dir,
 					 basename);
+			/* A parent that no longer exists is how a relocated store (moved,
+			 * restored, or reopened from a fixture) looks; the location is
+			 * rebased onto the store's own leaf rather than rejected. */
 			check(unlink(alias_dir) == 0 &&
-				  ps_layer_store->validate_local_layers(&legacy) != 0 &&
-				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
-				  access(validation_orphan, F_OK) == 0,
-				  "reject a disappeared alias before orphan recovery");
+				  ps_layer_store->validate_local_layers(&legacy) == 0 &&
+				  strcmp(legacy.layers[0].locations[0].uri, local_uri) == 0,
+				  "rebase a disappeared parent onto the store's own leaf");
 
 			snprintf(legacy.layers[0].locations[0].uri,
 					 sizeof(legacy.layers[0].locations[0].uri), "%s", local_uri);

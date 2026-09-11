@@ -20,6 +20,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -273,6 +274,7 @@ ACTION_FIELDS = {
     "set_fault": {"op", "id", "target", "fault", "action", "hit", "timeout", "extra"},
     "release_fault": {"op", "id", "target", "fault", "extra"},
     "layer_seed": {"op", "id", "target", "extra"},
+    "gc_seed": {"op", "id", "target", "workload", "extra"},
     "capture": {"op", "id", "target", "kind", "name", "horizon", "extra"},
     "compare": {"op", "id", "left", "right", "extra"},
     "expect_failure": {"op", "id", "target", "command", "sqlstate", "extra"},
@@ -300,6 +302,7 @@ REQUIRED_FIELDS = {
     "set_fault": {"target", "fault", "action"},
     "release_fault": {"target", "fault"},
     "layer_seed": {"target"},
+    "gc_seed": {"target", "workload"},
     "capture": {"target", "kind", "name", "horizon"},
     "compare": {"left", "right"},
     "expect_failure": {"target", "command"},
@@ -647,13 +650,14 @@ PG_CONTROL_FILE_SIZE = 8192
 
 RUNTIME_OPERATIONS = {
     "daemon_smoke": {"crash"},
-    "daemon_fault_smoke": {"crash", "set_fault", "release_fault", "layer_seed"},
+    "daemon_fault_smoke": {"crash", "set_fault", "release_fault", "layer_seed", "gc_seed"},
     "writer_smoke": {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
-        "install_reader", "assert", "capture",
+        "install_reader", "assert", "capture", "restart",
     },
     "materializer_smoke": {
-        "sql", "checkpoint", "materializer_fault", "inspect_relation", "crash", "assert",
+        "sql", "checkpoint", "materializer_fault", "inspect_relation", "crash",
+        "assert", "restart",
     },
 }
 
@@ -669,6 +673,9 @@ RUNTIME_CONSTRAINTS = {
         "set_fault": {},
         "release_fault": {"target": ["store"]},
         "layer_seed": {"target": ["store"]},
+        "gc_seed": {"target": ["store"], "workload": ["page_prune", "wal_index", "wal_reclaim",
+                                                      "timeline_delete", "timeline_delete_abort",
+                                                      "manifest_compact", "forkmeta"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -678,6 +685,7 @@ RUNTIME_CONSTRAINTS = {
         "install_reader": {"forbidden_values": {"target": ["writer"]}},
         "assert": {"oracle": ["sql_scalar"]},
         "capture": {"target": ["writer"], "kind": ["reader_datadir"]},
+        "restart": {},
     },
     "materializer_smoke": {
         "sql": {
@@ -694,6 +702,7 @@ RUNTIME_CONSTRAINTS = {
         },
         "materializer_fault": {"target": ["materializer"], "action": ["pause"]},
         "inspect_relation": {"target": ["materializer"]},
+        "restart": {"target": ["store", "writer", "materializer"]},
     },
 }
 
@@ -803,7 +812,7 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         writer_mutated_since_checkpoint = True
         bootstrapped = False
         for action in plan.actions:
-            if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
+            if action["op"] in ("sql", "assert", "restart") and action["target"] not in available_clients:
                 raise PlanError(
                     f"runtime {runtime!r} operation {action['op']!r} target "
                     f"{action['target']!r} is not an available compute"
@@ -921,7 +930,11 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             elif action["op"] == "bootstrap":
                 bootstrapped = True
                 writer_mutated_since_checkpoint = True
-            elif action["op"] in ("sql", "assert") and action["target"] == "writer":
+            elif action["op"] in ("sql", "assert", "restart") and \
+                    action["target"] == "writer":
+                # a restart runs recovery and writes its own checkpoint, so the
+                # declared checkpoint no longer describes the writer's data
+                # directory any more than a statement against it would
                 writer_mutated_since_checkpoint = True
     elif runtime == "materializer_smoke":
         required = {"writer", "materializer"}
@@ -967,10 +980,13 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 f"runtime {runtime!r} uses materializer_fault for named process faults"
             )
     elif runtime == "daemon_fault_smoke":
-        seed_actions = [action for action in plan.actions if action["op"] == "layer_seed"]
+        seed_actions = [
+            action for action in plan.actions
+            if action["op"] in ("layer_seed", "gc_seed")
+        ]
         if len(seed_actions) > 1:
             raise PlanError(
-                f"runtime {runtime!r} permits at most one layer_seed action"
+                f"runtime {runtime!r} permits at most one layer_seed or gc_seed action"
             )
         named = [
             action for action in plan.actions
@@ -985,15 +1001,55 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             )
         if seed_actions and plan.actions.index(seed_actions[0]) > plan.actions.index(named[0]):
             raise PlanError(
-                "runtime daemon_fault_smoke requires layer_seed before the named fault"
+                f"runtime daemon_fault_smoke requires {seed_actions[0]['op']} before the named fault"
             )
         fault = named[0]
-        if seed_actions and fault["fault"] not in {
+        # The seeds are the only workloads this runtime runs, so a fault that
+        # only their state can reach needs the seed that creates it: without
+        # one the plan is accepted and then deterministically expires as
+        # FaultNotReached against an empty store.
+        layer_faults = {
             "image_layer.after_create", "image_layer.after_write",
             "image_layer.after_seal", "image_layer.after_manifest_add",
-        }:
+        }
+        gc_workload = next(
+            (name for name, faults in GC_WORKLOAD_FAULTS.items()
+             if fault["fault"] in faults),
+            None,
+        )
+        if seed_actions and seed_actions[0]["op"] == "layer_seed" and \
+                fault["fault"] not in layer_faults:
             raise PlanError(
                 "runtime daemon_fault_smoke layer_seed requires an H1 image-layer fault"
+            )
+        if seed_actions and seed_actions[0]["op"] == "gc_seed":
+            if fault["fault"] not in (
+                GC_WORKLOAD_FAULTS.get(seed_actions[0].get("workload"), set())
+            ):
+                raise PlanError(
+                    "runtime daemon_fault_smoke gc_seed requires an H1 fault matching "
+                    "its workload"
+                )
+            reachable = GC_FAULT_MAX_HITS.get(fault["fault"], GC_FAULT_DEFAULT_MAX_HIT)
+            if fault.get("hit", 1) > reachable:
+                raise PlanError(
+                    f"runtime daemon_fault_smoke gc_seed fault {fault['fault']!r} is "
+                    f"reachable {reachable} time(s) in workload "
+                    f"{seed_actions[0].get('workload')!r}, plan asks for hit "
+                    f"{fault.get('hit')}"
+                )
+        if fault["fault"] in layer_faults and not (
+                seed_actions and seed_actions[0]["op"] == "layer_seed"):
+            raise PlanError(
+                f"runtime daemon_fault_smoke fault {fault['fault']!r} requires a "
+                "layer_seed"
+            )
+        if gc_workload is not None and not (
+                seed_actions and seed_actions[0]["op"] == "gc_seed" and
+                seed_actions[0].get("workload") == gc_workload):
+            raise PlanError(
+                f"runtime daemon_fault_smoke fault {fault['fault']!r} requires a "
+                f"gc_seed with workload {gc_workload!r}"
             )
         releases = [
             action for action in plan.actions
@@ -2222,6 +2278,1850 @@ def _capture_fault_diagnostics(
     return root / "fault-diagnostics.json"
 
 
+# The page-pruning H1 slice: history below a configured cutoff is compacted;
+# the three boundaries are the replacement layer publication, the retired
+# sources' durable mark-delete, and the durable page-prune frontier advance.
+# Each gc_seed workload names the H1 faults it can reach, the daemon flags
+# that make the publication observable at the workload's scale, and the
+# retained page-history horizon recovery must republish (None when the
+# workload pins no page history).
+# the deleted branch and its live sibling both fork from the root here, so the
+# sibling keeps the root's history capped at this LSN after the target is gone
+DELETE_FORK_LSN = 1024 * 1024
+GC_WORKLOADS: dict[str, dict[str, Any]] = {
+    "page_prune": {
+        "faults": {
+            "page_compaction.after_publish",
+            "page_gc.after_mark_delete",
+            "page_prune.after_frontier",
+        },
+        "daemon_args": [
+            "--segment-size", "65536", "--flush-pages", "8", "--segment-gc", "0",
+            "--wal-high-water-bytes", "1048576", "--wal-catch-up-bytes", "1",
+        ],
+        "retained_horizon": 3500,
+    },
+    "wal_index": {
+        "faults": {"wal_index.after_frontier"},
+        # one metadata-complete interval must make the timeline a snapshot
+        # candidate; the geometric default trigger needs a mebibyte of index
+        "daemon_args": ["--walidx-snapshot-bytes", "1"],
+        "retained_horizon": None,
+    },
+    "wal_reclaim": {
+        "faults": {
+            "wal_reclaim.before_unlink",
+            "wal_reclaim.after_unlink",
+            "wal_reclaim.before_dir_fsync",
+        },
+        # the sealed prefix is three segments, below the high water so the
+        # workload's own appends are never throttled behind the reclaim
+        "daemon_args": ["--wal-high-water-bytes", "8388608",
+                        "--wal-catch-up-bytes", "1"],
+        "retained_horizon": None,
+    },
+    "timeline_delete": {
+        "faults": {
+            "timeline_delete.after_deleting",
+            "timeline_delete.after_wal_cleanup",
+            "timeline_delete.after_segment_rewrite",
+            "timeline_delete.after_deleted",
+        },
+        # small segments and an eager flush give the branch an owner layer
+        # and several shared segments for the deletion to filter
+        "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
+                        "--segment-gc", "0"],
+        "retained_horizon": DELETE_FORK_LSN,
+    },
+    # the same seed, crashed on the old-state side of the first transition:
+    # the request is lost and the branch must survive intact
+    "timeline_delete_abort": {
+        "faults": {"timeline_delete.before_deleting"},
+        "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
+                        "--segment-gc", "0"],
+        "retained_horizon": DELETE_FORK_LSN,
+    },
+    "manifest_compact": {
+        "faults": {
+            "manifest_compact.after_tmp_sync",
+            "manifest_compact.after_rename",
+        },
+        # eager flushes and a low layer-compaction threshold grow the manifest
+        # log past its rewrite trigger; maintenance stays paused (the
+        # {pause} file) until the workload has written every page
+        "daemon_args": ["--segment-size", "65536", "--flush-pages", "8",
+                        "--compact-layers", "2", "--segment-gc", "0",
+                        "--test-maintenance-pause-file", "{pause}"],
+        "retained_horizon": None,
+        "pause_maintenance": True,
+    },
+    "forkmeta": {
+        "faults": {
+            "forkmeta.after_prepare",
+            "forkmeta.after_manifest_commit",
+            "forkmeta.after_source_rewrite",
+            "forkmeta.after_snapshot_gc",
+        },
+        # the page_prune history proves the cutoff through its frontier; the
+        # operational snapshot trigger is lowered to its floor so the seeded
+        # fork-size events are enough to publish a generation
+        "daemon_args": [
+            "--segment-size", "65536", "--flush-pages", "8", "--segment-gc", "0",
+            "--wal-high-water-bytes", "1048576", "--wal-catch-up-bytes", "1",
+        ],
+        "daemon_env": {"PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES": "1024"},
+        "retained_horizon": 3500,
+    },
+}
+# The supervisor's own pg_ctl stop and start are each bounded by its command
+# timeout (never below 60s), and a stop request cannot interrupt one.
+SUPERVISOR_COMMAND_TIMEOUT = 60
+SUPERVISOR_STOP_TIMEOUT = 2 * SUPERVISOR_COMMAND_TIMEOUT + 15
+FORKMETA_SNAPSHOTS = Path("forkmeta_snapshots")
+FORKMETA_MANIFEST = FORKMETA_SNAPSHOTS / "forkmeta_manifest_v1"
+FORKMETA_PREPARED = FORKMETA_SNAPSHOTS / "forkmeta_prepared_v1"
+FORKMETA_V2_MAGIC = 0x324D4B46
+FORKMETA_V3_MAGIC = 0x334D4B46
+FORKMETA_SNAPSHOT_BASE_KIND = 10
+DELETE_BRANCH = 1
+MANIFEST_TMP = "layers.manifest.tmp"
+WAL_RECLAIM_SEGMENTS = 3
+WAL_RECLAIM_SEGMENT_BYTES = 1024 * 1024
+WAL_RECLAIM_TOTAL = WAL_RECLAIM_SEGMENTS * WAL_RECLAIM_SEGMENT_BYTES
+WAL_STORE_METADATA_MAGIC = 0x4D535732        # "MSW2"
+WAL_STORE_METADATA_VERSION = 2
+WAL_STORE_METADATA_BYTES = 64
+WAL_RECLAIM_SEGMENT_DIR = Path("wal_segments_0")
+WAL_RECLAIM_SEGMENT_PREFIX = "walv1_1_"
+WAL_RECLAIM_IDENTITY = WAL_RECLAIM_SEGMENT_DIR / "wal_store_identity_v1"
+GC_WORKLOAD_FAULTS = {name: spec["faults"] for name, spec in GC_WORKLOADS.items()}
+# Each gc_seed workload installs its condition once, so its faults are
+# reachable exactly once per run; a plan asking for a later hit would wait
+# for work the seed never creates again and expire as FaultNotReached.
+GC_FAULT_MAX_HITS: dict[str, int] = {
+    # the reclaim workload unlinks three sealed segments, and the snapshot
+    # oracle reads hit N as the Nth unlink
+    "wal_reclaim.after_unlink": 3,
+}
+GC_FAULT_DEFAULT_MAX_HIT = 1
+GC_STAGES = {
+    "page_compaction.after_publish": "publish",
+    "page_gc.after_mark_delete": "mark_delete",
+    "page_prune.after_frontier": "frontier",
+    "wal_index.after_frontier": "walidx_frontier",
+    "wal_reclaim.before_unlink": "reclaim_before_unlink",
+    "wal_reclaim.after_unlink": "reclaim_after_unlink",
+    "wal_reclaim.before_dir_fsync": "reclaim_before_dir_fsync",
+    "timeline_delete.after_deleting": "delete_deleting",
+    "timeline_delete.after_wal_cleanup": "delete_wal_cleanup",
+    "timeline_delete.after_segment_rewrite": "delete_segment_rewrite",
+    "timeline_delete.after_deleted": "delete_deleted",
+    "timeline_delete.before_deleting": "delete_before_deleting",
+    "manifest_compact.after_tmp_sync": "manifest_tmp_sync",
+    "manifest_compact.after_rename": "manifest_rename",
+    "forkmeta.after_prepare": "forkmeta_prepare",
+    "forkmeta.after_manifest_commit": "forkmeta_manifest_commit",
+    "forkmeta.after_source_rewrite": "forkmeta_source_rewrite",
+    "forkmeta.after_snapshot_gc": "forkmeta_snapshot_gc",
+}
+WALIDX_SNAPSHOT_MAGIC = 0x4D534957          # "WISM"
+WALIDX_SNAPSHOT_VERSION = 1
+WALIDX_SNAPSHOT_HEADER_BYTES = 64
+WALIDX_SNAPSHOT_ENTRY_BYTES = 16
+WALIDX_PREPARED = Path("walidx_snapshots_0") / "walidx_prepared_v1"
+WALIDX_MANIFEST = Path("walidx_snapshots_0") / "walidx_manifest_v1"
+
+
+def _gc_fault_stage(fault_name: str) -> str | None:
+    return GC_STAGES.get(fault_name)
+
+
+MANIFEST_MAGIC = 0x504D414E
+MANIFEST_VERSION = 3
+MANIFEST_ADD_LAYER = 1
+MANIFEST_MARK_DELETE = 4
+PAGE_FRONTIER_MAGIC = 0x46504750
+PAGE_FRONTIER_VERSION = 3
+PAGE_FRONTIER_TIMELINES = 1024
+PAGE_FRONTIER_SLOTS = 2
+PAGE_FRONTIER_ENTRY_BYTES = 24        # incarnation, fence LSN, fence admission sequence
+
+
+def _fnv1a32(data: bytes) -> int:
+    crc = 2166136261
+    for byte in data:
+        crc ^= byte
+        crc = (crc * 16777619) & 0xFFFFFFFF
+    return crc
+
+
+def _page_frontier_fences(store: Path, timeline: int) -> list[tuple[int, int, int]]:
+    """(incarnation, fence LSN, fence admission sequence) of every slot the
+    durable page-prune frontier file holds for the timeline, after checking
+    the file's magic, version, and checksum.  Empty when the file is absent
+    or invalid."""
+    path = store / "page-prune.frontiers"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    body = 8 + PAGE_FRONTIER_TIMELINES * PAGE_FRONTIER_SLOTS * PAGE_FRONTIER_ENTRY_BYTES
+    if len(data) < body + 4:
+        return []
+    magic, version = struct.unpack_from("=II", data, 0)
+    crc = struct.unpack_from("=I", data, body)[0]
+    if magic != PAGE_FRONTIER_MAGIC or version != PAGE_FRONTIER_VERSION or \
+            _fnv1a32(data[:body]) != crc:
+        return []
+    fences = []
+    for slot in range(PAGE_FRONTIER_SLOTS):
+        offset = 8 + (timeline * PAGE_FRONTIER_SLOTS + slot) * PAGE_FRONTIER_ENTRY_BYTES
+        fences.append(struct.unpack_from("=QQQ", data, offset))
+    return fences
+MANIFEST_REMOVE_LAYER = 5
+
+
+def _wal_segment_files(store: Path) -> list[str]:
+    directory = store / WAL_RECLAIM_SEGMENT_DIR
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.name.startswith(WAL_RECLAIM_SEGMENT_PREFIX)
+    )
+
+
+def _wal_store_metadata(store: Path) -> dict[str, Any] | None:
+    """The shipped-WAL store's durable metadata: which prefix the directory
+    starts at, the base it retains, and how far it has been written.  None
+    when the record is missing or does not validate."""
+    try:
+        data = (store / WAL_RECLAIM_IDENTITY).read_bytes()
+    except OSError:
+        return None
+    if len(data) != WAL_STORE_METADATA_BYTES:
+        return None
+    # the daemon writes this record little-endian, not in host order
+    magic, version, record_bytes, reserved = struct.unpack_from("<IIII", data, 0)
+    timeline, segment_size = struct.unpack_from("<II", data, 16)
+    directory_start, retained_base, end = struct.unpack_from("<QQQ", data, 24)
+    crc = struct.unpack_from("<I", data, 48)[0]
+    if magic != WAL_STORE_METADATA_MAGIC or \
+            version != WAL_STORE_METADATA_VERSION or \
+            record_bytes != WAL_STORE_METADATA_BYTES or reserved != 0 or \
+            _fnv1a32(data[:48] + b"\x00" * 4 + data[52:]) != crc:
+        return None
+    return {
+        "timeline": timeline, "segment_size": segment_size,
+        "directory_start_lsn": directory_start,
+        "retained_base_lsn": retained_base, "end_lsn": end,
+    }
+
+def _manifest_layers(records: list[tuple[int, bytes]]) -> dict[int, dict[str, Any]]:
+    """Replay ADD/MARK_DELETE/REMOVE records to the layers the manifest still
+    names, keyed by layer id, with their owning timeline."""
+    layers: dict[int, dict[str, Any]] = {}
+    for kind, payload in records:
+        if kind == MANIFEST_ADD_LAYER and len(payload) >= 16:
+            layer_id, _layer_kind, timeline = struct.unpack_from("=QII", payload, 0)
+            layers[layer_id] = {"timeline": timeline, "deleting": False}
+        elif kind in (MANIFEST_MARK_DELETE, MANIFEST_REMOVE_LAYER) and len(payload) >= 8:
+            layer_id = struct.unpack_from("=Q", payload, 0)[0]
+            if kind == MANIFEST_REMOVE_LAYER:
+                layers.pop(layer_id, None)
+            elif layer_id in layers:
+                layers[layer_id]["deleting"] = True
+    return layers
+
+
+SEG_HEADER_BYTES = {
+    0x53454732: 48, 0x53454730: 48, 0x53454731: 48, 0x53454733: 48,   # SEG2/0/1/3
+    0x53454734: 56, 0x53454735: 56, 0x53454736: 56,                   # SEG4/5 bound, SEG6 admission
+    0x53454737: 64, 0x53454738: 64,                                   # SEG7/8 bound + admission
+}
+TIMELINE_META_MAGIC = 0x324D4C54
+TIMELINE_EVENT_STATE = 2
+FORKMETA_PAYLOAD_MAGIC = 0x31534D46
+
+
+def _segment_record_timelines(path: Path) -> list[int]:
+    """The owning timeline of every complete page record in one segment
+    file, decoded in host byte order; the scan stops at the first byte
+    pattern that is not a record magic (the unused tail)."""
+    data = path.read_bytes()
+    timelines: list[int] = []
+    offset = 0
+    while offset + 48 <= len(data):
+        magic, timeline = struct.unpack_from("=II", data, offset)
+        header = SEG_HEADER_BYTES.get(magic)
+        if header is None:
+            break
+        length = struct.unpack_from("=I", data, offset + 40)[0]
+        if offset + header + length > len(data):
+            break
+        timelines.append(timeline)
+        offset += header + length
+    return timelines
+
+
+def _timeline_events(store: Path) -> list[dict[str, int]]:
+    """Every lifecycle record of the timelines log (create records carry no
+    state), decoded in host byte order."""
+    try:
+        data = (store / "timelines").read_bytes()
+    except OSError:
+        return []
+    events: list[dict[str, int]] = []
+    offset = 0
+    while offset + 8 <= len(data):
+        magic, rec_len = struct.unpack_from("=II", data, offset)
+        if magic != TIMELINE_META_MAGIC or rec_len < 8 or offset + rec_len > len(data):
+            break
+        if rec_len == 56:
+            kind, ident, _parent, state = struct.unpack_from("=IIiI", data, offset + 8)
+            incarnation = struct.unpack_from("=Q", data, offset + 32)[0]
+            events.append({"kind": kind, "id": ident, "state": state, "incarnation": incarnation})
+        elif rec_len == 32:
+            events.append({"kind": 0, "id": struct.unpack_from("=I", data, offset + 8)[0],
+                           "state": 0, "incarnation": 0})
+        offset += rec_len
+    return events
+
+
+def _forkmeta_timelines(store: Path) -> set[int]:
+    """Timelines named by fork-size events in the shared forkmeta source and
+    in every snapshot payload part on disk (markers carry no owner)."""
+    owners: set[int] = set()
+
+    def scan(data: bytes, offset: int) -> None:
+        while offset + 64 <= len(data):
+            magic, rec_len, timeline = struct.unpack_from("=III", data, offset)
+            if rec_len != 64 or magic & 0x00FFFFFF != 0x4D4B46:   # "FKM?" family
+                break
+            kind = data[offset + 60]
+            if kind < 10:                                        # not a snapshot marker
+                owners.add(timeline)
+            offset += rec_len
+
+    try:
+        scan((store / "forkmeta").read_bytes(), 0)
+    except OSError:
+        pass
+    snapshots = store / "forkmeta_snapshots"
+    if snapshots.is_dir():
+        for part in snapshots.iterdir():
+            if not part.name.startswith(("forkmeta_checkpoint_v1_", "forkmeta_tail_v1_")):
+                continue
+            data = part.read_bytes()
+            if len(data) >= 80 and struct.unpack_from("=I", data, 0)[0] == FORKMETA_PAYLOAD_MAGIC:
+                scan(data, 80)
+    return owners
+
+
+def _manifest_removed_layers(records: list[tuple[int, bytes]]) -> dict[int, int]:
+    """For every layer id the log removed and did not add again, the timeline
+    that owned it when it went.  A file left behind by such a layer is an
+    orphan of that timeline, not of whoever reuses the id later."""
+    owner: dict[int, int] = {}
+    removed: dict[int, int] = {}
+    for kind, payload in records:
+        if kind == MANIFEST_ADD_LAYER and len(payload) >= 16:
+            layer_id, _layer_kind, timeline = struct.unpack_from("=QII", payload, 0)
+            owner[layer_id] = timeline
+            removed.pop(layer_id, None)
+        elif kind == MANIFEST_REMOVE_LAYER and len(payload) >= 8:
+            layer_id = struct.unpack_from("=Q", payload, 0)[0]
+            if layer_id in owner:
+                removed[layer_id] = owner.pop(layer_id)
+    return removed
+
+FORKMETA_RECORD_BYTES = 64
+FORKMETA_SNAPSHOT_MAGIC = 0x4D534946
+FORKMETA_SNAPSHOT_VERSION = 1
+FORKMETA_SNAPSHOT_RECORD_BYTES = 80
+
+
+def _fnv1a(data: bytes, crc: int = 2166136261) -> int:
+    for byte in data:
+        crc ^= byte
+        crc = (crc * 16777619) & 0xFFFFFFFF
+    return crc
+
+
+def _forkmeta_snapshot_record(path: Path) -> dict[str, Any] | None:
+    """The selected (manifest) or staged (prepared) generation record: its
+    generation, cutoff, and the length and checksum of each immutable part.
+    None when the file is absent, malformed, or fails its header checksum."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) != FORKMETA_SNAPSHOT_RECORD_BYTES:
+        return None
+    magic, version, header_bytes = struct.unpack_from("<III", data, 0)
+    if magic != FORKMETA_SNAPSHOT_MAGIC or version != FORKMETA_SNAPSHOT_VERSION or \
+            header_bytes != FORKMETA_SNAPSHOT_RECORD_BYTES:
+        return None
+    crc = struct.unpack_from("<I", data, 64)[0]
+    if _fnv1a(data[:64] + b"\0\0\0\0" + data[68:]) != crc:
+        return None
+    generation, cutoff_lsn, cutoff_seq, checkpoint_len = struct.unpack_from("<QQQQ", data, 16)
+    checkpoint_crc = struct.unpack_from("<I", data, 48)[0]
+    tail_len = struct.unpack_from("<Q", data, 52)[0]
+    tail_crc = struct.unpack_from("<I", data, 60)[0]
+    return {
+        "generation": generation, "cutoff_lsn": cutoff_lsn, "cutoff_seq": cutoff_seq,
+        "checkpoint": (checkpoint_len, checkpoint_crc), "tail": (tail_len, tail_crc),
+    }
+
+
+def _forkmeta_part_name(generation: int, part: str) -> str:
+    return f"forkmeta_{part}_v1_{generation:020d}"
+
+
+def _forkmeta_parts_valid(store: Path, record: dict[str, Any]) -> list[str]:
+    """Names of the record's parts that are missing, mis-sized, or fail the
+    checksum the record carries for them."""
+    broken = []
+    for part in ("checkpoint", "tail"):
+        length, crc = record[part]
+        path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+        try:
+            data = path.read_bytes()
+        except OSError:
+            broken.append(f"{path.name} (absent)")
+            continue
+        if len(data) != length or _fnv1a(data) != crc:
+            broken.append(f"{path.name} (len {len(data)} vs {length}, checksum mismatch)")
+    return broken
+
+
+def _forkmeta_generation_files(store: Path) -> list[str]:
+    directory = store / FORKMETA_SNAPSHOTS
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.name.startswith(("forkmeta_checkpoint_v1_", "forkmeta_tail_v1_"))
+    )
+
+
+def _forkmeta_temp_files(store: Path) -> list[str]:
+    """Publication debris in the snapshot directory.  Every part, prepared
+    intent and manifest is written to a `.tmp.` name and renamed into place,
+    so a temporary that outlives its publication is cleanup that did not
+    happen -- and startup's temp GC would sweep it away before the recovery
+    oracle could see it."""
+    directory = store / FORKMETA_SNAPSHOTS
+    if not directory.is_dir():
+        return []
+    return sorted(entry.name for entry in directory.iterdir()
+                  if ".tmp." in entry.name)
+
+
+def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
+    """The first record of the shared forkmeta log, decoded in the host's
+    byte order (the daemon persists the C struct directly)."""
+    source = store / "forkmeta"
+    try:
+        with source.open("rb") as handle:
+            record = handle.read(FORKMETA_RECORD_BYTES)
+    except OSError:
+        return None
+    if len(record) != FORKMETA_RECORD_BYTES:
+        return None
+    magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
+    key = struct.unpack_from("=IIIiI", record, 12)
+    lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
+    nblocks = struct.unpack_from("=I", record, 56)[0]
+    kind = record[60]
+    pad = record[61:64]
+    if not _forkmeta_record_wire_valid(record):
+        return None
+    return {
+        "magic": magic, "timeline": timeline, "key": key, "lsn": lsn,
+        "admission_seq": admission_seq, "order_id": order_id, "nblocks": nblocks,
+        "kind": kind, "pad": pad,
+    }
+
+
+FORKMETA_CUTOFF_LSN = 3500          # the workload's sole proven page frontier
+FORKMETA_SEED_FIRST_REL = 5000      # the gc client's oracle relations ...
+FORKMETA_SEED_RELS = 32             # ... and their count
+FORKMETA_SET_KIND = 1
+
+
+def _forkmeta_record_wire_valid(record: bytes) -> bool:
+    """A record's layout and checksum, the same test the daemon applies: a
+    legacy record carries a zero pad, a checksummed one carries the CRC-24
+    (OpenPGP polynomial) of every byte before that pad."""
+    magic, rec_len = struct.unpack_from("=II", record, 0)
+    if rec_len != FORKMETA_RECORD_BYTES:
+        return False
+    pad = record[61:64]
+    if magic == FORKMETA_V2_MAGIC:
+        return pad == b"\x00\x00\x00"
+    if magic != FORKMETA_V3_MAGIC:
+        return False
+    crc = 0xB704CE
+    for byte in record[:61]:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    crc &= 0xFFFFFF
+    return pad == bytes((crc >> 16, (crc >> 8) & 0xFF, crc & 0xFF))
+
+
+def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[str, Any]] | None:
+    """Every record of the shared forkmeta log, or None when the log is
+    absent or not a whole number of well-formed V2 records."""
+    try:
+        data = (store / "forkmeta").read_bytes()
+    except OSError:
+        return None
+    # The publication boundaries hold the admission write lock and every
+    # shard lock, so no foreground append is in flight at those probes and a
+    # partial record there is real damage.  The trickle workload does append
+    # between them, so a crash image taken elsewhere may end mid-record and
+    # recovery drops exactly that unacknowledged tail.
+    complete = len(data) - len(data) % FORKMETA_RECORD_BYTES
+    if aligned and complete != len(data):
+        return None
+    records = []
+    for offset in range(0, complete, FORKMETA_RECORD_BYTES):
+        record = data[offset:offset + FORKMETA_RECORD_BYTES]
+        magic, rec_len, timeline = struct.unpack_from("=III", record, 0)
+        # both the checksummed current record and the legacy one it replaced,
+        # each held to the checksum rule of its own version
+        if not _forkmeta_record_wire_valid(record):
+            return None
+        lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
+        records.append({
+            "timeline": timeline, "key": struct.unpack_from("=IIIiI", record, 12),
+            "lsn": lsn, "admission_seq": admission_seq, "order_id": order_id,
+            "nblocks": struct.unpack_from("=I", record, 56)[0], "kind": record[60],
+        })
+    return records
+
+
+def _forkmeta_seeded_events(above_lsn: int = 0) -> list[tuple[int, int, int, int]]:
+    """Every event the gc client's forkmeta seed persists for its oracle
+    relations, as (relation, lsn, kind, nblocks), above the given LSN.  The
+    seed creates each relation, zero-extends it to four blocks, and truncates
+    it below the cutoff for even relations and above it for odd ones."""
+    events = []
+    for index in range(FORKMETA_SEED_RELS):
+        rel = FORKMETA_SEED_FIRST_REL + index
+        truncate_lsn = 2500 + index if index % 2 == 0 else 4500 + index
+        for lsn, kind, nblocks in (
+            (1000 + index, FORKMETA_SET_KIND, 0),
+            (2000 + index, FORKMETA_GROW_KIND, 4),
+            (truncate_lsn, FORKMETA_SET_KIND, 2 if index % 2 == 0 else 3),
+        ):
+            if lsn > above_lsn:
+                events.append((rel, lsn, kind, nblocks))
+    return events
+
+
+def _forkmeta_seeded_events_missing(records: list[dict[str, Any]],
+                                    above_lsn: int) -> list[str]:
+    """The seeded events above the given LSN that the log no longer carries
+    with the same size and kind."""
+    present = {
+        (r["key"][2], r["lsn"], r["kind"], r["nblocks"]) for r in records
+        if r["timeline"] == 0
+    }
+    return [
+        f"rel {rel} kind {kind} lsn {lsn} nblocks {nblocks}"
+        for rel, lsn, kind, nblocks in _forkmeta_seeded_events(above_lsn)
+        if (rel, lsn, kind, nblocks) not in present
+    ]
+
+
+def _forkmeta_seeded_truncates_missing(records: list[dict[str, Any]], above_lsn: int) -> list[str]:
+    """The seeded truncate events (one per oracle relation, at a known LSN)
+    above the given LSN that the log no longer carries."""
+    present = {
+        (r["key"][2], r["lsn"]) for r in records
+        if r["timeline"] == 0 and r["kind"] == FORKMETA_SET_KIND
+    }
+    missing = []
+    for index in range(FORKMETA_SEED_RELS):
+        lsn = 2500 + index if index % 2 == 0 else 4500 + index
+        rel = FORKMETA_SEED_FIRST_REL + index
+        if lsn > above_lsn and (rel, lsn) not in present:
+            missing.append(f"rel {rel} truncate@{lsn}")
+    return missing
+
+
+FORKMETA_PAYLOAD_HEADER_BYTES = 80
+
+
+FORKMETA_MAX_TIMELINES = 1024
+FORKMETA_MAX_KLASS = 6                 # PS_KLASS_READER_SNAPSHOT
+FORKMETA_DEAD_KIND = 2
+FORKMETA_SEG_GROW_KIND = 5
+FORKMETA_SEG_COMMIT_KIND = 6
+FORKMETA_SEG_GROW_BOUND_KIND = 7
+FORKMETA_SEG_COMMIT_BOUND_KIND = 8
+
+
+def _forkmeta_payload_header(store: Path, record: dict[str, Any],
+                             part: str) -> dict[str, Any] | None:
+    """The payload header of one part, decoded; None when unreadable."""
+    path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < FORKMETA_PAYLOAD_HEADER_BYTES:
+        return None
+    magic, version, header_bytes = struct.unpack_from("=IHH", data, 0)
+    index, record_bytes = struct.unpack_from("=II", data, 8)
+    generation, cutoff_lsn, cutoff_seq, freeze_seq = struct.unpack_from("=QQQQ", data, 16)
+    checkpoint_records, tail_records, checkpoint_bytes, tail_bytes = \
+        struct.unpack_from("=QQQQ", data, 48)
+    return {
+        "magic": magic, "version": version, "header_bytes": header_bytes,
+        "part": index, "record_bytes": record_bytes, "generation": generation,
+        "cutoff_lsn": cutoff_lsn, "cutoff_seq": cutoff_seq, "freeze_seq": freeze_seq,
+        "checkpoint_records": checkpoint_records, "tail_records": tail_records,
+        "checkpoint_bytes": checkpoint_bytes, "tail_bytes": tail_bytes,
+        "body": len(data) - FORKMETA_PAYLOAD_HEADER_BYTES,
+    }
+
+
+def _forkmeta_event_future(lsn: int, seq: int, cutoff_lsn: int, cutoff_seq: int) -> bool:
+    """The loader's partition test: at the cutoff LSN a nonzero sequence
+    above the cutoff sequence still belongs to the tail."""
+    return lsn > cutoff_lsn or (lsn == cutoff_lsn and seq != 0 and seq > cutoff_seq)
+
+
+def _forkmeta_record_invalid(entry: dict[str, Any], part: str,
+                             cutoff_lsn: int, cutoff_seq: int) -> str | None:
+    """Why one staged record would be refused by the loader: its identity,
+    class, kind and order-id rules, its zero pad, and the partition it is
+    stored in."""
+    kind = entry["kind"]
+    ordered = FORKMETA_SEG_GROW_KIND <= kind <= FORKMETA_SEG_COMMIT_BOUND_KIND
+    bound = kind in (FORKMETA_SEG_GROW_BOUND_KIND, FORKMETA_SEG_COMMIT_BOUND_KIND)
+    if not _forkmeta_record_wire_valid(entry["raw"]):
+        return (f"record magic {entry['magic']:#x} length {entry['rec_len']} "
+                f"fails its version's checksum rule")
+    if entry["timeline"] >= FORKMETA_MAX_TIMELINES or entry["key"][4] > FORKMETA_MAX_KLASS:
+        return f"record timeline {entry['timeline']} class {entry['key'][4]}"
+    if not ordered and (kind > FORKMETA_DEAD_KIND or entry["order_id"] != 0):
+        return f"lifecycle record kind {kind} order {entry['order_id']}"
+    if ordered and (entry["nblocks"] == 0 or
+                    (bound and entry["order_id"] == 0) or
+                    (not bound and (entry["order_id"] != 0 or
+                                    entry["admission_seq"] != 0))):
+        return (f"ordered marker kind {kind} order {entry['order_id']} "
+                f"seq {entry['admission_seq']} nblocks {entry['nblocks']}")
+    if kind == FORKMETA_DEAD_KIND and entry["nblocks"] != 0:
+        return f"death record with {entry['nblocks']} blocks"
+    future = _forkmeta_event_future(entry["lsn"], entry["admission_seq"],
+                                    cutoff_lsn, cutoff_seq)
+    if (part == "checkpoint" and future) or (part == "tail" and not future):
+        return (f"{part} record at lsn {entry['lsn']} seq {entry['admission_seq']} "
+                f"is on the wrong side of the cutoff")
+    return None
+
+
+def _forkmeta_part_framing(store: Path, record: dict[str, Any], part: str) -> str | None:
+    """Why a part does not satisfy the framing invariants the loader applies:
+    its payload header must identify the part and the generation, its record
+    size must be the record size, and its body must be a whole number of
+    records matching the count the header states."""
+    path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return f"{path.name} is unreadable"
+    if len(data) < FORKMETA_PAYLOAD_HEADER_BYTES:
+        return f"{path.name} is shorter than its payload header"
+    header = _forkmeta_payload_header(store, record, part)
+    other = _forkmeta_payload_header(
+        store, record, "tail" if part == "checkpoint" else "checkpoint")
+    if header is None:
+        return f"{path.name} is shorter than its payload header"
+    expected_index = 0 if part == "checkpoint" else 1
+    if header["magic"] != FORKMETA_PAYLOAD_MAGIC or header["version"] != 1 or \
+            header["header_bytes"] != FORKMETA_PAYLOAD_HEADER_BYTES or \
+            header["record_bytes"] != FORKMETA_RECORD_BYTES or \
+            header["part"] != expected_index or \
+            header["generation"] != record["generation"]:
+        return (f"{path.name} has payload header magic {header['magic']:#x} version "
+                f"{header['version']} header {header['header_bytes']} record "
+                f"{header['record_bytes']} part {header['part']} generation "
+                f"{header['generation']}")
+    # the cutoff the header states is the one the record was selected with,
+    # and the freeze sequence that froze appends must be real
+    if header["cutoff_lsn"] != record["cutoff_lsn"] or \
+            header["cutoff_seq"] != record["cutoff_seq"] or header["freeze_seq"] == 0:
+        return (f"{path.name} states cutoff ({header['cutoff_lsn']}, "
+                f"{header['cutoff_seq']}) freeze {header['freeze_seq']}, record says "
+                f"({record['cutoff_lsn']}, {record['cutoff_seq']})")
+    if other is not None and any(header[field] != other[field] for field in (
+            "generation", "cutoff_lsn", "cutoff_seq", "freeze_seq",
+            "checkpoint_records", "tail_records", "checkpoint_bytes", "tail_bytes")):
+        return f"{path.name} disagrees with the other part's payload header"
+    body = header["body"]
+    if body % FORKMETA_RECORD_BYTES != 0:
+        return f"{path.name} ends with a partial record ({body} body bytes)"
+    stated = header["checkpoint_records"] if part == "checkpoint" else header["tail_records"]
+    stated_bytes = header["checkpoint_bytes"] if part == "checkpoint" else header["tail_bytes"]
+    if stated * FORKMETA_RECORD_BYTES != body or stated_bytes != body:
+        return (f"{path.name} holds {body // FORKMETA_RECORD_BYTES} records, "
+                f"header states {stated} ({stated_bytes} bytes)")
+    # every record, and the per-fork ordering the loader enforces
+    seen: dict[tuple[int, tuple[int, ...]], tuple[int, int]] = {}
+    for index, entry in enumerate(_forkmeta_part_records(store, record, part)):
+        invalid = _forkmeta_record_invalid(entry, part, record["cutoff_lsn"],
+                                           record["cutoff_seq"])
+        if invalid is not None:
+            return f"{path.name} index {index}: {invalid}"
+        previous = seen.get((entry["timeline"], entry["key"]))
+        position = (entry["lsn"], entry["admission_seq"])
+        if previous is not None and (
+                previous[0] > position[0] or
+                (previous[0] == position[0] and previous[1] != 0 and
+                 position[1] != 0 and previous[1] > position[1])):
+            return (f"{path.name} index {index} steps back from {previous} to "
+                    f"{position} for one fork")
+        seen[(entry["timeline"], entry["key"])] = position
+    return None
+
+
+def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> list[dict[str, Any]]:
+    """The fork-size records of one immutable snapshot part (after its
+    80-byte payload header); empty when the part cannot be read."""
+    path = store / FORKMETA_SNAPSHOTS / _forkmeta_part_name(record["generation"], part)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    records = []
+    for offset in range(80, len(data) - FORKMETA_RECORD_BYTES + 1, FORKMETA_RECORD_BYTES):
+        chunk = data[offset:offset + FORKMETA_RECORD_BYTES]
+        magic, rec_len = struct.unpack_from("=II", chunk, 0)
+        records.append({
+            "magic": magic, "rec_len": rec_len, "raw": bytes(chunk),
+            "timeline": struct.unpack_from("=I", chunk, 8)[0],
+            "key": struct.unpack_from("=IIIiI", chunk, 12),
+            "lsn": struct.unpack_from("=Q", chunk, 32)[0],
+            "admission_seq": struct.unpack_from("=Q", chunk, 40)[0],
+            "order_id": struct.unpack_from("=Q", chunk, 48)[0],
+            "nblocks": struct.unpack_from("=I", chunk, 56)[0], "kind": chunk[60],
+            "pad": chunk[61:64],
+        })
+    return records
+
+
+FORKMETA_GROW_KIND = 0
+
+
+def _forkmeta_size_asof(events: list[dict[str, Any]], horizon: int) -> int:
+    """The relation size the records reconstruct at one horizon: the newest
+    definitive size at or below it, raised by any growth after that."""
+    size = 0
+    for record in sorted(events, key=lambda r: (r["lsn"], r.get("admission_seq", 0))):
+        if record["lsn"] > horizon:
+            break
+        if record["kind"] == FORKMETA_SET_KIND:
+            size = record["nblocks"]
+        elif record["kind"] == FORKMETA_GROW_KIND:
+            size = max(size, record["nblocks"])
+    return size
+
+
+def _forkmeta_generation_incomplete(store: Path, record: dict[str, Any]) -> str | None:
+    """Why a staged or selected generation does not carry the seeded history.
+    The seed grows every oracle relation to four blocks and then truncates it,
+    below the cutoff for even relations and above it for odd ones, so the
+    generation's records must reconstruct four blocks at the cutoff for an odd
+    relation and its truncated size for an even one, and the truncated size
+    for every relation at the newest horizon.  Sizes are compared rather than
+    a record list, because which records survive is the compaction plan's
+    business while the sizes are the contract."""
+    for part in ("checkpoint", "tail"):
+        framing = _forkmeta_part_framing(store, record, part)
+        if framing is not None:
+            return framing
+    missing = _forkmeta_seeded_truncates_missing(
+        _forkmeta_part_records(store, record, "tail"), record["cutoff_lsn"])
+    if missing:
+        return f"tail of generation {record['generation']} lacks {missing!r}"
+    events: dict[int, list[dict[str, Any]]] = {}
+    for part in ("checkpoint", "tail"):
+        for entry in _forkmeta_part_records(store, record, part):
+            if entry["timeline"] == 0 and \
+                    entry["kind"] in (FORKMETA_SET_KIND, FORKMETA_GROW_KIND):
+                events.setdefault(entry["key"][2], []).append(entry)
+    wrong = []
+    for index in range(FORKMETA_SEED_RELS):
+        rel = FORKMETA_SEED_FIRST_REL + index
+        truncated = 2 if index % 2 == 0 else 3
+        at_cutoff = truncated if index % 2 == 0 else 4
+        entries = events.get(rel)
+        if not entries:
+            wrong.append(f"rel {rel} absent")
+            continue
+        cutoff_size = _forkmeta_size_asof(entries, record["cutoff_lsn"])
+        newest_size = _forkmeta_size_asof(entries, 2**64 - 1)
+        if cutoff_size != at_cutoff or newest_size != truncated:
+            wrong.append(
+                f"rel {rel} reconstructs {cutoff_size} blocks at the cutoff and "
+                f"{newest_size} at the newest horizon, expected {at_cutoff} and {truncated}"
+            )
+    if wrong:
+        return f"generation {record['generation']} misstates {wrong!r}"
+    return None
+
+
+def _forkmeta_old_epoch_intact(store: Path, selected: dict[str, Any]) -> str | None:
+    """Why the source is not the complete epoch that preceded the selected
+    generation: it must be a well-formed log that starts with the previous
+    generation's marker (or, for the first generation, with no marker at
+    all), names the selected generation nowhere, and still carries every
+    seeded truncate event that epoch is responsible for."""
+    records = _forkmeta_source_records(store)
+    if not records:
+        return "source absent, empty or malformed"
+    head = records[0]
+    previous = selected["generation"] - 1
+    if previous == 0:
+        if head["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND:
+            return f"first generation's source starts with a marker {head!r}"
+        floor = 0
+    elif head["kind"] != FORKMETA_SNAPSHOT_BASE_KIND or head["order_id"] != previous:
+        return f"source does not start with generation {previous}'s marker: {head!r}"
+    else:
+        floor = head["lsn"]
+    if any(r["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND and
+           r["order_id"] == selected["generation"] for r in records):
+        return "source already names the selected generation"
+    # the complete epoch, not only its truncates: a premature rewrite that
+    # kept the truncates and dropped the creates and growths would otherwise
+    # look intact, because the selected snapshot supplies them after startup
+    missing = _forkmeta_seeded_events_missing(records, floor)
+    if missing:
+        return f"source lost seeded events of the old epoch: {missing!r}"
+    return None
+
+
+def _forkmeta_marker_matches(store: Path, selected: dict[str, Any]) -> bool:
+    """True when the source epoch starts with the selected generation's exact
+    snapshot-base marker, the same test startup applies before it preserves
+    the epoch's suffix."""
+    head = _forkmeta_source_head(store)
+    return head is not None and head["kind"] == FORKMETA_SNAPSHOT_BASE_KIND and \
+        head["timeline"] == 0 and not any(head["key"]) and \
+        head["lsn"] == selected["cutoff_lsn"] and \
+        head["admission_seq"] == selected["cutoff_seq"] and \
+        head["order_id"] == selected["generation"] and head["nblocks"] == 0 and \
+        (head["magic"] != FORKMETA_V2_MAGIC or head["pad"] == b"\0\0\0")
+
+
+def _forkmeta_source_starts_with_marker(store: Path) -> bool:
+    selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
+    return selected is not None and _forkmeta_marker_matches(store, selected)
+
+
+def _forkmeta_cutoff_mismatch(store: Path, record: dict[str, Any]) -> str | None:
+    """Why a generation's cutoff is not the durable page frontier: the
+    runtime selects the full (lsn, admission sequence) tuple the frontier
+    published, so a record that keeps the LSN and misstates the sequence is
+    a boundary error even though every functional query still passes."""
+    fences = _page_frontier_fences(store, 0)
+    proven = [
+        (lsn, seq) for incarnation, lsn, seq in fences
+        if incarnation == 1 and lsn == FORKMETA_CUTOFF_LSN
+    ]
+    if not proven:
+        return (f"has no durable timeline 0 frontier at {FORKMETA_CUTOFF_LSN}: "
+                f"{fences!r}")
+    if record["cutoff_lsn"] != FORKMETA_CUTOFF_LSN or \
+            all(record["cutoff_seq"] != seq for _lsn, seq in proven):
+        return (f"states cutoff ({record['cutoff_lsn']}, {record['cutoff_seq']}), "
+                f"expected the proven frontier {proven!r}")
+    return None
+
+
+def _check_forkmeta_crash_snapshot(
+    store: Path, stage: str
+) -> dict[str, Any] | None:
+    """Prepare leaves a staged generation whose two parts are complete and
+    checksum-valid, without a selected manifest; commit selects it while the
+    source still names the old epoch; the rewrite puts the selected
+    generation's exact marker at the head of the source; GC leaves exactly
+    the selected second generation's valid pair."""
+    prepared = _forkmeta_snapshot_record(store / FORKMETA_PREPARED)
+    selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
+    files = _forkmeta_generation_files(store)
+    debris = _forkmeta_temp_files(store)
+    if debris:
+        raise OracleMismatch(
+            f"after_{stage} crash left publication temporaries {debris!r}"
+        )
+    if stage == "forkmeta_prepare":
+        if prepared is None or selected is not None:
+            raise OracleMismatch(
+                f"after_prepare crash left prepared={prepared!r} selected={selected!r}"
+            )
+        broken = _forkmeta_parts_valid(store, prepared)
+        if broken:
+            raise OracleMismatch(
+                f"after_prepare crash staged generation {prepared['generation']} "
+                f"with incomplete parts {broken!r}"
+            )
+        stale = _forkmeta_cutoff_mismatch(store, prepared)
+        if stale is not None:
+            raise OracleMismatch(f"after_prepare crash {stale}")
+        incomplete = _forkmeta_generation_incomplete(store, prepared)
+        if incomplete is not None:
+            raise OracleMismatch(f"after_prepare crash: {incomplete}")
+        # nothing is selected yet, so recovery is free to publish whatever
+        # generation it settles on
+        return None
+    if selected is None:
+        raise OracleMismatch(f"after_{stage} crash left no valid selected forkmeta manifest")
+    if prepared is not None or (store / FORKMETA_PREPARED).exists():
+        # the commit consumes the intent; a leftover would be re-committed or
+        # aborted by startup, which hides an incomplete commit
+        raise OracleMismatch(
+            f"after_{stage} crash left a prepared intent behind the selected "
+            f"generation {selected['generation']}: {prepared!r}"
+        )
+    broken = _forkmeta_parts_valid(store, selected)
+    if broken:
+        raise OracleMismatch(
+            f"after_{stage} crash selected generation {selected['generation']} "
+            f"with invalid parts {broken!r}"
+        )
+    stale = _forkmeta_cutoff_mismatch(store, selected)
+    if stale is not None:
+        raise OracleMismatch(f"after_{stage} crash {stale}")
+    incomplete = _forkmeta_generation_incomplete(store, selected)
+    if incomplete is not None:
+        raise OracleMismatch(f"after_{stage} crash: {incomplete}")
+    matches = _forkmeta_marker_matches(store, selected)
+    if stage == "forkmeta_manifest_commit":
+        # the complete old epoch is still the source behind the new manifest
+        stale = _forkmeta_old_epoch_intact(store, selected)
+        if stale is not None:
+            raise OracleMismatch(f"after_manifest_commit crash: {stale}")
+    if stage in ("forkmeta_source_rewrite", "forkmeta_snapshot_gc"):
+        # the source belongs to the selected generation from the rewrite on,
+        # and snapshot GC touches only the retired files, so it must still
+        # carry that marker and nothing that contradicts it
+        if not matches:
+            raise OracleMismatch(
+                f"after_{stage} crash left the forkmeta source without the "
+                f"selected generation's exact marker: {_forkmeta_source_head(store)!r}"
+            )
+        # The rewritten source is the marker plus whatever was appended
+        # after the freeze; the seeded history lives in the parts, checked
+        # above, so the source only has to be well formed and marker-only
+        # before the first post-freeze append.  These probes fire with the
+        # admission and shard write locks held, so no append is in flight
+        # and a partial record is damage rather than a crash tail.
+        records = _forkmeta_source_records(store, aligned=True)
+        if records is None or any(
+                r["kind"] >= FORKMETA_SNAPSHOT_BASE_KIND for r in records[1:]):
+            raise OracleMismatch(
+                f"after_{stage} crash left a malformed rewritten source "
+                f"or a second marker: {records!r}"
+            )
+    # The seed starts from an empty store, so the commit and the rewrite
+    # publish its first generation and nothing else can be on disk, while
+    # snapshot GC retires that one and leaves the second.  Requiring the exact
+    # pair is what rejects an orphan generation left by a faulty first
+    # publication: startup schedules snapshot GC unconditionally, so the
+    # recovery oracle would see the leak already swept up.
+    expected_generation = 2 if stage == "forkmeta_snapshot_gc" else 1
+    expected = sorted(
+        _forkmeta_part_name(selected["generation"], part)
+        for part in ("checkpoint", "tail")
+    )
+    if selected["generation"] != expected_generation or files != expected:
+        raise OracleMismatch(
+            f"after_{stage} crash selected generation {selected['generation']} "
+            f"and left {files!r}, expected exactly generation "
+            f"{expected_generation}'s {expected!r}"
+        )
+    return selected
+
+
+def _check_forkmeta_recovery(
+    store: Path, stage: str, timeout: float,
+    crash_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Recovery selects one durable generation whose parts are valid, finishes
+    any staged or retired file cleanup, and serves the source behind that
+    generation's exact marker.  Returns the settled generation record so the
+    clean restart can be held to the same one."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        selected = _forkmeta_snapshot_record(store / FORKMETA_MANIFEST)
+        files = _forkmeta_generation_files(store)
+        prepared = (store / FORKMETA_PREPARED).exists()
+        debris = _forkmeta_temp_files(store)
+        if selected is not None and not prepared and not debris and \
+                not _forkmeta_parts_valid(store, selected) and \
+                files == sorted(
+                    _forkmeta_part_name(selected["generation"], part)
+                    for part in ("checkpoint", "tail")
+                ) and _forkmeta_marker_matches(store, selected):
+            stale = _forkmeta_cutoff_mismatch(store, selected)
+            if stale is not None:
+                raise OracleMismatch(f"after_{stage} recovery {stale}")
+            # The crash had already selected a generation, and the probe holds
+            # the locks that would let an acknowledged write land, so recovery
+            # has nothing new to publish.  Accepting whatever it settles on
+            # would let one unnecessary republication through, since the clean
+            # restart is then compared with that.
+            crash_selected = (crash_state or {}).get("forkmeta_selected")
+            if crash_selected is not None and selected != crash_selected:
+                raise OracleMismatch(
+                    f"after_{stage} recovery settled on {selected!r} instead of "
+                    f"the generation the crash had selected, {crash_selected!r}"
+                )
+            return selected
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery did not settle the forkmeta snapshot: "
+                f"selected={selected!r} prepared={prepared} files={files!r} "
+                f"temporaries={debris!r} head={_forkmeta_source_head(store)!r}"
+            )
+        time.sleep(min(0.05, deadline - now))
+
+
+def _check_manifest_crash_snapshot(store: Path, stage: str) -> None:
+    """Before the rename the live log is intact next to the fsync'd temp
+    file; after it the compacted log has replaced the live log."""
+    manifest = store / "layers.manifest"
+    if not manifest.exists() or manifest.stat().st_size == 0:
+        raise OracleMismatch(f"after_{stage} crash left no layers.manifest")
+    tmp = store / MANIFEST_TMP
+    if stage == "manifest_tmp_sync":
+        if not tmp.exists():
+            raise OracleMismatch("after_tmp_sync crash left no compacted temp manifest")
+        # The boundary is a complete, fsynced rewrite.  A temp file that had
+        # only been created and truncated would satisfy a presence check, and
+        # recovery would then discard it, replay the intact live log, and
+        # satisfy every later check -- the scenario would pass while testing
+        # nothing.  Require the compacted log to replay to the live one.
+        compacted = _manifest_layers(_manifest_records_at(tmp))
+        live = _manifest_layers(_manifest_records(store))
+        if not compacted or compacted != live:
+            raise OracleMismatch(
+                f"after_tmp_sync crash left a temp manifest replaying to "
+                f"{compacted!r}, expected the live log's {live!r}"
+            )
+    if stage == "manifest_rename" and tmp.exists():
+        raise OracleMismatch("after_rename crash left the temp manifest after its rename")
+
+
+def _check_manifest_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """Either log replays to the same layer map: the manifest is sane and
+    reconciled with the local layers, and no crashed temp file leaks."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+        if manifest.get("manifest_poisoned") is not False:
+            raise OracleMismatch(
+                f"after_{stage} recovery reported manifest_poisoned="
+                f"{manifest.get('manifest_poisoned')!r}"
+            )
+        if manifest.get("deleting_layers") == 0 and \
+                manifest.get("layer_count") == manifest.get("local_layers") and \
+                isinstance(manifest.get("layer_count"), int) and \
+                manifest.get("layer_count") > 0:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery did not reconcile the manifest within "
+                f"{poll_timeout:.3f}s; last manifest={manifest!r}"
+            )
+        time.sleep(min(0.05, deadline - now))
+    if (store / MANIFEST_TMP).exists():
+        raise OracleMismatch(f"after_{stage} recovery kept the crashed temp manifest")
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected none"
+        )
+    # the counts come from the replayed map, so they say nothing about files
+    # an interrupted retirement may have left behind
+    replayed = set(_manifest_layers(_manifest_records(store)))
+    on_disk = {int(path.name.rsplit("_", 1)[1], 16) for path in _canonical_layer_files(store)}
+    if replayed != on_disk:
+        raise OracleMismatch(
+            f"after_{stage} recovery left the manifest naming {sorted(replayed)!r} "
+            f"while the store holds {sorted(on_disk)!r}"
+        )
+    return None
+
+
+# A sealed segment is named walv1_<store>_<segment number, 20 digits>; the
+# publication writes a "...tmp.<suffix>" file first, which is not one.
+SEALED_WAL_SEGMENT = re.compile(r"^walv1_[0-9]+_([0-9]{20})$")
+DELETE_WAL_SEGMENT_NUMBER = 1          # the branch's WAL starts at 1 MiB
+
+
+def _branch_sealed_wal_segments(store: Path, timeline: int) -> list[str]:
+    """The canonical sealed immutable WAL segment files of one timeline.  The
+    directory itself appears on the first aligned append, before any segment
+    is sealed, and a staging file is not a sealed segment either, so neither
+    says anything about immutable-WAL cleanup on its own."""
+    directory = store / f"wal_segments_{timeline}"
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.is_file() and SEALED_WAL_SEGMENT.fullmatch(entry.name)
+    )
+
+
+def _branch_seeded_wal_segment(store: Path, timeline: int) -> bool:
+    """Whether the segment the seed's aligned WAL fills is sealed under its
+    canonical name."""
+    return any(
+        int(SEALED_WAL_SEGMENT.fullmatch(name).group(1)) == DELETE_WAL_SEGMENT_NUMBER
+        for name in _branch_sealed_wal_segments(store, timeline)
+    )
+
+
+def _branch_private_artifacts(store: Path, timeline: int) -> list[str]:
+    """Private WAL and WAL-index artifacts of one timeline, plus the layer
+    files the manifest still attributes to it.  Layer file names carry the
+    shard, not the owner, so ownership comes from the manifest's ADD records.
+    """
+    names = []
+    prefixes = (f"walidx_{timeline}_", f"wal_segments_{timeline}", f"walidx_snapshots_{timeline}")
+    for entry in sorted(store.iterdir()):
+        name = entry.name
+        if name == f"wal_{timeline}" or name.startswith(f"wal_{timeline}.") or \
+                any(name.startswith(prefix) for prefix in prefixes):
+            names.append(name)
+    records = _manifest_records(store)
+    owned = {
+        layer_id for layer_id, layer in _manifest_layers(records).items()
+        if layer["timeline"] == timeline
+    }
+    on_disk = {int(path.name.rsplit("_", 1)[1], 16) for path in _canonical_layer_files(store)}
+    # A layer the manifest still attributes to the owner is an artifact
+    # whether or not its file is still there (publishing DELETED before the
+    # manifest REMOVE would otherwise look artifact-free after an unlink),
+    # and so is a file left behind by a layer the manifest has already
+    # removed but whose unlink failed or was skipped.
+    orphaned = {
+        layer_id for layer_id, layer_timeline in _manifest_removed_layers(records).items()
+        if layer_timeline == timeline
+    }
+    for layer_id in sorted(owned | (orphaned & on_disk)):
+        names.append(f"layer_{layer_id:#x} (layer of timeline {timeline}, "
+                     f"{'on disk' if layer_id in on_disk else 'file gone'}, "
+                     f"{'in the manifest' if layer_id in owned else 'orphaned'})")
+    return names
+
+
+def _check_delete_abort_crash_snapshot(store: Path) -> None:
+    """Before the DELETING record is durable nothing of the branch has
+    changed: no lifecycle record, and every seeded artifact present."""
+    _check_delete_abort_state(store)
+
+
+def _check_delete_abort_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+) -> dict[str, Any]:
+    """The branch survived the lost request intact, and the root still
+    carries the cap both live branches fork at."""
+    state = _check_delete_abort_state(store)
+    # The client reads only pages each branch owns, so nothing else here would
+    # notice a cap recovery dropped -- and dropping it admits pruning of the
+    # ancestor history those branches read through.
+    timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
+    if timeline.get("retained_horizon") != DELETE_FORK_LSN:
+        raise OracleMismatch(
+            "a deletion that never became durable reported retained_horizon="
+            f"{timeline.get('retained_horizon')!r}, expected the branches' fork "
+            f"point {DELETE_FORK_LSN}"
+        )
+    return state
+
+
+def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
+    """DELETING is durable at every stage; the owner's private WAL artifacts
+    survive the first boundary and are gone from the second on, and nothing
+    of the owner remains once DELETED is durable."""
+    artifacts = _branch_private_artifacts(store, DELETE_BRANCH)
+    wal = [name for name in artifacts if not name.startswith("layer_")]
+    if stage == "delete_deleting":
+        # every consumer the later stages claim to clean up must exist now,
+        # or their absence afterwards proves nothing
+        missing = [
+            what for what, present in (
+                ("private WAL", f"wal_{DELETE_BRANCH}" in wal),
+                ("WAL-index epoch", any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in wal)),
+                ("owner layer", any(n.startswith("layer_") for n in artifacts)),
+                ("sealed immutable WAL segment",
+                 _branch_seeded_wal_segment(store, DELETE_BRANCH)),
+                ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
+            ) if not present
+        ]
+        if missing:
+            raise OracleMismatch(
+                f"after_deleting crash found the branch without its seeded {missing!r}: "
+                f"{artifacts!r}"
+            )
+        return
+    if wal:
+        raise OracleMismatch(
+            f"after_{stage} crash left private WAL artifacts {wal!r}"
+        )
+    if stage == "delete_segment_rewrite":
+        # the probe fires after one shared segment was atomically rewritten
+        # without the owner's records: some segment must now hold survivors
+        # of timeline 0 and nothing of the deleted owner
+        rewritten = [
+            path.name for path in sorted(store.glob("seg_*"))
+            for owners in [_segment_record_timelines(path)]
+            if owners and DELETE_BRANCH not in owners
+        ]
+        if not rewritten:
+            raise OracleMismatch(
+                "after_segment_rewrite crash left no shared segment rewritten "
+                "without the deleted owner's records"
+            )
+    if stage == "delete_deleted":
+        if artifacts:
+            raise OracleMismatch(
+                f"after_deleted crash left owner artifacts {artifacts!r}"
+            )
+        events = [e for e in _timeline_events(store) if e["id"] == DELETE_BRANCH]
+        if not events or events[-1]["kind"] != TIMELINE_EVENT_STATE or \
+                events[-1]["state"] != 3 or events[-1]["incarnation"] != 1:
+            raise OracleMismatch(
+                "after_deleted crash did not leave a durable DELETED event with the "
+                f"seeded incarnation as the branch's latest record: {events[-1:]!r}"
+            )
+
+
+def _check_delete_abort_state(store: Path) -> dict[str, Any]:
+    """A deletion whose DELETING record never became durable leaves nothing
+    behind: the branch keeps its lifecycle, and every artifact it owned is
+    still there (the verify client already read its pages back)."""
+    events = [e for e in _timeline_events(store) if e["id"] == DELETE_BRANCH]
+    lifecycle = [e for e in events if e["kind"] == TIMELINE_EVENT_STATE]
+    if lifecycle:
+        raise OracleMismatch(
+            "a deletion that never became durable left lifecycle records "
+            f"{lifecycle!r}"
+        )
+    artifacts = _branch_private_artifacts(store, DELETE_BRANCH)
+    missing = [
+        what for what, present in (
+            ("private WAL", f"wal_{DELETE_BRANCH}" in artifacts),
+            ("WAL-index epoch",
+             any(n.startswith(f"walidx_{DELETE_BRANCH}_") for n in artifacts)),
+            ("sealed immutable WAL segment",
+             _branch_seeded_wal_segment(store, DELETE_BRANCH)),
+            # both halves of the layer must still be there: a manifest entry
+            # whose file was unlinked, or a file whose entry was removed, is
+            # half a retirement the aborted deletion must not have started
+            ("owner layer in the manifest and on disk",
+             any(n.startswith("layer_") and "on disk" in n and "in the manifest" in n
+                 for n in artifacts)),
+            ("fork metadata", DELETE_BRANCH in _forkmeta_timelines(store)),
+        ) if not present
+    ]
+    if missing:
+        raise OracleMismatch(
+            f"a deletion that never became durable lost {missing!r}: {artifacts!r}"
+        )
+    # the same settled state the completed deletion reports, so the clean
+    # restart is held to what this recovery left behind
+    return {
+        "events": _timeline_events(store),
+        "artifacts": artifacts,
+        "forkmeta_owners": sorted(_forkmeta_timelines(store)),
+    }
+
+
+def _check_delete_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """The verify client already waited for DELETED; the owner's artifacts
+    must be gone, the manifest reconciled, the root's history still capped by
+    the live sibling's fork point, and no owner registered.  Returns the
+    settled deletion state so the clean restart can be held to it."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        artifacts = _branch_private_artifacts(store, DELETE_BRANCH)
+        manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+        if manifest.get("manifest_poisoned") is not False:
+            raise OracleMismatch(
+                f"after_{stage} recovery reported manifest_poisoned="
+                f"{manifest.get('manifest_poisoned')!r}"
+            )
+        owning_segments = [
+            path.name for path in sorted(store.glob("seg_*"))
+            if DELETE_BRANCH in _segment_record_timelines(path)
+        ]
+        settled = not artifacts and manifest.get("deleting_layers") == 0 and \
+            manifest.get("layer_count") == manifest.get("local_layers") and \
+            DELETE_BRANCH not in _forkmeta_timelines(store) and not owning_segments
+        if settled:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery left artifacts {artifacts!r} manifest "
+                f"{manifest!r} forkmeta owners {sorted(_forkmeta_timelines(store))!r} "
+                f"segments still holding the owner's records {owning_segments!r} "
+                f"after {poll_timeout:.3f}s"
+            )
+        time.sleep(min(0.05, deadline - now))
+    timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
+    if timeline.get("parent_timeline") != -1:
+        raise OracleMismatch(f"after_{stage} recovery changed timeline 0: {timeline!r}")
+    # The live sibling forks from the root at the same LSN, so deleting its
+    # sibling must not lift the root's structural cap: cleanup that dropped it
+    # would let the ancestor history the sibling still reads be pruned, and
+    # the client only ever reads the parent's latest page.
+    if timeline.get("retained_horizon") != DELETE_FORK_LSN:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported retained_horizon="
+            f"{timeline.get('retained_horizon')!r}, expected the live sibling's "
+            f"fork point {DELETE_FORK_LSN}"
+        )
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected none"
+        )
+    # The settled deletion state: a restart that re-appends a lifecycle event
+    # or rewrites the deletion's artifacts reaches the same predicates above
+    # while changing what is durable, which is what idempotence is about.
+    return {
+        "events": _timeline_events(store),
+        "artifacts": _branch_private_artifacts(store, DELETE_BRANCH),
+        "forkmeta_owners": sorted(_forkmeta_timelines(store)),
+    }
+
+
+def _check_wal_reclaim_crash_snapshot(store: Path, stage: str, hit: int) -> None:
+    """The physical frontier is durable at every stage; the number of sealed
+    segments still on disk tells the stage apart: none unlinked before the
+    first unlink, one per hit after an unlink, none before the directory
+    fsync that retires the residual prefix."""
+    expected = {
+        "reclaim_before_unlink": WAL_RECLAIM_SEGMENTS,
+        "reclaim_after_unlink": WAL_RECLAIM_SEGMENTS - hit,
+        "reclaim_before_dir_fsync": 0,
+    }[stage]
+    metadata = _wal_store_metadata(store)
+    if metadata is None:
+        raise OracleMismatch(
+            f"after_{stage} crash left no valid shipped-WAL store metadata"
+        )
+    # The physical frontier is what these boundaries are about, and before the
+    # first unlink it is the only thing that distinguishes the crash image
+    # from the state before publication: the files are all still there either
+    # way, and restart maintenance would publish the frontier and reclaim them
+    # before the recovery checks ran.
+    if metadata["directory_start_lsn"] != WAL_RECLAIM_TOTAL or \
+            metadata["retained_base_lsn"] != WAL_RECLAIM_TOTAL:
+        raise OracleMismatch(
+            f"after_{stage} crash published {metadata!r}, expected the "
+            f"directory to start and retain at {WAL_RECLAIM_TOTAL}"
+        )
+    files = _wal_segment_files(store)
+    if len(files) != expected:
+        raise OracleMismatch(
+            f"after_{stage} crash left {len(files)} sealed WAL segments "
+            f"{files!r}, expected {expected}"
+        )
+
+
+def _check_wal_reclaim_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """The verify client already waited for the prefix reads to be refused;
+    the segment files must be gone, the identity kept, and the reclaimer
+    must have released its physical debt."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        files = _wal_segment_files(store)
+        if not files:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery left sealed WAL segments {files!r} "
+                f"after {poll_timeout:.3f}s"
+            )
+        time.sleep(min(0.05, deadline - now))
+    if not (store / WAL_RECLAIM_IDENTITY).exists():
+        raise OracleMismatch(f"after_{stage} recovery lost the shipped-WAL identity")
+    backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
+    if backpressure.get("wal_throttled") not in (0, False) or \
+            backpressure.get("wal_lag_bytes") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery kept WAL reclaim debt: "
+            f"throttled={backpressure.get('wal_throttled')!r} "
+            f"lag={backpressure.get('wal_lag_bytes')!r}"
+        )
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected none"
+        )
+    metadata = _wal_store_metadata(store)
+    if metadata is None:
+        raise OracleMismatch(
+            f"after_{stage} recovery left no valid shipped-WAL store metadata"
+        )
+    # the settled shipped-WAL state, so the clean restart has to adopt what
+    # recovery reclaimed instead of moving the directory or its files again
+    return {"metadata": metadata, "files": _wal_segment_files(store)}
+
+
+
+
+def _manifest_records_at(manifest: Path) -> list[tuple[int, bytes]]:
+    """(type, payload) of every complete record of one manifest log, in
+    order."""
+    try:
+        # compaction replaces the log by rename, so it can be absent for an
+        # instant while a polling oracle reads it
+        data = manifest.read_bytes()
+    except OSError:
+        return []
+    records: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset + 20 <= len(data):
+        # the daemon persists its C structs directly: decode in host byte order
+        magic, version, kind, length, _crc = struct.unpack_from("=IIIII", data, offset)
+        if magic != MANIFEST_MAGIC or version != MANIFEST_VERSION:
+            break
+        if offset + 20 + length > len(data):
+            break
+        records.append((kind, data[offset + 20:offset + 20 + length]))
+        offset += 20 + length
+    return records
+
+
+def _manifest_records(store: Path) -> list[tuple[int, bytes]]:
+    return _manifest_records_at(store / "layers.manifest")
+
+
+def _manifest_record_layer_id(payload: bytes) -> int | None:
+    """The layer id a record names: the leading uint64 of every payload that
+    carries one.  Matching the raw bytes anywhere in the payload would also
+    match an unrelated block range or size that happens to look like it."""
+    return struct.unpack_from("=Q", payload, 0)[0] if len(payload) >= 8 else None
+
+
+def _manifest_names_layer(records: list[tuple[int, bytes]], kind: int, layer_id: int) -> bool:
+    return any(k == kind and _manifest_record_layer_id(payload) == layer_id
+               for k, payload in records)
+
+
+def _manifest_marks_after_add(records: list[tuple[int, bytes]], layer_id: int) -> int:
+    """Tombstones the log records after the given layer's ADD, whether or not
+    their layer files are still on disk."""
+    after = False
+    marks = 0
+    for kind, payload in records:
+        if kind == MANIFEST_ADD_LAYER and _manifest_record_layer_id(payload) == layer_id:
+            after = True
+        elif after and kind == MANIFEST_MARK_DELETE:
+            marks += 1
+    return marks
+
+
+def _gc_granted_cutoff_seq(control: Path) -> int | None:
+    """The admission sequence the seed's reservation was granted, as the seed
+    recorded it; None when the seed has not reported one."""
+    try:
+        return int((control / "cutoff-seq").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _check_gc_crash_snapshot(
+    store: Path, stage: str, control: Path, hit: int = 1
+) -> dict[str, Any] | None:
+    """Check the stage-specific durable state before recovery mutates the store.
+
+    The replacement layer file is sealed before the frontier advances, its
+    manifest ADD lands after the frontier probe, and the sources' tombstones
+    after the publication probe.  The newest layer id on disk is the
+    replacement; whether the manifest names it, and whether any tombstone
+    exists yet, tells the three boundaries apart.  The WAL-index stage follows
+    the durable frontier but precedes the generation commit, so the prepared
+    generation is still staged.
+    """
+    if stage.startswith("reclaim_"):
+        _check_wal_reclaim_crash_snapshot(store, stage, hit)
+        return
+    if stage == "delete_before_deleting":
+        _check_delete_abort_crash_snapshot(store)
+        return
+    if stage.startswith("delete_"):
+        _check_delete_crash_snapshot(store, stage)
+        return
+    if stage.startswith("manifest_"):
+        _check_manifest_crash_snapshot(store, stage)
+        return
+    if stage.startswith("forkmeta_"):
+        # the cutoff a forkmeta generation carries is only meaningful if the
+        # page frontier that proves it is durable in the same crash image
+        fences = _page_frontier_fences(store, 0)
+        if not any(incarnation == 1 and lsn == FORKMETA_CUTOFF_LSN
+                   for incarnation, lsn, _seq in fences):
+            raise OracleMismatch(
+                f"after_{stage} crash published timeline 0 fences {fences!r}, "
+                f"expected the proven frontier {FORKMETA_CUTOFF_LSN} in incarnation 1"
+            )
+        selected = _check_forkmeta_crash_snapshot(store, stage)
+        # the generation the crash had already selected, so recovery can be
+        # held to it instead of to whatever it settles on
+        return {"forkmeta_selected": selected} if selected is not None else None
+    if stage == "walidx_frontier":
+        if not (store / "walidx-prune.frontiers").exists():
+            raise OracleMismatch(
+                "after_walidx_frontier did not leave a durable WAL-index frontier"
+            )
+        if not (store / WALIDX_PREPARED).exists():
+            raise OracleMismatch(
+                "after_walidx_frontier did not leave the prepared WAL-index "
+                "generation staged for its restart retry"
+            )
+        if (store / WALIDX_MANIFEST).exists():
+            raise OracleMismatch(
+                "after_walidx_frontier committed the WAL-index generation "
+                "before the probe"
+            )
+        prepared = _walidx_snapshot_record(store / WALIDX_PREPARED)
+        if prepared is None:
+            raise OracleMismatch(
+                "after_walidx_frontier staged a WAL-index generation the "
+                "harness cannot read"
+            )
+        # the frontier already covers this generation, so recovery has to
+        # retry it rather than build an equivalent one under a new number
+        return {"walidx_prepared": prepared}
+    files = _canonical_layer_files(store)
+    if len(files) < 2:
+        raise OracleMismatch(
+            f"after_{stage} crash left {len(files)} canonical layer files, "
+            "expected the replacement next to its retired sources"
+        )
+    records = _manifest_records(store)
+    if not records:
+        raise OracleMismatch(f"after_{stage} crash left no published layers.manifest")
+    ids = {int(path.name.rsplit("_", 1)[1], 16) for path in files}
+    replacement = max(ids)
+    published = _manifest_names_layer(records, MANIFEST_ADD_LAYER, replacement)
+    # earlier flush-driven passes may have retired layers of their own; only
+    # tombstones on the sources still on disk belong to the crashed pass
+    tombstones = sum(
+        1 for layer_id in ids
+        if layer_id != replacement and
+        _manifest_names_layer(records, MANIFEST_MARK_DELETE, layer_id)
+    )
+    # The frontier is the prerequisite of both later boundaries: publishing a
+    # replacement or a tombstone before it is durable is an ordering error
+    # that recovery would otherwise repair before any later check runs.
+    fences = _page_frontier_fences(store, 0)
+    if not fences:
+        raise OracleMismatch(
+            f"after_{stage} did not leave a valid durable page-prune frontier"
+        )
+    # this store defines timeline 0 with the first incarnation, so the cutoff
+    # must be published for that one, not merely for some slot, and at the
+    # admission sequence the reservation was granted
+    expected = GC_WORKLOADS["page_prune"]["retained_horizon"]
+    granted = _gc_granted_cutoff_seq(control)
+    if not any(incarnation == 1 and lsn == expected and
+               (granted is None or seq == granted)
+               for incarnation, lsn, seq in fences):
+        raise OracleMismatch(
+            f"after_{stage} published timeline 0 fences {fences!r}, expected the "
+            f"configured cutoff {expected} in incarnation 1 at "
+            f"admission sequence {granted}"
+        )
+    if stage == "frontier":
+        if published:
+            raise OracleMismatch(
+                "after_frontier crash already published the replacement layer"
+            )
+        if tombstones:
+            raise OracleMismatch(
+                f"after_frontier crash already wrote {tombstones} source tombstone(s)"
+            )
+    elif stage == "publish":
+        if not published:
+            raise OracleMismatch(
+                f"after_publish crash did not publish replacement layer {replacement:#x}"
+            )
+        # No tombstone of this pass's sources at all, wherever the record
+        # sits: retirement ordered ahead of publication is the defect, and
+        # counting only records after the ADD would miss it.
+        if tombstones:
+            raise OracleMismatch(
+                f"after_publish crash already wrote {tombstones} source tombstone(s)"
+            )
+    elif stage == "mark_delete":
+        if not published or tombstones == 0:
+            raise OracleMismatch(
+                "after_mark_delete crash left no source tombstone behind the "
+                f"published replacement (published={published}, tombstones={tombstones})"
+            )
+        if not _manifest_marks_after_add(records, replacement):
+            raise OracleMismatch(
+                "after_mark_delete crash retired a source before publishing the "
+                f"replacement layer {replacement:#x}"
+            )
+    return None
+
+
+def _walidx_snapshot_record(path: Path) -> dict[str, Any] | None:
+    """The identity of one WAL-index snapshot generation, as the staged and
+    the committed file both carry it: the generation, the interval it covers,
+    and the shard payloads it names."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < WALIDX_SNAPSHOT_HEADER_BYTES:
+        return None
+    # the daemon writes this header little-endian, not in host order
+    magic, version, header_bytes, entry_bytes, timeline, nshards = \
+        struct.unpack_from("<IIIIII", data, 0)
+    generation, start_lsn, end_lsn = struct.unpack_from("<QQQ", data, 24)
+    if magic != WALIDX_SNAPSHOT_MAGIC or version != WALIDX_SNAPSHOT_VERSION or \
+            header_bytes != WALIDX_SNAPSHOT_HEADER_BYTES or \
+            entry_bytes != WALIDX_SNAPSHOT_ENTRY_BYTES:
+        return None
+    if len(data) != header_bytes + nshards * entry_bytes:
+        return None
+    shards = []
+    for shard in range(nshards):
+        index, crc, length = struct.unpack_from(
+            "<IIQ", data, header_bytes + shard * entry_bytes
+        )
+        if index != shard:
+            return None
+        shards.append((crc, length))
+    return {
+        "timeline": timeline, "generation": generation,
+        "start_lsn": start_lsn, "end_lsn": end_lsn, "shards": shards,
+    }
+
+
+def _walidx_generation_files(store: Path) -> list[str]:
+    """The committed WAL-index snapshot manifest and the shard payloads
+    beside it, as the names that identify one generation."""
+    directory = store / "walidx_snapshots_0"
+    if not directory.is_dir():
+        return []
+    return sorted(entry.name for entry in directory.iterdir() if entry.is_file())
+
+
+def _check_walidx_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    stage: str,
+    crash_state: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The verify client already waited for the compacted chains, so the
+    retried generation is committed: the staged copy is gone, the committed
+    manifest exists, and the fixed WAL-index reader survived recovery."""
+    if (store / WALIDX_PREPARED).exists():
+        raise OracleMismatch(
+            f"after_{stage} recovery served the compacted chains but left the "
+            "prepared WAL-index generation staged"
+        )
+    if not (store / WALIDX_MANIFEST).exists():
+        raise OracleMismatch(
+            f"after_{stage} recovery did not commit the WAL-index generation"
+        )
+    if not (store / "walidx-prune.frontiers").exists():
+        raise OracleMismatch(f"after_{stage} recovery lost the WAL-index frontier")
+    committed = _walidx_snapshot_record(store / WALIDX_MANIFEST)
+    if committed is None:
+        raise OracleMismatch(
+            f"after_{stage} recovery committed a WAL-index generation the "
+            "harness cannot read"
+        )
+    # The staged generation was already covered by the durable frontier, so
+    # recovery has to retry that one.  Rebuilding an equivalent snapshot under
+    # a new generation would satisfy every later check -- the restart
+    # comparison starts from whatever this recovery settled on -- while
+    # abandoning the generation the frontier was published for.
+    prepared = (crash_state or {}).get("walidx_prepared")
+    if prepared is not None and committed != prepared:
+        raise OracleMismatch(
+            f"after_{stage} recovery committed {committed!r} instead of the "
+            f"staged generation {prepared!r}"
+        )
+    owners = inspect_store(inspector, shm, "owners", inspection_schema)
+    if owners.get("retention_poisoned") is not False or \
+            owners.get("wal_index_owners") != 1 or \
+            owners.get("page_history_owners") != 0:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported owners={owners!r}, expected one "
+            "WAL-index owner and no page-history owner"
+        )
+    # the committed generation, so a restart that republishes it can be told
+    # from one that adopts what recovery already committed
+    return {
+        "manifest": (store / WALIDX_MANIFEST).read_bytes(),
+        "files": _walidx_generation_files(store),
+    }
+
+
+def _check_gc_recovery(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    store: Path,
+    workload: str,
+    stage: str,
+    timeout: float,
+    crash_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """After recovery the manifest is sane, the retired sources are gone once
+    cleanup has resumed (only the replacement remains, in the manifest and on
+    disk), and the retained horizon is the configured cutoff."""
+    if workload == "wal_index":
+        return _check_walidx_recovery(inspector, shm, inspection_schema, store,
+                                      stage, crash_state)
+    if workload == "wal_reclaim":
+        return _check_wal_reclaim_recovery(
+            inspector, shm, inspection_schema, store, stage, timeout
+        )
+    if workload == "timeline_delete":
+        return _check_delete_recovery(inspector, shm, inspection_schema, store,
+                                      stage, timeout)
+    if workload == "timeline_delete_abort":
+        return _check_delete_abort_recovery(inspector, shm, inspection_schema,
+                                            store)
+    if workload == "manifest_compact":
+        return _check_manifest_recovery(inspector, shm, inspection_schema, store,
+                                        stage, timeout)
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+        if manifest.get("manifest_poisoned") is not False:
+            raise OracleMismatch(
+                f"after_{stage} recovery reported manifest_poisoned="
+                f"{manifest.get('manifest_poisoned')!r}"
+            )
+        layer_count = manifest.get("layer_count")
+        deleting = manifest.get("deleting_layers")
+        files = _canonical_layer_files(store)
+        if isinstance(layer_count, int) and isinstance(deleting, int) and \
+                deleting == 0 and layer_count == manifest.get("local_layers") == 1 and \
+                len(files) == 1:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery did not retire the source layers within "
+                f"{poll_timeout:.3f}s; last manifest={manifest!r}, files={[f.name for f in files]!r}"
+            )
+        time.sleep(min(0.05, deadline - now))
+    expected_horizon = GC_WORKLOADS[workload]["retained_horizon"]
+    timeline = inspect_store(inspector, shm, "timeline", inspection_schema, timeline=0)
+    if timeline.get("retained_horizon") != expected_horizon:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported retained_horizon="
+            f"{timeline.get('retained_horizon')!r}, expected {expected_horizon}"
+        )
+    if workload == "forkmeta":
+        return _check_forkmeta_recovery(store, stage, timeout, crash_state)
+    return None
+
+
+def _gc_converged_state(store: Path) -> dict[str, Any]:
+    """The durable state a converged store must not change on a further boot.
+
+    Every per-boot oracle is satisfied by a recovery that recompacts the sole
+    surviving layer into a fresh replacement each time it starts, so the
+    idempotence contract needs the state that such churn moves: which layer
+    files exist, which layers the manifest still publishes, and the durable
+    page-prune frontiers.
+    """
+    records = _manifest_records(store)
+    live: set[int] = set()
+    for kind, payload in records:
+        layer_id = _manifest_record_layer_id(payload)
+        if layer_id is None:
+            continue
+        if kind == MANIFEST_ADD_LAYER:
+            live.add(layer_id)
+        elif kind == MANIFEST_MARK_DELETE:
+            live.discard(layer_id)
+    return {
+        "layer_files": sorted(path.name for path in _canonical_layer_files(store)),
+        "published_layers": sorted(live),
+        "frontiers": sorted(_page_frontier_fences(store, 0)),
+    }
+
+
+def _check_gc_restart_idempotent(
+    store: Path, converged: dict[str, Any], stage: str
+) -> None:
+    """The extra clean restart must converge on the state the first recovery
+    already reached, not merely on a state that passes the same checks."""
+    current = _gc_converged_state(store)
+    if current != converged:
+        differing = sorted(
+            key for key in converged if current.get(key) != converged.get(key)
+        )
+        raise OracleMismatch(
+            f"after_{stage} the extra restart changed durable state "
+            f"{differing!r}: {converged!r} became {current!r}"
+        )
+
+
 def _layer_fault_stage(fault_name: str) -> str | None:
     stages = {
         "image_layer.after_create": "create",
@@ -2238,7 +4138,13 @@ def _canonical_layer_files(store: Path) -> list[Path]:
     for path in sorted(store.iterdir()):
         if not pattern.fullmatch(path.name):
             continue
-        value = path.lstat()
+        try:
+            value = path.lstat()
+        except FileNotFoundError:
+            # a recovering daemon retires source layers while the oracles
+            # poll: a name listed a moment ago may already be unlinked, which
+            # is the state this listing is watching for, not an error
+            continue
         if stat.S_ISREG(value.st_mode):
             files.append(path)
     return files
@@ -2336,20 +4242,36 @@ def _check_layer_manifest_after_restart(
 
 
 def _start_layer_client(
-    client: Path, shm: str, mode: str, log: Path,
+    client: Path, shm: str, mode: str, log: Path, arm_marker: Path | None = None,
+    workload: str | None = None, resume_file: Path | None = None,
+    cutoff_seq_file: Path | None = None,
 ) -> subprocess.Popen[str]:
+    command = [str(client.resolve()), "--shm", shm, "--mode", mode]
+    if workload is not None:
+        command.extend(["--workload", workload])
+    if arm_marker is not None:
+        command.extend(["--arm-marker", str(arm_marker)])
+    if resume_file is not None:
+        command.extend(["--resume-file", str(resume_file)])
+    if cutoff_seq_file is not None:
+        command.extend(["--cutoff-seq-file", str(cutoff_seq_file)])
     with log.open("a", encoding="utf-8") as output:
         return subprocess.Popen(
-            [str(client.resolve()), "--shm", shm, "--mode", mode],
+            command,
             stdout=output, stderr=subprocess.STDOUT, text=True,
             env=private_environment(), start_new_session=True,
         )
 
 
-def _verify_layer_client(client: Path, shm: str, log: Path, timeout: float) -> None:
+def _verify_layer_client(
+    client: Path, shm: str, log: Path, timeout: float, workload: str | None = None,
+) -> None:
+    command = [str(client.resolve()), "--shm", shm, "--mode", "verify"]
+    if workload is not None:
+        command.extend(["--workload", workload])
     with log.open("a", encoding="utf-8") as output:
         result = subprocess.run(
-            [str(client.resolve()), "--shm", shm, "--mode", "verify"],
+            command,
             stdout=output, stderr=subprocess.STDOUT, text=True,
             env=private_environment(), timeout=max(5.0, timeout), check=False,
         )
@@ -2371,11 +4293,13 @@ def run_daemon_fault_recovery(
     rerun_command: list[str] | None = None,
     timeout: float = 15.0,
     layer_client: Path | None = None,
+    gc_client: Path | None = None,
 ) -> Path:
     """Run one pre-armed named daemon fault and prove recovery is idempotent."""
     daemon = daemon.resolve()
     inspector = inspector.resolve()
     layer_client = layer_client.resolve() if layer_client is not None else None
+    gc_client = gc_client.resolve() if gc_client is not None else None
     validate_plan(plan, capabilities, capabilities_path)
     validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
     root, temporary = run_root(requested_root)
@@ -2386,6 +4310,7 @@ def run_daemon_fault_recovery(
     trace = root / "trace"
     store = root / "store"
     control = root / "fault-control"
+    pause_file = control / "maintenance-pause"
     trace.mkdir()
     store.mkdir()
     shutil.copy2(plan.path, root / "plan.jsonl")
@@ -2422,6 +4347,16 @@ def run_daemon_fault_recovery(
     if layer_seed_actions and layer_client is None:
         raise PlanError("layer_seed requires --layer-client-binary")
     layer_stage = _layer_fault_stage(action["fault"]) if layer_seed_actions else None
+    gc_seed_actions = [item for item in plan.actions if item["op"] == "gc_seed"]
+    if gc_seed_actions and gc_client is None:
+        raise PlanError("gc_seed requires --gc-client-binary")
+    gc_stage = _gc_fault_stage(action["fault"]) if gc_seed_actions else None
+    crash_state: dict[str, Any] | None = None
+    gc_workload = gc_seed_actions[0]["workload"] if gc_seed_actions else None
+    # Both seeds drive the same one-client workload protocol; the layer and
+    # page-pruning slices differ only in the binary, daemon flags, and oracles.
+    seed_client = gc_client if gc_seed_actions else layer_client
+    seed_actions = gc_seed_actions or layer_seed_actions
     validate_fault_action(
         action, capabilities, f"{plan.path}:{action['id']}", capabilities_path,
         require_model=action["op"] == "crash",
@@ -2464,6 +4399,17 @@ def run_daemon_fault_recovery(
     marker = control / "arm"
     report = control / "report.jsonl"
     release = control / "release"
+    pause_file = control / "maintenance-pause"
+    cutoff_seq_file = control / "cutoff-seq"
+    # The seed installs the cutoff that makes pruning due and then arms the
+    # fault; maintenance stays paused across both, so no pass can run against
+    # the old floor and none can outrun arming either.
+    # Every gc workload starts its crash generation paused: the seed installs
+    # the cutoff that makes its work due and then arms the fault, and a pass
+    # in between would either be planned against the old floor or consume the
+    # only due work before the fault is armed.  A workload whose daemon_args
+    # name {pause} places the file itself; the rest get the flag added.
+    gc_pauses_maintenance = bool(gc_seed_actions)
     failure: Exception | None = None
     current_action_id: str | None = None
 
@@ -2496,7 +4442,20 @@ def run_daemon_fault_recovery(
         if layer_seed_actions:
             command.extend(["--segment-size", "65536", "--flush-pages", "2",
                             "--compact-layers", "1000"])
+        if gc_seed_actions:
+            command.extend(
+                arg.replace("{pause}", str(pause_file))
+                for arg in GC_WORKLOADS[gc_workload]["daemon_args"]
+            )
+            # workloads whose own daemon_args do not name the pause file still
+            # start paused while the seed installs its cutoff and arms
+            if inject_fault and gc_pauses_maintenance and \
+                    "--test-maintenance-pause-file" not in \
+                    GC_WORKLOADS[gc_workload]["daemon_args"]:
+                command.extend(["--test-maintenance-pause-file", str(pause_file)])
         env = private_environment()
+        if gc_seed_actions:
+            env.update(GC_WORKLOADS[gc_workload].get("daemon_env", {}))
         if inject_fault:
             # Keep these names local and explicit: inherited PAGESTORE_* values
             # are removed by private_environment before this point.
@@ -2562,20 +4521,51 @@ def run_daemon_fault_recovery(
         control.mkdir(mode=0o700)
         if any(control.iterdir()):
             raise PlanError(f"fault control path is not fresh: {control}")
-        _atomic_arm_marker(marker)
+        # The page-pruning workload arms the marker itself, right before it
+        # installs the cutoff: the flush-driven compactions that run while
+        # its history is written would otherwise trip the probe with nothing
+        # to retire.  Every other fault is armed before the daemon starts.
+        if not gc_seed_actions:
+            _atomic_arm_marker(marker)
+        # A workload that needs its writes complete before maintenance runs
+        # starts the crash generation paused; the workload removes the file
+        # once it has armed the fault.  Restarts never pause.
+        if gc_pauses_maintenance:
+            pause_file.touch()
         daemon_log.touch()
         emit("run_start", shm_base=shm_base)
         current_action_id = action["id"]
-        emit("fault_arm", target="store", name=fault_name, hit=fault_hit)
+        if gc_seed_actions:
+            # the workload creates the marker itself; fault_arm is recorded
+            # when that marker is observed, so the event log places the
+            # arming after the history writes it must follow
+            emit("fault_configured", target="store", name=fault_name, hit=fault_hit,
+                 armed_by="workload")
+        else:
+            emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
+                 armed_by="harness")
+        workload_armed = not gc_seed_actions
+        # the crash generation starts paused; the workload releases it once
+        # the cutoff is durable and the fault armed.  Restarts never pause.
+        if gc_pauses_maintenance:
+            pause_file.touch()
         process = start_daemon(True, action["id"])
-        if layer_seed_actions:
+        if seed_actions:
             wait_ready(process)
             layer_client_process = _start_layer_client(
-                layer_client, shm, "seed", trace / "layer-client.log"
+                seed_client, shm, "seed", trace / "layer-client.log",
+                arm_marker=marker if gc_seed_actions else None,
+                workload=gc_workload,
+                resume_file=pause_file if gc_pauses_maintenance else None,
+                cutoff_seq_file=cutoff_seq_file if gc_seed_actions else None,
             )
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
             while process.poll() is None and time.monotonic() < deadline:
+                if not workload_armed and marker.exists():
+                    workload_armed = True
+                    emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
+                         armed_by="workload")
                 if layer_client_process is not None and layer_client_process.poll() is not None:
                     if layer_client_process.returncode == 0:
                         raise FaultNotReached(
@@ -2585,6 +4575,12 @@ def run_daemon_fault_recovery(
                         f"layer workload exited with status {layer_client_process.returncode}"
                     )
                 time.sleep(0.02)
+            if not workload_armed and marker.exists():
+                # the daemon may have crashed within the same poll interval
+                # in which the workload armed it
+                workload_armed = True
+                emit("fault_arm", target="store", name=fault_name, hit=fault_hit,
+                     armed_by="workload")
             if process.poll() is None:
                 raise FaultNotReached(
                     f"deadline waiting for fault {fault_name!r} expired; expected crash was unhit"
@@ -2612,6 +4608,12 @@ def run_daemon_fault_recovery(
             shutil.copy2(report, trace / "fault-report.jsonl")
             if layer_stage is not None:
                 _check_layer_crash_snapshot(store, layer_stage)
+            if gc_stage is not None:
+                # what the crash left behind, for the recovery oracles that
+                # must prove recovery settled on it rather than on an
+                # equivalent state of its own making
+                crash_state = _check_gc_crash_snapshot(store, gc_stage, control,
+                                                       fault_hit)
             if layer_client_process is not None and layer_client_process.poll() is None:
                 layer_client_process.kill()
                 layer_client_process.wait(timeout=5)
@@ -2740,6 +4742,13 @@ def run_daemon_fault_recovery(
             _verify_layer_client(layer_client, shm, trace / "layer-client.log", timeout)
             manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
             _check_layer_manifest(manifest, layer_stage, False)
+        recovered_state = None
+        if gc_seed_actions:
+            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
+                                 workload=gc_workload)
+            recovered_state = _check_gc_recovery(inspector, shm, inspection_schema,
+                                                 store, gc_workload, gc_stage, timeout,
+                                                 crash_state)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
@@ -2752,6 +4761,9 @@ def run_daemon_fault_recovery(
              returncode=process.returncode)
         remove_shm(shm)
         process = None
+        # the first recovery has converged and its daemon is down, so this is
+        # the durable state the additional restart has to leave alone
+        converged = _gc_converged_state(store) if gc_seed_actions else None
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
         if layer_seed_actions:
@@ -2759,8 +4771,39 @@ def run_daemon_fault_recovery(
             _check_layer_manifest_after_restart(
                 inspector, shm, inspection_schema, layer_stage, timeout
             )
+        if gc_seed_actions:
+            _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
+                                 workload=gc_workload)
+            restarted_state = _check_gc_recovery(inspector, shm, inspection_schema,
+                                                 store, gc_workload, gc_stage, timeout)
+            # nothing mutates the store between the two starts, so a restart
+            # that republishes a generation is not idempotent
+            if restarted_state != recovered_state:
+                # nothing changed between the two starts, so a restart that
+                # publishes a new generation is not idempotent
+                raise OracleMismatch(
+                    f"clean restart changed the settled state from {recovered_state!r} "
+                    f"to {restarted_state!r}"
+                )
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
+        if gc_seed_actions:
+            # Readiness is published as soon as the maintenance thread is
+            # created, so the pass that startup marks due may not have run
+            # yet: comparing while the daemon is up can see the state before
+            # a recompaction it is about to do.  Stop it first -- the same
+            # quiescent point the converged state was taken at.
+            stop_daemon()
+            if process.returncode != 0:
+                raise UnexpectedExit(
+                    "restarted daemon did not stop cleanly; status "
+                    f"{process.returncode}"
+                )
+            emit("process_stop", target="store", pid=process.pid,
+                 returncode=process.returncode)
+            remove_shm(shm)
+            process = None
+            _check_gc_restart_idempotent(store, converged, gc_stage)
         emit("run_pass")
     except Exception as error:
         failure = error
@@ -2795,6 +4838,8 @@ def run_daemon_fault_recovery(
                 "--daemon-binary", str(daemon), "--inspect-binary", str(inspector),
                 *( ["--layer-client-binary", str(layer_client)]
                    if layer_client is not None else [] ),
+                *( ["--gc-client-binary", str(gc_client)]
+                   if gc_client is not None else [] ),
                 "--run-root", str(root.parent / f"{root.name}.rerun"), "--keep",
             ],
         }
@@ -2931,6 +4976,7 @@ def run_writer_smoke(
         reader_seeds: dict[str, Path] = {}
         reader_clients: dict[str, tuple[Path, int]] = {}
         reader_data_dirs: dict[str, Path] = {}
+        reader_lsns: dict[str, str] = {}
         reader_owner_ids: dict[str, int] = {}
         for action in plan.actions:
             if action["op"] == "sql":
@@ -3029,7 +5075,100 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(reader_data), "-l", str(trace / "reader.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 reader_clients[action["target"]] = (reader_socket, reader_port)
                 reader_data_dirs[action["target"]] = reader_data
+                reader_lsns[action["target"]] = lsn
                 events.emit("install_reader", id=action["id"], target=action["target"], lsn=lsn, data=str(reader_data), port=reader_port)
+                continue
+            elif action["op"] == "restart":
+                # A clean compute restart: the writer or an installed pinned
+                # reader stops with a fast shutdown and starts from its own
+                # data directory against the unchanged store.  A pinned
+                # reader's shutdown checkpoint rewrites its pg_control, so its
+                # restart follows the documented protocol and restores the
+                # boot control image at its immutable identity first.
+                restored_control = False
+                if action["target"] == "writer":
+                    restart_data, restart_log = data, trace / "writer.log"
+                elif action["target"] in reader_data_dirs:
+                    restart_data, restart_log = reader_data_dirs[action["target"]], trace / "reader.log"
+                else:
+                    raise PlanError(f"restart {action['id']} targets unavailable compute {action['target']!r}")
+
+                def compute_instance(what: Path) -> dict[str, Any]:
+                    """The postmaster this data directory is running, as a
+                    PID with its start time: a replacement handed the same PID
+                    is a different process, and the trace has to be able to
+                    show that the named compute was in fact replaced."""
+                    try:
+                        pid = int(
+                            (what / "postmaster.pid").read_text(encoding="utf-8")
+                            .splitlines()[0]
+                        )
+                    except (OSError, ValueError, IndexError) as error:
+                        raise PlanError(
+                            f"restart {action['id']} cannot read the postmaster pid "
+                            f"of {what}: {error}"
+                        ) from error
+                    return {"pid": pid, "starttime": read_process_starttime(pid)}
+
+                previous_instance = compute_instance(restart_data)
+                subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(restart_data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                if action["target"] in reader_data_dirs:
+                    assert control_restore is not None
+                    subprocess.run(
+                        pagestore_control_restore_command(
+                            control_restore, shm, 0, 1, reader_lsns[action["target"]], restart_data,
+                        ),
+                        check=True, capture_output=True, encoding="utf-8", env=env,
+                    )
+                    restored_control = True
+                subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(restart_data), "-l", str(restart_log), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                # `pg_ctl -w start` establishes only that the PID file says
+                # the server accepts connections.  What the restart owes is
+                # that the target came back as itself: the writer out of
+                # recovery, a pinned reader in recovery and still at its own
+                # horizon.  Ask it here rather than leaving it to an
+                # assertion the plan may not have.
+                if action["target"] == "writer":
+                    health_socket, health_port = sockdir, port
+                    health_sql = "SELECT NOT pg_is_in_recovery()"
+                else:
+                    health_socket, health_port = reader_clients[action["target"]]
+                    # A pinned reader is an ordinary instance held at a
+                    # horizon by its own GUC, not a standby, so what it owes
+                    # after a restart is that horizon.  Compare as LSNs, not
+                    # as text: the value is a string GUC and the reader is
+                    # free to echo it back in its own spelling.
+                    health_sql = (
+                        "SELECT NOT pg_is_in_recovery() AND "
+                        "current_setting('pagestore.read_lsn')::pg_lsn = '"
+                        + reader_lsns[action["target"]].replace("'", "''")
+                        + "'::pg_lsn"
+                    )
+                health_deadline = time.monotonic() + 40
+                health = ""
+                while True:
+                    probe = subprocess.run(
+                        [str(pg_bin / "psql"), "-h", str(health_socket),
+                         "-p", str(health_port), "-U", "postgres", "-tA",
+                         "-v", "ON_ERROR_STOP=1", "-c", health_sql],
+                        check=False, capture_output=True, encoding="utf-8", env=env,
+                    )
+                    health = (probe.stdout or probe.stderr or "").strip()
+                    if health == "t":
+                        break
+                    if time.monotonic() >= health_deadline:
+                        raise OracleMismatch(
+                            f"restart {action['id']} left {action['target']!r} "
+                            f"unhealthy: {health_sql} returned {health!r}"
+                        )
+                    time.sleep(.1)
+                instance = compute_instance(restart_data)
+                if instance == previous_instance:
+                    raise OracleMismatch(
+                        f"restart {action['id']} left the {action['target']} "
+                        f"instance {previous_instance!r} in place"
+                    )
+                events.emit("restart", id=action["id"], target=action["target"], mode="fast", data=str(restart_data), restored_control=restored_control, health=health, previous_instance=previous_instance, instance=instance)
                 continue
             elif action["op"] == "capture":
                 ref = action["horizon"]
@@ -3273,18 +5412,19 @@ def run_materializer_smoke(
             signal=stop.signal_method, wait=stop.wait_method,
         )
 
-    def postmaster_pid() -> int:
+    def compute_postmaster_pid(data: Path, role: str) -> int:
         try:
             value = int(
-                (materializer_data / "postmaster.pid")
-                .read_text(encoding="utf-8")
-                .splitlines()[0]
+                (data / "postmaster.pid").read_text(encoding="utf-8").splitlines()[0]
             )
         except (OSError, ValueError, IndexError) as error:
-            raise PlanError(f"materializer postmaster pid is unreadable: {error}") from error
+            raise PlanError(f"{role} postmaster pid is unreadable: {error}") from error
         if value <= 0:
-            raise PlanError(f"materializer postmaster pid is invalid: {value}")
+            raise PlanError(f"{role} postmaster pid is invalid: {value}")
         return value
+
+    def postmaster_pid() -> int:
+        return compute_postmaster_pid(materializer_data, "materializer")
 
     def lsn_value(value: str) -> int:
         try:
@@ -3472,33 +5612,41 @@ def run_materializer_smoke(
             "run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
             shm=shm, postgres_major=postgres_major,
         )
-        with (trace / "daemon.log").open("w", encoding="utf-8") as log:
-            dproc = subprocess.Popen(
-                [
-                    str(daemon), "--shm", shm, "--store", str(store),
-                    "--page-size", str(profile["page_size"]),
-                    "--nshards", str(plan.header["case"]["shards"]),
-                    "--storage", plan.header["case"]["storage"],
-                ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
-            )
-        deadline = time.monotonic() + 10
-        while True:
-            if dproc.poll() is not None:
-                raise PlanError(
-                    f"daemon exited before readiness with status {dproc.returncode}"
+        daemon_command = [
+            str(daemon), "--shm", shm, "--store", str(store),
+            "--page-size", str(profile["page_size"]),
+            "--nshards", str(plan.header["case"]["shards"]),
+            "--storage", plan.header["case"]["storage"],
+        ]
+
+        def start_store(reason: str) -> dict[str, Any]:
+            nonlocal dproc
+            with (trace / "daemon.log").open("a", encoding="utf-8") as log:
+                dproc = subprocess.Popen(
+                    daemon_command,
+                    stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
                 )
-            try:
-                health = inspect_store(inspector, shm, "health", schema)
-                break
-            except PlanError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(.05)
-        validate_runtime_health(
-            plan, capabilities, "materializer_smoke", health, schema
-        )
-        probe_runtime_inspection(inspector, shm, capabilities, schema)
+            deadline = time.monotonic() + 10
+            while True:
+                if dproc.poll() is not None:
+                    raise PlanError(
+                        f"daemon exited before readiness with status {dproc.returncode}"
+                    )
+                try:
+                    health = inspect_store(inspector, shm, "health", schema)
+                    break
+                except PlanError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.05)
+            validate_runtime_health(
+                plan, capabilities, "materializer_smoke", health, schema
+            )
+            probe_runtime_inspection(inspector, shm, capabilities, schema)
+            events.emit("process_start", target="store", pid=dproc.pid, reason=reason)
+            return health
+
+        health = start_store("provision")
         subprocess.run(
             [
                 str(pg_bin / "initdb"), "-D", str(writer_data),
@@ -3526,14 +5674,98 @@ def run_materializer_smoke(
                 f"unix_socket_directories = {postgresql_conf_string(writer_socket)}\n"
                 f"port = {writer_port}\n"
             )
-        subprocess.run(
-            [
-                str(pg_bin / "pg_ctl"), "-D", str(writer_data), "-l",
-                str(trace / "writer.log"), "-w", "start",
-            ],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
+        def start_writer(reason: str) -> None:
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(writer_data), "-l",
+                    str(trace / "writer.log"), "-w", "start",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            wait_scalar(
+                writer_socket, writer_port, "SELECT 1", "1",
+                f"writer did not accept connections after {reason}",
+            )
+            events.emit("process_start", target="writer", reason=reason)
+
+        def process_instance(pid: int) -> dict[str, Any]:
+            """A process identity a replacement cannot accidentally repeat:
+            the PID together with its start time, since the OS is free to
+            hand the old PID to the new process."""
+            return {"pid": pid, "starttime": read_process_starttime(pid)}
+
+        def restart_instance(target: str) -> dict[str, Any]:
+            """What a restart of this target actually replaces: the writer's
+            and the store's own process, and the materializer's worker
+            generation.  A restart event that reported the materializer's
+            generation for every target could not distinguish a writer or
+            store that came back from one that never went down."""
+            if target == "writer":
+                return process_instance(compute_postmaster_pid(writer_data, "writer"))
+            if target == "materializer":
+                return {"generation": materializer_generation}
+            if dproc is None:
+                raise PlanError("store restart has no daemon process")
+            return process_instance(dproc.pid)
+
+        def stop_writer(reason: str) -> None:
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(writer_data),
+                    "-m", "fast", "-w", "stop",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            events.emit("process_stop", target="writer", mode="fast", reason=reason)
+
+        def stop_materializer_worker(reason: str) -> None:
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
+                    "-m", "fast", "-w", "stop",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            events.emit(
+                "process_stop", target="materializer",
+                generation=materializer_generation, mode="fast", reason=reason,
+            )
+
+        def stop_supervisor(reason: str) -> None:
+            nonlocal supervisor_proc
+            if supervisor_proc is None:
+                return
+            supervisor_proc.terminate()
+            # SIGTERM only asks the supervisor to stop; it cannot leave a
+            # blocking pg_ctl stop/start, each bounded by its own command
+            # timeout, so the wait allows for both plus a margin.  If it still
+            # has not exited, escalate and stop the worker it was driving,
+            # rather than leaving a postmaster behind.
+            try:
+                supervisor_proc.wait(timeout=SUPERVISOR_STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                supervisor_proc.kill()
+                supervisor_proc.wait(timeout=30)
+                stop_materializer_worker(f"{reason} (supervisor escalation)")
+                raise PlanError(
+                    f"materializer supervisor did not stop within "
+                    f"{SUPERVISOR_STOP_TIMEOUT}s for {reason}"
+                )
+            if supervisor_proc.returncode != 0:
+                raise PlanError(
+                    f"materializer supervisor did not stop cleanly for {reason}: "
+                    f"status {supervisor_proc.returncode}"
+                )
+            events.emit(
+                "process_stop", target="materializer-supervisor",
+                pid=supervisor_proc.pid, reason=reason,
+            )
+            supervisor_proc = None
+
+        start_writer("provision")
         events.emit("ready", target="writer", health=health, port=writer_port)
 
         subprocess.run(
@@ -3617,16 +5849,39 @@ def run_materializer_smoke(
                     ),
                 }
             )
-        with (trace / "materializer-supervisor.log").open(
-            "w", encoding="utf-8"
-        ) as log:
-            supervisor_proc = subprocess.Popen(
-                [
-                    sys.executable, str(supervisor),
-                    "--config", str(supervisor_config),
-                ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
+        supervisor_starts = 0
+
+        def start_supervisor(log_name: str) -> None:
+            nonlocal supervisor_proc, supervisor_starts
+            supervisor_starts += 1
+            # Once the named fault has fired and been recovered its control
+            # directory is gone; a supervisor started after that must not
+            # inherit the fault configuration, or its worker would refuse the
+            # missing directory instead of restarting.
+            env = supervisor_env
+            if materializer_recovered:
+                env = {
+                    key: value for key, value in supervisor_env.items()
+                    if not key.startswith("PAGESTORE_TEST_FAULT_")
+                }
+            with (trace / log_name).open("w", encoding="utf-8") as log:
+                supervisor_proc = subprocess.Popen(
+                    [
+                        sys.executable, str(supervisor),
+                        "--config", str(supervisor_config),
+                    ],
+                    stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
+                )
+
+        def wait_materializer_role(context: str) -> None:
+            wait_scalar(
+                materializer_socket, materializer_port,
+                "SELECT pg_is_in_recovery() AND "
+                "current_setting('pagestore.materializer')::boolean",
+                "t", context,
             )
+
+        start_supervisor("materializer-supervisor.log")
         supervisor_status = wait_supervisor_status(
             lambda status: (
                 status.get("owner_pid") == supervisor_proc.pid
@@ -3636,12 +5891,7 @@ def run_materializer_smoke(
             "materializer supervisor did not start its worker",
         )
         sync_materializer_generation(supervisor_status)
-        wait_scalar(
-            materializer_socket, materializer_port,
-            "SELECT pg_is_in_recovery() AND "
-            "current_setting('pagestore.materializer')::boolean",
-            "t", "materializer did not enter its declared recovery role",
-        )
+        wait_materializer_role("materializer did not enter its declared recovery role")
         events.emit(
             "process_start", target="materializer",
             generation=materializer_generation, reason="supervisor provisioned",
@@ -3665,16 +5915,7 @@ def run_materializer_smoke(
                 "materializer supervisor did not stop cleanly for handoff: "
                 f"status {supervisor_proc.returncode}"
             )
-        with (trace / "materializer-supervisor-replacement.log").open(
-            "w", encoding="utf-8"
-        ) as log:
-            supervisor_proc = subprocess.Popen(
-                [
-                    sys.executable, str(supervisor),
-                    "--config", str(supervisor_config),
-                ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
-            )
+        start_supervisor("materializer-supervisor-replacement.log")
         supervisor_status = wait_supervisor_status(
             lambda status: (
                 status.get("owner_pid") == supervisor_proc.pid
@@ -4110,6 +6351,91 @@ def run_materializer_smoke(
                     crashed_generation=crashed_generation,
                     generation=materializer_generation,
                 )
+            elif action["op"] == "restart":
+                restarted_generation = materializer_generation
+                restarted_retention_generation = materializer_retention_generation
+                previous_instance = restart_instance(action["target"])
+                if action["target"] == "writer":
+                    stop_writer(action["id"])
+                    start_writer(action["id"])
+                elif action["target"] == "materializer":
+                    # The supervisor keeps running and treats a cleanly stopped
+                    # worker exactly like a crashed one: a new worker and a new
+                    # retention generation, adopted through the same status.
+                    stop_materializer_worker(action["id"])
+                    supervisor_status = wait_supervisor_status(
+                        lambda status: (
+                            isinstance(status.get("worker_generation"), int)
+                            and status["worker_generation"] > restarted_generation
+                            and isinstance(status.get("retention_generation"), int)
+                            and status["retention_generation"]
+                                > restarted_retention_generation
+                            and status.get("state")
+                            in {"running", "waiting_for_progress_api"}
+                        ),
+                        f"supervisor did not replace the stopped worker after {action['id']}",
+                    )
+                    sync_materializer_generation(supervisor_status)
+                    wait_materializer_role(
+                        f"restarted materializer did not become healthy after {action['id']}"
+                    )
+                else:
+                    # Every attached compute must be down while the daemon
+                    # reinitializes its shared memory; the supervisor stops
+                    # first so it cannot replace the worker mid-restart.
+                    stop_supervisor(action["id"])
+                    stop_materializer_worker(action["id"])
+                    stop_writer(action["id"])
+                    assert dproc is not None
+                    dproc.terminate()
+                    # the daemon's own clean-stop bound: draining maintenance
+                    # and flushing persistent state is allowed to take this
+                    # long, and a slower shutdown is not a failed one
+                    dproc.wait(timeout=60)
+                    if dproc.returncode != 0:
+                        raise UnexpectedExit(
+                            f"daemon did not stop cleanly for {action['id']}: "
+                            f"status {dproc.returncode}"
+                        )
+                    events.emit(
+                        "process_stop", target="store", pid=dproc.pid,
+                        returncode=dproc.returncode, reason=action["id"],
+                    )
+                    remove_shm(shm)
+                    health = start_store(action["id"])
+                    start_writer(action["id"])
+                    start_supervisor(f"materializer-supervisor-restart-{supervisor_starts}.log")
+                    supervisor_status = wait_supervisor_status(
+                        lambda status: (
+                            status.get("owner_pid") == supervisor_proc.pid
+                            and isinstance(status.get("worker_generation"), int)
+                            and status["worker_generation"] > restarted_generation
+                            and status.get("state")
+                            in {"running", "waiting_for_progress_api"}
+                        ),
+                        f"supervisor did not restart the worker after {action['id']}",
+                    )
+                    sync_materializer_generation(supervisor_status)
+                    wait_materializer_role(
+                        f"materializer did not recover after {action['id']}"
+                    )
+                instance = restart_instance(action["target"])
+                if instance == previous_instance:
+                    raise OracleMismatch(
+                        f"restart {action['id']} left the {action['target']} "
+                        f"instance {previous_instance!r} in place"
+                    )
+                # The materializer's generation is the restarted instance only
+                # when the materializer is the target; for a writer or store
+                # restart it is unrelated context, and reporting it as the
+                # event's generation described a restart that never showed.
+                events.emit(
+                    "restart", id=action["id"], target=action["target"],
+                    previous_instance=previous_instance, instance=instance,
+                    previous_materializer_generation=restarted_generation,
+                    materializer_generation=materializer_generation,
+                    health=health if action["target"] == "store" else None,
+                )
             elif action["op"] == "assert":
                 if action["target"] == "writer":
                     socket_dir, port = writer_socket, writer_port
@@ -4213,6 +6539,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group.add_argument("--legacy-integration", action="store_true")
     parser.add_argument("--daemon-binary", type=Path)
     parser.add_argument("--layer-client-binary", type=Path)
+    parser.add_argument("--gc-client-binary", type=Path)
     parser.add_argument("--materializer-supervisor", type=Path)
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--integration-script", type=Path,
@@ -4341,6 +6668,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.daemon_binary, args.inspect_binary, args.run_root, args.keep,
                 args.capabilities, command,
                 layer_client=args.layer_client_binary,
+                gc_client=args.gc_client_binary,
             )
             if args.keep or args.run_root:
                 print(root)

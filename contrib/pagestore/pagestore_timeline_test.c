@@ -27,6 +27,7 @@
 
 #define TEST_TIMELINE_MAGIC 0x324d4c54U
 #define TEST_FORK_META_V2_MAGIC 0x324d4b46U
+#define TEST_FORK_META_V3_MAGIC 0x334d4b46U
 #define TEST_FEV_SEG_GROW_BOUND 7
 #define TEST_FEV_SEG_COMMIT_BOUND 8
 #define TEST_SEG_CLAMPED_ADMISSION_MAGIC 0x53454738U
@@ -241,16 +242,19 @@ fork_meta_source_contains(const TestForkMetaRecV2 *wanted)
 			return 0;
 		if (nread != (int) sizeof(magic))
 			return -1;
-		if (magic != 0x324d4b46U)
+		if (magic != TEST_FORK_META_V2_MAGIC && magic != TEST_FORK_META_V3_MAGIC)
 			return -1;
 		{
 			TestForkMetaRecV2 rec;
 
+			/* daemon-written FKM3 records carry a checksum in the pad bytes;
+			 * the injected FKM2 residue keeps them zero */
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
 			if (nread != (int) sizeof(rec) || rec.magic != magic ||
 				rec.rec_len != sizeof(rec) || rec.timeline >= 1024 ||
 				rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
-				rec.pad[0] != 0 || rec.pad[1] != 0 || rec.pad[2] != 0)
+				(magic == TEST_FORK_META_V2_MAGIC &&
+				 (rec.pad[0] != 0 || rec.pad[1] != 0 || rec.pad[2] != 0)))
 				return -1;
 			if (memcmp(&rec, wanted, sizeof(rec)) == 0)
 				return 1;
@@ -1984,7 +1988,8 @@ strip_ordered_markers(const char *store, uint32_t timeline)
 		if (n == 0)
 			break;
 		if (n != (ssize_t) sizeof(rec) ||
-			rec.magic != TEST_FORK_META_V2_MAGIC ||
+			(rec.magic != TEST_FORK_META_V2_MAGIC &&
+			 rec.magic != TEST_FORK_META_V3_MAGIC) ||
 			rec.rec_len != sizeof(rec))
 		{
 			(void) close(fd);

@@ -89,6 +89,28 @@ pagestore_layer_crash_client = executable('pagestore_layer_crash_client',
 )
 contrib_targets += pagestore_layer_crash_client
 
+# Deterministic POSIX page-pruning crash workload/oracle used by the H1
+# harness slice: history below a configured cutoff is compacted, and the
+# scenarios crash at the replacement publication, the source mark-delete, and
+# the durable frontier advance.
+pagestore_format_versions = executable('pagestore_format_versions',
+  files('pagestore_format_versions.c', 'pagestore_core.c', 'pagestore_fault.c',
+        'storage_posix.c', 'pagestore_layer.c', 'pagestore_store_owner.c',
+        'pagestore_layer_store.c', 'pagestore_manifest.c', 'pagestore_memtable.c',
+        'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_retention.c',
+        'pagestore_wal_store.c', 'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+
+pagestore_gc_crash_client = executable('pagestore_gc_crash_client',
+  files('pagestore_gc_crash_client.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_gc_crash_client
+
 # Pure process-local unit test for the first crash-only named fault registry.
 pagestore_fault_test = executable('pagestore_fault_test',
   files('pagestore_fault_test.c', 'pagestore_fault.c'),
@@ -485,7 +507,7 @@ test('pagestore_wal_segment',
 # Atomic immutable segment publication and cross-segment shipped-WAL reads.
 pagestore_wal_store_test = executable('pagestore_wal_store_test',
   files('pagestore_wal_store_test.c', 'pagestore_wal_store.c',
-        'pagestore_wal_segment.c'),
+        'pagestore_wal_segment.c', 'pagestore_fault.c'),
   install: false,
 )
 test('pagestore_wal_store',
@@ -620,6 +642,8 @@ test('pagestore_harness_materializer_lifecycle_plan',
 foreach materializer_fault_scenario : [
   'materializer_restartpoint_after_relation_sync_before_marker',
   'materializer_restartpoint_after_marker_sync',
+  'materializer_restart_combinations',
+  'writer_reader_restart',
 ]
   test('pagestore_harness_' + materializer_fault_scenario + '_plan',
     pagestore_harness_python,
@@ -693,5 +717,60 @@ foreach layer_fault_scenario : [
     depends: [pagestore_daemon, pagestore_layer_crash_client, pagestore_inspect],
     suite: ['pagestore'],
     timeout: 60,
+  )
+endforeach
+# Persisted-format fixture: the compiled identities must match the committed
+# fixture, the fixture must reopen with its oracle intact, and every declared
+# mutation must be rejected as documented.  The archive holds the raw C
+# structures a little-endian host wrote, and both the daemon and the checker
+# read them in native order, so the fixture is skipped where the host byte
+# order differs; a big-endian baseline would be a second archive.
+if host_machine.endian() == 'little'
+test('pagestore_persisted_format_fixture',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_fixture.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline',
+         meson.current_source_dir() / 'fixtures' / 'posix-forkmeta-crc',
+         '--daemon-binary', pagestore_daemon,
+         '--client-binary', pagestore_gc_crash_client,
+         '--inspect-binary', pagestore_inspect,
+         '--format-tool', pagestore_format_versions],
+  depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect,
+            pagestore_format_versions],
+  suite: ['pagestore'],
+  timeout: 300,
+)
+endif
+foreach prune_fault_scenario : [
+  'page_prune_after_frontier',
+  'page_compaction_after_publish',
+  'page_gc_after_mark_delete',
+  'wal_index_after_frontier',
+  'wal_reclaim_before_unlink',
+  'wal_reclaim_after_unlink',
+  'wal_reclaim_before_dir_fsync',
+  'timeline_delete_after_deleting',
+  'timeline_delete_after_wal_cleanup',
+  'timeline_delete_after_segment_rewrite',
+  'timeline_delete_after_deleted',
+  'timeline_delete_before_deleting',
+  'manifest_compact_after_tmp_sync',
+  'manifest_compact_after_rename',
+  'forkmeta_after_prepare',
+  'forkmeta_after_manifest_commit',
+  'forkmeta_after_source_rewrite',
+  'forkmeta_after_snapshot_gc',
+]
+  test('pagestore_harness_' + prune_fault_scenario,
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--daemon-fault-recovery', files('harness/scenarios/' + prune_fault_scenario + '.jsonl'),
+           '--daemon-binary', pagestore_daemon,
+           '--gc-client-binary', pagestore_gc_crash_client,
+           '--inspect-binary', pagestore_inspect],
+    depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect],
+    suite: ['pagestore'],
+    timeout: 90,
   )
 endforeach

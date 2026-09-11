@@ -79,6 +79,8 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_test pagestore_layer_test.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c pagestore_store_owner.c -lrt -pthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_store_test pagestore_layer_store_test.c pagestore_layer_store.c pagestore_layer.c pagestore_fault.c pagestore_store_owner.c -lrt -pthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_crash_client pagestore_layer_crash_client.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_gc_crash_client pagestore_gc_crash_client.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_format_versions pagestore_format_versions.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_tiering_test pagestore_tiering_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_cutover_test pagestore_forkmeta_cutover_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_crash_matrix_test pagestore_forkmeta_crash_matrix_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
@@ -140,6 +142,46 @@ jobs:
               --layer-client-binary ./pagestore_layer_crash_client \
               --inspect-binary ./pagestore_inspect
           done
+
+      - name: Run page-pruning, WAL-index, WAL-reclaim, deletion, manifest, and forkmeta H1 crash scenarios
+        working-directory: contrib/pagestore
+        run: |
+          for scenario in \
+            page_prune_after_frontier \
+            page_compaction_after_publish \
+            page_gc_after_mark_delete \
+            wal_index_after_frontier \
+            wal_reclaim_before_unlink \
+            wal_reclaim_after_unlink \
+            wal_reclaim_before_dir_fsync \
+            timeline_delete_after_deleting \
+            timeline_delete_after_wal_cleanup \
+            timeline_delete_after_segment_rewrite \
+            timeline_delete_after_deleted \
+            timeline_delete_before_deleting \
+            manifest_compact_after_tmp_sync \
+            manifest_compact_after_rename \
+            forkmeta_after_prepare \
+            forkmeta_after_manifest_commit \
+            forkmeta_after_source_rewrite \
+            forkmeta_after_snapshot_gc; do
+            python3 harness/pagestore_harness.py \
+              --capabilities harness/capabilities.json \
+              --daemon-fault-recovery "harness/scenarios/${scenario}.jsonl" \
+              --daemon-binary ./pagestore_daemon \
+              --gc-client-binary ./pagestore_gc_crash_client \
+              --inspect-binary ./pagestore_inspect
+          done
+
+      - name: Check persisted-format fixtures
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_fixture.py \
+            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc \
+            --daemon-binary ./pagestore_daemon \
+            --client-binary ./pagestore_gc_crash_client \
+            --inspect-binary ./pagestore_inspect \
+            --format-tool ./pagestore_format_versions
 
       - name: Run image-layer unit test
         working-directory: contrib/pagestore
@@ -245,6 +287,15 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
 
+      - name: Run H1 writer and pinned-reader restart combinations
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --writer-smoke contrib/pagestore/harness/scenarios/writer_reader_restart.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
+
       - name: Run pagestore harness managed materializer smoke
         if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
         run: |
@@ -289,6 +340,25 @@ jobs:
             --capabilities contrib/pagestore/harness/capabilities.json \
             --materializer-smoke \
               contrib/pagestore/harness/scenarios/materializer_restartpoint_after_marker_sync.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Run H1 store, writer, and materializer restart combinations
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke \
+              contrib/pagestore/harness/scenarios/materializer_restart_combinations.jsonl \
             --build-dir "$(pwd)/build" \
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \

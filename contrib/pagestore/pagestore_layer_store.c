@@ -486,25 +486,50 @@ canonicalize_local_layer_uri(PsLayerLocation *location,
 		return -1;
 	}
 	expected_basename = strrchr(expected, '/') + 1;
-	if (strcmp(basename, expected_basename) != 0 ||
-		realpath(parent, resolved) == NULL)
+	if (strcmp(basename, expected_basename) != 0)
 	{
 		errno = EINVAL;
 		return -1;
 	}
-	if (stat(resolved, &parent_st) != 0 || stat(layer_dir, &root_st) != 0 ||
-		parent_st.st_dev != root_st.st_dev || parent_st.st_ino != root_st.st_ino)
+	if (realpath(parent, resolved) == NULL)
+	{
+		/* The recorded parent directory no longer exists: the store was
+		 * relocated (moved, restored from a backup, or reopened from a
+		 * fixture).  The manifest travels with its layers, so the only place
+		 * the leaf can be is this store's own layer directory; rebase the
+		 * location there.  A parent that exists but is a different directory
+		 * stays rejected below: that manifest may belong to another store. */
+		if (errno != ENOENT)
+		{
+			errno = EINVAL;
+			return -1;
+		}
+	}
+	else
+	{
+		if (stat(resolved, &parent_st) != 0 || stat(layer_dir, &root_st) != 0 ||
+			parent_st.st_dev != root_st.st_dev ||
+			parent_st.st_ino != root_st.st_ino)
+		{
+			errno = EINVAL;
+			return -1;
+		}
+		n = snprintf(joined, sizeof(joined), "%s/%s", resolved, basename);
+		if (n < 0 || (size_t) n >= sizeof(joined) ||
+			strcmp(joined, expected) != 0)
+		{
+			errno = EINVAL;
+			return -1;
+		}
+	}
+	/* From here on the leaf is addressed by the store's own path, never by
+	 * the recorded one. */
+	if (strlen(expected) >= sizeof(location->uri))
 	{
 		errno = EINVAL;
 		return -1;
 	}
-	n = snprintf(joined, sizeof(joined), "%s/%s", resolved, basename);
-	if (n < 0 || (size_t) n >= sizeof(joined) ||
-		strcmp(joined, expected) != 0)
-	{
-		errno = EINVAL;
-		return -1;
-	}
+	memcpy(location->uri, expected, strlen(expected) + 1);
 	/* The leaf may be absent while a remote-durable or deleting layer is
 	 * replayed.  If present, it must already be a non-symlink regular file. */
 	if (lstat(location->uri, &st) == 0)
@@ -520,13 +545,6 @@ canonicalize_local_layer_uri(PsLayerLocation *location,
 		errno = EINVAL;
 		return -1;
 	}
-	if (strlen(expected) >= sizeof(location->uri))
-	{
-		errno = EINVAL;
-		return -1;
-	}
-	if (strcmp(location->uri, expected) != 0)
-		snprintf(location->uri, sizeof(location->uri), "%s", expected);
 	return 0;
 }
 

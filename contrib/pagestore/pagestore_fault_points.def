@@ -8,6 +8,28 @@ PAGESTORE_FAULT_POINT(PAGE_COMPACTION_AFTER_PUBLISH, "page_compaction.after_publ
 PAGESTORE_FAULT_POINT(PAGE_GC_AFTER_MARK_DELETE, "page_gc.after_mark_delete", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(PAGE_PRUNE_AFTER_FRONTIER, "page_prune.after_frontier", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(WAL_INDEX_AFTER_FRONTIER, "wal_index.after_frontier", "store", "process_abort", "crash", 1, 0)
+// WAL reclaim probes are ordered POSIX-local process-abort boundaries under the
+// store lock: after the durable physical frontier and before the first unlink,
+// after each authorized segment unlink (hit N = N unlinks), and after the last
+// unlink but before the directory fsync that retires the residual prefix.
+PAGESTORE_FAULT_POINT(WAL_RECLAIM_BEFORE_UNLINK, "wal_reclaim.before_unlink", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(WAL_RECLAIM_AFTER_UNLINK, "wal_reclaim.after_unlink", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(WAL_RECLAIM_BEFORE_DIR_FSYNC, "wal_reclaim.before_dir_fsync", "store", "process_abort", "crash", 1, 0)
+// Timeline deletion probes are lock-held process-abort boundaries: after the
+// fsync'd DELETING event and before its in-memory publication, after the
+// owner's private WAL/WAL-index artifacts are removed, after a shared page
+// segment is atomically rewritten without the owner's records, and after the
+// fsync'd DELETED event and before its in-memory publication.
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_BEFORE_DELETING, "timeline_delete.before_deleting", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETING, "timeline_delete.after_deleting", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_WAL_CLEANUP, "timeline_delete.after_wal_cleanup", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_SEGMENT_REWRITE, "timeline_delete.after_segment_rewrite", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETED, "timeline_delete.after_deleted", "store", "process_abort", "crash", 1, 0)
+// Manifest replacement probes bracket the atomic rewrite of layers.manifest
+// under map-wr: after the compacted temp file is fsync'd and before the
+// rename, and after the rename and before the directory fsync.
+PAGESTORE_FAULT_POINT(MANIFEST_COMPACT_AFTER_TMP_SYNC, "manifest_compact.after_tmp_sync", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(MANIFEST_COMPACT_AFTER_RENAME, "manifest_compact.after_rename", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_PREPARE, "forkmeta.after_prepare", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_MANIFEST_COMMIT, "forkmeta.after_manifest_commit", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SOURCE_REWRITE, "forkmeta.after_source_rewrite", "store", "process_abort", "crash", 1, 0)

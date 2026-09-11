@@ -50,6 +50,10 @@ extern uint64_t wal_reclaim_high_water_bytes;
 extern uint64_t wal_reclaim_catchup_bytes;
 extern uint64_t walidx_reclaim_high_water_bytes;
 extern uint64_t walidx_reclaim_catchup_bytes;
+/* Zero keeps the default (or test) WAL-index snapshot trigger; otherwise the
+ * bytes of new index log, beyond the snapshotted size, that make a timeline a
+ * snapshot publication candidate. */
+extern uint64_t walidx_snapshot_trigger_option_bytes;
 extern uint64_t forkmeta_reclaim_high_water_bytes;
 extern uint64_t forkmeta_reclaim_catchup_bytes;
 extern const PsStorage *ps_storage;

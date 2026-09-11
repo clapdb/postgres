@@ -89,6 +89,137 @@ retains the durable layer and republishes segment-backed coverage once; the
 second restart waits for background maintenance to compact that conservative
 duplicate to one layer. Clean shutdown alone does not guarantee compaction.
 
+The H1 page-pruning slice reuses that harness with a deterministic IPC
+workload (`pagestore_gc_crash_client`): three generations of relation history
+plus a newer block, then a configured page-history owner at the cutoff that
+lets maintenance retire the older history.  The workload arms the named fault
+itself right before it installs the cutoff, because the flush-driven
+compactions that run while the history is written have nothing to retire.
+Three process aborts cover the durable page-prune frontier, the compacted
+layer's manifest publication, and the retired layer's mark-delete step.  Each
+crash keeps the physical snapshot (a durable frontier file after the frontier
+stage, a non-empty manifest and at least two local layers otherwise), and
+recovery must serve the published newest block and the retained history at the
+cutoff, refuse the retired pre-cutoff version, reconcile the manifest to the
+local layer set with no pending deletions, and republish the configured
+horizon; a second restart proves idempotence, and idempotence now means the
+durable state itself -- the layer files, the layers the manifest publishes,
+and the prune frontiers -- is unchanged by that restart, not merely that it
+passes the same checks.  Both snapshots are taken with the daemon stopped:
+readiness is published as soon as the maintenance thread exists, so a
+comparison made while it runs can precede the pass startup marked due.  Compaction accordingly leaves a converged shard
+alone: a single source with nothing to prune is already its own compacted
+result, so it is no longer rewritten into a fresh layer by the pruning pass
+each startup marks due.
+
+The same workload binary carries a `wal_index` workload for the WAL-index
+compaction boundary: one metadata-complete interval on timeline 0 with a
+fixed WAL-index reader at 40 below FPI-led chains at 10/30, 50/70, and
+90/110, published under a one-byte `--walidx-snapshot-bytes` trigger so the
+first committed interval is a compaction candidate.  The process abort after
+the durable frontier must leave the frontier file and the staged, uncommitted
+generation, whose identity the oracle records; recovery must commit that same
+generation -- not an equivalent one rebuilt under a new number, which the
+frontier was never published for -- and must serve the reader's exact chain
+and the newest chain while refusing the dropped middle point, and keep the WAL-index owner; a second restart proves idempotence.
+
+The `wal_reclaim` workload ships three complete 1 MiB segments on timeline 0,
+publishes a control note whose redo is the shipped end, arms the fault, and
+commits WAL-index progress through that end so the whole sealed prefix is
+reclaimable.  Three named store-lock probes crash after the durable physical
+frontier and before the first unlink, after each authorized segment unlink,
+and after the last unlink but before the directory fsync that retires the
+residual prefix.  The crash snapshot must carry the durable store
+metadata with the directory start and retained base already at the shipped
+end -- before the first unlink that frontier is the only thing separating the
+crash image from the state before publication -- and exactly the expected
+number of sealed segments; recovery must finish the unlink retry, refuse
+reads below the frontier, keep the WAL end and the retain floor at the
+shipped end, clear the reclaimer's physical debt, and leave no retention
+owner; a second restart must then reproduce that settled shipped-WAL state,
+metadata and files alike.
+
+The `timeline_delete` workload creates a branch of timeline 0 with its own
+shipped WAL, a committed WAL-index interval, and enough relation pages for an
+owner layer and several shared segments, then arms the fault and issues
+BEGIN_DELETE.  Four lock-held probes crash after the fsync'd DELETING event
+and before its publication, after the owner's private WAL and WAL-index
+artifacts are removed, after a shared page segment is atomically rewritten
+without the owner's records, and after the fsync'd DELETED event and before
+its publication.  The crash snapshot must keep the private WAL at the first
+boundary, have removed it from the second on, and leave no owner artifact
+once DELETED is durable; recovery must reach DELETED with the incarnation
+token, keep serving the parent's page, reject branch reads, leave no owner
+artifact, reconcile the manifest, keep the root's history capped at the live
+sibling's fork point, and register no owner; a second restart
+proves idempotence.  A fifth probe crashes on the old-state side of the
+first transition, where the request is lost: the branch must keep its
+lifecycle, its artifacts, and its persisted ancestry -- parent, fork point
+and parent token, none of which the pages it serves would reveal -- and the
+root must still carry the cap both live branches fork at.
+
+The `manifest_compact` workload writes 320 relation pages while the harness
+holds maintenance paused, so the write path flushes layers and their manifest
+records but layer compaction and the manifest rewrite wait; it then arms the
+fault and releases maintenance.  Two map-held probes crash after the
+compacted temp log is fsync'd and before the rename, and after the rename
+and before the directory fsync.  The crash snapshot must keep a non-empty
+live log with the temp file absent after the rename and, before it, present
+and already replaying to the same layers as the live log -- a temp file that
+had only been created would satisfy a presence check and then be discarded by
+recovery, which replays the intact live log and passes everything after it;
+recovery must replay either log to a sane manifest reconciled with the local
+layers, serve every page written before the rewrite, remove a crashed temp
+log on open, and register no owner; a second restart proves idempotence.
+
+Compute-restart combinations are composed through a `restart` operation in
+the writer and materializer runtimes.  The writer runtime restarts the writer
+or an installed pinned reader with a fast shutdown and then asks the target
+itself whether it came back as itself -- out of recovery, and, for a pinned
+reader, still at the horizon its own GUC pins it to -- because `pg_ctl -w`
+establishes only that the PID file says connections are accepted; a pinned reader's
+shutdown checkpoint rewrites its `pg_control`, so its restart restores the
+boot control image at its immutable identity before starting, as the
+documented reader protocol requires.  The materializer runtime restarts the
+writer, the materializer worker (the supervisor replaces the cleanly stopped
+worker with a new generation), or the store, where the supervisor stops
+first, both computes shut down, the daemon restarts on the same shared
+memory name, and the writer and supervisor return.  The two scenarios
+require the pinned reader to keep its horizon and hide the in-flight
+prepared transaction across its restart and the writer's -- including
+after that transaction commits -- and the materializer to serve the last
+durable boundary as soon as its replacement is up, then each boundary
+after a writer restart, a worker restart, and a store restart with zero
+lag at the end.  Each restart event in both runtimes records the instance the
+restart actually replaced -- the writer's, reader's or daemon's process as a
+PID with its start time, since the OS may hand the replacement the same PID,
+or the materializer's worker generation -- and fails if it is unchanged, and a writer restart
+invalidates the declared checkpoint, so a later reader base or capture
+must declare a new one.  Remaining outside
+the harness: branch-compute restarts, which the golden scenario covers.
+
+The `forkmeta` workload composes the four fork-metadata publication probes
+(after the fsync'd prepared generation, after the manifest commit, after the
+source-epoch rewrite, and after the retired generation's GC) on the daemon:
+the page-pruning history proves the cutoff through its frontier, thirty-two
+relations carry create, zero-extend, and truncate events on both sides of
+the cutoff, and a trickle of further fork events after the cutoff drives the
+second generation that retires the first.  Snapshots check the staged
+generation without a selected manifest, and the selected manifest before and
+after the source-epoch marker; every crash image must hold exactly the
+selected generation's two files and no publication temporary -- every part,
+prepared intent and manifest is renamed into place, and startup's temp GC
+would sweep any debris away before recovery could be inspected -- -- the first generation's at the commit and
+the rewrite, the second's after GC -- because startup schedules snapshot GC
+unconditionally, so an orphan generation left by a faulty publication would
+be swept away before recovery is inspected;
+recovery must settle on the generation the crash had already selected --
+these probes hold the locks that would let an acknowledged write land, so
+there is nothing new to publish -- behind its marker, and serve
+every relation's current size and its retained size history above the
+cutoff, refuse size queries below the cutoff, keep the page-pruning
+guarantees, and republish the configured horizon.
+
 POSIX store opens now hold an exclusive advisory ownership lease across recovery
 and provider teardown. Cooperating storage and local-layer
 provider users share the same ownership mechanism. After successful manifest
@@ -420,14 +551,46 @@ exact-redo twin of a kept checkpoint image is retained with it, which is what
 an earlier attempt at this floor had missed
 (`pagestore_control_prune_test`; the soak now models the materializer with
 its real WAL/WAL-index mask and a progress marker).  Still required for the
-gate:
-
-- a WAL-index-only owner's horizon (the materializer's) is not page-protected,
-  so stored pages cannot replace the FPI-led chains it keeps and cold pages
-  pin shipped WAL until the horizon advances; treating the derived cutoff as
-  that owner's page fence needs the owner to advance its pin before its
-  marker, so a standing horizon can never lose its base;
-- SLRU-class object versions are still retained without a dedicated protocol.
+gate: none.  The materializer's own WAL-index horizon is page-protected by the
+cutoff derived from its pin (the base at that horizon and the horizon itself
+are the same pin and move together), so stored pages replace its FPI-led
+chains and cold pages no longer pin shipped WAL beyond the reclaimer's
+declared bound.  That exception stops where the pin coincides with a standing
+horizon: the durable WAL-index frontier and the shipper's progress admit a new
+WAL-index-only owner at exactly their LSN, which would arrive after the
+materializer advanced and the base was retired, so a pin at either keeps its
+FPI-led chain.  The plan is built before publication is excluded and progress
+can advance in between, so the standing horizons are rechecked under the
+publication lock and an exception that has since become one is withdrawn.
+SLRU-class and reader-artifact versions now have their retention protocol.
+Seeds and reader snapshots are exact-generation artifacts: a consumer reads
+every page of the object at exactly the generation it captured, which is
+the newest generation at or below the horizon it pinned or forked at, so a
+page copy is kept only when it belongs to the newest generation at or below
+the floor or some fence (a copy from an older generation of a page the newer
+generation no longer has serves nobody and is retired with its control-era
+fence).  Only a seed is a replay base, though: a horizon above the floor is
+served by the newest seed at or below it plus the WAL after it, while a
+reader snapshot resolves at exactly the horizon it was captured for, so a
+snapshot is kept only while a fence names that horizon and no longer pins its
+control era once its reader is gone.  The live mirror, tombstones, and watermark are read at the newest
+horizon by their consumer and at the fork point by a branch, so they keep
+only the newest version and the newest at or below each fence.  Retried
+copies collapse to one, and a retired artifact releases the control era it
+fenced (`pagestore_control_prune_test`).  One limitation is deliberate and
+documented: a generation is defined by the pages that carry its LSN, and
+nothing marks a publication complete, so a publication that appends some
+pages and then fails is indistinguishable from an object that shrank.  Such a
+partial generation supersedes the complete one below it, and a consumer at
+that cutoff then fails to reconstruct rather than silently reading a stale
+page from the older generation.  Making the newer generation wait for a
+durable completion marker is part of the artifact-publication protocol, not
+of retention.  The same missing lifecycle shows at object granularity: the
+newest generation at or below the floor is the replay base for every horizon
+above it, so it is kept even when the object it describes is gone (a reader
+snapshot of a dropped database publishes no newer generation of that key).
+Retiring it needs a durable drop event for the artifact, which the
+publication protocol does not emit yet.
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):
@@ -446,13 +609,92 @@ revision is reported in each job summary.  A
 run that cannot write its JSON report fails rather than passing with nothing
 to compare across nights.
 
-### 5. Composed crash and format-compatibility coverage -- partial
+### 5. Composed crash and format-compatibility coverage -- crash coverage composed; format fixtures started
 
-The POSIX image-layer publication slice is now covered by the declarative
-harness.  Other crash boundaries remain outside this slice.
-Before declaring the MVP repeatable, add process-level fault scenarios around
-manifest replacement and retention/reclaim/GC, plus
-a persisted-format fixture for restart/upgrade compatibility.
+The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
+reclaim, timeline deletion, manifest replacement, fork-metadata publication,
+and compute-restart slices are now covered by the declarative harness.  The
+deletion slice crashes on both sides of its first transition: before the
+DELETING record is durable the request is lost and the branch must survive
+intact, and after each later boundary the cleanup must resume.  Its workload
+seeds a live sibling branch with the same kind of private state, so cleanup
+that reached past its owner would be caught.
+
+The first persisted-format fixture slice is in place under the recommended
+D5 policy (fixtures for every format shipped after the MVP baseline;
+explicit migration for supported older versions; fail closed otherwise),
+which is still an open decision and is flagged as an assumption.  Every
+daemon-side format reports its compiled magic and version through
+`pagestore_format_versions`; `fixtures/posix-mvp-baseline` holds a captured
+store carrying page history and its cutoff, fork-size events on both sides of
+the cutoff plus a post-cutover source tail, a sealed shipped-WAL segment
+with a control note inside it, a compacted WAL-index interval with a fixed
+reader, a live branch with one record of every page-segment format the daemon
+writes (an ordinary versioned record, a below-floor copy clamped to the branch
+point, and a zero-version WAL-less record), and a deleted branch.
+`harness/pagestore_fixture.py
+--check` fails when the compiled identities differ from the fixture (a
+format change without a fixture update) and when the archive's own bytes do
+not carry the identities its metadata records (metadata edited without a new
+capture), reopens the fixture and runs its
+oracle across a restart -- including the identities the archive's own
+metadata carries: both seeded retention pins are looked up by owner and must
+still name that owner, its resources and its horizon; the live branch must
+still record the parent and fork point it was created at and serve its own
+shipped WAL bytes, and its WAL-index entry must still name the branch as its
+source timeline; and the relation the extension phase creates must still
+exist exactly above its create event and be grown exactly above its growth
+event, none of which is visible in the horizons, the latest sizes or the
+pages a read returns -- and applies forty mutations (unknown newer
+version, checksum corruption, truncation) across the WAL store identity,
+sealed WAL segments, retention state and records, page and WAL-index
+frontiers, forkmeta and WAL-index snapshot manifests and payloads, the
+WAL-index epoch watermark, the persisted shard count, the timelines log, the
+forkmeta source epoch, the layer manifest, and image layers.  Each is rejected at open except the documented torn-tail repairs of
+the timelines and layer manifest logs; a daemon that dies of a signal or
+exits under use is reported as a crash, never as a rejection.  The identity
+table also covers the page-segment (versioned, WAL-less, and clamped),
+flat-WAL, WAL-index source-log, POSIX WAL-index watermark, and persisted
+shard-count formats the daemon writes, and the check requires the fixture to carry a record of every
+advertised page-segment and WAL-index log format; the capture therefore runs
+in two phases, seeding under the trigger that publishes a WAL-index snapshot
+and then extending under the one the archive records, so the records appended
+after the cutover stay in the live epoch; it does not
+advertise delta layers, which no maintenance path produces yet.  Captures run
+in a private directory and canonicalize the absolute layer locations the
+manifest persists, so repeated captures produce byte-identical archives, and
+the check starts every daemon with the configuration the archive records
+rather than today's defaults.  Forkmeta source and snapshot payload records
+are now sealed as FKM3, the FKM2 layout with a CRC-24 in the three former pad
+bytes, so a flipped byte inside a record is rejected at open; FKM2 records
+stay readable, and `fixtures/posix-mvp-baseline` (FKM2) is kept as the legacy
+fixture that must keep reopening while `fixtures/posix-forkmeta-crc` is the
+current one that pins the compiled identities and takes every mutation.  This
+was the first format change to go through the fixture process.  Five findings
+were fixed on the way: a store reopened at a new path was refused because
+layer locations recorded their absolute parent directory (a missing parent now
+rebases onto the store's own leaf; a foreign existing parent is still
+rejected); a damaged forkmeta snapshot marker silently discarded acknowledged
+post-cutover events (a source epoch that conflicts with the selected snapshot,
+an emptied source included, now refuses to open); a segment record header
+persisted its alignment padding uninitialized; a fork-metadata snapshot part
+could be published in an order its own loader refuses, because ordered markers
+that live only in the source log were appended after the in-memory events of
+the same fork -- a below-floor copy followed by a higher-LSN write on the same
+relation published a snapshot the daemon then could not open, so each part is
+now sorted into per-fork order before it is written; and a torn legacy prefix
+stayed repairable only after the unknown-magic check learned to read a legacy
+record first.  One gap remains documented in the check: a
+page-segment record can never be the only copy of a page, because a cleanly
+stopped daemon flushes its memtable into a layer before it exits, so every
+archived page is also in a layer and a read resolves there (`reads mem=0
+layer=9 seg=0` on a reopened fixture).  The segment readers are still
+exercised -- every open replays the uncovered tail to rebuild the index, and a
+record whose framing is wrong fails that scan -- but a mutation inside one
+cannot be observed through a read while the layer carries the same version.
+Backend-side artifacts (reader manifests, branch bootstrap,
+materializer markers, the writer checkpoint block) remain for the next fixture
+slice.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it

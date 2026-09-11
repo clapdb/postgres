@@ -507,7 +507,17 @@ Expected scope: one or two PRs.
 
 ### R4b. Compact and reclaim fork metadata
 
-Status: **runtime implementation and the focused POSIX crash-matrix first slice are implemented; the full R4b acceptance matrix remains incomplete**.
+Status: **runtime implementation, the POSIX crash matrix, and the composed
+H1 publication scenarios are implemented; the acceptance matrix remains
+incomplete on its concurrency clause**.  Per-horizon existence/size
+equivalence across compaction is exercised by the R6 soak's reader and
+branch verifications, every publication boundary by the composed daemon
+scenarios, and crash recovery by the matrix; but acknowledged concurrent
+mutations are verified exactly-once only at the source-rewrite boundary
+(the matrix's deterministic concurrent appender), while the composed
+workload's post-cutoff trickle is untracked by its oracle.  Prepare,
+manifest-commit, and snapshot-GC still need a concurrent-append oracle;
+SPDK remains outside the claim.
 
 The pure forkmeta keep-planner and exhaustive unit/property coverage now define
 the event visibility, exact-fence base retention, legacy sequence handling, and
@@ -532,7 +542,10 @@ boundaries. It reopens each store in a fresh parent, checks the exact named
 fault report and exit 88, and covers deterministic concurrent append overlap
 plus four configured POSIX shards. This work does not claim coverage of every
 internal unlink/fsync instruction, SPDK hardware, or the remaining composed H1
-crash scenarios; the full R4b acceptance gate remains incomplete.
+crash scenarios at the time it landed; the composed `forkmeta` daemon
+scenarios now cover those boundaries (without a concurrent-append oracle
+at prepare, manifest commit, and snapshot GC), and SPDK stays outside the
+claim.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
@@ -572,7 +585,9 @@ Acceptance:
   during source-log removal may roll acknowledged metadata back;
 - concurrent metadata mutations at every publication/crash boundary reopen
   with every acknowledged event exactly once;
-- H1 exercises each publication boundary before R6 begins its soak.
+- H1 exercises each publication boundary before R6 begins its soak
+  (composed daemon scenarios now cover prepare, manifest commit, source
+  rewrite, and snapshot GC).
 
 Expected scope: one implementation PR and one crash-test PR.
 
@@ -770,13 +785,9 @@ page-history owner; the branch controller's base pin carries page history
 while a branch is prepared, and a kept checkpoint image retains its
 exact-redo twin.
 
-Remaining before the gate closes:
-
-- a WAL-index-only owner's horizon is not page-protected, so stored pages
-  cannot replace its FPI-led chains and cold pages pin shipped WAL until it
-  advances (bounded by the owner's publication interval, and accounted for in
-  the soak's declared WAL bound);
-- SLRU-class object versions need their dedicated retention protocol.
+The materializer's own WAL-index horizon is page-protected by the cutoff
+derived from its pin, so stored pages replace its FPI-led chains; nothing
+remains before the gate closes beyond keeping the nightly soak green.
 
 The nightly long-run configuration is `.github/workflows/pagestore-nightly.yml`
 (three seeds, 8000 rounds each, scheduled daily and dispatchable with chosen
@@ -889,9 +900,11 @@ remain separate gates.
 ### H1. Compose process-level crash scenarios
 
 Status: **materializer replay/restartpoint, branch prepared-receipt/service-
-restore, portable bootstrap/install, and POSIX image-layer publication slices
-implemented; manifest replacement, reclaim, and GC cases remain and
-depend on H0/R2-R5**.
+restore, portable bootstrap/install, POSIX image-layer publication, POSIX
+page-pruning, POSIX WAL-index compaction, POSIX WAL reclaim, POSIX timeline
+deletion, POSIX manifest replacement, POSIX fork-metadata publication, and
+writer/reader/materializer/store restart-combination slices implemented;
+branch-compute restarts remain with the golden scenario**.
 
 Required scenario families:
 
@@ -920,6 +933,74 @@ postmaster and lets the supervisor recover it; it does not assume that the
 checkpointer child is the supervisor's worker generation.  Each plan records
 both R1 and R2 relation metadata and requires the R2 main fork to grow.
 
+The page-pruning slice adds a `gc_seed` runtime operation to the daemon fault
+harness.  A dedicated IPC client seeds three generations of relation history
+and a newer block, arms the named fault marker, then installs a configured
+page-history owner at the cutoff; three process-abort scenarios crash after
+the durable page-prune frontier, after the compacted layer's manifest
+publication, and after the retired layer's mark-delete.  The snapshot, recovery
+read (published newest block, retained history at the cutoff, refused
+pre-cutoff version), manifest/local-layer reconciliation, and republished
+retained horizon are checked, followed by one idempotent restart.
+
+The WAL-index compaction slice reuses `gc_seed` with a `wal_index` workload:
+a fixed WAL-index reader at 40 under three FPI-led chains on one block, one
+committed interval made a snapshot candidate by `--walidx-snapshot-bytes 1`,
+and a process abort after the durable frontier.  The crash must leave the
+frontier plus the staged generation without its commit; recovery must commit
+the retried generation, serve the reader's exact chain and the newest chain,
+refuse the dropped point below the frontier, and keep the WAL-index owner.
+
+The WAL reclaim slice adds three named store-lock probes to the shipped-WAL
+prefix reclaim (`wal_reclaim.before_unlink`, `wal_reclaim.after_unlink`,
+`wal_reclaim.before_dir_fsync`) beside the existing environment hooks the
+core/store unit tests use, and a `wal_reclaim` gc_seed workload: three sealed
+1 MiB segments, a control note at the shipped end, workload-armed fault, and
+WAL-index progress through the end.  Snapshots count the sealed segments left
+on disk per stage; recovery must finish the unlink retry, refuse prefix reads,
+keep the WAL end and retain floor, clear physical reclaim debt, and leave no
+owner.
+
+The timeline deletion slice adds four lock-held probes
+(`timeline_delete.after_deleting`, `.after_wal_cleanup`,
+`.after_segment_rewrite`, `.after_deleted`) around the durable DELETING event,
+private WAL/WAL-index removal, shared segment rewrite, and the durable DELETED
+event, and a `timeline_delete` gc_seed workload: a branch with private shipped
+WAL, a committed WAL-index interval, an owner layer, and shared-segment pages,
+then a workload-armed BEGIN_DELETE.  Snapshots check the owner's private
+artifacts per stage; recovery must reach DELETED with its incarnation token,
+keep the parent readable, reject branch reads, remove every owner artifact,
+reconcile the manifest, and register no owner.
+
+The manifest replacement slice adds two map-held probes around the atomic
+`layers.manifest` rewrite (`manifest_compact.after_tmp_sync`,
+`manifest_compact.after_rename`), removes a crashed compaction's temp log on
+manifest open, and adds a `manifest_compact` gc_seed workload that writes 320
+pages under a harness-held maintenance pause (`--test-maintenance-pause-file`)
+before arming the fault and releasing maintenance.  Snapshots check the temp
+file per stage; recovery must replay to a reconciled manifest, serve every
+page, and leave no temp log.
+
+The restart-combination slice adds a `restart` operation to the writer and
+materializer runtimes.  Writer-runtime targets are the writer and installed
+pinned readers (a reader restart restores its boot control image with
+`pagestore_control_restore` first); materializer-runtime targets are the
+writer, the materializer worker (replaced by the supervisor with a new
+generation), and the store (supervisor and computes stopped, daemon
+restarted on the same shared memory, computes and supervisor returned).
+`writer_reader_restart` and `materializer_restart_combinations` compose
+them with horizon, visibility, boundary, and zero-lag assertions.
+
+The fork-metadata slice composes the existing `forkmeta.*` probes on the
+daemon through a `forkmeta` gc_seed workload: the page-pruning history and
+cutoff pin prove the cutoff, thirty-two relations carry persisted fork-size
+events on both sides of it, and a post-cutoff trickle publishes the second
+generation that retires the first.  This covers the R4b acceptance item that
+H1 exercise each publication boundary in a composed process-crash scenario;
+the concurrent-mutation clause stays open at the prepare, manifest-commit,
+and snapshot-GC boundaries because the trickle relations are not in the
+oracle.
+
 Acceptance:
 
 - each declared transition is exercised before and after its durability point;
@@ -933,7 +1014,22 @@ Expected scope: two or three focused PRs.
 
 ### H2. Add persisted-format fixtures and compatibility CI
 
-Status: **not started; decision D5 required**.
+Status: **daemon-side POSIX formats covered under the recommended D5 policy
+(flagged as an assumption while D5 stays open), including a legacy fixture
+exercised by the first format change; backend-side artifact fixtures
+remain**.
+
+The slice adds `pagestore_format.h` identities reported by every format-owning
+module, the `pagestore_format_versions` tool, the `fixture` workload of
+`pagestore_gc_crash_client`, `harness/pagestore_fixture.py` (capture and
+check), and `fixtures/posix-mvp-baseline`.  The check enforces identity
+freshness, reopen with the oracle across a restart, and thirty-six declared
+mutations with their documented outcomes.  It surfaced and fixed two defects
+(relocated stores refused by absolute layer locations; a damaged forkmeta
+marker discarding acknowledged post-cutover events).  The gap it documented
+(forkmeta source records had no checksum) is closed by FKM3 records, the
+same 64-byte layout with a CRC-24 in the former pad bytes; FKM2 stays
+readable and its fixture is the legacy one.
 
 Fixture families:
 
@@ -1104,6 +1200,17 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Sealed forkmeta source and snapshot payload records as FKM3 (FKM2 layout, CRC-24 in the former pad bytes; a complete record with a bad checksum refuses to open instead of being treated as a torn tail); FKM2 stays readable; `fixtures/posix-mvp-baseline` becomes the legacy fixture and `fixtures/posix-forkmeta-crc` the current one; the fixture check distinguishes legacy (reopen/oracle) from current (identity pin plus mutations) fixtures and takes several directories | First format change through the fixture process; cutover, crash-matrix, timeline, lifecycle unit tests; both fixtures checked; standalone and integration lanes |
+| 2026-09-10 | Added the first H2 persisted-format fixture slice: per-module format identities and `pagestore_format_versions`, a `fixture` workload covering every daemon-side POSIX family, `harness/pagestore_fixture.py` capture/check with identity freshness, reopen-and-restart oracle, and thirty-six mutation cases, `fixtures/posix-mvp-baseline`, meson and standalone CI checks; fixed relocated-store layer locations and a damaged forkmeta marker discarding post-cutover events; documented the forkmeta record checksum gap | Fixture check locally against the captured baseline; layer-store and forkmeta crash-matrix unit tests; standalone and integration lanes; D5 remains open and is flagged as an assumption |
+| 2026-09-10 | Added the H1 fork-metadata publication crash slice: a `forkmeta` gc_seed workload (page-pruning cutoff, thirty-two relations with create/zero-extend/truncate events on both sides of the cutoff, post-cutoff trickle for the second generation) composing the four existing `forkmeta.*` probes, with staged/selected/marker/GC snapshots, settled-generation recovery, current and retained fork sizes, refused below-cutoff queries, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Added the H1 restart-combination slice: a `restart` operation for the writer runtime (writer, installed pinned readers via boot-control restore) and the materializer runtime (writer, supervisor-replaced worker, store with all computes down), plus `writer_reader_restart` and `materializer_restart_combinations` scenarios asserting reader horizon and prepared-xid hiding across restarts and materialized boundaries after writer, worker, and store restarts | Harness validation tests and meson plan checks; both scenarios in the integration CI lane; no SPDK execution |
+| 2026-09-10 | Added the H1 manifest replacement crash slice: map-held probes after the fsync'd compacted temp log and after its rename, crashed temp-log removal on manifest open, a `manifest_compact` gc_seed workload (320 pages under a harness-held maintenance pause, workload-armed fault and release), per-stage temp-file snapshots, reconciled-manifest recovery with every page served and no temp log, and idempotent restart | Harness validation tests; two meson/CI scenarios against the POSIX daemon; manifest unit test; no SPDK execution |
+| 2026-09-10 | Added the H1 timeline deletion crash slice: lock-held probes after the durable DELETING event, after private WAL/WAL-index removal, after a shared segment rewrite, and after the durable DELETED event; a `timeline_delete` gc_seed workload (branch with private WAL, WAL-index interval, owner layer, shared-segment pages, workload-armed BEGIN_DELETE); per-stage private-artifact snapshots, DELETED-with-token recovery, parent readable, branch reads rejected, owner artifacts gone, manifest reconciled, no owner, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Added the H1 WAL reclaim crash slice: named store-lock probes before the first unlink, after each unlink, and before the residual-prefix directory fsync; a `wal_reclaim` gc_seed workload (three sealed segments, control note at the shipped end, workload-armed fault, WAL-index progress); per-stage sealed-segment snapshot counts, unlink-retry recovery, refused prefix reads, WAL end/retain floor, cleared reclaim debt, no owner, and idempotent restart | Harness validation tests; three meson/CI scenarios against the POSIX daemon; fault registry and WAL-store unit tests; no SPDK execution |
+| 2026-09-10 | Added the H1 WAL-index compaction crash slice: a `wal_index` gc_seed workload (fixed WAL-index reader at 40 under three FPI-led chains, one committed interval, workload-armed fault), a `--walidx-snapshot-bytes` daemon trigger override, and a process abort after the durable WAL-index frontier with staged-generation snapshot, retried commit, chain/refusal reads, owner, and idempotent-restart checks | Harness validation tests; meson/CI scenario against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Added the H1 page-pruning crash slice: a `gc_seed` daemon-harness operation backed by `pagestore_gc_crash_client` (three history generations, newer block, workload-armed fault, configured cutoff at 3500), three process aborts after the durable prune frontier, the compacted layer's manifest publication, and the retired layer's mark-delete, with snapshot, recovery-read, manifest reconciliation, retained-horizon, and idempotent-restart checks | Harness validation tests; three meson/CI scenarios against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Made the materializer's WAL-index horizon page-protected by its own derived cutoff (unless another WAL-index-only owner shares the LSN), so stored pages replace its FPI-led chains and the soak's WAL bound returns to two publication intervals | Reclaim-core case (a WAL/WAL-index materializer pin authorizes the base at its horizon; a shared LSN still does not); control/lifecycle/standalone suites; integration lane; 2400/8000-round soaks within the tighter bound |
+| 2026-09-10 | Added SLRU-class and reader-artifact retention: seeds (replay bases), reader snapshots, the live SLRU mirror, tombstones, and the watermark follow the relation plan below their consumers' pins and branch fork points, and a retired artifact releases its control-image fence (the registry now counts artifact versions) | Control-prune cases for a pinned reader, a branch fork point, a dropped pin, retry collapse, fence release, and restart; lifecycle/reclaim/standalone suites; integration lane; 2400/8000-round soaks |
 | 2026-09-10 | Added the nightly long-run soak workflow: a seed matrix (default three seeds at 8000 rounds) built from the freestanding daemon and harness, scheduled daily and dispatchable with chosen seeds/rounds, with per-job report summaries and 30-day JSON artifacts | Workflow YAML validated; the same soak binary and report format as the pull-request lane |
 | 2026-09-10 | Derived the operational page-history cutoff from the writing compute (the materializer's restart-redo pin, or the newest checkpoint note's redo), kept the exact-redo twin of every retained checkpoint image, gave the branch controller's base pin page history, and modeled the real materializer mask plus progress marker in the soak | Control-prune cases for marker and note cutoffs with refusal below the frontier and restart; lifecycle/reclaim/standalone suites; integration lane with pruning active in the golden and branch-boot flows; 2400/8000-round soaks |
 | 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |

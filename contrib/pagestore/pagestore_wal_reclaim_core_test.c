@@ -716,8 +716,10 @@ test_dependency_cutoffs(void)
 	close_store();
 	remove_tree(store);
 
-	/* A materializer that pins only WAL resources establishes no page-history
-	 * floor; its horizon keeps the FPI chain like any other unprotected one. */
+	/* A materializer pins only WAL resources, but its pin LSN (the redo of its
+	 * last durable restartpoint) is the operational page-history cutoff, so
+	 * the stored base at its own horizon is retained by that same pin and
+	 * authorizes the replacement. */
 	configure_core();
 	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
@@ -726,9 +728,8 @@ test_dependency_cutoffs(void)
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
 					  PS_RETENTION_RESOURCE_WAL |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL) &&
-		  !maintenance_until_count(store, 0, 0) &&
-		  segment_count(store, 0) == 2,
-		  "a WAL-only materializer pin does not authorize the stored base");
+		  maintenance_until_count(store, 0, 0),
+		  "a materializer's WAL/WAL-index pin authorizes the stored base at its own horizon");
 	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
 		  "clear the WAL-index snapshot trigger override after the WAL-only pin");
 	close_store();

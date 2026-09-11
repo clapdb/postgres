@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "pagestore_walidx_snapshot.h"
+#include "pagestore_format.h"
 
 /*
  * A timeline manifest is the only discovery point.  Shards are immutable and
@@ -1893,4 +1894,16 @@ ps_walidx_snapshot_close(PsWalIdxSnapshot *snapshot)
 		close(snapshot->directory_fd);
 	memset(snapshot, 0, sizeof(*snapshot));
 	snapshot->directory_fd = -1;
+}
+
+size_t
+ps_walidx_snapshot_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"walidx_snapshot", "walidx_snapshots_<tl>/walidx_manifest_v1",
+		 WALIDX_SNAPSHOT_MAGIC, WALIDX_SNAPSHOT_VERSION},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
 }

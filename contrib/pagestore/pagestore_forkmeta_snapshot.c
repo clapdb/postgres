@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "pagestore_forkmeta_snapshot.h"
+#include "pagestore_format.h"
 
 #define FORKMETA_SNAPSHOT_MAGIC UINT32_C(0x4d534946) /* "FISM" */
 #define FORKMETA_SNAPSHOT_VERSION 1
@@ -2829,4 +2830,16 @@ ps_forkmeta_snapshot_close(PsForkmetaSnapshot *snapshot)
 	snapshot->directory_fd = -1;
 	snapshot->checkpoint_fd = -1;
 	snapshot->tail_fd = -1;
+}
+
+size_t
+ps_forkmeta_snapshot_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"forkmeta_snapshot", "forkmeta_snapshots/forkmeta_manifest_v1",
+		 FORKMETA_SNAPSHOT_MAGIC, FORKMETA_SNAPSHOT_VERSION},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
 }

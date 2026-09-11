@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_format.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
 #include "pagestore_memtable.h"
@@ -73,6 +74,7 @@ uint64_t	wal_reclaim_high_water_bytes;
 uint64_t	wal_reclaim_catchup_bytes;
 uint64_t	walidx_reclaim_high_water_bytes;
 uint64_t	walidx_reclaim_catchup_bytes;
+uint64_t	walidx_snapshot_trigger_option_bytes;
 uint64_t	forkmeta_reclaim_high_water_bytes;
 uint64_t	forkmeta_reclaim_catchup_bytes;
 /*
@@ -399,6 +401,7 @@ static char page_frontier_dir[4096];
 static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS];
 static int page_frontier_load(const char *store_dir);
 static void page_prune_mark_all_due_locked(void);
+static int key_eq(const PsKey *a, const PsKey *b);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
 static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -1767,6 +1770,11 @@ layer_matches_read_shard(const PsLayerDesc *layer, uint32_t shard)
 		(layer->legacy_shard_zero && layer_shard == 0 && shard != 0);
 }
 
+/* The shard count is persisted as a decimal number with no header, so its
+ * schema number is what a fixture pins: a different representation must bump
+ * it and ship a fixture that carries the new one. */
+#define PS_STORE_SHARD_COUNT_SCHEMA 1
+
 static int
 store_shard_count_path(const char *store_dir, char *path, size_t path_len)
 {
@@ -2536,6 +2544,171 @@ compact_same_page(const CompactOrder *a, const CompactOrder *b)
 		a->key.forkNum == b->key.forkNum && a->key.klass == b->key.klass;
 }
 
+/* The first index whose value is at least x, in a sorted array. */
+static uint32_t
+lower_bound_u64(const uint64_t *values, uint32_t n, uint64_t x)
+{
+	uint32_t	lo = 0,
+				hi = n;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (values[mid] < x)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* Collapse a sorted array to its distinct values, returning how many remain. */
+static uint32_t
+unique_sorted_u64(uint64_t *values, uint32_t n)
+{
+	uint32_t	out = 0;
+
+	for (uint32_t i = 0; i < n; i++)
+		if (out == 0 || values[out - 1] != values[i])
+			values[out++] = values[i];
+	return out;
+}
+
+/*
+ * The exact-generation artifact classes (SLRU seeds, reader snapshots) are
+ * consumed at exactly the LSN they were captured at; a consumer whose base
+ * is generation C reads every page of the object at exactly C, and a page
+ * that has no copy at C is absent there.  The newest generation at or below
+ * a retained horizon is therefore the only one that horizon can use, and an
+ * older copy of a page missing from that generation serves nobody.  The
+ * generations of an object are the distinct version LSNs of its pages in
+ * this compaction's input; a generation held only in layers outside the
+ * input is unknown here, which only ever keeps more.
+ */
+static int
+cmp_u64(const void *a, const void *b)
+{
+	uint64_t	x = *(const uint64_t *) a;
+	uint64_t	y = *(const uint64_t *) b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* The newest generation at or below the horizon, over the object's sorted
+ * distinct generations. */
+static uint64_t
+artifact_generation_at(const uint64_t *generations, uint32_t ngenerations,
+					   uint64_t horizon)
+{
+	uint32_t	lo = 0,
+				hi = ngenerations;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (generations[mid] <= horizon)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo == 0 ? 0 : generations[lo - 1];
+}
+
+/*
+ * The generations of one object that any retained horizon can still consume,
+ * built once for the whole object rather than rederived for every page copy.
+ *
+ * A seed is a replay base: a horizon above the floor is served by the newest
+ * seed at or below it plus the WAL after it, so the newest generation below
+ * the floor, and below every fence, survives.  A reader snapshot is not: its
+ * consumer resolves it at exactly the horizon it was captured for, so a fence
+ * keeps it only by naming that horizon, and a fence above it -- a live
+ * descendant branch, say -- never resolves it.  A required value that is not
+ * a generation of this object simply matches no record.
+ */
+static uint32_t
+artifact_required_generations(const uint64_t *generations, uint32_t ngenerations,
+							  uint64_t floor, const PsPruneFence *fences,
+							  uint32_t nfences, int replay_base,
+							  uint64_t *required)
+{
+	uint32_t	n = 0;
+
+	if (replay_base)
+	{
+		uint64_t	base = artifact_generation_at(generations, ngenerations, floor);
+
+		if (base != 0)
+			required[n++] = base;
+	}
+	for (uint32_t f = 0; f < nfences; f++)
+	{
+		uint64_t	value = replay_base
+			? artifact_generation_at(generations, ngenerations, fences[f].lsn)
+			: fences[f].lsn;
+
+		if (value != 0)
+			required[n++] = value;
+	}
+	qsort(required, n, sizeof(*required), cmp_u64);
+	return unique_sorted_u64(required, n);
+}
+
+static int
+artifact_generation_required(const uint64_t *required, uint32_t nrequired,
+							 uint64_t lsn)
+{
+	uint32_t	lo = lower_bound_u64(required, nrequired, lsn);
+
+	return lo < nrequired && required[lo] == lsn;
+}
+
+/*
+ * Emit one page's planned versions.  Sorted equal (LSN, admission sequence)
+ * identities are one logical version that may exist as several physical
+ * copies (a compaction that crashed after publishing its replacement leaves
+ * the sources beside it): retain one physical copy when any copy is kept,
+ * or record the identity as dropped exactly once, so page_idx removal and
+ * artifact fence accounting see each logical version once.
+ */
+static uint32_t
+compact_emit_grouped(const CompactOrder *order, uint32_t first, uint32_t end,
+					 const unsigned char *keep, const PsImgRec *recs,
+					 PsImgRec *selected, uint32_t out, PsImgRec *dropped,
+					 uint32_t *ndropped)
+{
+	for (uint32_t i = first; i < end;)
+	{
+		uint32_t next = i + 1;
+		int kept_source = -1;
+
+		while (next < end &&
+			   order[next].version.lsn == order[i].version.lsn &&
+			   order[next].version.admission_seq ==
+			   order[i].version.admission_seq)
+			next++;
+		/* The sorted order breaks an identity tie by input index, and the
+		 * input is read in layer-id order, so the last kept copy is the one
+		 * a read resolves to.  Legacy records share (LSN, admission
+		 * sequence) even when their bytes differ, which is exactly when this
+		 * choice decides what survives. */
+		for (uint32_t j = next; j > i; j--)
+			if (keep[j - 1 - first])
+			{
+				kept_source = (int) order[j - 1].source;
+				break;
+			}
+		if (kept_source >= 0)
+			selected[out++] = recs[kept_source];
+		else
+			dropped[(*ndropped)++] = recs[order[i].source];
+		i = next;
+	}
+	return out;
+}
+
 static int
 prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 						 uint64_t floor,
@@ -2552,6 +2725,11 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint32_t	nfences = 0;
 	PsPruneFence *control_fences = NULL;
 	uint32_t	ncontrol_fences = 0;
+	uint64_t   *obj_generations = NULL;
+	uint32_t	obj_ngenerations = 0;
+	uint64_t   *obj_required = NULL;
+	uint32_t	obj_nrequired = 0;
+	uint32_t	obj_hi = 0;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
@@ -2566,13 +2744,19 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	keep = malloc(*nrec);
 	selected = malloc((size_t) *nrec * sizeof(*selected));
 	dropped = malloc((size_t) *nrec * sizeof(*dropped));
-	if (!order || !versions || !keep || !selected || !dropped)
+	obj_generations = malloc((size_t) *nrec * sizeof(*obj_generations));
+	/* one required generation per fence, plus the floor's */
+	obj_required = malloc(((size_t) nfences + 1) * sizeof(*obj_required));
+	if (!order || !versions || !keep || !selected || !dropped ||
+		!obj_generations || !obj_required)
 	{
 		free(order);
 		free(versions);
 		free(keep);
 		free(selected);
 		free(dropped);
+		free(obj_generations);
+		free(obj_required);
 		free(fences);
 		free(control_fences);
 		return -1;
@@ -2605,8 +2789,117 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		if (order[first].key.klass != PS_KLASS_RELATION &&
 			order[first].key.klass != PS_KLASS_CONTROL)
 		{
-			for (uint32_t i = first; i < end; i++)
-				selected[out++] = recs[order[i].source];
+			uint32_t	klass = order[first].key.klass;
+			int			exact_generations = klass == PS_KLASS_SLRU ||
+				klass == PS_KLASS_READER_SNAPSHOT;
+			int			latest_state = klass == PS_KLASS_SLRU_LIVE ||
+				klass == PS_KLASS_SLRU_TOMB || klass == PS_KLASS_SLRU_WM;
+
+			if (floor != 0 && (exact_generations || latest_state))
+			{
+				PsPruneFence plan_floor = {floor, UINT64_MAX};
+
+				/* The live mirror, tombstones, and watermark are read at the
+				 * newest horizon by their consumer, and by a branch at its
+				 * fork point: nothing above the newest version, and nothing
+				 * between a fence and the newest, is ever asked for.  Plan
+				 * them with the newest version as the floor so only that
+				 * version and the newest at or below each fence survive. */
+				if (latest_state)
+					for (uint32_t i = first; i < end; i++)
+						if (order[i].version.lsn > plan_floor.lsn)
+							plan_floor.lsn = order[i].version.lsn;
+				if (exact_generations)
+				{
+					/* Every page of this object is contiguous in the sorted
+					 * order; its generations are their distinct version LSNs.
+					 * Compaction holds the shard and map write locks, so the
+					 * set is built once for the whole object and reused by
+					 * each of its page groups rather than rebuilt per page. */
+					if (first >= obj_hi)
+					{
+						uint32_t	lo = first;
+
+						while (lo > 0 && key_eq(&order[lo - 1].key, &order[first].key))
+							lo--;
+						obj_hi = end;
+						while (obj_hi < *nrec &&
+							   key_eq(&order[obj_hi].key, &order[first].key))
+							obj_hi++;
+						obj_ngenerations = 0;
+						for (uint32_t i = lo; i < obj_hi; i++)
+							if (order[i].version.lsn != 0)
+								obj_generations[obj_ngenerations++] =
+									order[i].version.lsn;
+						/* Sorting once beats deduplicating by searching what
+						 * has been found so far, which is quadratic in the
+						 * generations an object accumulates, and it leaves
+						 * the list ordered for the horizon lookups below. */
+						qsort(obj_generations, obj_ngenerations,
+							  sizeof(*obj_generations), cmp_u64);
+						obj_ngenerations = unique_sorted_u64(obj_generations,
+															 obj_ngenerations);
+						/* The generations any retained horizon can still
+						 * consume do not depend on the page, so resolve the
+						 * floor and every fence once for the object instead
+						 * of once per surviving copy. */
+						obj_nrequired = artifact_required_generations(
+							obj_generations, obj_ngenerations, floor,
+							fences, nfences, klass == PS_KLASS_SLRU,
+							obj_required);
+					}
+				}
+				/* SLRU-class objects and reader artifacts are consumed as-of
+				 * a horizon their consumer pinned first (a reader, a branch
+				 * being prepared) or that is a branch's fork point.  A seed
+				 * is a replay base: a horizon R is served by the newest seed
+				 * at or below R plus the WAL after it, so the newest seed
+				 * below every retained horizon must survive.  A reader
+				 * snapshot is read at exactly its reader's horizon, which is
+				 * that reader's pin, and the live mirror, tombstones, and
+				 * watermark resolve to the newest version at or below the
+				 * horizon.  All of them therefore follow the relation plan:
+				 * the newest version at or below the floor and every fence,
+				 * everything above the floor; a retried copy of a retained
+				 * version collapses to the newest tuple like any other. */
+				for (uint32_t i = first; i < end; i++)
+					versions[i - first] = order[i].version;
+				if (ps_page_prune_plan(versions, end - first, plan_floor,
+									   fences, nfences, keep) < 0)
+					memset(keep, 1, end - first);
+				/* A page copy below the floor is kept only when it belongs to
+				 * the newest generation at or below some retained horizon;
+				 * a copy from an older generation of a page the newer
+				 * generation no longer has serves no consumer and would keep
+				 * its control era fenced forever. */
+				if (exact_generations)
+					for (uint32_t i = first; i < end; i++)
+						if (keep[i - first] && order[i].version.lsn != 0 &&
+							order[i].version.lsn < floor &&
+							!artifact_generation_required(obj_required,
+														  obj_nrequired,
+														  order[i].version.lsn))
+							keep[i - first] = 0;
+				/* zero-version (WAL-less) state is latest-only: its newest
+				 * admission stays whatever the plan says, every older
+				 * zero-version admission is superseded and goes */
+				{
+					uint64_t	newest = 0;
+
+					for (uint32_t i = first; i < end; i++)
+						if (order[i].version.lsn == 0 &&
+							order[i].version.admission_seq >= newest)
+							newest = order[i].version.admission_seq;
+					for (uint32_t i = first; i < end; i++)
+						if (order[i].version.lsn == 0)
+							keep[i - first] =
+								order[i].version.admission_seq == newest;
+				}
+			}
+			else
+				memset(keep, 1, end - first);
+			out = compact_emit_grouped(order, first, end, keep, recs,
+									   selected, out, dropped, &ndropped);
 			first = end;
 			continue;
 		}
@@ -2629,6 +2922,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(keep);
 				free(selected);
 				free(dropped);
+				free(obj_generations);
+				free(obj_required);
 				free(fences);
 				free(control_fences);
 				return -1;
@@ -2670,33 +2965,13 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 										  fences, nfences))
 					keep[i - first] = 0;
 		}
-		for (uint32_t i = first; i < end;)
-		{
-			uint32_t next = i + 1;
-			int kept_source = -1;
-
-			while (next < end &&
-				   order[next].version.lsn == order[i].version.lsn &&
-				   order[next].version.admission_seq ==
-				   order[i].version.admission_seq)
-				next++;
-			for (uint32_t j = i; j < next; j++)
-				if (keep[j - first])
-				{
-					kept_source = (int) order[j].source;
-					break;
-				}
-			/* Sorted equal identities are one logical version.  Retain one
-			 * physical copy, or remove the identity from page_idx exactly once. */
-			if (kept_source >= 0)
-				selected[out++] = recs[kept_source];
-			else
-				dropped[ndropped++] = recs[order[i].source];
-			i = next;
-		}
+		out = compact_emit_grouped(order, first, end, keep, recs, selected,
+								   out, dropped, &ndropped);
 		first = end;
 	}
 	memcpy(recs, selected, (size_t) out * sizeof(*recs));
+	free(obj_generations);
+	free(obj_required);
 	free(order);
 	free(versions);
 	free(keep);
@@ -2755,6 +3030,22 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			d->timeline == timeline &&
 			layer_shard_from_id(d->layer_id) == shard)
 			old[nold++] = *d;
+	}
+	/* Read the sources in layer-id order.  A lookup resolves two copies of
+	 * one identity by the highest layer id, and legacy records carry no
+	 * admission sequence, so the compaction input must be ordered the same
+	 * way for its own tie-break to select the copy a read would serve. */
+	for (uint32_t i = 1; i < nold; i++)
+	{
+		PsLayerDesc entry = old[i];
+		uint32_t	j = i;
+
+		while (j > 0 && old[j - 1].layer_id > entry.layer_id)
+		{
+			old[j] = old[j - 1];
+			j--;
+		}
+		old[j] = entry;
 	}
 	/* A read snapshots and pins the complete timeline layer set before doing
 	 * remote I/O.  Do not publish a partial compaction while any source is
@@ -2843,6 +3134,19 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	 * drop/recreate churn would keep every such layer alive forever. */
 	if (nrec == 0 && ndropped == 0)
 		goto cleanup;
+	/* A single source with nothing to drop is already the compacted result.
+	 * Publishing an identical replacement and retiring the source rewrites
+	 * the whole layer and churns the manifest on every pass that finds
+	 * pruning due -- including the pass each startup marks, so a converged
+	 * store would move to a fresh layer id at every boot.  The pass is
+	 * complete, not skipped: there is nothing to prune and nothing to merge.
+	 * A legacy shard-zero source is left alone here: its rewrite is governed
+	 * by the legacy compaction path, not by this merge. */
+	if (nold == 1 && ndropped == 0 && !old[0].legacy_shard_zero)
+	{
+		rc = 1;
+		goto cleanup;
+	}
 	frontier_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (frontier_seq != 0)
 		frontier_seq--;
@@ -3238,6 +3542,8 @@ static void artifact_fence_reset(void);
 static void artifact_fence_note(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_reserve(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_release(uint32_t timeline, uint64_t lsn);
+static void artifact_fence_forget_versions(uint32_t timeline, uint64_t lsn,
+										   uint32_t versions);
 static void artifact_fence_forget(uint32_t timeline);
 
 static void
@@ -4185,6 +4491,10 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	}
 	if (ps_storage->seg_rewrite(s->id, seg, replacement, out_off) != 0)
 		goto fail;
+	/* The rewritten segment is durable; recovery rescans it, so the in-memory
+	 * relocation below is the only state a crash here can lose. */
+	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_SEGMENT_REWRITE) != 0)
+		goto fail;
 	for (uint32_t i = 0; i < nrelocs; i++)
 	{
 		SegmentReloc *r = &relocs[i];
@@ -4331,6 +4641,37 @@ static void
 page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 							   uint32_t nrec)
 {
+	/*
+	 * The artifact cutoffs these records retire, each with the versions
+	 * retired at it.  One dropped identity can match several in-memory
+	 * versions -- legacy records share an identity even when their bytes
+	 * differ -- so the counts are accumulated per cutoff rather than one
+	 * entry per retired version, which no per-record bound would cover.
+	 */
+	uint64_t   *cutoffs = nrec != 0
+		? malloc((size_t) nrec * sizeof(*cutoffs)) : NULL;
+	uint32_t   *retired = NULL;
+	uint32_t	ncutoffs = 0;
+
+	if (cutoffs != NULL)
+	{
+		for (uint32_t r = 0; r < nrec; r++)
+			if (recs[r].lsn != 0 &&
+				(recs[r].key.klass == PS_KLASS_SLRU ||
+				 recs[r].key.klass == PS_KLASS_READER_SNAPSHOT))
+				cutoffs[ncutoffs++] = recs[r].lsn;
+		qsort(cutoffs, ncutoffs, sizeof(*cutoffs), cmp_u64);
+		ncutoffs = unique_sorted_u64(cutoffs, ncutoffs);
+		retired = ncutoffs != 0
+			? calloc(ncutoffs, sizeof(*retired)) : NULL;
+		if (retired == NULL)
+		{
+			free(cutoffs);
+			cutoffs = NULL;
+			ncutoffs = 0;
+		}
+	}
+
 	for (uint32_t r = 0; r < nrec;)
 	{
 		uint32_t	end = r + 1;
@@ -4372,29 +4713,66 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 				remove = 1;
 			if (!remove)
 				e->vers[out++] = *v;
+			else if (e->key.klass == PS_KLASS_SLRU ||
+					 e->key.klass == PS_KLASS_READER_SNAPSHOT)
+			{
+				uint32_t	at = lower_bound_u64(cutoffs, ncutoffs, v->lsn);
+
+				if (at < ncutoffs && cutoffs[at] == v->lsn)
+					retired[at]++;
+				else
+					artifact_fence_forget_versions(timeline, v->lsn, 1);
+			}
 		}
 		e->nver = out;
 		r = end;
 	}
-	for (uint32_t r = 0; r < nrec; r++)
-		if (recs[r].lsn == 0)
-		{
-			ForkEnt    *fork = fork_find(timeline, &recs[r].key);
-			Shard	   *shard = shard_for(&recs[r].key);
-			int			found = 0;
+	/*
+	 * A dropped zero-version record may have been the fork's last WAL-less
+	 * page.  Recompute the flag once per affected fork, walking that fork's
+	 * own page list: doing it per record rescanned the whole page index for
+	 * every superseded admission of the same page, under both the shard and
+	 * map write locks.
+	 */
+	/*
+	 * One fence entry backs every page of a snapshot generation, and a
+	 * released pin can retire several generations at once, so the versions
+	 * retired at one cutoff arrive together.  Settling them one at a time
+	 * searched the fence table from the start for each, under the shard and
+	 * map write locks; count them per cutoff and search once.
+	 */
+	for (uint32_t i = 0; i < ncutoffs; i++)
+		if (retired[i] != 0)
+			artifact_fence_forget_versions(timeline, cutoffs[i], retired[i]);
+	free(cutoffs);
+	free(retired);
 
-			for (uint32_t b = 0; b < IDX_BUCKETS && !found; b++)
-				for (PageEnt *e = shard->page_idx[b]; e && !found; e = e->next)
-					if (e->timeline == timeline && key_eq(&e->key, &recs[r].key))
-						for (int i = 0; i < e->nver; i++)
-							if (e->vers[i].lsn == 0)
-							{
-								found = 1;
-								break;
-							}
-			if (fork != NULL)
-				fork->has_wal_less = found;
-		}
+	const PsKey *last_wal_less = NULL;
+
+	for (uint32_t r = 0; r < nrec; r++)
+	{
+		ForkEnt    *fork;
+
+		if (recs[r].lsn != 0)
+			continue;
+		/* the dropped identities are key-sorted, so one comparison with the
+		 * previous zero-version key is the whole deduplication */
+		if (last_wal_less != NULL && key_eq(last_wal_less, &recs[r].key))
+			continue;
+		last_wal_less = &recs[r].key;
+		fork = fork_find(timeline, &recs[r].key);
+		if (fork == NULL)
+			continue;
+		fork->has_wal_less = 0;
+		for (PageEnt *e = fork->pages; e != NULL && !fork->has_wal_less;
+			 e = e->fork_next)
+			for (int i = 0; i < e->nver; i++)
+				if (e->vers[i].lsn == 0)
+				{
+					fork->has_wal_less = 1;
+					break;
+				}
+	}
 }
 
 /*
@@ -6090,7 +6468,8 @@ typedef struct ForkMetaRecV1
 	uint8_t		pad[3];
 } ForkMetaRecV1;
 
-#define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2" */
+#define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2": no record checksum (accepted) */
+#define FORK_META_V3_MAGIC 0x334d4b46 /* "FKM3": V2 layout, pad carries CRC-24 */
 #define FORK_META_SNAPSHOT_PAYLOAD_MAGIC 0x31534d46 /* "FMS1" */
 #define FORK_META_SNAPSHOT_PAYLOAD_VERSION 1
 #define FORK_META_SNAPSHOT_CHECKPOINT 0
@@ -6126,6 +6505,66 @@ typedef struct ForkMetaSnapshotPayloadHeader
 	uint64_t	checkpoint_bytes;
 	uint64_t	tail_bytes;
 } ForkMetaSnapshotPayloadHeader;
+
+/* CRC-24 (OpenPGP polynomial) over every record byte before the pad.  A V3
+ * record stores it in the three former pad bytes, so the 64-byte layout and
+ * every rec_len check stay unchanged while a flipped byte inside a record is
+ * detected; V2 records (zero pad, no checksum) remain readable. */
+static uint32_t
+fork_meta_rec_crc24(const ForkMetaRecV2 *rec)
+{
+	const unsigned char *bytes = (const unsigned char *) rec;
+	uint32_t	crc = 0xB704CEu;
+
+	for (size_t i = 0; i < offsetof(ForkMetaRecV2, pad); i++)
+	{
+		crc ^= (uint32_t) bytes[i] << 16;
+		for (int bit = 0; bit < 8; bit++)
+		{
+			crc <<= 1;
+			if (crc & 0x1000000u)
+				crc ^= 0x1864CFBu;
+		}
+	}
+	return crc & 0xFFFFFFu;
+}
+
+static void
+fork_meta_rec_seal(ForkMetaRecV2 *rec)
+{
+	uint32_t	crc;
+
+	rec->magic = FORK_META_V3_MAGIC;
+	crc = fork_meta_rec_crc24(rec);
+	rec->pad[0] = (uint8_t) (crc >> 16);
+	rec->pad[1] = (uint8_t) (crc >> 8);
+	rec->pad[2] = (uint8_t) crc;
+}
+
+static int
+fork_meta_magic_v2_family(uint32_t magic)
+{
+	return magic == FORK_META_V2_MAGIC || magic == FORK_META_V3_MAGIC;
+}
+
+/* Layout and checksum validity of a record read from the source log or a
+ * snapshot payload; field semantics are checked by the callers. */
+static int
+fork_meta_rec_wire_valid(const ForkMetaRecV2 *rec)
+{
+	if (rec->rec_len != sizeof(*rec))
+		return 0;
+	if (rec->magic == FORK_META_V2_MAGIC)
+		return rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
+	if (rec->magic == FORK_META_V3_MAGIC)
+	{
+		uint32_t	crc = fork_meta_rec_crc24(rec);
+
+		return rec->pad[0] == (uint8_t) (crc >> 16) &&
+			rec->pad[1] == (uint8_t) (crc >> 8) && rec->pad[2] == (uint8_t) crc;
+	}
+	return 0;
+}
 
 static uint64_t fork_meta_snapshot_generation;
 static uint64_t fork_meta_snapshot_cutoff_lsn;
@@ -6174,6 +6613,7 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 	rec.admission_seq = admission_seq;
 	rec.nblocks = nblocks;
 	rec.kind = kind;
+	fork_meta_rec_seal(&rec);
 	rc = ps_storage->fork_meta_append(&rec, sizeof(rec));
 	if (rc == 0)
 		fork_meta_bytes_add(sizeof(rec));
@@ -6204,6 +6644,7 @@ fork_meta_persist_segment(uint32_t timeline, const PsKey *key, uint64_t lsn,
 	rec.nblocks = nblocks;
 	rec.kind = kind == FEV_SEG_GROW ? FEV_SEG_GROW_BOUND :
 		FEV_SEG_COMMIT_BOUND;
+	fork_meta_rec_seal(&rec);
 	rc = ps_storage->fork_meta_append(&rec, sizeof(rec));
 	if (rc == 0)
 		fork_meta_bytes_add(sizeof(rec));
@@ -6561,6 +7002,7 @@ fork_meta_vec_record(ForkMetaByteVec *vec, uint32_t timeline,
 	rec.order_id = order_id;
 	rec.nblocks = nblocks;
 	rec.kind = kind;
+	fork_meta_rec_seal(&rec);
 	return fork_meta_vec_append(vec, &rec, sizeof(rec));
 }
 
@@ -6594,14 +7036,13 @@ fork_meta_ordered_marker_valid(const ForkMetaRecV2 *rec,
 		rec->kind == FEV_SEG_COMMIT_BOUND;
 	int unbound = rec->kind == FEV_SEG_GROW || rec->kind == FEV_SEG_COMMIT;
 
-	return (bound || unbound) && rec->magic == FORK_META_V2_MAGIC &&
-		rec->rec_len == sizeof(*rec) && rec->timeline < MAX_TIMELINES &&
+	return (bound || unbound) && fork_meta_rec_wire_valid(rec) &&
+		rec->timeline < MAX_TIMELINES &&
 		rec->key.klass <= PS_KLASS_READER_SNAPSHOT &&
 		rec->nblocks != 0 &&
 		((bound && rec->order_id != 0 &&
 		  (allow_zero_bound_seq || rec->admission_seq != 0)) ||
-		 (unbound && rec->order_id == 0 && rec->admission_seq == 0)) &&
-		rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
+		 (unbound && rec->order_id == 0 && rec->admission_seq == 0));
 }
 
 static int
@@ -6621,13 +7062,12 @@ fork_meta_snapshot_record_valid(const ForkMetaRecV2 *records, uint64_t index,
 		rec->kind <= FEV_SEG_COMMIT_BOUND;
 	int future;
 
-	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
 		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
 		(!ordered_marker && (rec->kind > FEV_DEAD || rec->order_id != 0)) ||
 		(ordered_marker && !fork_meta_ordered_marker_valid(rec, 1)) ||
-		rec->pad[0] != 0 || rec->pad[1] != 0 ||
-		rec->pad[2] != 0 || (rec->kind == FEV_DEAD && rec->nblocks != 0))
+		(rec->kind == FEV_DEAD && rec->nblocks != 0))
 	{
 		fprintf(stderr, "pagestore: invalid forkmeta snapshot record part=%u index=%llu kind=%u timeline=%u\n",
 				part, (unsigned long long) index, rec->kind, rec->timeline);
@@ -6845,23 +7285,21 @@ fork_meta_snapshot_marker_matches(const ForkMetaRecV2 *rec)
 	PsKey zero_key;
 
 	memset(&zero_key, 0, sizeof(zero_key));
-	return rec->magic == FORK_META_V2_MAGIC && rec->rec_len == sizeof(*rec) &&
+	return fork_meta_rec_wire_valid(rec) &&
 		rec->timeline == 0 && key_eq(&rec->key, &zero_key) &&
 		rec->lsn == fork_meta_snapshot_cutoff_lsn &&
 		rec->admission_seq == fork_meta_snapshot_cutoff_seq &&
 		rec->order_id == fork_meta_snapshot_generation && rec->nblocks == 0 &&
-		rec->kind == FEV_SNAPSHOT_BASE && rec->pad[0] == 0 &&
-		rec->pad[1] == 0 && rec->pad[2] == 0;
+		rec->kind == FEV_SNAPSHOT_BASE;
 }
 
 static int
 fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
 {
-	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
 		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
-		rec->admission_seq == 0 || rec->pad[0] != 0 || rec->pad[1] != 0 ||
-		rec->pad[2] != 0 ||
+		rec->admission_seq == 0 ||
 		!fork_meta_event_future(rec->lsn, rec->admission_seq,
 								fork_meta_snapshot_cutoff_lsn,
 								fork_meta_snapshot_cutoff_seq))
@@ -6881,6 +7319,100 @@ fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
 			/* Migration, legacy/unbound segment, SEG_ID, and epoch markers are
 			 * never valid records after a selected current-epoch marker. */
 			return 0;
+	}
+}
+
+/* A source epoch that does not start with the selected generation's marker
+ * is only legitimate when it is the pre-cutover log the snapshot already
+ * captured: the publication froze appends at the snapshot's freeze sequence,
+ * so such a log holds no event admitted after it and no marker of the
+ * selected or a later generation.  Anything else means the marker was damaged
+ * after acknowledged post-cutover events were appended; discarding the epoch
+ * would silently lose them, so refuse to open instead. */
+static int
+fork_meta_source_conflicts_with_snapshot(void)
+{
+	uint64_t	off = 0;
+
+	for (;;)
+	{
+		ForkMetaRecV2 rec;
+		int			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+
+		if (nread == 0)
+		{
+			/* The cutover rewrites the source atomically, so it never
+			 * produces an empty log.  Treating one as the captured
+			 * pre-cutover epoch would replace it with a marker-only epoch
+			 * and silently discard acknowledged post-cutover events. */
+			if (off == 0)
+			{
+				fprintf(stderr, "pagestore: forkmeta source is empty while snapshot "
+						"generation %llu is selected\n",
+						(unsigned long long) fork_meta_snapshot_generation);
+				return 1;
+			}
+			return 0;
+		}
+		if (nread < 0)
+			return 1;
+		if (nread != (int) sizeof(rec))
+			return 0;			/* a torn tail is the unacknowledged crash tail */
+		if (!fork_meta_magic_v2_family(rec.magic))
+		{
+			/* A store migrated from the legacy layout can legitimately crash
+			 * after the manifest commit with its source still in that layout:
+			 * legacy records carry no admission sequence and predate every
+			 * snapshot, so they are never a conflict.  Walk them at their own
+			 * size (a bound marker carries a paired identity record) and only
+			 * refuse what is not a well-formed legacy record either. */
+			ForkMetaRecV1 old;
+			int			legacy_read = ps_storage->fork_meta_read(off, &old, sizeof(old));
+
+			if (legacy_read != (int) sizeof(old) || old.timeline >= MAX_TIMELINES ||
+				old.key.klass > PS_KLASS_READER_SNAPSHOT ||
+				old.kind > FEV_SEG_COMMIT_BOUND)
+			{
+				fprintf(stderr, "pagestore: forkmeta source epoch record at %llu is "
+						"neither a V2 nor a legacy record while snapshot generation "
+						"%llu is selected\n", (unsigned long long) off,
+						(unsigned long long) fork_meta_snapshot_generation);
+				return 1;
+			}
+			off += sizeof(old);
+			if (old.kind == FEV_SEG_GROW_BOUND || old.kind == FEV_SEG_COMMIT_BOUND)
+				off += sizeof(old);
+			continue;
+		}
+		if (!fork_meta_rec_wire_valid(&rec))
+		{
+			fprintf(stderr, "pagestore: forkmeta source epoch record at %llu is not "
+					"a valid record while snapshot generation %llu is selected\n",
+					(unsigned long long) off,
+					(unsigned long long) fork_meta_snapshot_generation);
+			return 1;
+		}
+		if (rec.kind == FEV_SNAPSHOT_BASE &&
+			rec.order_id >= fork_meta_snapshot_generation)
+		{
+			fprintf(stderr, "pagestore: forkmeta source epoch carries a damaged or "
+					"newer snapshot marker (generation %llu, selected %llu)\n",
+					(unsigned long long) rec.order_id,
+					(unsigned long long) fork_meta_snapshot_generation);
+			return 1;
+		}
+		if (rec.kind != FEV_SNAPSHOT_BASE &&
+			rec.admission_seq > fork_meta_snapshot_freeze_seq)
+		{
+			fprintf(stderr, "pagestore: forkmeta source epoch holds an event admitted "
+					"after snapshot generation %llu froze (%llu > %llu) but no "
+					"matching marker; refusing to discard it\n",
+					(unsigned long long) fork_meta_snapshot_generation,
+					(unsigned long long) rec.admission_seq,
+					(unsigned long long) fork_meta_snapshot_freeze_seq);
+			return 1;
+		}
+		off += sizeof(rec);
 	}
 }
 
@@ -6933,6 +7465,8 @@ fork_meta_snapshot_reconcile_source(void)
 		free(rewritten.data);
 		return 0;
 	}
+	if (fork_meta_source_conflicts_with_snapshot())
+		goto fail;
 	if (rewritten.len > UINT32_MAX || ps_storage->fork_meta_rewrite == NULL ||
 		ps_storage->fork_meta_rewrite(rewritten.data, (uint32_t) rewritten.len) != 0)
 		goto fail;
@@ -6966,11 +7500,20 @@ load_fork_meta(void)
 		if (nread != (int) sizeof(first))
 			break;
 		memset(&rec, 0, sizeof(rec));
-		if (first == FORK_META_V2_MAGIC)
+		if (fork_meta_magic_v2_family(first))
 		{
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
-			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
-				break;
+			if (nread != (int) sizeof(rec))
+				break;			/* a short read is the unacknowledged crash tail */
+			if (!fork_meta_rec_wire_valid(&rec))
+			{
+				/* A complete record with a bad checksum, or a checksummed
+				 * length that does not match, is corruption, not a torn
+				 * tail; never replay or truncate past it. */
+				fprintf(stderr, "pagestore: forkmeta record at %llu fails its "
+						"checksum or length\n", (unsigned long long) off);
+				return -1;
+			}
 			rec_size = sizeof(rec);
 			if (rec.kind >= FEV_SEG_GROW &&
 				rec.kind <= FEV_SEG_COMMIT_BOUND)
@@ -6983,7 +7526,17 @@ load_fork_meta(void)
 
 			nread = ps_storage->fork_meta_read(off, &old, sizeof(old));
 			if (nread != (int) sizeof(old))
-				break;
+				break;			/* a torn prefix or tail is repaired below */
+			/* A complete legacy record starts with its timeline id.  Any
+			 * other first word is a record magic this daemon does not know
+			 * (a newer layout): fail closed instead of misreading it as a
+			 * legacy record and walking the log at the wrong size. */
+			if (first >= MAX_TIMELINES)
+			{
+				fprintf(stderr, "pagestore: unsupported forkmeta record magic 0x%08x "
+						"at %llu\n", first, (unsigned long long) off);
+				return -1;
+			}
 			rec.timeline = old.timeline;
 			rec.key = old.key;
 			rec.lsn = old.lsn;
@@ -7444,10 +7997,10 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			return 0;
 		if (nread != (int) sizeof(magic))
 			return -1;
-		if (magic == FORK_META_V2_MAGIC)
+		if (fork_meta_magic_v2_family(magic))
 		{
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
-			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
+			if (nread != (int) sizeof(rec) || !fork_meta_rec_wire_valid(&rec))
 				return -1;
 			if (fork_meta_ordered_marker_valid(&rec, 0) &&
 				(!filter_deleting ||
@@ -7479,6 +8032,14 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			nread = ps_storage->fork_meta_read(off, &old, sizeof(old));
 			if (nread != (int) sizeof(old))
 				return -1;
+			/* a complete record whose first word is not a plausible legacy
+			 * timeline id carries a magic this daemon does not know */
+			if (magic >= MAX_TIMELINES)
+			{
+				fprintf(stderr, "pagestore: unsupported forkmeta record magic 0x%08x "
+						"at %llu\n", magic, (unsigned long long) off);
+				return -1;
+			}
 			off += sizeof(old);
 			memset(&rec, 0, sizeof(rec));
 			rec.magic = FORK_META_V2_MAGIC;
@@ -7536,12 +8097,86 @@ fork_meta_migration_marker_valid(const ForkMetaRecV2 *rec)
 	PsKey zero_key;
 
 	memset(&zero_key, 0, sizeof(zero_key));
-	return rec->magic == FORK_META_V2_MAGIC &&
-		rec->rec_len == sizeof(*rec) && rec->timeline == 0 &&
+	return fork_meta_rec_wire_valid(rec) && rec->timeline == 0 &&
 		key_eq(&rec->key, &zero_key) && rec->lsn == 0 &&
 		rec->admission_seq == 0 && rec->order_id == 0 && rec->nblocks == 0 &&
-		(rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED) &&
-		rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
+		(rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED);
+}
+
+typedef struct ForkMetaSnapshotSortRef
+{
+	const ForkMetaRecV2 *rec;
+	uint64_t	index;
+} ForkMetaSnapshotSortRef;
+
+static int
+fork_meta_snapshot_sort_cmp(const void *a, const void *b)
+{
+	const ForkMetaSnapshotSortRef *x = a;
+	const ForkMetaSnapshotSortRef *y = b;
+	int			c;
+
+	if (x->rec->timeline != y->rec->timeline)
+		return x->rec->timeline < y->rec->timeline ? -1 : 1;
+	c = memcmp(&x->rec->key, &y->rec->key, sizeof(x->rec->key));
+	if (c != 0)
+		return c;
+	if (x->rec->lsn != y->rec->lsn)
+		return x->rec->lsn < y->rec->lsn ? -1 : 1;
+	if (x->rec->admission_seq != y->rec->admission_seq &&
+		x->rec->admission_seq != 0 && y->rec->admission_seq != 0)
+		return x->rec->admission_seq < y->rec->admission_seq ? -1 : 1;
+	/* Equal position: keep the physical order the part was built in.  Legacy
+	 * sequence-zero markers are ordered by it and nothing else.  An element
+	 * compared with itself must compare equal, which qsort is allowed to do. */
+	if (x->index == y->index)
+		return 0;
+	return x->index < y->index ? -1 : 1;
+}
+
+/*
+ * A part is loaded back under a per-fork ordering invariant: records of one
+ * fork must not step backwards in (lsn, admission_seq).  The per-entry pass
+ * emits each fork's in-memory events in order, but ordered markers that live
+ * only in the source log are appended afterwards, so a fork whose in-memory
+ * events reach past such a marker would be written in an order the loader
+ * refuses -- a snapshot the daemon publishes and then cannot open.  Sort each
+ * part into per-fork order before it is wrapped, keeping equal positions in
+ * their original physical order.
+ */
+static int
+fork_meta_snapshot_sort_part(ForkMetaByteVec *part)
+{
+	uint64_t	nrecords = part->len / sizeof(ForkMetaRecV2);
+	ForkMetaSnapshotSortRef *refs;
+	unsigned char *sorted;
+
+	if (nrecords < 2)
+		return 0;
+	if (nrecords > SIZE_MAX / sizeof(*refs))
+		return -1;
+	refs = malloc((size_t) nrecords * sizeof(*refs));
+	sorted = malloc(part->len);
+	if (refs == NULL || sorted == NULL)
+	{
+		free(refs);
+		free(sorted);
+		return -1;
+	}
+	for (uint64_t i = 0; i < nrecords; i++)
+	{
+		refs[i].rec = (const ForkMetaRecV2 *)
+			(part->data + i * sizeof(ForkMetaRecV2));
+		refs[i].index = i;
+	}
+	qsort(refs, (size_t) nrecords, sizeof(*refs), fork_meta_snapshot_sort_cmp);
+	for (uint64_t i = 0; i < nrecords; i++)
+		memcpy(sorted + i * sizeof(ForkMetaRecV2), refs[i].rec,
+			   sizeof(ForkMetaRecV2));
+	memcpy(part->data, sorted, part->len);
+	free(refs);
+	free(sorted);
+	return 0;
 }
 
 static int
@@ -7750,6 +8385,9 @@ fail_entry:
 	if (fork_meta_snapshot_append_source_markers(checkpoint, tail, cutoff,
 											 filter_deleting,
 											 preserve_survivors) != 0)
+		return -1;
+	if (fork_meta_snapshot_sort_part(checkpoint) != 0 ||
+		fork_meta_snapshot_sort_part(tail) != 0)
 		return -1;
 	{
 		ForkMetaSnapshotPayloadHeader headers[2];
@@ -10090,6 +10728,19 @@ static int walidx_plan_bases_valid;
  * caps).  Only such a horizon may rely on a stored image as its replacement
  * base; any other horizon keeps its FPI-led chain. */
 static uint64_t *walidx_plan_protected;
+/* The horizons the materializer exception granted: their protection depends
+ * on no standing horizon sitting at the same LSN, which publication itself
+ * can change.  `added` records whether the exception is what put the horizon
+ * into the protected set; a horizon an exact page fence protects on its own
+ * keeps that protection when the exception is withdrawn. */
+typedef struct WalIdxMatGrant
+{
+	uint64_t	lsn;
+	int			added;
+} WalIdxMatGrant;
+
+static WalIdxMatGrant *walidx_plan_mat_protected;
+static uint32_t walidx_plan_n_mat_protected;
 static uint32_t walidx_plan_nprotected;
 
 static int
@@ -10130,6 +10781,48 @@ walidx_plan_bases_free(void)
 	free(walidx_plan_protected);
 	walidx_plan_protected = NULL;
 	walidx_plan_nprotected = 0;
+	free(walidx_plan_mat_protected);
+	walidx_plan_mat_protected = NULL;
+	walidx_plan_n_mat_protected = 0;
+}
+
+/*
+ * The plan is built before publication is excluded, and walidx_commit() can
+ * advance the shipper's progress in between.  A materializer horizon that has
+ * become equal to a standing horizon since then must lose its exception, or
+ * this publication would drop the FPI chain at an LSN a later WAL-index-only
+ * owner is still admitted at.  Called with the publish write lock held.
+ */
+static void
+walidx_plan_recheck_standing(uint32_t tl)
+{
+	uint64_t	frontier = walidx_frontier_current(tl);
+	uint64_t	progress = walidx_progress_read(tl);
+
+	for (uint32_t i = 0; i < walidx_plan_n_mat_protected; i++)
+	{
+		uint64_t	lsn = walidx_plan_mat_protected[i].lsn;
+		uint32_t	out = 0;
+		int			dropped = 0;
+
+		if (lsn != frontier && lsn != progress)
+			continue;
+		/* Withdraw only what this exception added.  An exact page fence at
+		 * the same LSN protects that horizon in its own right, and the plan
+		 * keeps such a fence even when a standing WAL-index horizon shares
+		 * its LSN; removing every entry would withdraw the page owner's
+		 * protection too, and the publication would keep an FPI chain and
+		 * its raw WAL for a horizon whose base is already retained. */
+		if (!walidx_plan_mat_protected[i].added)
+			continue;
+		for (uint32_t j = 0; j < walidx_plan_nprotected; j++)
+			if (walidx_plan_protected[j] == lsn && !dropped)
+				dropped = 1;
+			else
+				walidx_plan_protected[out++] = walidx_plan_protected[j];
+		walidx_plan_nprotected = out;
+		walidx_plan_mat_protected[i].added = 0;
+	}
 }
 
 static int
@@ -10726,6 +11419,9 @@ timeline_delete_wal_cleanup_one(void)
 			wal_segment_store_opened[tl] = 0;
 		}
 		rc = ps_storage->timeline_wal_cleanup(tl);
+		if (rc == 0 &&
+			ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_WAL_CLEANUP) != 0)
+			rc = -1;
 		if (rc == 0)
 		{
 			wal_runtime_purge(tl);
@@ -10807,10 +11503,9 @@ fork_meta_source_record_valid(const ForkMetaRecV2 *rec)
 	PsKey zero_key;
 	int ordered_marker;
 
-	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
-		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
-		rec->pad[0] != 0 || rec->pad[1] != 0 || rec->pad[2] != 0)
+		rec->key.klass > PS_KLASS_READER_SNAPSHOT)
 		return 0;
 	ordered_marker = rec->kind >= FEV_SEG_GROW &&
 		rec->kind <= FEV_SEG_COMMIT_BOUND;
@@ -10846,7 +11541,7 @@ fork_meta_source_has_timeline(uint32_t target)
 			return 0;
 		if (nread != (int) sizeof(first))
 			return -1;
-		if (first == FORK_META_V2_MAGIC)
+		if (fork_meta_magic_v2_family(first))
 		{
 			ForkMetaRecV2 rec;
 
@@ -10863,7 +11558,8 @@ fork_meta_source_has_timeline(uint32_t target)
 			ForkMetaRecV1 rec;
 
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
-			if (nread != (int) sizeof(rec) || rec.timeline >= MAX_TIMELINES ||
+			if (nread != (int) sizeof(rec) || first >= MAX_TIMELINES ||
+				rec.timeline >= MAX_TIMELINES ||
 				rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
 				rec.kind > FEV_DEAD ||
 				(rec.kind == FEV_DEAD && rec.nblocks != 0) ||
@@ -11114,7 +11810,8 @@ timeline_delete_publish_one(void)
 		pthread_rwlock_wrlock(wal_lock);
 		ps_lock_map_wr();
 		if (timeline_delete_publish_ready(tl) &&
-			timeline_persist_state(tl, PS_TIMELINE_DELETED, incarnation) == 0)
+			timeline_persist_state(tl, PS_TIMELINE_DELETED, incarnation) == 0 &&
+			ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_DELETED) == 0)
 		{
 			/* The append is fsync-durable before this release publication. */
 			__atomic_store_n(&timelines[tl].state, PS_TIMELINE_DELETED,
@@ -11725,7 +12422,12 @@ walidx_plan_bases_build(uint32_t tl)
 	 * pin that carries no page history is not kept alive by another owner's
 	 * page fence at the same LSN, because that owner may advance or drop its
 	 * pin first and page compaction would then retire the base while the
-	 * WAL-index horizon still needs it.  Such a horizon keeps its FPI chain. */
+	 * WAL-index horizon still needs it.  Such a horizon keeps its FPI chain.
+	 * The materializer's own pin is the exception: it carries no page history,
+	 * but its LSN (the redo of its last durable restartpoint) is the
+	 * operational page-history cutoff derived from it, so the newest version
+	 * at or below that horizon is retained by the very same pin and the two
+	 * can only move together. */
 	walidx_plan_protected = malloc((size_t) (nfences + 1) *
 								   sizeof(*walidx_plan_protected));
 	if (walidx_plan_protected == NULL)
@@ -11753,10 +12455,89 @@ walidx_plan_bases_build(uint32_t tl)
 				(pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 ||
 				!retention_project_lsn(pins[i].timeline, tl, &projected))
 				continue;
+			if (pins[i].timeline == tl &&
+				pins[i].owner_kind == PS_RETENTION_OWNER_MATERIALIZER)
+				continue;
 			for (uint32_t j = 0; j < walidx_plan_nprotected; j++)
 				if (walidx_plan_protected[j] != projected)
 					walidx_plan_protected[out++] = walidx_plan_protected[j];
 			walidx_plan_nprotected = out;
+		}
+		/* A materializer horizon is protected by its own derived cutoff,
+		 * unless another WAL-index-only owner shares the LSN: that owner
+		 * would keep standing there after the materializer advanced.  The
+		 * durable WAL-index frontier and the shipper's progress are such
+		 * standing horizons even when no owner holds them right now: a new
+		 * WAL-index-only owner is admitted at exactly that LSN, and it would
+		 * arrive after the materializer advanced and page compaction retired
+		 * the base, with no chain left to read. */
+		for (uint32_t i = 0; i < npins; i++)
+		{
+			int			present = 0;
+			int			shared = 0;
+
+			if (pins[i].timeline != tl ||
+				pins[i].owner_kind != PS_RETENTION_OWNER_MATERIALIZER ||
+				(pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0 ||
+				pins[i].lsn == 0)
+				continue;
+			if (pins[i].lsn == walidx_frontier_current(tl) ||
+				pins[i].lsn == walidx_progress_read(tl))
+				continue;
+			for (uint32_t k = 0; k < npins && !shared; k++)
+			{
+				uint64_t	projected = pins[k].lsn;
+
+				if (k != i &&
+					(pins[k].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+					(pins[k].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0 &&
+					!(pins[k].timeline == tl &&
+					  pins[k].owner_kind == PS_RETENTION_OWNER_MATERIALIZER) &&
+					retention_project_lsn(pins[k].timeline, tl, &projected) &&
+					projected == pins[i].lsn)
+					shared = 1;
+			}
+			if (shared)
+				continue;
+			/* Record the grant before asking whether the horizon is already
+			 * protected: an LSN that a page fence protects today can still
+			 * become a standing WAL-index horizon before publication, and
+			 * the recheck can only withdraw what it knows about. */
+			{
+				WalIdxMatGrant *grown = realloc(walidx_plan_mat_protected,
+											(size_t) (walidx_plan_n_mat_protected + 1) *
+											sizeof(*walidx_plan_mat_protected));
+
+				if (grown == NULL)
+				{
+					free(pins);
+					free(fences);
+					return -1;
+				}
+				walidx_plan_mat_protected = grown;
+				walidx_plan_mat_protected[walidx_plan_n_mat_protected].lsn = pins[i].lsn;
+				walidx_plan_mat_protected[walidx_plan_n_mat_protected++].added = 0;
+			}
+			for (uint32_t j = 0; j < walidx_plan_nprotected && !present; j++)
+				if (walidx_plan_protected[j] == pins[i].lsn)
+					present = 1;
+			if (present)
+				continue;
+			walidx_plan_mat_protected[walidx_plan_n_mat_protected - 1].added = 1;
+			{
+				uint64_t   *grown = realloc(walidx_plan_protected,
+											(size_t) (walidx_plan_nprotected + 1) *
+											sizeof(*walidx_plan_protected));
+
+				if (grown == NULL)
+				{
+					free(pins);
+					free(fences);
+					return -1;
+				}
+				walidx_plan_protected = grown;
+				walidx_plan_protected[walidx_plan_nprotected++] = pins[i].lsn;
+			}
 		}
 		free(pins);
 	}
@@ -12491,6 +13272,8 @@ walidx_snapshot_trigger_bytes(void)
 	unsigned long long parsed;
 	char *end = NULL;
 
+	if (walidx_snapshot_trigger_option_bytes != 0)
+		return walidx_snapshot_trigger_option_bytes;
 	if (value == NULL)
 		return WALIDX_SNAPSHOT_DEFAULT_TRIGGER;
 	errno = 0;
@@ -12625,6 +13408,7 @@ walidx_snapshot_publish_one(void)
 	for (uint32_t shard = ns; shard > 0; shard--)
 		ps_unlock_shard(shard - 1);
 	walidx_publish_wrlock();
+	walidx_plan_recheck_standing((uint32_t) candidate);
 	{
 		uint32_t tl = (uint32_t) candidate;
 		uint64_t generation;
@@ -13382,6 +14166,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	ps_unlock_map();
 
+	/* The header is persisted whole, so its alignment padding is persisted
+	 * too; zero it so equivalent stores hold identical bytes. */
+	memset(&hdr, 0, sizeof(hdr));
+	memset(&admission_hdr, 0, sizeof(admission_hdr));
+	memset(&bound_hdr, 0, sizeof(bound_hdr));
 	hdr.magic = SEG_ADMISSION_MAGIC;
 	hdr.timeline = timeline;
 	hdr.key = *key;
@@ -14674,7 +15463,7 @@ typedef struct ArtifactFence
 	uint32_t	timeline;
 	uint64_t	lsn;
 	uint32_t	pending;		/* appends admitted at this cutoff, in flight */
-	unsigned char durable;		/* an artifact version exists at this cutoff */
+	uint32_t	versions;		/* artifact versions that exist at this cutoff */
 } ArtifactFence;
 
 static ArtifactFence *artifact_fences;
@@ -14718,7 +15507,8 @@ artifact_fence_entry(uint32_t timeline, uint64_t lsn)
 	return &artifact_fences[nartifact_fences++];
 }
 
-/* An artifact version exists at this cutoff (append, or recovery replay). */
+/* One more artifact version exists at this cutoff (append, or recovery
+ * replay).  The fence lives as long as any version does. */
 static void
 artifact_fence_note(uint32_t timeline, uint64_t lsn)
 {
@@ -14728,8 +15518,42 @@ artifact_fence_note(uint32_t timeline, uint64_t lsn)
 		return;
 	pthread_mutex_lock(&artifact_fence_lock);
 	entry = artifact_fence_entry(timeline, lsn);
-	if (entry != NULL)
-		entry->durable = 1;
+	if (entry != NULL && entry->versions != UINT32_MAX)
+		entry->versions++;
+	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+/* Artifact versions at this cutoff were retired by compaction.  The last one
+ * releases the fence, so the control era it named can be retired too.  One
+ * fence backs every page of a snapshot and every generation a released pin
+ * retires, so the count comes in at once and the table is searched once. */
+static void
+artifact_fence_forget_versions(uint32_t timeline, uint64_t lsn,
+							   uint32_t versions)
+{
+	if (lsn == 0 || versions == 0)
+		return;
+	pthread_mutex_lock(&artifact_fence_lock);
+	if (nartifact_fences != UINT32_MAX)
+		for (uint32_t i = 0; i < nartifact_fences; i++)
+			if (artifact_fences[i].timeline == timeline &&
+				artifact_fences[i].lsn == lsn)
+			{
+				if (artifact_fences[i].versions != UINT32_MAX)
+					artifact_fences[i].versions -=
+						versions < artifact_fences[i].versions
+						? versions : artifact_fences[i].versions;
+				if (artifact_fences[i].versions == 0 &&
+					artifact_fences[i].pending == 0)
+				{
+					artifact_fences[i] = artifact_fences[--nartifact_fences];
+					/* the control era this fence kept alive may now be
+					 * reclaimable; the current pass already snapshotted the
+					 * fence, so make sure a later pass looks again */
+					page_prune_mark_all_due_locked();
+				}
+				break;
+			}
 	pthread_mutex_unlock(&artifact_fence_lock);
 }
 
@@ -14760,6 +15584,8 @@ artifact_fence_reserve(uint32_t timeline, uint64_t lsn)
 static void
 artifact_fence_release(uint32_t timeline, uint64_t lsn)
 {
+	int			reschedule = 0;
+
 	if (lsn == 0)
 		return;
 	pthread_mutex_lock(&artifact_fence_lock);
@@ -14771,11 +15597,19 @@ artifact_fence_release(uint32_t timeline, uint64_t lsn)
 				if (artifact_fences[i].pending != 0)
 					artifact_fences[i].pending--;
 				if (artifact_fences[i].pending == 0 &&
-					!artifact_fences[i].durable)
+					artifact_fences[i].versions == 0)
+				{
 					artifact_fences[i] = artifact_fences[--nartifact_fences];
+					reschedule = 1;
+				}
 				break;
 			}
 	pthread_mutex_unlock(&artifact_fence_lock);
+	/* Marking every timeline due reads the timeline table, which a
+	 * concurrent branch creation publishes under the map lock; take that
+	 * lock here rather than under the fence lock the caller holds. */
+	if (reschedule)
+		page_prune_mark_all_due();
 }
 
 /* A deleted (or reused) timeline's artifacts are purged with its pages. */
@@ -16104,8 +16938,14 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 	if (state != PS_TIMELINE_LIVE || timeline_has_live_descendant(timeline) ||
 		timeline_has_active_owner(timeline))
 		return -1;
+	/* The old-state side of the transition: nothing of the branch may have
+	 * changed while the request is not yet durable. */
+	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_BEFORE_DELETING) != 0)
+		return -1;
 	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
 										incarnation) != 0)
+		return -1;
+	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_DELETING) != 0)
 		return -1;
 	/* All writers are drained by the caller's lifecycle/admission fences.  Drop
 	 * their staged pages now so shutdown cannot publish a fresh manifest layer
@@ -17988,10 +18828,17 @@ ps_core_maintenance_impl(void)
 				retention_effective_floor_internal(ftl,
 					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1) == 0)
 			{
-				/* Zero disables pruning but still permits a safe layer merge. */
+				int		was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh],
+													  0, __ATOMIC_ACQ_REL);
+
+				/* Consume the mark before the pass: anything the pass itself
+				 * makes due (a released artifact fence, a note that became
+				 * durable) is a fresh mark for the next pass, not one this
+				 * pass clears on its way out.  Zero disables pruning but
+				 * still permits a safe layer merge. */
 				did = compact_timeline(ftl, fsh, page_floor) > 0;
-				if (did)
-					__atomic_store_n(&page_prune_due[ftl][fsh], 0,
+				if (!did && was_due)
+					__atomic_store_n(&page_prune_due[ftl][fsh], 1,
 									 __ATOMIC_RELEASE);
 			}
 			ps_unlock_map();
@@ -18594,4 +19441,41 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	__atomic_store_n(&core_opened, 1, __ATOMIC_RELEASE);
 
 	return 0;
+}
+
+size_t
+ps_core_format_identities(const PsFormatIdentity **out)
+{
+	static const PsFormatIdentity identities[] = {
+		{"page_frontier", "page-prune.frontiers", PS_PAGE_FRONTIER_MAGIC,
+		 PS_PAGE_FRONTIER_VERSION},
+		{"walidx_frontier", "walidx-prune.frontiers", PS_WALIDX_FRONTIER_MAGIC,
+		 PS_WALIDX_FRONTIER_VERSION},
+		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 2},
+		{"forkmeta", "forkmeta record", FORK_META_V3_MAGIC, 3},
+		{"forkmeta", "forkmeta record (accepted legacy)", FORK_META_V2_MAGIC, 2},
+		{"forkmeta_snapshot", "forkmeta checkpoint/tail payload",
+		 FORK_META_SNAPSHOT_PAYLOAD_MAGIC, FORK_META_SNAPSHOT_PAYLOAD_VERSION},
+		{"walidx_snapshot", "walidx snapshot shard payload",
+		 WALIDX_SNAPSHOT_PAYLOAD_MAGIC, WALIDX_SNAPSHOT_PAYLOAD_VERSION},
+		/* The source logs: their record magics are their versions.  Only the
+		 * magics the daemon writes today are reported; older ones stay
+		 * readable but are not identities a fixture pins. */
+		{"page_segment", "seg_* record (versioned page)", SEG_ADMISSION_MAGIC, 0},
+		{"page_segment", "seg_* record (WAL-less page)",
+		 SEG_WALLESS_ADMISSION_MAGIC, 0},
+		{"page_segment", "seg_* record (clamped below-floor page)",
+		 SEG_CLAMPED_ADMISSION_MAGIC, 0},
+		{"wal_log", "wal_<tl> record", WAL_MAGIC, 0},
+		{"walidx_log", "walidx_<tl>_<shard> record", WALIDX_MAGIC, 0},
+		{"walidx_log", "walidx_<tl>_<shard> progress record",
+		 WALIDX_PROGRESS_MAGIC, 0},
+		/* Headerless persisted configuration: the schema number stands in
+		 * for a magic, which is why it reports zero. */
+		{"store_config", ".pagestore-nshards decimal shard count", 0,
+		 PS_STORE_SHARD_COUNT_SCHEMA},
+	};
+
+	*out = identities;
+	return sizeof(identities) / sizeof(identities[0]);
 }

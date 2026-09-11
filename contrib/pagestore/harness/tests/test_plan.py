@@ -538,6 +538,154 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
                 MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
+    def test_page_prune_fault_scenarios_validate_as_composed_slices(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        scenario_dir = ROOT / "scenarios"
+        scenarios = [
+            scenario_dir / "page_prune_after_frontier.jsonl",
+            scenario_dir / "page_compaction_after_publish.jsonl",
+            scenario_dir / "page_gc_after_mark_delete.jsonl",
+            scenario_dir / "wal_index_after_frontier.jsonl",
+            scenario_dir / "wal_reclaim_before_unlink.jsonl",
+            scenario_dir / "wal_reclaim_after_unlink.jsonl",
+            scenario_dir / "wal_reclaim_before_dir_fsync.jsonl",
+            scenario_dir / "timeline_delete_after_deleting.jsonl",
+            scenario_dir / "timeline_delete_after_wal_cleanup.jsonl",
+            scenario_dir / "timeline_delete_after_segment_rewrite.jsonl",
+            scenario_dir / "timeline_delete_after_deleted.jsonl",
+            scenario_dir / "manifest_compact_after_tmp_sync.jsonl",
+            scenario_dir / "manifest_compact_after_rename.jsonl",
+            scenario_dir / "forkmeta_after_prepare.jsonl",
+            scenario_dir / "forkmeta_after_manifest_commit.jsonl",
+            scenario_dir / "forkmeta_after_source_rewrite.jsonl",
+            scenario_dir / "forkmeta_after_snapshot_gc.jsonl",
+        ]
+        for path in scenarios:
+            with self.subTest(scenario=path.name):
+                plan = MODULE.read_plan(path)
+                MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+                MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_gc_seed_requires_a_matching_page_pruning_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-gc-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "page_prune"},
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "image_layer.after_create",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed requires an H1 fault matching"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_page_pruning_fault_requires_its_gc_seed(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "unseeded-gc-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "requires a gc_seed with workload 'page_prune'"
+        ):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_image_layer_fault_requires_its_layer_seed(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "unseeded-layer-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "image_layer.after_create",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "requires a layer_seed"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_gc_seed_cannot_follow_named_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-gc-order", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "page_prune"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed before"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_gc_seed_rejects_an_unknown_workload(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-gc-workload", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "timeline_delete"},
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        with self.assertRaises(MODULE.PlanError):
+            MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_wal_index_seed_rejects_a_page_pruning_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-walidx-fault", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "gc_seed", "id": "seed", "target": "store", "workload": "wal_index"},
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "page_prune.after_frontier",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "gc_seed requires an H1 fault matching"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
     def test_image_layer_seed_cannot_follow_named_fault(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
@@ -1767,6 +1915,91 @@ class PlanValidationTests(unittest.TestCase):
             self.assertTrue(evidence.is_file())
             MODULE.cleanup_temporary_root(root, True, False, [])
             self.assertFalse(root.exists())
+
+    def test_restart_combination_scenarios_validate(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        scenario_dir = ROOT / "scenarios"
+        for name, runtime in (
+            ("materializer_restart_combinations.jsonl", "materializer_smoke"),
+            ("writer_reader_restart.jsonl", "writer_smoke"),
+        ):
+            with self.subTest(scenario=name):
+                plan = MODULE.read_plan(scenario_dir / name)
+                MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+                MODULE.validate_runtime_plan(plan, capabilities, runtime)
+
+    def test_writer_restart_requires_an_installed_compute(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-restart-target", "seed": 1,
+                "contracts": ["write_read"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "restart", "id": "restart", "target": "reader-R"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "not an available compute"):
+            MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
+
+    def test_writer_restart_invalidates_the_declared_checkpoint(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "restart-then-capture", "seed": 1,
+                "contracts": ["write_read"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "bootstrap", "id": "route-all", "target": "writer"},
+            {"op": "checkpoint", "id": "r0", "target": "writer", "name": "R"},
+            {"op": "restart", "id": "writer-restart", "target": "writer"},
+            {"op": "capture", "id": "copy", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "does not describe the current writer data directory"
+        ):
+            MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
+
+    def test_writer_restart_invalidates_a_reader_base(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "restart-then-reader-base", "seed": 1,
+                "contracts": ["write_read"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "bootstrap", "id": "route-all", "target": "writer"},
+            {"op": "checkpoint", "id": "r0", "target": "writer", "name": "R"},
+            {"op": "restart", "id": "writer-restart", "target": "writer"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R", "name": "C"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "does not describe the current unmodified writer"
+        ):
+            MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
+
+    def test_materializer_restart_rejects_reader_targets(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-materializer-restart", "seed": 1,
+                "contracts": ["lifecycle"],
+                "case": {"storage": "posix", "shards": 1,
+                         "compute": ["writer", "materializer"]},
+            },
+            {"op": "restart", "id": "restart", "target": "reader-R"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaises(MODULE.PlanError):
+            MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
 
     def test_materializer_fault_validates_scenario_identity(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")

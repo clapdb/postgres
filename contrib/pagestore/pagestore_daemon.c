@@ -1151,6 +1151,12 @@ main(int argc, char **argv)
 			if (parse_u64_option(argv[++i], &walidx_reclaim_catchup_bytes) != 0)
 				return 2;
 		}
+		else if (strcmp(argv[i], "--walidx-snapshot-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i],
+								 &walidx_snapshot_trigger_option_bytes) != 0)
+				return 2;
+		}
 		else if (strcmp(argv[i], "--forkmeta-high-water-bytes") == 0 && i + 1 < argc)
 		{
 			if (parse_u64_option(argv[++i], &forkmeta_reclaim_high_water_bytes) != 0)
@@ -1198,7 +1204,7 @@ main(int argc, char **argv)
 					"[--nshards N] [--storage NAME] "
 					"[--page-high-water-bytes N --page-catch-up-bytes N] "
 				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
-				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
+				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] [--walidx-snapshot-bytes N] "
 				"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N] "
 					"[--test-maintenance-pause-file PATH] "
 					"[--test-shutdown-cancel-pause-file PATH] "
@@ -1244,7 +1250,7 @@ main(int argc, char **argv)
 				"[--nshards N] [--storage NAME] "
 				"[--page-high-water-bytes N --page-catch-up-bytes N] "
 				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
-				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
+				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] [--walidx-snapshot-bytes N] "
 				"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N] "
 				"[--test-maintenance-pause-file PATH] "
 				"[--test-shutdown-cancel-pause-file PATH] "
