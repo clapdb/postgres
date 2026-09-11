@@ -1298,7 +1298,10 @@ inside them), because only the former can have a page-store support window.
    on -- the CRC-protected branch preparation journal
    (`pagestore_branch.prepare.json`), the branch retention-generation
    authority file that fences owner-generation reuse, the materializer
-   supervisor's configuration and status, and the SLRU mirror continuity
+   supervisor's configuration, status, and its own generation-authority
+   file (`retention-owner-<id>.json`, read independently of the status and
+   published before a new worker generation is registered), and the SLRU
+   mirror continuity
    markers (`pagestore.slru_mirror_debt`, and
    `pagestore.slru_mirror_primed` with its raw eight-byte checkpoint-redo
    stamp, whose presence and stamp decide at boot whether the stored SLRU
@@ -1350,8 +1353,9 @@ seeding entrypoints, and the independent-recovery comparison for the SLRU
 appliers; then the store-object backend families; then the PGDATA
 artifacts -- the reader and branch manifests, branch bootstrap, reader
 snapshot and catalog files, the branch controller's journal and authority
-files, the materializer supervisor's configuration and status, and the
-SLRU mirror continuity markers with their migration semantics -- then the
+files, the materializer supervisor's configuration, status, and
+generation-authority file, and the SLRU mirror continuity markers with
+their migration semantics -- then the
 R4b concurrent-append oracle, then the final MVP status update once the
 nightly lane has a run history.
 

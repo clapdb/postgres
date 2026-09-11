@@ -732,8 +732,8 @@ but is not complete.  What remains before the MVP is declared complete is:
    writer control blocks and reader snapshot objects in the store; the reader
    and branch manifests, branch bootstrap, reader snapshot/catalog files,
    the branch controller's journal and authority files, the materializer
-   supervisor's configuration and status, and the SLRU mirror continuity
-   markers in PGDATA).
+   supervisor's configuration, status, and generation-authority file, and
+   the SLRU mirror continuity markers in PGDATA).
 3. Close the R4b concurrency clause: a concurrent-append oracle at the
    prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
    crash matrix already has at the source rewrite.
