@@ -35,6 +35,16 @@ permissions:
 jobs:
   plan:
     name: seed matrix
+    # Forks of this repository inherit the schedule, and an old fork with
+    # Actions enabled but without a `pagestore` branch would then start a
+    # failing run every night (the lookup below cannot resolve the branch).
+    # `pg-ci.yml` gates on an opt-in variable for the same reason.  A manual
+    # dispatch is always an explicit request; the schedule fires only in this
+    # repository or in a fork that opted in.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.repository == 'clapdb/postgres'
+      || vars.PAGESTORE_NIGHTLY_ENABLED == '1'
     runs-on: ubuntu-latest
     outputs:
       seeds: ${{ steps.matrix.outputs.seeds }}
