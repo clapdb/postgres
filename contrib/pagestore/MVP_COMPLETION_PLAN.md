@@ -721,9 +721,10 @@ Expected scope: one or two PRs.
 
 ### R6. Prove bounded space
 
-Status: **soak implemented and in CI; every persisted category proven
-bounded on CI-sized and 6000/8000-round runs; owner-less branch timelines
-and SLRU-class versions remain**.
+Status: **implemented; every persisted category proven bounded on CI-sized
+and 6000/8000-round runs, the operational cutoff no longer needs a
+page-history owner, SLRU-class and reader-artifact versions follow the
+relation plan, and the nightly long-run lane is scheduled from `master`**.
 
 `pagestore_soak_test` is the acceptance harness.  It plays every retention
 role over the daemon protocol: a WAL-shipping writer with a bounded live set
@@ -1168,16 +1169,21 @@ packaging do not block MVP completion.
 
 ## Proposed PR sequence
 
-The remaining default sequence is:
+The default sequence was:
 
-1. R3b retained-base foundation, then the WAL reclaimer enabled by replacement-base compaction;
-2. R4b forkmeta compaction/reclamation and publication crash tests;
-3. R5 timeline deletion;
-4. R5b reclaimer backpressure controllers (implementation complete; R6 owns soak/tuning);
-5. H0 fault/inspection primitives;
-6. H1 composed crash scenarios;
-7. H2 format fixtures and compatibility CI;
-8. R6 bounded-space acceptance and final MVP status update.
+1. R3b retained-base foundation, then the WAL reclaimer enabled by replacement-base compaction -- done;
+2. R4b forkmeta compaction/reclamation and publication crash tests -- done except the concurrency clause;
+3. R5 timeline deletion -- done;
+4. R5b reclaimer backpressure controllers -- done;
+5. H0 fault/inspection primitives -- done;
+6. H1 composed crash scenarios -- done;
+7. H2 format fixtures and compatibility CI -- daemon-side done; backend-side artifacts remain;
+8. R6 bounded-space acceptance and final MVP status update -- soak and nightly lane done; the
+   final status update follows the first scheduled nightly runs.
+
+What remains, in order: the backend-side H2 fixture slice with the D5
+decision, then the R4b concurrent-append oracle, then the final MVP status
+update once the nightly lane has a run history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
@@ -1213,6 +1219,8 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-10 | Added SLRU-class and reader-artifact retention: seeds (replay bases), reader snapshots, the live SLRU mirror, tombstones, and the watermark follow the relation plan below their consumers' pins and branch fork points, and a retired artifact releases its control-image fence (the registry now counts artifact versions) | Control-prune cases for a pinned reader, a branch fork point, a dropped pin, retry collapse, fence release, and restart; lifecycle/reclaim/standalone suites; integration lane; 2400/8000-round soaks |
 | 2026-09-10 | Added the nightly long-run soak workflow: a seed matrix (default three seeds at 8000 rounds) built from the freestanding daemon and harness, scheduled daily and dispatchable with chosen seeds/rounds, with per-job report summaries and 30-day JSON artifacts | Workflow YAML validated; the same soak binary and report format as the pull-request lane |
 | 2026-09-10 | Derived the operational page-history cutoff from the writing compute (the materializer's restart-redo pin, or the newest checkpoint note's redo), kept the exact-redo twin of every retained checkpoint image, gave the branch controller's base pin page history, and modeled the real materializer mask plus progress marker in the soak | Control-prune cases for marker and note cutoffs with refusal below the frontier and restart; lifecycle/reclaim/standalone suites; integration lane with pruning active in the golden and branch-boot flows; 2400/8000-round soaks |
+| 2026-09-11 | Rolled the merged #238-#248 stack (SLRU/reader retention, materializer horizon, the H1 page-prune/WAL-index/WAL-reclaim/timeline-delete/manifest/restart/forkmeta slices, the first H2 fixture slice, FKM3) onto `pagestore`; the stacked PRs had each merged into the PR below them, so their content had stopped on the top branch | PR #249, ancestry-only merge with the tree of the reviewed #248 head; pagestore CI green |
+| 2026-09-11 | Scheduled the nightly soak from the default branch: the workflow is carried on `master` unchanged apart from a schedule guard (this repository or `PAGESTORE_NIGHTLY_ENABLED=1`; manual dispatch always), and the same guard is on the `pagestore` copy | PR #250; a 200-round dispatch resolved and checked out `pagestore` at the #249 merge, 1426 checks, 0 failures |
 | 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
 | 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
