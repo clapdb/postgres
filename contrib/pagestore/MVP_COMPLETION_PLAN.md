@@ -721,10 +721,16 @@ Expected scope: one or two PRs.
 
 ### R6. Prove bounded space
 
-Status: **implemented; every persisted category proven bounded on CI-sized
-and 6000/8000-round runs, the operational cutoff no longer needs a
-page-history owner, SLRU-class and reader-artifact versions follow the
-relation plan, and the nightly long-run lane is scheduled from `master`**.
+Status: **soak in CI and scheduled nightly; every persisted category the
+soak's owner mix exercises is proven bounded on CI-sized and 6000/8000-round
+runs, the operational cutoff no longer needs a page-history owner, and
+SLRU-class and reader-artifact versions follow the relation plan.  One
+documented limitation stays open: the newest artifact generation at or below
+the floor is retained even after the object it describes is dropped, because
+the publication protocol emits no durable drop event, so churn of artifact
+keys (a reader snapshot per dropped database, say) accumulates one surviving
+generation per removed object, which the soak's fixed/advancing readers do
+not exercise**.
 
 `pagestore_soak_test` is the acceptance harness.  It plays every retention
 role over the daemon protocol: a WAL-shipping writer with a bounded live set

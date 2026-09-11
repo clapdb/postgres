@@ -364,7 +364,7 @@ watermark still cannot substitute for the proven capture API: its newest-image
 contract deliberately permits bytes newer than its completeness floor and is
 therefore unsafe as an exact branch seed.
 
-### 4. Retention-driven space reclamation -- implemented for local POSIX
+### 4. Retention-driven space reclamation -- implemented for local POSIX; dropped artifacts keep one generation
 
 Segment GC removes page-log segments covered by image layers, and image
 compaction now bounds retained page-version history.  `retention.meta` is the
@@ -711,8 +711,10 @@ it; the integration test models exactly that.
 ## Recommended sequence
 
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
-acceptance contract.  The five gates are implemented for the local POSIX
-deployment; what remains before the MVP is declared complete is:
+acceptance contract.  Gates 1-4 are implemented for the local POSIX
+deployment, with the dropped-artifact limitation gate 4 documents above;
+gate 5 has its crash coverage composed and its daemon-side format fixtures,
+but is not complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
 2. Add the backend-side persisted-format fixtures (reader manifests, branch
