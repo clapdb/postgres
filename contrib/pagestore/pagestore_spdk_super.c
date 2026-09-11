@@ -138,6 +138,8 @@ ps_spdk_super_decode(const unsigned char *buf, size_t len,
 {
 	uint32_t	version;
 	PsSpdkSuperStatus geometry;
+	bool		le_magic;
+	bool		native_magic;
 	bool		legacy;
 
 	if (nshards == 0 || nshards > PS_SPDK_SUPER_MAX_SHARDS)
@@ -149,14 +151,25 @@ ps_spdk_super_decode(const unsigned char *buf, size_t len,
 	 * v2 is little-endian everywhere; the legacy struct images carry the
 	 * magic in the byte order of the host that wrote them, which is the
 	 * host reading them back (a store is not moved between byte orders).
-	 * On a little-endian host the two readings coincide.
+	 * On a little-endian host the two readings coincide, so a
+	 * little-endian magic with a version word other than 2 is a legacy
+	 * image there and a newer or corrupt versioned superblock on a
+	 * big-endian host, where no legacy image can carry that magic.
 	 */
-	if (get_le32(buf) == PS_SPDK_SUPER_MAGIC && get_le32(buf + 4) == PS_SPDK_SUPER_VERSION)
+	le_magic = get_le32(buf) == PS_SPDK_SUPER_MAGIC;
+	native_magic = get_native32(buf) == PS_SPDK_SUPER_MAGIC;
+	if (!le_magic && !native_magic)
+		return PS_SPDK_SUPER_BAD_MAGIC;
+	if (le_magic && get_le32(buf + 4) == PS_SPDK_SUPER_VERSION)
 		legacy = false;
-	else if (get_native32(buf) == PS_SPDK_SUPER_MAGIC)
+	else if (native_magic)
 		legacy = true;
 	else
-		return PS_SPDK_SUPER_BAD_MAGIC;
+	{
+		version = get_le32(buf + 4);
+		return version > PS_SPDK_SUPER_VERSION && version < LEGACY_SINGLE_MIN_SECTOR
+			? PS_SPDK_SUPER_NEWER : PS_SPDK_SUPER_CORRUPT;
+	}
 
 	if (!legacy)
 	{

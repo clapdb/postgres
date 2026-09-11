@@ -39,6 +39,16 @@ put64(unsigned char *p, uint64_t v)
 	memcpy(p, &v, 8);
 }
 
+/* v2 fields are little-endian on every host */
+static void
+put_le32(unsigned char *p, uint32_t v)
+{
+	p[0] = (unsigned char) v;
+	p[1] = (unsigned char) (v >> 8);
+	p[2] = (unsigned char) (v >> 16);
+	p[3] = (unsigned char) (v >> 24);
+}
+
 /* the sharded struct image storage_spdk.c used to fwrite(), version word 1 */
 static size_t
 legacy_sharded_image(unsigned char *buf, uint32_t sector, uint64_t segsize,
@@ -129,23 +139,23 @@ main(void)
 		unsigned char copy[1024];
 
 		memcpy(copy, buf, len);
-		put32(copy + 8, (uint32_t) len + 4);
+		put_le32(copy + 8, (uint32_t) len + 4);
 		check(ps_spdk_super_decode(copy, len, sector, segsize, 4, out, NULL) != PS_SPDK_SUPER_OK,
 			  "a length that disagrees with the shard count is rejected");
 		memcpy(copy, buf, len);
-		put32(copy + 4, 3);
+		put_le32(copy + 4, 3);
 		check(ps_spdk_super_decode(copy, len, sector, segsize, 4, out, NULL) == PS_SPDK_SUPER_NEWER,
 			  "a newer version is refused, not decoded as something else");
 		memcpy(copy, buf, len);
-		put32(copy + 4, 0);
+		put_le32(copy + 4, 0);
 		check(ps_spdk_super_decode(copy, len, sector, segsize, 4, out, NULL) == PS_SPDK_SUPER_CORRUPT,
 			  "a zero version word matches no layout and is corrupt");
 		memcpy(copy, buf, len);
-		put32(copy + 4, 511);
+		put_le32(copy + 4, 511);
 		check(ps_spdk_super_decode(copy, len, sector, segsize, 4, out, NULL) == PS_SPDK_SUPER_NEWER,
 			  "the largest version word below a sector size is still a version");
 		memcpy(copy, buf, len);
-		put32(copy, 0x41424344);
+		put_le32(copy, 0x41424344);
 		check(ps_spdk_super_decode(copy, len, sector, segsize, 4, out, NULL) == PS_SPDK_SUPER_BAD_MAGIC,
 			  "a foreign magic is not a superblock");
 	}

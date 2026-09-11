@@ -93,6 +93,16 @@ struct io_ctx
 	volatile int err;
 };
 
+/*
+ * The shard context of the calling worker thread, set by
+ * ps_spdk_thread_init().  SPDK I/O qpairs are single-threaded: a command a
+ * worker submits and polls must go through that worker's own qpair, never
+ * another shard's, which its owner may be polling at the same time outside
+ * the core lock.  NULL on the main thread, which uses the qpairs only after
+ * the workers have been joined.
+ */
+static __thread PsSpdkThread *g_self;
+
 /* the single control device this daemon owns */
 static struct spdk_nvme_ctrlr *g_ctrlr;
 static struct spdk_nvme_ns *g_ns;
@@ -144,15 +154,17 @@ do_io(PsSpdkThread *t, void *buf, uint64_t lba, uint32_t sectors, int is_write)
  * completes once the controller has the data, which on a namespace with a
  * volatile write cache is not yet nonvolatile media; the superblock must not
  * record segment counts whose extents could still be lost, so a namespace
- * flush precedes each publication.  Flush is namespace-wide; any qpair
- * carries it.
+ * flush precedes each publication.  Flush is namespace-wide, so it is
+ * submitted and polled on the calling worker's own qpair (shard 0's on the
+ * main thread once the workers are gone).
  */
 static int
-do_flush(PsSpdkThread *t)
+do_flush(void)
 {
+	PsSpdkThread *t = g_self ? g_self : &g_threads[0];
 	struct io_ctx c = {0, 0};
 
-	if (spdk_nvme_ns_cmd_flush(g_ns, t->qpair, io_cb, &c) != 0)
+	if (!t->qpair || spdk_nvme_ns_cmd_flush(g_ns, t->qpair, io_cb, &c) != 0)
 		return -1;
 	while (!c.done)
 		spdk_nvme_qpair_process_completions(t->qpair, 0);
@@ -617,7 +629,7 @@ spdk_close(void)
 	 */
 	for (uint32_t i = 0; i < g_nshards; i++)
 		flush_curbuf(&g_threads[i]);
-	if (do_flush(&g_threads[0]) != 0)
+	if (do_flush() != 0)
 		fprintf(stderr, "storage_spdk: namespace flush failed at close; the "
 				"previous superblock stays in place so unflushed extents are "
 				"never recorded as appended\n");
@@ -637,10 +649,18 @@ spdk_close(void)
 static int
 spdk_sync(void)
 {
+	/*
+	 * Flushing another shard's dirty append buffer submits on that shard's
+	 * qpair from this worker; it predates the superblock work and is
+	 * excluded from it only while the other worker holds no dirty buffer.
+	 * Moving each shard's flush onto its own worker is SPDK follow-up work
+	 * (SHARDING.md); the namespace flush below already stays on this
+	 * worker's qpair.
+	 */
 	for (uint32_t i = 0; i < g_nshards; i++)
 		if (flush_curbuf(&g_threads[i]) != 0)
 			return -1;
-	if (do_flush(&g_threads[0]) != 0)
+	if (do_flush() != 0)
 	{
 		fprintf(stderr, "storage_spdk: namespace flush failed; segment counts "
 				"are not published\n");
@@ -831,7 +851,12 @@ ps_spdk_poll(uint32_t shard)
 int
 ps_spdk_thread_init(uint32_t shard)
 {
-	return thread_init(thread_for(shard));
+	PsSpdkThread *t = thread_for(shard);
+
+	if (thread_init(t) != 0)
+		return -1;
+	g_self = t;
+	return 0;
 }
 
 void
