@@ -1022,11 +1022,11 @@ Expected scope: two or three focused PRs.
 ### H2. Add persisted-format fixtures and compatibility CI
 
 Status: **daemon-side POSIX record formats covered under D5 rule 2,
-including a legacy fixture exercised by the first format change;
-backend-side artifact fixtures (D5 rule 4), the PostgreSQL payload-version
-binding in envelopes (D5 rule 1), and rule 3's container obligations --
-the POSIX and SPDK container identities, and a fail-closed SPDK superblock
-open -- remain**.
+including a legacy fixture exercised by the first format change; rule 3's
+container obligations met for the POSIX and SPDK container identities and
+a fail-closed, durably published SPDK superblock; backend-side artifact
+fixtures (D5 rule 4) and the PostgreSQL payload-version binding in
+envelopes (D5 rule 1) remain**.
 
 The slice adds `pagestore_format.h` identities reported by every format-owning
 module, the `pagestore_format_versions` tool, the `fixture` workload of
@@ -1276,8 +1276,8 @@ inside them), because only the former can have a page-store support window.
    record format is provider-neutral and one fixture proves it for every
    provider; a provider must not fork it.  Each provider registers the
    identity of its own container format -- the POSIX store's file naming
-   and directory layout, the SPDK store's `spdk_super` (V1 legacy, V2
-   current) and its on-device segment extent layout -- so a container
+   and directory layout, the SPDK store's `spdk_super` (the two legacy struct
+   images and the checksummed v2) and its on-device segment extent layout -- so a container
    change is caught by the identity check even where its fixture cannot
    run in CI, and rule 2 applies to it: a container shipped after the MVP
    baseline stays openable by a later release or migrates explicitly (as
@@ -1291,19 +1291,24 @@ inside them), because only the former can have a page-store support window.
    published durably -- written to a temporary file, fsynced, renamed over
    the old copy, the directory fsynced, with every failure propagated to
    the caller -- because a valid but stale copy that survives a lost write
-   or crash reopens to the same overwrite.  The SPDK provider meets
-   neither today: `super_read()` leaves every per-shard segment count at
-   zero when neither known `spdk_super` layout matches and `spdk_open()`
-   proceeds, and `super_write()` overwrites `spdk_super` in place, ignores
-   open and write failures, never fsyncs, and `spdk_sync()` reports
-   success regardless, so a later append would reuse live extents in
-   either case.  Closing both is part of the remaining H2 work, ahead of
-   the SPDK fixture.  Neither provider
-   registers its container identity yet: `ps_storage_posix_format_identities()`
-   reports only the WAL-index watermark record.  The SPDK container fixture
-   itself follows the MVP: it needs the device layout split from NVMe I/O
-   behind a file-backed shim before it can be captured and checked without
-   hardware.
+   or crash reopens to the same overwrite.  The SPDK superblock now meets
+   both (`pagestore_spdk_super.c`, a module without SPDK dependencies so
+   the format is unit-tested and reported on every host): v2 is
+   little-endian, length-prefixed and checksummed and records the shard
+   count it was written for; the earlier sharded struct (version word 1)
+   and single-shard struct (no version word) images are decoded and
+   rewritten as v2 at the next publication; a truncated, foreign, newer,
+   corrupt, differently sized, or differently sharded superblock refuses
+   the open instead of restarting every shard at segment zero (the shard
+   count is part of the extent layout, so a store recorded for N shards is
+   never sliced or extended to another N); publication writes a temporary
+   file, fsyncs, renames, fsyncs the directory, and returns the failure to
+   `spdk_sync()`.  Both providers register their container identity: the
+   POSIX directory layout and file naming as `posix_container`, and the
+   SPDK superblock versions and the on-device extent layout as
+   `spdk_container`.  The SPDK container fixture itself follows the MVP: it
+   needs the device layout split from NVMe I/O behind a file-backed shim
+   before it can be captured and checked without hardware.
 4. **Backend-side artifacts follow rule 2 for their envelopes and rule 1
    for their payloads.**  Reader and branch manifests, the branch bootstrap,
    reader snapshot and catalog files, the reader's published snapshot
@@ -1364,11 +1369,8 @@ The default sequence was:
 
 What remains, in order: the H2 slices under the D5 decision -- first the
 PostgreSQL payload-identity binding in envelopes (the control tuple plus
-the native header identities the control image does not carry), the POSIX
-and SPDK container identities, a fail-closed `spdk_super` open (unknown,
-newer, truncated, or corrupt metadata refuses the store instead of zeroing
-the segment counts) with durable, error-propagating superblock
-publication, control-tuple validation in the public and legacy SLRU
+the native header identities the control image does not carry),
+control-tuple validation in the public and legacy SLRU
 seeding entrypoints, and the independent-recovery comparison for the SLRU
 appliers; then the store-object backend families, the page-store-defined
 raw payloads (control block 1's redo note, the SLRU watermark and
@@ -1418,6 +1420,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-11 | Rolled the merged #238-#248 stack (SLRU/reader retention, materializer horizon, the H1 page-prune/WAL-index/WAL-reclaim/timeline-delete/manifest/restart/forkmeta slices, the first H2 fixture slice, FKM3) onto `pagestore`; the stacked PRs had each merged into the PR below them, so their content had stopped on the top branch | PR #249, ancestry-only merge with the tree of the reviewed #248 head; pagestore CI green |
 | 2026-09-11 | Scheduled the nightly soak: GitHub runs schedules only from the default branch and `master` is reserved for the upstream mirror, so `pagestore` became the repository's default branch and the workflow gained a schedule guard (this repository or `PAGESTORE_NIGHTLY_ENABLED=1`; manual dispatch always); the interim copy on `master` (#250) is withdrawn | A 200-round dispatch resolved and checked out `pagestore` at the #249 merge, 1426 checks, 0 failures; after the default-branch change a 100-round dispatch ran from `pagestore` itself (run 34610482840, 978 checks, 0 failures) |
 | 2026-09-12 | Decided D5: PostgreSQL-native payloads are wrapped and never rewritten, with their PostgreSQL version identity recorded in the envelope and checked by the loader; daemon envelopes keep a fixture per shipped version with explicit migration or fail-closed; container formats are registered per provider (SPDK `spdk_super` and extent layout included, its fixture after the MVP); backend artifacts follow the same envelope/payload split | `MVP_COMPLETION_PLAN.md` D5; the H2 backend slices are sequenced against these rules |
+| 2026-09-12 | Registered the POSIX and SPDK container identities and made the SPDK superblock fail closed and durable: `pagestore_spdk_super.c` (no SPDK dependency) decodes the checksummed v2 and both legacy struct images, refuses truncated, foreign, newer, corrupt, differently sized or differently sharded superblocks instead of zeroing the segment counts, publishes v2 through temp/fsync/rename/dir-fsync with failures returned to `spdk_sync()`; `posix_container` and `spdk_container` join `pagestore_format_versions` and the current fixture's identity table | `pagestore_spdk_super_test` (62 checks) in meson and the standalone lane; the fixture check passes against both fixtures; the SPDK daemon links with the module |
 | 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
 | 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |

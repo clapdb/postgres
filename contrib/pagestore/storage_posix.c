@@ -1105,6 +1105,19 @@ posix_walidx_name(uint32_t tl, uint32_t shard, uint64_t epoch,
 }
 
 #define POSIX_WALIDX_WATERMARK_MAGIC UINT64_C(0x31524b4d58444957)
+/*
+ * The container identity of a POSIX store: which files a store directory is
+ * made of and how they are named -- seg_*, layer_<shard>_<id>, layers.manifest,
+ * wal_<tl> and wal_segments_<tl>/, walidx_<tl>_<shard>_e<epoch> and
+ * walidx_snapshots_<tl>/, forkmeta and forkmeta_snapshots/, retention.meta and
+ * retention.state, timelines, the prune frontiers, .pagestore-nshards and the
+ * ownership lock.  The records inside those files carry their own
+ * identities; this one changes when a file is renamed, moved into or out of
+ * a subdirectory, split, or merged, so that a fixture captured under the old
+ * layout is kept as a legacy fixture and the reopen path that reads it is
+ * proven rather than silently dropped.
+ */
+#define POSIX_STORE_LAYOUT_VERSION 1
 typedef struct PosixWalIdxWatermark
 {
 	uint64_t magic;
@@ -2862,6 +2875,8 @@ ps_storage_posix_format_identities(const PsFormatIdentity **out)
 	static const PsFormatIdentity identities[] = {
 		{"walidx_watermark", "walidx_<tl>_<shard>_e<epoch>.size",
 		 POSIX_WALIDX_WATERMARK_MAGIC, 1},
+		{"posix_container", "store directory layout and file naming", 0,
+		 POSIX_STORE_LAYOUT_VERSION},
 	};
 
 	*out = identities;

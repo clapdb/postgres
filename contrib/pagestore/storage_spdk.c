@@ -21,7 +21,10 @@
  *     now they stay on the filesystem, delegated to the POSIX backend under the
  *     same --store dir.  (Putting them on-device is a later LSM-layer refinement.)
  *   - Segment counts are persisted in <store>/spdk_super per shard, so restart
- *     continues from the same append position.
+ *     continues from the same append position.  The superblock is versioned,
+ *     checksummed, and published durably (pagestore_spdk_super.c); a store
+ *     whose superblock cannot be trusted refuses to open rather than
+ *     restarting every shard at segment zero over its own data.
  *
  * I/O uses spdk_nvme_ns_cmd_* asynchronously plus completion polling.  SPDK
  * daemon threads each use their own qpair and per-thread read-pool so multiple
@@ -43,6 +46,7 @@
 #include "spdk/nvme.h"
 
 #include "pagestore_core.h"
+#include "pagestore_spdk_super.h"
 #include "pagestore_storage.h"
 #include "storage_spdk.h"
 
@@ -88,27 +92,6 @@ struct io_ctx
 	volatile int done;
 	volatile int err;
 };
-
-#define SPDK_SUPER_MAGIC	0x53504b53	/* "SPKS" */
-#define SPDK_SUPER_VERSION	1
-
-typedef struct SpdkSuperV1
-{
-	uint32_t	magic;
-	uint32_t	sector_size;
-	uint64_t	segment_size;
-	uint32_t	num_segments;
-} SpdkSuperV1;
-
-typedef struct SpdkSuperV2
-{
-	uint32_t	magic;
-	uint32_t	version;
-	uint32_t	sector_size;
-	uint64_t	segment_size;
-	uint32_t	nshards;
-	uint32_t	num_segments[PS_MAX_CHANNELS];
-} SpdkSuperV2;
 
 /* the single control device this daemon owns */
 static struct spdk_nvme_ctrlr *g_ctrlr;
@@ -168,13 +151,12 @@ seg_byte(PsSpdkThread *t, int seg, uint64_t off)
 	return ((uint64_t) seg * g_nshards + t->id) * g_segsize + off;
 }
 
-/* --- spdk_super (segment count) in the store dir ------------------------- */
-
-static void
-super_path(char *buf, size_t buflen)
-{
-	snprintf(buf, buflen, "%s/spdk_super", g_store);
-}
+/* --- spdk_super (segment count) in the store dir -------------------------
+ *
+ * The superblock format lives in pagestore_spdk_super.c so it can be
+ * unit-tested and reported without SPDK.  Here it is only read at open and
+ * published at sync/close.
+ */
 
 static void
 super_init_threads(void)
@@ -197,67 +179,70 @@ super_init_threads(void)
 	}
 }
 
-static void
+/*
+ * Load the per-shard segment counts.  A store that never published a
+ * superblock starts every shard at zero; anything else that is not a valid
+ * superblock for this device geometry and shard count refuses the open,
+ * because the counts are what keeps a new append off existing extents --
+ * defaulting them to zero would overwrite the store.
+ */
+static int
 super_read(void)
 {
-	char			path[2300];
-	FILE		   *f;
-	SpdkSuperV2	 s2;
-	SpdkSuperV1	 s1;
+	uint32_t	counts[PS_MAX_CHANNELS];
+	uint32_t	version = 0;
+	PsSpdkSuperStatus status;
 
 	for (uint32_t i = 0; i < g_nshards; i++)
 		g_threads[i].num_segments = 0;
-	super_path(path, sizeof(path));
-	f = fopen(path, "rb");
-	if (!f)
-		return;
-
-	if (fread(&s2, sizeof(s2), 1, f) == 1 &&
-		s2.magic == SPDK_SUPER_MAGIC &&
-		s2.version == SPDK_SUPER_VERSION &&
-		s2.sector_size == g_sector &&
-		s2.segment_size == g_segsize)
+	status = ps_spdk_super_read(g_store, g_sector, g_segsize, g_nshards,
+								counts, &version);
+	if (status == PS_SPDK_SUPER_ABSENT)
+		return 0;
+	if (status != PS_SPDK_SUPER_OK)
 	{
-		uint32_t copy = s2.nshards < g_nshards ? s2.nshards : g_nshards;
-
-		for (uint32_t i = 0; i < copy; i++)
-			g_threads[i].num_segments = s2.num_segments[i];
-		fclose(f);
-		return;
+		if (status == PS_SPDK_SUPER_IO)
+			fprintf(stderr, "storage_spdk: cannot read %s/%s: %s\n",
+					g_store, PS_SPDK_SUPER_FILE, strerror(errno));
+		else
+			fprintf(stderr, "storage_spdk: %s/%s: %s (sector=%u segsize=%llu "
+					"nshards=%u); refusing to open the store\n",
+					g_store, PS_SPDK_SUPER_FILE,
+					ps_spdk_super_status_name(status), g_sector,
+					(unsigned long long) g_segsize, g_nshards);
+		return -1;
 	}
-
-	rewind(f);
-	if (fread(&s1, sizeof(s1), 1, f) == 1 &&
-		s1.magic == SPDK_SUPER_MAGIC &&
-		s1.sector_size == g_sector &&
-		s1.segment_size == g_segsize)
-	{
-		g_threads[0].num_segments = s1.num_segments;
-	}
-	fclose(f);
+	for (uint32_t i = 0; i < g_nshards; i++)
+		g_threads[i].num_segments = counts[i];
+	if (version != PS_SPDK_SUPER_VERSION)
+		fprintf(stderr, "storage_spdk: %s/%s is legacy v%u; it is rewritten as "
+				"v%u at the next publication\n", g_store, PS_SPDK_SUPER_FILE,
+				version, PS_SPDK_SUPER_VERSION);
+	return 0;
 }
 
-static void
+/*
+ * Publish the per-shard segment counts durably.  Returns 0, or -1 with the
+ * failure logged: the previous superblock is still in place, so the counts
+ * this open appended past are not yet persisted and the caller must report
+ * the sync as failed rather than let the next open reuse those extents.
+ */
+static int
 super_write(void)
 {
-	char		path[2300];
-	SpdkSuperV2	s = {0};
-	FILE	   *f;
+	uint32_t	counts[PS_MAX_CHANNELS];
+	int			rc;
 
-	s.magic = SPDK_SUPER_MAGIC;
-	s.version = SPDK_SUPER_VERSION;
-	s.sector_size = g_sector;
-	s.segment_size = g_segsize;
-	s.nshards = g_nshards;
 	for (uint32_t i = 0; i < g_nshards; i++)
-		s.num_segments[i] = g_threads[i].num_segments;
-
-	super_path(path, sizeof(path));
-	f = fopen(path, "wb");
-	if (!f)
-		return;					/* best-effort */
-	fwrite(&s, sizeof(s), 1, f);
-	fclose(f);
+		counts[i] = g_threads[i].num_segments;
+	rc = ps_spdk_super_publish(g_store, g_sector, g_segsize, g_nshards, counts);
+	if (rc != 0)
+	{
+		fprintf(stderr, "storage_spdk: cannot publish %s/%s: %s\n",
+				g_store, PS_SPDK_SUPER_FILE, strerror(-rc));
+		return -1;
+	}
+	return 0;
 }
 
 /* --- thread context allocation ------------------------------------------- */
@@ -562,7 +547,8 @@ spdk_open(const char *path, uint64_t segment_size)
 
 	g_nshards = resolve_nshards();
 	super_init_threads();
-	super_read();				/* segment counts */
+	if (super_read() != 0)		/* segment counts; refuses an unreadable store */
+		goto fail;
 
 	for (uint32_t i = 0; i < g_nshards; i++)
 	{
@@ -611,7 +597,10 @@ spdk_close(void)
 	 */
 	for (uint32_t i = 0; i < g_nshards; i++)
 		flush_curbuf(&g_threads[i]);
-	super_write();
+	if (super_write() != 0)
+		fprintf(stderr, "storage_spdk: close leaves the previous superblock in "
+				"place; segments appended since the last sync are not "
+				"recorded\n");
 	for (uint32_t i = 0; i < g_nshards; i++)
 		thread_free(&g_threads[i]);
 	if (g_ctrlr)
@@ -627,8 +616,7 @@ spdk_sync(void)
 	for (uint32_t i = 0; i < g_nshards; i++)
 		if (flush_curbuf(&g_threads[i]) != 0)
 			return -1;
-	super_write();
-	return 0;
+	return super_write();
 }
 
 /* --- segment byte I/O ---------------------------------------------------- */

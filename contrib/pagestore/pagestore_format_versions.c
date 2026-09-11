@@ -13,6 +13,7 @@
 #include "pagestore_format.h"
 #include "pagestore_ipc.h"
 #include "pagestore_layer.h"
+#include "pagestore_spdk_super.h"
 #include "pagestore_wal_segment.h"
 
 typedef size_t (*IdentityProvider) (const PsFormatIdentity **out);
@@ -45,7 +46,7 @@ main(void)
 		ps_manifest_format_identities, ps_retention_format_identities,
 		ps_wal_store_format_identities, ps_forkmeta_snapshot_format_identities,
 		ps_walidx_snapshot_format_identities, ps_core_format_identities,
-		ps_storage_posix_format_identities,
+		ps_storage_posix_format_identities, ps_storage_spdk_format_identities,
 	};
 	PsFormatIdentity all[64];
 	size_t		n = 0;

@@ -66,6 +66,12 @@
     "version": 0
   },
   {
+    "family": "posix_container",
+    "artifact": "store directory layout and file naming",
+    "magic": "0x00000000",
+    "version": 1
+  },
+  {
     "family": "retention",
     "artifact": "retention.meta record",
     "magic": "0x4e544552",
@@ -76,6 +82,30 @@
     "artifact": "retention.state",
     "magic": "0x53544552",
     "version": 2
+  },
+  {
+    "family": "spdk_container",
+    "artifact": "on-device segment extent layout",
+    "magic": "0x00000000",
+    "version": 1
+  },
+  {
+    "family": "spdk_container",
+    "artifact": "spdk_super",
+    "magic": "0x53504b53",
+    "version": 2
+  },
+  {
+    "family": "spdk_container",
+    "artifact": "spdk_super (accepted legacy sharded struct, version word 1)",
+    "magic": "0x53504b53",
+    "version": 1
+  },
+  {
+    "family": "spdk_container",
+    "artifact": "spdk_super (accepted legacy single-shard struct, no version word)",
+    "magic": "0x53504b53",
+    "version": 0
   },
   {
     "family": "store_config",
