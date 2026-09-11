@@ -1174,25 +1174,47 @@ inside them), because only the former can have a page-store support window.
    payload: what the store holds is byte-exact.  Where an install step must
    derive a different PostgreSQL object from a stored one, that derivation
    is an explicit, named transformation on PostgreSQL's own definitions and
-   never a second persisted format.  The one such step today is the
-   archive-bootstrap control install: after checking `pg_control_version`
-   and `catalog_version_no` against the running build,
-   `pagestore_control_restore --archive-bootstrap` copies the stored
-   `ControlFileData`, sets `minRecoveryPoint`/`minRecoveryPointTLI` to the
-   checkpoint redo and its timeline, clears the backup start/end fields,
-   recomputes the CRC with PostgreSQL's algorithm, and installs the result,
-   so a fresh skeleton enters archive recovery at the stored checkpoint
-   instead of trusting a foreign `initdb` state.  A fixture for that path
-   checks the stored image byte-exactly and the installed file against the
-   named transformation, not for byte equality with the image.  A payload's
-   version is therefore
-   PostgreSQL's (`PG_CONTROL_VERSION`, `CATALOG_VERSION_NO`,
-   `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, `PG_PAGE_LAYOUT_VERSION`), and
-   whether a payload can be loaded by a different PostgreSQL build is
-   PostgreSQL's question, not a page-store migration.  Envelopes record the
-   PostgreSQL version identity of their payload, loaders compare it with the
-   running build, and a mismatch fails closed naming the payload version
-   rather than the envelope.  The only page-store-defined payload is the
+   never a second persisted format.  Two such steps exist today, and each
+   fixture checks the stored input byte-exactly and the installed output
+   against the named transformation, not for byte equality with the input:
+   - the archive-bootstrap control install: after checking the control
+     image's compatibility tuple against the running build,
+     `pagestore_control_restore --archive-bootstrap` copies the stored
+     `ControlFileData`, sets `minRecoveryPoint`/`minRecoveryPointTLI` to the
+     checkpoint redo and its timeline, clears the backup start/end fields,
+     recomputes the CRC with PostgreSQL's algorithm, and installs the
+     result, so a fresh skeleton enters archive recovery at the stored
+     checkpoint instead of trusting a foreign `initdb` state;
+   - SLRU seeding for a branch (`pagestore_seed_clog`,
+     `pagestore_seed_commit_ts`, `pagestore_seed_multixact`, driven by
+     `pagestore_seed_branch_slrus()`): each page over the fork's horizon is
+     the stored seed page at the base cutoff `C` with the shipped WAL in
+     `(C, target]` applied by the corresponding PostgreSQL redo routine,
+     written as whole segments under `pg_xact`, `pg_commit_ts`, and
+     `pg_multixact`.  The seed pages, the WAL bytes, and the redo logic are
+     all PostgreSQL's; the page store contributes only the cutoff, the
+     horizon, and the fail-closed drive.  The transformation is version
+     checked through the control image it resolves its horizon from and
+     the WAL it replays, both of which carry the compatibility tuple below.
+   A payload's version is therefore
+   PostgreSQL's, and whether a payload can be loaded by a different
+   PostgreSQL build is PostgreSQL's question, not a page-store migration.
+   That identity is the full compatibility tuple PostgreSQL itself checks
+   when it opens a cluster, not the version constants alone: a build with a
+   different `BLCKSZ`, `XLOG_BLCKSZ`, `RELSEG_SIZE`, `SLRU_PAGES_PER_SEGMENT`,
+   `MAXALIGN`, `NAMEDATALEN`, `INDEX_MAX_KEYS`, `TOAST_MAX_CHUNK_SIZE`,
+   `LOBLKSIZE`, or float format writes incompatible page, WAL, and SLRU
+   bytes under the same `PG_CONTROL_VERSION` and `CATALOG_VERSION_NO`.  The
+   tuple is therefore the version constants (`PG_CONTROL_VERSION`,
+   `CATALOG_VERSION_NO`, `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`,
+   `PG_PAGE_LAYOUT_VERSION`) together with the layout parameters
+   `ControlFileData` records and `pagestore_control_restore` already
+   compares one by one.  Envelopes record that tuple for their payload --
+   the control image carries it natively, other envelopes bind it by
+   reference to the control image of the same timeline or by copying the
+   fields they need -- loaders compare it with the running build, and a
+   mismatch fails closed naming the payload identity rather than the
+   envelope.  The only page-store-defined payload is the
    reader's running-transaction snapshot, which PostgreSQL has no stable
    serialization for; it is versioned as an envelope.
 2. **Envelopes -- the daemon's record formats -- keep a fixture for every

@@ -630,8 +630,9 @@ for every format shipped after the MVP baseline, with explicit migration for
 supported older versions and fail-closed otherwise; container formats are
 registered per provider; backend artifacts follow the same envelope/payload
 split).  Every
-daemon-side format reports its compiled magic and version through
-`pagestore_format_versions`; `fixtures/posix-mvp-baseline` holds a captured
+daemon-side record format reports its compiled magic and version through
+`pagestore_format_versions` (the POSIX and SPDK container identities are
+still to be registered); `fixtures/posix-mvp-baseline` holds a captured
 store carrying page history and its cutoff, fork-size events on both sides of
 the cutoff plus a post-cutover source tail, a sealed shipped-WAL segment
 with a control note inside it, a compacted WAL-index interval with a fixed
