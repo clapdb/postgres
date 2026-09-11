@@ -599,13 +599,12 @@ seeds/rounds, one job per seed, with every JSON report summarized in the job
 and kept as a 30-day artifact.  Each job takes the time its rounds need
 instead of a fixed limit, and a dispatch too large to finish inside the
 hosted-runner limit is refused rather than killed before it reports.  GitHub fires scheduled and dispatchable
-workflows only from the repository's default branch, so the same file is
-carried on `master` (#250), where a run resolves `pagestore` and checks it
-out explicitly; the schedule fires only in this repository or in a fork that
-sets `PAGESTORE_NIGHTLY_ENABLED=1`, while a manual dispatch is always
-honoured.  A 200-round dispatch from `master` proved the path against the
-#249 roll-up.  Changes to the workflow on `pagestore` must be carried to
-`master` as well, since the copy there defines what the schedule runs.
+workflows only from the repository's default branch, and `master` is reserved
+for the upstream mirror, so `pagestore` is the repository's default branch and
+the lane runs from it directly; the schedule fires only in this repository or
+in a fork that sets `PAGESTORE_NIGHTLY_ENABLED=1`, while a manual dispatch is
+always honoured.  A 200-round dispatch proved the path against the #249
+roll-up (1426 checks, 0 failures).
 The branch is resolved to a commit once, before the seeds fan out, and every
 job checks that commit out, so a run's seeds stay one experiment even when
 the branch advances between jobs or a job is rerun later; the resolved
