@@ -623,12 +623,16 @@ intact, and after each later boundary the cleanup must resume.  Its workload
 seeds a live sibling branch with the same kind of private state, so cleanup
 that reached past its owner would be caught.
 
-The first persisted-format fixture slice is in place under the recommended
-D5 policy (fixtures for every format shipped after the MVP baseline;
-explicit migration for supported older versions; fail closed otherwise),
-which is still an open decision and is flagged as an assumption.  Every
-daemon-side format reports its compiled magic and version through
-`pagestore_format_versions`; `fixtures/posix-mvp-baseline` holds a captured
+The first persisted-format fixture slice is in place under the D5 policy
+(now decided: PostgreSQL-native payloads are wrapped and never rewritten and
+carry their PostgreSQL version identity; page-store envelopes keep a fixture
+for every format shipped after the MVP baseline, with explicit migration for
+supported older versions and fail-closed otherwise; container formats are
+registered per provider; backend artifacts follow the same envelope/payload
+split).  Every
+daemon-side record format reports its compiled magic and version through
+`pagestore_format_versions` (the POSIX and SPDK container identities are
+still to be registered); `fixtures/posix-mvp-baseline` holds a captured
 store carrying page history and its cutoff, fork-size events on both sides of
 the cutoff plus a post-cutover source tail, a sealed shipped-WAL segment
 with a control note inside it, a compacted WAL-index interval with a fixed
@@ -716,9 +720,22 @@ gate 5 has its crash coverage composed and its daemon-side format fixtures,
 but is not complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
-2. Add the backend-side persisted-format fixtures (reader manifests, branch
-   bootstrap, materializer markers, the writer checkpoint block) and settle
-   the D5 support-window decision the daemon-side fixtures assume.
+2. Finish H2 under the decided D5 policy: bind the PostgreSQL payload
+   identity into the envelopes (the control tuple plus the native header
+   identities the control image does not carry), register the POSIX and
+   SPDK container identities, make an unknown or corrupt `spdk_super` fail
+   the open instead of zeroing the segment counts and publish it durably
+   with errors propagated, validate the control tuple in the public and
+   legacy SLRU seeding entrypoints and compare their output with
+   independently recovered SLRUs, then add the backend-side
+   persisted-format fixtures (the materializer and
+   writer control blocks, the reader snapshot objects, and the raw
+   redo-note, SLRU watermark, and tombstone values in the store; the reader
+   and branch manifests, branch bootstrap, reader snapshot/catalog files,
+   the reader-map intent marker, the branch controller's configuration,
+   journal, and authority files, the materializer supervisor's
+   configuration, status, and generation-authority file, and the SLRU
+   mirror continuity markers in PGDATA).
 3. Close the R4b concurrency clause: a concurrent-append oracle at the
    prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
    crash matrix already has at the source rewrite.
