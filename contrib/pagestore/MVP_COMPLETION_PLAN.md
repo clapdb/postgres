@@ -1297,8 +1297,13 @@ inside them), because only the former can have a page-store support window.
    controller artifacts that recovery of an interrupted operation depends
    on -- the CRC-protected branch preparation journal
    (`pagestore_branch.prepare.json`), the branch retention-generation
-   authority file that fences owner-generation reuse, and the materializer
-   supervisor's configuration and status -- are page-store envelopes with
+   authority file that fences owner-generation reuse, the materializer
+   supervisor's configuration and status, and the SLRU mirror continuity
+   markers (`pagestore.slru_mirror_debt`, and
+   `pagestore.slru_mirror_primed` with its raw eight-byte checkpoint-redo
+   stamp, whose presence and stamp decide at boot whether the stored SLRU
+   mirror is complete or the cluster carries mirror debt) -- are page-store
+   envelopes with
    a fixture and a support window of their own (their readers enforce
    exact schemas, so a schema change without a retained fixture and
    migration could leave a controller unable to resume or clean up, with
@@ -1343,9 +1348,12 @@ the segment counts) with durable, error-propagating superblock
 publication, control-tuple validation in the public and legacy SLRU
 seeding entrypoints, and the independent-recovery comparison for the SLRU
 appliers; then the store-object backend families; then the PGDATA
-artifacts, the controller journal and authority files included -- then
-the R4b concurrent-append oracle, then the final MVP status update once
-the nightly lane has a run history.
+artifacts -- the reader and branch manifests, branch bootstrap, reader
+snapshot and catalog files, the branch controller's journal and authority
+files, the materializer supervisor's configuration and status, and the
+SLRU mirror continuity markers with their migration semantics -- then the
+R4b concurrent-append oracle, then the final MVP status update once the
+nightly lane has a run history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
