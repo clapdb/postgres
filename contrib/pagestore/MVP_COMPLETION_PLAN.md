@@ -1189,13 +1189,24 @@ inside them), because only the former can have a page-store support window.
      `pagestore_seed_commit_ts`, `pagestore_seed_multixact`, driven by
      `pagestore_seed_branch_slrus()`): each page over the fork's horizon is
      the stored seed page at the base cutoff `C` with the shipped WAL in
-     `(C, target]` applied by the corresponding PostgreSQL redo routine,
-     written as whole segments under `pg_xact`, `pg_commit_ts`, and
-     `pg_multixact`.  The seed pages, the WAL bytes, and the redo logic are
-     all PostgreSQL's; the page store contributes only the cutoff, the
-     horizon, and the fail-closed drive.  The transformation is version
-     checked through the control image it resolves its horizon from and
-     the WAL it replays, both of which carry the compatibility tuple below.
+     `(C, target]` applied, written as whole segments under `pg_xact`,
+     `pg_commit_ts`, and `pg_multixact`.  The seed pages and the WAL bytes
+     are PostgreSQL's, but the appliers are not: `ps_clog_apply_range()`
+     and the commit-ts and multixact seeders decode the records and set
+     the status bits, timestamps, and member slots themselves, mirroring
+     `clog_redo`, `CommitTsRedo`, and `multixact_redo` rather than calling
+     them.  That mirror is page-store-owned transformation logic: it is
+     versioned with the envelope, bound to the PostgreSQL version whose
+     redo it mirrors, and proven equivalent to actual recovery by the
+     golden scenario's recovery-produced SLRU base, not by a fixture that
+     would only compare the mirror with itself.  Refactoring the appliers
+     onto PostgreSQL's redo routines would retire that obligation.  The
+     transformation is version checked only where its inputs are resolved
+     from a control image: the serialized branch controller path does so;
+     the public `pagestore_seed_branch_slrus()` and legacy
+     `pagestore_prepare_branch_impl()` entrypoints take caller-supplied
+     cutoffs and horizons and check nothing, so H2 requires them to resolve
+     and validate the control tuple before interpreting a seed page.
    A payload's version is therefore
    PostgreSQL's, and whether a payload can be loaded by a different
    PostgreSQL build is PostgreSQL's question, not a page-store migration.
@@ -1209,12 +1220,19 @@ inside them), because only the former can have a page-store support window.
    `CATALOG_VERSION_NO`, `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`,
    `PG_PAGE_LAYOUT_VERSION`) together with the layout parameters
    `ControlFileData` records and `pagestore_control_restore` already
-   compares one by one.  Envelopes record that tuple for their payload --
-   the control image carries it natively, other envelopes bind it by
-   reference to the control image of the same timeline or by copying the
-   fields they need -- loaders compare it with the running build, and a
-   mismatch fails closed naming the payload identity rather than the
-   envelope.  The only page-store-defined payload is the
+   compares one by one.  Envelopes record that tuple for their payload,
+   and a control-image reference covers only what `ControlFileData`
+   contains: the control and catalog versions and the layout parameters.
+   `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, and `PG_PAGE_LAYOUT_VERSION`
+   live in the native headers of the WAL page, the relation map, and the
+   relation page, so the envelope or loader that hands one of those
+   payloads to PostgreSQL binds or checks that native identity as well
+   (the WAL segment envelope against the first page header it carries, the
+   relation-map envelope against the map's own magic, the page path
+   against the page header) rather than relying on the control image.
+   Loaders compare the tuple with the running build, and a mismatch fails
+   closed naming the payload identity rather than the envelope.  The only
+   page-store-defined payload is the
    reader's running-transaction snapshot, which PostgreSQL has no stable
    serialization for; it is versioned as an envelope.
 2. **Envelopes -- the daemon's record formats -- keep a fixture for every
@@ -1231,14 +1249,21 @@ inside them), because only the former can have a page-store support window.
    file naming and directory layout, the SPDK store's `spdk_super` (V1
    legacy, V2 current) and its on-device segment extent layout -- so a
    container change is caught by the identity check even where its fixture
-   cannot run in CI.  Registration is not the whole obligation: a container
-   whose metadata is unknown, newer, truncated, or corrupt must fail the
-   open, never degrade to a default that can overwrite existing data.  The
-   SPDK provider does not meet that today -- `super_read()` leaves every
-   per-shard segment count at zero when neither known `spdk_super` layout
-   matches and `spdk_open()` proceeds, so a later append would reuse
-   segment zero over live extents -- and closing that is part of the
-   remaining H2 work, ahead of the SPDK fixture.  Neither provider
+   cannot run in CI.  Registration is not the whole obligation.  A
+   container whose metadata is unknown, newer, truncated, or corrupt must
+   fail the open, never degrade to a default that can overwrite existing
+   data; and the metadata a container depends on to place new data must be
+   published durably -- written to a temporary file, fsynced, renamed over
+   the old copy, the directory fsynced, with every failure propagated to
+   the caller -- because a valid but stale copy that survives a lost write
+   or crash reopens to the same overwrite.  The SPDK provider meets
+   neither today: `super_read()` leaves every per-shard segment count at
+   zero when neither known `spdk_super` layout matches and `spdk_open()`
+   proceeds, and `super_write()` overwrites `spdk_super` in place, ignores
+   open and write failures, never fsyncs, and `spdk_sync()` reports
+   success regardless, so a later append would reuse live extents in
+   either case.  Closing both is part of the remaining H2 work, ahead of
+   the SPDK fixture.  Neither provider
    registers its container identity yet: `ps_storage_posix_format_identities()`
    reports only the WAL-index watermark record.  The SPDK container fixture
    itself follows the MVP: it needs the device layout split from NVMe I/O
@@ -1280,12 +1305,15 @@ The default sequence was:
    final status update follows the first scheduled nightly runs.
 
 What remains, in order: the H2 slices under the D5 decision -- first the
-PostgreSQL payload-version binding in envelopes, the POSIX and SPDK
-container identities, and a fail-closed `spdk_super` open (unknown, newer,
-truncated, or corrupt metadata refuses the store instead of zeroing the
-segment counts); then the store-object backend families; then the PGDATA
-artifacts -- then the R4b concurrent-append oracle, then the final MVP
-status update once the nightly lane has a run history.
+PostgreSQL payload-identity binding in envelopes (the control tuple plus
+the native header identities the control image does not carry), the POSIX
+and SPDK container identities, a fail-closed `spdk_super` open (unknown,
+newer, truncated, or corrupt metadata refuses the store instead of zeroing
+the segment counts) with durable, error-propagating superblock
+publication, and control-tuple validation in the public and legacy SLRU
+seeding entrypoints; then the store-object backend families; then the
+PGDATA artifacts -- then the R4b concurrent-append oracle, then the final
+MVP status update once the nightly lane has a run history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
