@@ -100,8 +100,8 @@ main(void)
 		  "v2 image decodes");
 	check(version == PS_SPDK_SUPER_VERSION, "v2 reports its version");
 	check(memcmp(out, counts, 16) == 0, "v2 counts survive the round trip");
-	check(ps_spdk_super_decode(buf, len + 100, sector, segsize, 4, out, NULL) == PS_SPDK_SUPER_OK,
-		  "trailing bytes beyond the announced length are ignored");
+	check(ps_spdk_super_decode(buf, len + 1, sector, segsize, 4, out, NULL) == PS_SPDK_SUPER_OVERLONG,
+		  "a byte beyond the announced length refuses the superblock");
 	check(ps_spdk_super_encode(buf, sector, segsize, 0, counts) == 0,
 		  "zero shards cannot be encoded");
 	check(ps_spdk_super_encode(buf, sector, segsize, PS_SPDK_SUPER_MAX_SHARDS + 1, counts) == 0,
@@ -169,6 +169,8 @@ main(void)
 		  "the sharded struct reports version word 1 and its counts");
 	check(ps_spdk_super_decode(buf, len - 1, sector, segsize, 3, out, NULL) == PS_SPDK_SUPER_TRUNCATED,
 		  "a short sharded image is truncated");
+	check(ps_spdk_super_decode(buf, len + 1, sector, segsize, 3, out, NULL) == PS_SPDK_SUPER_OVERLONG,
+		  "a sharded image with a trailing byte is overlong");
 	check(ps_spdk_super_decode(buf, len, sector, segsize, 2, out, NULL) == PS_SPDK_SUPER_SHARDS,
 		  "a sharded image for another shard count is refused rather than sliced");
 	check(ps_spdk_super_decode(buf, len, 4096, segsize, 3, out, NULL) == PS_SPDK_SUPER_GEOMETRY,
@@ -183,6 +185,8 @@ main(void)
 		  "a single-shard image cannot serve a sharded store");
 	check(ps_spdk_super_decode(buf, len - 1, sector, segsize, 1, out, NULL) == PS_SPDK_SUPER_TRUNCATED,
 		  "a short single-shard image is truncated");
+	check(ps_spdk_super_decode(buf, len + 1, sector, segsize, 1, out, NULL) == PS_SPDK_SUPER_OVERLONG,
+		  "a single-shard image with a trailing byte is overlong");
 	len = legacy_single_image(buf, 4096, segsize, 77);
 	check(ps_spdk_super_decode(buf, len, sector, segsize, 1, out, NULL) == PS_SPDK_SUPER_GEOMETRY,
 		  "a single-shard image for another sector size is refused");
@@ -237,6 +241,13 @@ main(void)
 		check(truncate(path, 0) == 0, "empty the superblock on disk");
 		check(ps_spdk_super_read(dir, sector, segsize, 3, out, NULL) == PS_SPDK_SUPER_TRUNCATED,
 			  "an empty superblock is truncated, not absent");
+		check(ps_spdk_super_publish(dir, sector, segsize, 3, out) == 0, "republish a valid superblock");
+		check(truncate(path, 28 + 12 + 4 + 1) == 0, "append one byte to the superblock on disk");
+		check(ps_spdk_super_read(dir, sector, segsize, 3, out, NULL) == PS_SPDK_SUPER_OVERLONG,
+			  "a superblock file with a trailing byte is overlong");
+		check(truncate(path, 4096) == 0, "grow the superblock past every layout and the read buffer");
+		check(ps_spdk_super_read(dir, sector, segsize, 3, out, NULL) == PS_SPDK_SUPER_OVERLONG,
+			  "a superblock file longer than the read buffer is overlong, not silently cut");
 	}
 
 	/* a failed publication leaves the previous superblock untouched */

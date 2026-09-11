@@ -11,6 +11,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -60,6 +61,25 @@ put_le64(unsigned char *p, uint64_t v)
 	put_le32(p + 4, (uint32_t) (v >> 32));
 }
 
+/* the legacy struct images were written in host byte order */
+static uint32_t
+get_native32(const unsigned char *p)
+{
+	uint32_t	v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static uint64_t
+get_native64(const unsigned char *p)
+{
+	uint64_t	v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
 static uint32_t
 fnv1a(const unsigned char *data, size_t len)
 {
@@ -84,6 +104,8 @@ ps_spdk_super_status_name(PsSpdkSuperStatus status)
 			return "absent";
 		case PS_SPDK_SUPER_TRUNCATED:
 			return "truncated";
+		case PS_SPDK_SUPER_OVERLONG:
+			return "longer than its layout";
 		case PS_SPDK_SUPER_BAD_MAGIC:
 			return "not a superblock";
 		case PS_SPDK_SUPER_NEWER:
@@ -116,26 +138,33 @@ ps_spdk_super_decode(const unsigned char *buf, size_t len,
 {
 	uint32_t	version;
 	PsSpdkSuperStatus geometry;
+	bool		legacy;
 
 	if (nshards == 0 || nshards > PS_SPDK_SUPER_MAX_SHARDS)
 		return PS_SPDK_SUPER_SHARDS;
 	if (len < 8)
 		return PS_SPDK_SUPER_TRUNCATED;
-	if (get_le32(buf) != PS_SPDK_SUPER_MAGIC)
-		return PS_SPDK_SUPER_BAD_MAGIC;
 
 	/*
-	 * The single-shard image had no version word: its second word is the
-	 * sector size, a power of two no smaller than 512, which no version
-	 * number reaches.
+	 * v2 is little-endian everywhere; the legacy struct images carry the
+	 * magic in the byte order of the host that wrote them, which is the
+	 * host reading them back (a store is not moved between byte orders).
+	 * On a little-endian host the two readings coincide.
 	 */
-	version = get_le32(buf + 4);
-	if (version == PS_SPDK_SUPER_VERSION)
+	if (get_le32(buf) == PS_SPDK_SUPER_MAGIC && get_le32(buf + 4) == PS_SPDK_SUPER_VERSION)
+		legacy = false;
+	else if (get_native32(buf) == PS_SPDK_SUPER_MAGIC)
+		legacy = true;
+	else
+		return PS_SPDK_SUPER_BAD_MAGIC;
+
+	if (!legacy)
 	{
 		uint32_t	length;
 		uint32_t	rec_shards;
 		size_t		body;
 
+		version = PS_SPDK_SUPER_VERSION;
 		if (len < PS_SPDK_SUPER_FIXED_BYTES)
 			return PS_SPDK_SUPER_TRUNCATED;
 		length = get_le32(buf + 8);
@@ -147,6 +176,8 @@ ps_spdk_super_decode(const unsigned char *buf, size_t len,
 			return PS_SPDK_SUPER_CORRUPT;
 		if (len < length)
 			return PS_SPDK_SUPER_TRUNCATED;
+		if (len > length)
+			return PS_SPDK_SUPER_OVERLONG;
 		if (get_le32(buf + body) != fnv1a(buf, body))
 			return PS_SPDK_SUPER_CORRUPT;
 		geometry = check_geometry(sector_size, segment_size,
@@ -161,22 +192,30 @@ ps_spdk_super_decode(const unsigned char *buf, size_t len,
 			*version_out = version;
 		return PS_SPDK_SUPER_OK;
 	}
+	/*
+	 * The single-shard image had no version word: its second word is the
+	 * sector size, a power of two no smaller than 512, which no version
+	 * number reaches.
+	 */
+	version = get_native32(buf + 4);
 	if (version == PS_SPDK_SUPER_LEGACY_SHARDED)
 	{
 		uint32_t	rec_shards;
 
 		if (len < LEGACY_SHARDED_BYTES)
 			return PS_SPDK_SUPER_TRUNCATED;
+		if (len > LEGACY_SHARDED_BYTES)
+			return PS_SPDK_SUPER_OVERLONG;
 		geometry = check_geometry(sector_size, segment_size,
-								  get_le32(buf + LEGACY_SHARDED_SECTOR),
-								  get_le64(buf + LEGACY_SHARDED_SEGSIZE));
+								  get_native32(buf + LEGACY_SHARDED_SECTOR),
+								  get_native64(buf + LEGACY_SHARDED_SEGSIZE));
 		if (geometry != PS_SPDK_SUPER_OK)
 			return geometry;
-		rec_shards = get_le32(buf + LEGACY_SHARDED_NSHARDS);
+		rec_shards = get_native32(buf + LEGACY_SHARDED_NSHARDS);
 		if (rec_shards != nshards)
 			return PS_SPDK_SUPER_SHARDS;
 		for (uint32_t i = 0; i < nshards; i++)
-			counts[i] = get_le32(buf + LEGACY_SHARDED_COUNTS + 4u * i);
+			counts[i] = get_native32(buf + LEGACY_SHARDED_COUNTS + 4u * i);
 		if (version_out)
 			*version_out = version;
 		return PS_SPDK_SUPER_OK;
@@ -184,19 +223,22 @@ ps_spdk_super_decode(const unsigned char *buf, size_t len,
 	if (version > PS_SPDK_SUPER_VERSION && version < LEGACY_SINGLE_MIN_SECTOR)
 		return PS_SPDK_SUPER_NEWER;
 	if (version < LEGACY_SINGLE_MIN_SECTOR)
-		return PS_SPDK_SUPER_CORRUPT;	/* version word 0: neither layout */
+		return PS_SPDK_SUPER_CORRUPT;	/* version word 0 or a v2 word in the
+										 * wrong byte order: neither layout */
 
 	/* single-shard image: the word at 4 is the sector size */
 	if (len < LEGACY_SINGLE_BYTES)
 		return PS_SPDK_SUPER_TRUNCATED;
+	if (len > LEGACY_SINGLE_BYTES)
+		return PS_SPDK_SUPER_OVERLONG;
 	geometry = check_geometry(sector_size, segment_size,
-							  get_le32(buf + LEGACY_SINGLE_SECTOR),
-							  get_le64(buf + LEGACY_SINGLE_SEGSIZE));
+							  get_native32(buf + LEGACY_SINGLE_SECTOR),
+							  get_native64(buf + LEGACY_SINGLE_SEGSIZE));
 	if (geometry != PS_SPDK_SUPER_OK)
 		return geometry;
 	if (nshards != 1)
 		return PS_SPDK_SUPER_SHARDS;
-	counts[0] = get_le32(buf + LEGACY_SINGLE_COUNT);
+	counts[0] = get_native32(buf + LEGACY_SINGLE_COUNT);
 	if (version_out)
 		*version_out = PS_SPDK_SUPER_LEGACY_SINGLE;
 	return PS_SPDK_SUPER_OK;
@@ -243,8 +285,9 @@ ps_spdk_super_read(const char *store_dir, uint32_t sector_size,
 				   uint32_t *counts, uint32_t *version_out)
 {
 	char		path[4096];
-	unsigned char buf[LEGACY_SHARDED_BYTES > PS_SPDK_SUPER_MAX_BYTES
-					  ? LEGACY_SHARDED_BYTES : PS_SPDK_SUPER_MAX_BYTES];
+	/* one byte more than the largest layout, so a longer file is seen as such */
+	unsigned char buf[(LEGACY_SHARDED_BYTES > PS_SPDK_SUPER_MAX_BYTES
+					   ? LEGACY_SHARDED_BYTES : PS_SPDK_SUPER_MAX_BYTES) + 1];
 	int			fd;
 	size_t		len = 0;
 

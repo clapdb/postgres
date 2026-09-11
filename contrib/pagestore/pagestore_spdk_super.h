@@ -32,7 +32,14 @@
  *  28  u32 num_segments[nshards]
  *  28 + 4 * nshards  u32 crc   FNV-1a over bytes [0, 28 + 4 * nshards)
  *
- * Accepted legacy layouts (native struct images written by fwrite):
+ * A superblock is exactly as long as its layout says: bytes beyond the
+ * declared v2 length or beyond a legacy image are not ignored but refuse the
+ * open, since container metadata that has grown is not the metadata this
+ * build wrote.
+ *
+ * Accepted legacy layouts (native struct images written by fwrite, and so
+ * read back in the host's byte order, while v2 is little-endian on every
+ * host):
  *   sharded, version word 1:
  *       {u32 magic, u32 version = 1, u32 sector_size, u64 segment_size,
  *        u32 nshards, u32 num_segments[PS_MAX_CHANNELS]}
@@ -67,6 +74,7 @@ typedef enum PsSpdkSuperStatus
 	PS_SPDK_SUPER_OK = 0,		/* decoded; counts filled */
 	PS_SPDK_SUPER_ABSENT,		/* no superblock: a store that never published one */
 	PS_SPDK_SUPER_TRUNCATED,	/* shorter than the layout it announces */
+	PS_SPDK_SUPER_OVERLONG,		/* longer than the layout it announces */
 	PS_SPDK_SUPER_BAD_MAGIC,	/* not a superblock */
 	PS_SPDK_SUPER_NEWER,		/* a version this build does not know */
 	PS_SPDK_SUPER_CORRUPT,		/* checksum or length mismatch */
@@ -76,9 +84,10 @@ typedef enum PsSpdkSuperStatus
 } PsSpdkSuperStatus;
 
 /*
- * Decode 'len' bytes of a superblock against the device geometry and the
- * configured shard count.  On PS_SPDK_SUPER_OK, counts[0..nshards) hold the
- * recorded append positions and *version_out the layout that carried them.
+ * Decode a superblock of exactly 'len' bytes against the device geometry
+ * and the configured shard count.  On PS_SPDK_SUPER_OK, counts[0..nshards)
+ * hold the recorded append positions and *version_out the layout that
+ * carried them.
  */
 extern PsSpdkSuperStatus ps_spdk_super_decode(const unsigned char *buf, size_t len,
 											  uint32_t sector_size,

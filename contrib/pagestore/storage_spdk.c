@@ -139,6 +139,26 @@ do_io(PsSpdkThread *t, void *buf, uint64_t lba, uint32_t sectors, int is_write)
 	return c.err;
 }
 
+/*
+ * Make every completed write of this namespace durable.  A write command
+ * completes once the controller has the data, which on a namespace with a
+ * volatile write cache is not yet nonvolatile media; the superblock must not
+ * record segment counts whose extents could still be lost, so a namespace
+ * flush precedes each publication.  Flush is namespace-wide; any qpair
+ * carries it.
+ */
+static int
+do_flush(PsSpdkThread *t)
+{
+	struct io_ctx c = {0, 0};
+
+	if (spdk_nvme_ns_cmd_flush(g_ns, t->qpair, io_cb, &c) != 0)
+		return -1;
+	while (!c.done)
+		spdk_nvme_qpair_process_completions(t->qpair, 0);
+	return c.err;
+}
+
 static uint64_t
 seg_lba(PsSpdkThread *t, int seg)
 {
@@ -597,7 +617,11 @@ spdk_close(void)
 	 */
 	for (uint32_t i = 0; i < g_nshards; i++)
 		flush_curbuf(&g_threads[i]);
-	if (super_write() != 0)
+	if (do_flush(&g_threads[0]) != 0)
+		fprintf(stderr, "storage_spdk: namespace flush failed at close; the "
+				"previous superblock stays in place so unflushed extents are "
+				"never recorded as appended\n");
+	else if (super_write() != 0)
 		fprintf(stderr, "storage_spdk: close leaves the previous superblock in "
 				"place; segments appended since the last sync are not "
 				"recorded\n");
@@ -616,6 +640,12 @@ spdk_sync(void)
 	for (uint32_t i = 0; i < g_nshards; i++)
 		if (flush_curbuf(&g_threads[i]) != 0)
 			return -1;
+	if (do_flush(&g_threads[0]) != 0)
+	{
+		fprintf(stderr, "storage_spdk: namespace flush failed; segment counts "
+				"are not published\n");
+		return -1;
+	}
 	return super_write();
 }
 
