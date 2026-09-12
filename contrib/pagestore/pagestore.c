@@ -3860,6 +3860,16 @@ pagestore_control_image_compatible(const ControlFileData *cf, const char *what)
 		ereport(ERROR,
 				(errmsg("%s: control image WAL segment size %u differs from this cluster's %d",
 						what, cf->xlog_seg_size, wal_segment_size)));
+	/*
+	 * A store populated by another initdb can carry an image whose versions
+	 * and layout match this build exactly; its pages and WAL are still
+	 * another database system's.
+	 */
+	if (cf->system_identifier != GetSystemIdentifier())
+		ereport(ERROR,
+				(errmsg("%s: control image belongs to database system %llu; this cluster is %llu",
+						what, (unsigned long long) cf->system_identifier,
+						(unsigned long long) GetSystemIdentifier())));
 }
 
 
@@ -12648,7 +12658,17 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 	 * to interpret only if the payload identity they were seeded under is */
 	pagestore_bind_seed_identity(base);
 
-	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
+	/*
+	 * A verified preparation never reuses seeded SLRUs: whether the manifest
+	 * matches or not, the pages are reconstructed again and each compared
+	 * with the reference before publication (seeding is idempotent -- it
+	 * stages and renames), so a retry whose earlier reply was lost, or a
+	 * directory prepared before verification was asked for, is verified
+	 * rather than accepted on the strength of its manifest.
+	 */
+	if ((pagestore_seed_reference_slru_dir == NULL ||
+		 pagestore_seed_reference_slru_dir[0] == '\0') &&
+		pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
 												   incarnation, parent_incarnation,
 													   base, target,
 												   oldest_xid, next_xid,

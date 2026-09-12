@@ -1328,15 +1328,13 @@ class BranchPreparer:
         if seeded < 0:
             raise BranchPrepareError("branch prepare returned a negative page count")
         if self.verify_seed_against_materializer and self.seed_reference_report is None:
-            # The server's idempotent fast path reused a prepared directory
-            # whose manifest already matched (a previous prepare whose reply
-            # was lost) without seeding or comparing a page.  Verification
-            # was asked for and did not happen; say so rather than report a
+            # Under verification the server reseeds even a directory whose
+            # manifest already matches, so a missing report means the
+            # comparison did not run at all; say so rather than report a
             # verified preparation.
             raise BranchPrepareError(
-                "branch prepare reused an already prepared directory without comparing "
-                "its SLRUs against the materializer; remove the prepared directory to "
-                "re-seed under verification"
+                "branch prepare returned no SLRU comparison report although verification "
+                "against the materializer was requested"
             )
         return seeded
 
@@ -1493,6 +1491,23 @@ class BranchPreparer:
                 archived_through_lsn=self.journal["switch_lsn"],
             )
             state = "branch_prepared"
+        if state in ("branch_prepared", "prepared") and self.verify_seed_against_materializer:
+            # Prepared before verification was requested (or by a run whose
+            # verification we cannot see): the materializer is still paused
+            # at the fork LSN in these states, so re-seed under verification
+            # now -- the server reconstructs and compares every page again
+            # instead of reusing the manifest -- before carrying on.
+            seeded = self.prepare_branch(
+                self.journal["base_lsn"],
+                self.journal["checkpoint_redo_lsn"],
+                self.journal["fork_lsn"],
+            )
+            self.journal_update(state, None, seeded_slru_pages=seeded)
+        if state in ("materializer_resumed", "writer_restored") and self.verify_seed_against_materializer:
+            raise BranchPrepareError(
+                f"branch journal state {state!r} has resumed the materializer past the fork "
+                "LSN; the seeded SLRUs cannot be verified against it now"
+            )
         if state == "branch_prepared":
             if self.journal.get("intent") not in (None, "publish_prepared_receipt"):
                 raise BranchPrepareError("branch journal has a contradictory prepared intent")
@@ -1524,6 +1539,13 @@ class BranchPreparer:
         existing = self.read_journal()
         if existing is not None:
             if existing.get("state") == "complete":
+                if self.verify_seed_against_materializer:
+                    # nothing left to verify against: the materializer was
+                    # resumed past the fork LSN when this journal completed
+                    raise BranchPrepareError(
+                        "the prepared branch is already complete and its materializer "
+                        "resumed; its SLRUs cannot be verified against the materializer now"
+                    )
                 return existing
             self.journal = existing
             self.restore_ownership_from_journal()

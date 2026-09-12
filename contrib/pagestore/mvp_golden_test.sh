@@ -332,13 +332,28 @@ echo "ok   - SLRU capture fails closed before recovery is paused"
 # seed-versus-recovery comparison covers pg_xact, pg_commit_ts (the writer
 # tracks commit timestamps) and both pg_multixact halves: two sessions holding
 # key-share locks on the same row at once create a multixact with two members.
-"${WP[@]}" -c "BEGIN; SELECT id FROM mvp_golden WHERE id = 1 FOR KEY SHARE; SELECT pg_sleep(3); COMMIT;" \
+"${WP[@]}" -c "BEGIN; SELECT id FROM mvp_golden WHERE id = 1 FOR KEY SHARE; SELECT pg_sleep(30); COMMIT;" \
 	>/dev/null 2>&1 &
 golden_locker=$!
-sleep 1
+# wait until the first session observably holds its lock and is sleeping,
+# rather than trusting elapsed time on a loaded host
+for _ in $(seq 1 100); do
+	if [ "$("${WP[@]}" -c "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE '%pg_sleep(30)%' AND wait_event = 'PgSleep';")" = "1" ]; then
+		break
+	fi
+	sleep 0.1
+done
+assert_eq "$("${WP[@]}" -c "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'transactionid' AND a.query LIKE '%pg_sleep(30)%';")" "1" \
+	"the first key-share holder is in its transaction"
 "${WP[@]}" -c "SELECT id FROM mvp_golden WHERE id = 1 FOR KEY SHARE;" >/dev/null ||
 	fail "could not take the second key-share lock"
-wait "$golden_locker" || fail "the first key-share holder did not commit"
+"${WP[@]}" -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(30)%' AND wait_event = 'PgSleep';" >/dev/null
+wait "$golden_locker" 2>/dev/null
+# the multixact exists once both lockers overlapped; cancelling the sleep
+# aborted the first transaction, which is fine -- the multixact was created
+# when the second locker joined, and it is what the SLRUs carry
+assert_eq "$("${WP[@]}" -c "SELECT count(*) FROM pg_get_multixact_members((SELECT xmax FROM mvp_golden WHERE id = 1));" 2>/dev/null)" "2" \
+	"the overlapping lockers created a two-member multixact on the row"
 assert_eq "$("${WP[@]}" -c "SELECT (SELECT count(*) FROM mvp_golden) = 1 AND pg_xact_commit_timestamp((SELECT xmin FROM mvp_golden WHERE id = 1)) IS NOT NULL;")" "t" \
 	"multixact and commit-timestamp workload committed before the fork"
 
