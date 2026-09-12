@@ -431,8 +431,15 @@ class OwnerLock:
 
 
 class BranchPreparer:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, verify_seed_against_materializer: bool = False) -> None:
         self.config = config
+        # Compare every SLRU page the seeders reconstruct with the same page in
+        # the materializer's PGDATA, which is paused at the fork LSN right
+        # after a restartpoint flushed its SLRUs: PostgreSQL recovery's own
+        # result for the same interval, and so an oracle independent of the
+        # seeders' replay.  A mismatch fails the preparation.
+        self.verify_seed_against_materializer = verify_seed_against_materializer
+        self.seed_reference_report: str | None = None
         self.pause_owned = False
         self.writer_owned = False
         self.restricted_writer_running = False
@@ -666,6 +673,16 @@ class BranchPreparer:
         if errors:
             raise BranchPrepareError("; ".join(errors))
 
+    def command_with_notices(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run psql and keep the seed-comparison NOTICE, the one server
+        message the receipt's reader may want to see."""
+        result = self.command(command)
+        for line in (result.stderr or "").splitlines():
+            if "seeded SLRU pages compared with recovery's" in line:
+                self.seed_reference_report = line.split("NOTICE:", 1)[-1].strip()
+                print(self.seed_reference_report, file=sys.stderr)
+        return result
+
     def command(self, command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
             result = subprocess.run(
@@ -693,7 +710,7 @@ class BranchPreparer:
         )
 
     def psql(self, host: str, port: int, sql: str) -> str:
-        result = self.command(
+        result = self.command_with_notices(
             [
                 str(self.config.psql),
                 "-X",
@@ -1271,9 +1288,17 @@ class BranchPreparer:
         )
 
     def prepare_branch(self, base: str, redo: str, fork: str) -> int:
+        reference = ""
+        if self.verify_seed_against_materializer:
+            reference = (
+                "SET pagestore.seed_reference_slru_dir = "
+                + sql_literal(str(self.config.materializer_data_dir))
+                + "; "
+            )
         output = last_output_line(
             self.writer_sql(
-                "SET pagestore.redo_wal_from_store = on; "
+                reference
+                + "SET pagestore.redo_wal_from_store = on; "
                 "SELECT "
                 + self.extension_function(
                     self.writer_extension_schema,
@@ -1613,6 +1638,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument(
+        "--verify-seed-against-materializer", action="store_true",
+        help="compare every seeded SLRU page with the materializer's, which recovery "
+             "produced for the same interval; a mismatch fails the preparation",
+    )
     return parser.parse_args(argv)
 
 
@@ -1631,7 +1661,9 @@ def main(argv: list[str] | None = None) -> int:
                             config.materializer_lock_file,
                             "materializer supervisor or branch prepare",
                         ):
-                            preparer = BranchPreparer(config)
+                            preparer = BranchPreparer(
+                                config, args.verify_seed_against_materializer
+                            )
 
                             def cancel(signum: int, _frame: object) -> None:
                                 raise CancelledError(f"received signal {signum}")

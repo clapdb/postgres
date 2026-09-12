@@ -934,6 +934,31 @@ all_seeded=$($P -c "SELECT pagestore_seed_branch_slrus('$ALLSEED', '$ctsC', '$ct
 assert "$([ -f "$ALLSEED/pg_commit_ts/$(printf '%04X' $(( (ctsXA / cts_per_page) / 32 )))" ] && echo present || echo absent)" "present" \
 	"commit-ts toggle: the all-SLRU seeder treats an active pre-checkpoint fork as seedable"
 rm -rf "$ALLSEED"
+# The seed pages are PostgreSQL payloads whose identity the timeline's control
+# image binds (D5 rule 1): the public entrypoint resolves the image at the
+# base cutoff and fails closed when there is none to bind, whatever horizons
+# the caller supplies.
+NOCTL=$(mktemp -d)
+assert "$($P -c "SELECT pagestore_seed_branch_slrus('$NOCTL', '0/1', '$ctsLpre', '3'::xid, '$all_next'::text::xid, '0'::xid, '0'::xid, '$allOldMx'::xid, '$allNextMx'::xid, $allNextMOff, $allNextMOff);" 2>&1 | grep -c 'no mirrored control image at or below the base cutoff')" "1" \
+	"the public SLRU seeder refuses a base cutoff with no control image to bind the seed pages to"
+rm -rf "$NOCTL"
+# With pagestore.seed_reference_slru_dir set, every reconstructed page is
+# compared with the same page under that data directory before it is written
+# -- the branch controller points it at the paused materializer.  A reference
+# that disagrees is an ERROR naming the SLRU, the page and the byte; one that
+# lacks the segment is an ERROR too.
+FAKEREF=$(mktemp -d)
+mkdir -p "$FAKEREF/pg_xact"
+head -c 8192 /dev/zero | tr '\0' '\377' > "$FAKEREF/pg_xact/0000"
+REFSEED=$(mktemp -d)
+assert "$($P -c "SET pagestore.seed_reference_slru_dir = '$FAKEREF'; SELECT pagestore_seed_branch_slrus('$REFSEED', '$ctsC', '$ctsLpre', '3'::xid, '$all_next'::text::xid, '0'::xid, '0'::xid, '$allOldMx'::xid, '$allNextMx'::xid, $allNextMOff, $allNextMOff);" 2>&1 | grep -c 'seeded clog page 0 differs from the reference')" "1" \
+	"a seed reference that disagrees with the reconstructed clog page fails the seeding"
+assert "$([ -d "$REFSEED/pg_xact" ] && echo published || echo none)" "none" \
+	"a failed seed comparison publishes nothing"
+rm -rf "$FAKEREF/pg_xact"
+assert "$($P -c "SET pagestore.seed_reference_slru_dir = '$FAKEREF'; SELECT pagestore_seed_branch_slrus('$REFSEED', '$ctsC', '$ctsLpre', '3'::xid, '$all_next'::text::xid, '0'::xid, '0'::xid, '$allOldMx'::xid, '$allNextMx'::xid, $allNextMOff, $allNextMOff);" 2>&1 | grep -c 'has no reference segment')" "1" \
+	"a seed reference without the segment fails the seeding"
+rm -rf "$FAKEREF" "$REFSEED"
 PRESEED=$(mktemp -d)
 tog_next=$(( ctsE2 + 1 ))
 pre_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$PRESEED', '$ctsC', '$ctsLpre', '0'::xid, '$tog_next'::text::xid);")
