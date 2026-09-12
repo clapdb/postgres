@@ -3304,7 +3304,17 @@ def _check_forkmeta_acked_records(store: Path, selected: dict[str, Any] | None,
     the workload's ledger must be recorded exactly once in what recovery
     composes."""
     acked: dict[tuple[int, str], bool] = {}
-    for line in ack_file.read_text(encoding="utf-8").splitlines():
+    text = ack_file.read_text(encoding="utf-8")
+    # the seed is killed once the daemon has crashed, possibly mid-entry: an
+    # unterminated final line is a torn entry, not a record, and the step it
+    # would have named stays pending (it can never be the eight required
+    # ones, which are complete before maintenance may run)
+    lines = text.split("\n")
+    if lines and lines[-1] != "":
+        lines = lines[:-1]
+    for line in lines:
+        if line == "":
+            continue
         fields = line.split()
         if len(fields) != 3:
             raise OracleMismatch(f"malformed ledger entry {line!r}")

@@ -641,11 +641,27 @@ forkmeta_check_acks(void)
 		die("the acknowledged-append ledger is missing");
 	memset(create, TRICKLE_UNSENT, sizeof(create));
 	memset(grow, TRICKLE_UNSENT, sizeof(grow));
-	while (fscanf(in, "%u %15s %15s", &rel, op, state) == 3)
+	for (;;)
 	{
+		char		line[64];
 		unsigned char *slot;
 		unsigned char value;
+		size_t		len;
 
+		if (fgets(line, sizeof(line), in) == NULL)
+			break;
+		len = strlen(line);
+		/* the seed is killed once the daemon has crashed, possibly
+		 * mid-entry: an unterminated final line is a torn entry, not a
+		 * record, and the step it would have named stays as it was */
+		if (len == 0 || line[len - 1] != '\n')
+		{
+			if (fgetc(in) != EOF)
+				die("the acknowledged-append ledger has an overlong entry");
+			break;
+		}
+		if (sscanf(line, "%u %15s %15s", &rel, op, state) != 3)
+			die("the acknowledged-append ledger has a malformed entry");
 		if (rel < FORKMETA_TRICKLE_REL || rel >= FORKMETA_TRICKLE_REL + FORKMETA_TRICKLE_RELS)
 			die("the acknowledged-append ledger names a relation outside the trickle");
 		if (strcmp(op, "create") == 0)
