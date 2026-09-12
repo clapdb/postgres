@@ -58,8 +58,12 @@ remove_tree(const char *path)
 {
 	char command[512];
 
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0)
-		(void) system(command);
+	/* best effort: a store left behind in /tmp is a nuisance, not a failure
+	 * (and the compiler's warn_unused_result on system() is not silenced by
+	 * a void cast) */
+	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0 &&
+		system(command) != 0)
+		fprintf(stderr, "note: could not remove %s\n", path);
 }
 
 static void
