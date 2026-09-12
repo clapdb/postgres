@@ -1290,7 +1290,11 @@ class BranchPreparer:
     def prepare_branch(self, base: str, redo: str, fork: str) -> int:
         reference = ""
         if self.verify_seed_against_materializer:
+            # the comparison report is a NOTICE; a role or database that
+            # raised client_min_messages would otherwise hide a completed
+            # comparison and make it look like an unverified fast-path reuse
             reference = (
+                "SET client_min_messages = notice; "
                 "SET pagestore.seed_reference_slru_dir = "
                 + sql_literal(str(self.config.materializer_data_dir))
                 + "; "
