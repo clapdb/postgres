@@ -14,18 +14,21 @@ import subprocess
 import sys
 import tempfile
 import time
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pagestore_artifact_schema as artifact_schema
+from pagestore_artifact_schema import ArtifactError
 from pagestore_branch_fault import BranchFaultProbe
 
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
-CONFIG_SCHEMA = 2
-RECEIPT_SCHEMA = 2
+# the persisted layouts -- schema numbers, checksums, key sets -- are
+# pagestore_artifact_schema's, shared with the persisted-format fixture
+CONFIG_SCHEMA = artifact_schema.ARTIFACTS["branch_config"].schema
+RECEIPT_SCHEMA = artifact_schema.ARTIFACTS["branch_journal"].schema
 LEGACY_RECEIPT_SCHEMA = 1
 JOURNAL_OPERATION = "pagestore_branch_prepare"
 JOURNAL_STATES = {
@@ -34,61 +37,11 @@ JOURNAL_STATES = {
     "fork_captured", "branch_prepared", "prepared", "materializer_resumed",
     "writer_restored", "complete",
 }
-JOURNAL_KEYS = {
-    "schema", "operation", "identity", "state", "intent", "base_lsn",
-    "checkpoint_redo_lsn", "checkpoint_end_lsn", "switch_lsn",
-    "archived_through_lsn", "fork_lsn",
-    "seeded_slru_pages", "retention_generation", "pause_owned", "writer_owned",
-    "retention_owned", "retention_set_attempted",
-    "restricted_writer_running", "materializer_resumed", "writer_restored",
-    "prepared_dir", "crc32",
-}
+JOURNAL_KEYS = set(artifact_schema.BRANCH_JOURNAL_KEYS)
 SAFE_POSTGRES_OPTION_PATH = re.compile(r"^[A-Za-z0-9_./-]+$")
 WAL_FILE_NAME = re.compile(r"^[0-9A-F]{24}$")
-CONFIG_FIELDS = {
-    "schema",
-    "pg_ctl",
-    "psql",
-    "writer_data_dir",
-    "writer_host",
-    "writer_port",
-    "writer_log_file",
-    "private_socket_dir",
-    "private_port",
-    "materializer_data_dir",
-    "materializer_host",
-    "materializer_port",
-    "retention_authority_dir",
-    "retention_owner_id",
-    "prepared_dir",
-    "new_timeline",
-    "parent_timeline",
-    "new_incarnation",
-    "database",
-    "user",
-    "poll_interval_ms",
-    "progress_timeout_ms",
-    "command_timeout_seconds",
-}
-REQUIRED_CONFIG_FIELDS = {
-    "schema",
-    "pg_ctl",
-    "psql",
-    "writer_data_dir",
-    "writer_host",
-    "writer_port",
-    "writer_log_file",
-    "private_socket_dir",
-    "private_port",
-    "materializer_data_dir",
-    "materializer_host",
-    "materializer_port",
-    "retention_authority_dir",
-    "retention_owner_id",
-    "prepared_dir",
-    "new_timeline",
-    "parent_timeline",
-}
+CONFIG_FIELDS = set(artifact_schema.BRANCH_CONFIG_FIELDS)
+REQUIRED_CONFIG_FIELDS = set(artifact_schema.BRANCH_CONFIG_REQUIRED)
 
 
 class ConfigError(ValueError):
@@ -225,23 +178,12 @@ class Config:
 
     @classmethod
     def load(cls, path: Path) -> Config:
+        # the layout (schema, key set) is judged by the shared module; what
+        # the values name is judged here
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ConfigError(f"cannot read branch config {path}: {error}") from error
-        if not isinstance(value, dict):
-            raise ConfigError("branch config must be a JSON object")
-        unknown = sorted(set(value) - CONFIG_FIELDS)
-        missing = sorted(REQUIRED_CONFIG_FIELDS - set(value))
-        if unknown:
-            raise ConfigError(f"unknown branch config field(s): {', '.join(unknown)}")
-        if missing:
-            raise ConfigError(f"missing branch config field(s): {', '.join(missing)}")
-        if (
-            value.get("schema") != CONFIG_SCHEMA
-            or isinstance(value.get("schema"), bool)
-        ):
-            raise ConfigError(f"branch config schema must be {CONFIG_SCHEMA}")
+            value = artifact_schema.load("branch_config", path)
+        except (OSError, ArtifactError) as error:
+            raise ConfigError(f"cannot load branch config {path}: {error}") from error
 
         paths: dict[str, Path] = {}
         for field in (
@@ -470,12 +412,6 @@ class BranchPreparer:
             "retention_owner_id": self.config.retention_owner_id,
         }
 
-    @staticmethod
-    def journal_crc(value: dict[str, Any]) -> str:
-        payload = {key: item for key, item in value.items() if key != "crc32"}
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        return f"{zlib.crc32(encoded) & 0xffffffff:08x}"
-
     def new_journal(self) -> dict[str, Any]:
         return {
             "schema": RECEIPT_SCHEMA,
@@ -512,15 +448,15 @@ class BranchPreparer:
             return None
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise BranchPrepareError("branch journal is unreadable or corrupt") from error
-        if not isinstance(value, dict):
-            raise BranchPrepareError("branch journal must be a JSON object")
-        if value.get("schema") == LEGACY_RECEIPT_SCHEMA:
+        if isinstance(value, dict) and value.get("schema") == LEGACY_RECEIPT_SCHEMA:
             raise BranchPrepareError(
                 "legacy branch receipt is unsupported without a full prepared-manifest identity; "
                 "refusing recovery"
             )
-        if value.get("schema") != RECEIPT_SCHEMA or set(value) != JOURNAL_KEYS:
-            raise BranchPrepareError("branch journal schema or fields are invalid")
+        try:
+            artifact_schema.parse("branch_journal", value)
+        except ArtifactError as error:
+            raise BranchPrepareError(f"branch journal is invalid: {error}") from error
         if value.get("operation") != JOURNAL_OPERATION:
             raise BranchPrepareError("branch journal operation is invalid")
         if value.get("identity") != self.config_identity():
@@ -536,14 +472,11 @@ class BranchPreparer:
         ):
             if not isinstance(value[field], bool):
                 raise BranchPrepareError(f"branch journal {field} is invalid")
-        if value["crc32"] != self.journal_crc(value):
-            raise BranchPrepareError("branch journal CRC mismatch")
         return value
 
     def write_journal(self, journal: dict[str, Any] | None = None) -> None:
-        value = dict(journal or self.journal or self.new_journal())
-        value.pop("crc32", None)
-        value["crc32"] = self.journal_crc(value)
+        value = artifact_schema.stamp(
+            "branch_journal", journal or self.journal or self.new_journal())
         atomic_write_json(self.config.receipt_file, value)
         self.journal = value
 
@@ -761,8 +694,8 @@ class BranchPreparer:
 
     def validate_retention_authority_identity(self) -> int:
         try:
-            authority = json.loads(
-                self.config.retention_authority_file.read_text(encoding="utf-8")
+            authority = artifact_schema.load(
+                "retention_authority", self.config.retention_authority_file
             )
             authority_generation = authority["retention_generation"]
             authority_data_dir = authority["consumer_data_dir"]
@@ -780,7 +713,7 @@ class BranchPreparer:
             ):
                 raise ValueError("authority identity mismatch")
             return authority_generation
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (OSError, KeyError, TypeError, ValueError) as error:
             raise BranchPrepareError(
                 "materializer retention authority does not match the configured consumer"
             ) from error
@@ -1022,10 +955,9 @@ class BranchPreparer:
         path = self.config.branch_retention_generation_file
         generation = 0
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = artifact_schema.load("branch_retention_generation", path)
             if (
-                value.get("schema") != 1
-                or value.get("retention_owner_id")
+                value.get("retention_owner_id")
                 != self.config.retention_owner_id
                 or not isinstance(value.get("generation"), int)
                 or isinstance(value.get("generation"), bool)
@@ -1035,7 +967,7 @@ class BranchPreparer:
             generation = value["generation"]
         except FileNotFoundError:
             pass
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (OSError, TypeError, ValueError) as error:
             raise BranchPrepareError(
                 "branch retention generation authority is unreadable"
             ) from error
@@ -1044,11 +976,13 @@ class BranchPreparer:
         generation += 1
         atomic_write_json(
             path,
-            {
-                "schema": 1,
-                "retention_owner_id": self.config.retention_owner_id,
-                "generation": generation,
-            },
+            artifact_schema.stamp(
+                "branch_retention_generation",
+                {
+                    "retention_owner_id": self.config.retention_owner_id,
+                    "generation": generation,
+                },
+            ),
         )
         self.branch_retention_generation = generation
 

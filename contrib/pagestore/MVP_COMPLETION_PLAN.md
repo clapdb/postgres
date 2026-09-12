@@ -1036,8 +1036,38 @@ the current fixture) and its backend data-directory artifacts done (the
 prepared branch and reader files and the two raw-value markers have their
 identities in the same header, the markers carry an identity trailer, and
 `pgdata-artifacts` is their fixture, loaded through the backend's own
-loaders); the branch controller's and materializer supervisor's JSON
-files remain**.
+loaders) and the controller's and supervisor's JSON files done (their
+layouts live in `pagestore_artifact_schema.py`, every one carries a
+schema member and the ones a later run relies on a checksum, and
+`controller-json` is their fixture).  H2 is complete.**
+
+The controller's and supervisor's JSON.  `pagestore_branch_prepare`
+persists its configuration (schema 2), its crash journal
+`pagestore_branch.prepare.json` (schema 2 with `crc32`; schema 1, a
+receipt without the prepared-manifest identity, is refused by name) and
+its retention generation authority `branch-retention-generation-<id>.json`
+(schema 2 with `crc32`; 1 read as legacy); `pagestore_materializer_supervisor`
+its configuration (schema 4), `status.json` (schema 3 with `crc32`; 2 and a
+status without the member read as legacy) and the materializer's retention
+generation authority `retention-owner-<id>.json` (schema 1 with `crc32`;
+the original, without the member, read as legacy), which the controller
+reads too.  `pagestore_artifact_schema.py`, installed beside both tools,
+holds each kind's schema, accepted and refused schemas, checksum rule and
+key set; both tools stamp what they write and judge what they read through
+it, so an unknown schema, a missing or wrong checksum or a member the
+layout does not define fails closed before the tool interprets a value,
+and `--identities` prints the table the fixture pins.  The fixture
+`controller-json` holds what real runs left behind -- the golden scenario
+captures the controller's three files, the managed materializer smoke the
+supervisor's three -- and `harness/pagestore_controller_fixture.py --check`
+(Python only, so the standalone lane runs it) holds the identities to it,
+loads every artifact, and applies forty mutations: an unknown or null
+schema, a file that is not JSON, an unknown member, a wrong or missing
+checksum and a member edited under a stale one are refused; each legacy
+layout is accepted; the journal's schema 1 is refused.  The legacy and
+refused schemas come from the fixture's own identity table, not from the
+reader under test, so a reader that drops a legacy schema fails the
+check rather than shrinking it.
 
 Data-directory artifacts.  The files a compute leaves for another to load
 -- the prepared branch's `pagestore_branch.manifest` (JSON, format 2; 1
@@ -1491,16 +1521,12 @@ The default sequence was:
 4. R5b reclaimer backpressure controllers -- done;
 5. H0 fault/inspection primitives -- done;
 6. H1 composed crash scenarios -- done;
-7. H2 format fixtures and compatibility CI -- daemon-side and backend data-directory artifacts done; the controller's and supervisor's JSON files remain;
+7. H2 format fixtures and compatibility CI -- done;
 8. R6 bounded-space acceptance and final MVP status update -- soak and nightly lane done; the
    final status update follows the first scheduled nightly runs.
 
-What remains, in order: the last H2 slice under the D5 decision -- the
-branch controller's configuration, journal, and authority files and the
-materializer supervisor's configuration, status, and generation-authority
-file, JSON the Python tools write and read with their own schema numbers
-and CRCs -- then the R4b concurrent-append oracle, then the final MVP
-status update once the nightly lane has a run history.
+What remains, in order: the R4b concurrent-append oracle, then the final
+MVP status update once the nightly lane has a run history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
@@ -1542,6 +1568,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-12 | Registered the POSIX and SPDK container identities and made the SPDK superblock fail closed and durable: `pagestore_spdk_super.c` (no SPDK dependency) decodes the checksummed v2 and both legacy struct images, refuses truncated, overlong, foreign, newer, corrupt, differently sized or differently sharded superblocks instead of zeroing the segment counts, publishes v2 through NVMe flush, temp/fsync/rename/dir-fsync with failures returned to `spdk_sync()`; `posix_container` and `spdk_container` join `pagestore_format_versions` and the current fixture's identity table | `pagestore_spdk_super_test` (69 checks) in meson and the standalone lane; the fixture check passes against both fixtures; the SPDK daemon links with the module |
 | 2026-09-12 | Bound the PostgreSQL payload identity on the paths that hand bytes to PostgreSQL: shipped-WAL envelope version 2 records `xlp_magic`, `xlp_info` and the WAL segment size from the payload's page header (read in host byte order, as PostgreSQL wrote it) in the bytes version 1 reserved, the store re-derives them from the first chunk once per open before serving any range, `pagestore_walrestore` (now built with the PostgreSQL headers) refuses a WAL page magic or segment size the payload was not written for, and a read the store refuses, with an exit status recovery treats as fatal, `pagestore_control_restore --payload-identity` prints the build's tuple and the control install refuses an image whose WAL segment size differs from the target cluster's; `posix-wal-payload-identity` is the current fixture, its predecessor legacy | `pagestore_wal_segment_test` (25 checks), fixture check across three fixtures with the new use-rejected mutation, meson fixture check against the build's identity, integration test with accept/refuse assertions for the restore command, golden scenario and managed materializer smoke with bound restore commands |
 | 2026-09-12 | Bound the SLRU seed pages' PostgreSQL identity on every seeding path (`pagestore_seed_branch_slrus_impl` resolves the control image at the base cutoff, refuses a cutoff with none, and checks its compatibility tuple; the controller's horizon derivation checks it too) and proved the seeders' replay against recovery: `pagestore.seed_reference_slru_dir` compares every reconstructed page with the paused materializer's before writing it, the branch controller sets it with `--verify-seed-against-materializer`, and the golden scenario requires pages of all four SLRUs to have been compared equal | Golden scenario (4 reconstructed pages equal), integration test (fail-closed base cutoff, forged-reference mismatch and missing-segment refusals, nothing published), branch boot test |
+| 2026-09-12 | Gave the controller's and supervisor's JSON artifacts their identities and fixture: `pagestore_artifact_schema.py` holds each kind's schema, accepted/refused schemas, checksum rule and key set, both tools stamp and judge through it (the retention authorities and the supervisor status gain a schema member and `crc32`, their previous layouts read as legacy), and `fixtures/controller-json`, captured from the golden scenario and the managed materializer smoke, is checked by `harness/pagestore_controller_fixture.py` in the standalone lane | controller fixture check (6 artifacts load, 40 mutations refused or accepted as declared), both tools' unit suites, golden scenario and managed materializer smoke with the capture hooks |
 | 2026-09-12 | Gave the backend's data-directory artifacts their identities and fixture: `pagestore_artifact_format.h` names and lays out the prepared branch's manifest and bootstrap, the prepared reader's manifest, snapshot and catalog provenance, the reader-map intent marker and the SLRU mirror's primed marker (both now value at 0 with an identity trailer at 8, legacy read, foreign fails closed), the backend's structs are pinned to them, `pagestore_format_versions` reports the `pgdata` family, `pagestore_pgdata_artifact_check()` loads an artifact through its production loader, `integration_test.sh` captures a real backend's artifacts, and `fixtures/pgdata-artifacts` is checked by `harness/pagestore_pgdata_fixture.py` -- identities in the standalone lane, loaders and twenty-one mutations in a scratch cluster in the integration lane | pgdata fixture check (8 artifacts load, 21 mutations rejected or accepted as declared), store fixture check across four fixtures, standalone suite, integration test (with the capture hook), golden scenario, branch boot test |
 | 2026-09-12 | Gave the backend's store-object payloads their identities: `pagestore_artifact_format.h` (freestanding) holds the layouts of the redo note, SLRU watermark and tombstone (value at 0, identity trailer at 8, zero for legacy), the materializer marker and release and writer checkpoint blocks, and the five reader snapshot objects, plus PostgreSQL's CRC-32C; the backend stamps and checks the trailers, the daemon's WAL floor fails closed on a note it cannot read, `pagestore_format_versions` reports all twelve identities, the fixture workload seeds one of each and verifies them on reopen, `posix-backend-objects` is the current fixture and `posix-wal-payload-identity` legacy | `pagestore_control_prune_test` (legacy note counts, foreign trailer makes the floor unknown), fixture check across four fixtures, standalone suite, integration test, golden scenario, materializer smoke; `--payload-identity` proves the header's CRC-32C against `pg_crc32c` |
 | 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
