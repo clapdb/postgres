@@ -3260,14 +3260,16 @@ FORKMETA_EVENT_SET = 1
 FORKMETA_TRICKLE_REL = 7000
 FORKMETA_TRICKLE_CREATE_LSN = 6000
 FORKMETA_TRICKLE_GROW_LSN = 7000
+FORKMETA_TRICKLE_NBLOCKS = 2
 
 
 def _forkmeta_event_records(store: Path, selected: dict[str, Any] | None,
-                            rel: int, kind: int, lsn: int) -> int:
+                            rel: int, kind: int, lsn: int, nblocks: int) -> int:
     """How many records of one fork event (relation, kind, LSN) the durable
     set recovery composes carries: the selected generation's checkpoint and
     tail parts and the source records after that generation's base marker,
-    or the whole source when no generation is selected."""
+    or the whole source when no generation is selected.  A record of the
+    event with another size is the event rewritten, not a copy of it."""
     count = 0
 
     def scan(data: bytes, offset: int) -> None:
@@ -3278,7 +3280,13 @@ def _forkmeta_event_records(store: Path, selected: dict[str, Any] | None,
                 raise OracleMismatch("forkmeta record stream is malformed")
             rel_number = struct.unpack_from("=I", data, offset + 20)[0]
             record_lsn = struct.unpack_from("=Q", data, offset + 32)[0]
+            record_nblocks = struct.unpack_from("=I", data, offset + 56)[0]
             if data[offset + 60] == kind and rel_number == rel and record_lsn == lsn:
+                if record_nblocks != nblocks:
+                    raise OracleMismatch(
+                        f"a record of relation {rel}'s event at {lsn} carries {record_nblocks} "
+                        f"blocks, acknowledged {nblocks}"
+                    )
                 count += 1
             offset += rec_len
 
@@ -3325,9 +3333,10 @@ def _check_forkmeta_acked_records(store: Path, selected: dict[str, Any] | None,
         raise OracleMismatch(f"after_{stage} the acknowledged-append ledger is empty")
     for (rel, op) in sorted(acked):
         j = rel - FORKMETA_TRICKLE_REL
-        kind, lsn = ((FORKMETA_EVENT_SET, FORKMETA_TRICKLE_CREATE_LSN + j) if op == "create"
-                     else (FORKMETA_EVENT_GROW, FORKMETA_TRICKLE_GROW_LSN + j))
-        records = _forkmeta_event_records(store, selected, rel, kind, lsn)
+        kind, lsn, nblocks = (
+            (FORKMETA_EVENT_SET, FORKMETA_TRICKLE_CREATE_LSN + j, 0) if op == "create"
+            else (FORKMETA_EVENT_GROW, FORKMETA_TRICKLE_GROW_LSN + j, FORKMETA_TRICKLE_NBLOCKS))
+        records = _forkmeta_event_records(store, selected, rel, kind, lsn, nblocks)
         if records != 1:
             raise OracleMismatch(
                 f"after_{stage} recovery carries {records} record(s) of the acknowledged "
