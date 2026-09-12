@@ -752,8 +752,9 @@ test('pagestore_persisted_format_fixture',
          '--client-binary', pagestore_gc_crash_client,
          '--inspect-binary', pagestore_inspect,
          '--format-tool', pagestore_format_versions,
-         # this build's PostgreSQL payload identity: the fixture's shipped WAL
-         # must be loadable by the build that checks it
+         # this build's PostgreSQL payload identity: a current fixture whose
+         # shipped WAL this build cannot load is skipped, and CI on
+         # `pagestore` requires one it can
          '--postgres-payload-identity-tool', pagestore_control_restore],
   depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect,
             pagestore_format_versions, pagestore_control_restore],

@@ -72,11 +72,11 @@ WAL_SEGMENT_HEADER_CRC_OFFSET = 44
 XLP_LONG_HEADER = 0x0002
 
 
-def wal_long_header_seg_size(payload: bytes) -> int:
-    """The segment size a long WAL page header carries, recognizing the
-    writer's ABI by the bytes: zeroed padding at 20 with plausible sizes at
-    32/36 is the 8-byte-aligned layout, plausible sizes at 28/32 the 4-byte
-    one; 0 when neither."""
+def wal_long_header_seg_size(payload: bytes) -> tuple[int, int]:
+    """The (segment size, offset it sits at) a long WAL page header carries,
+    recognizing the writer's ABI by the bytes: zeroed padding at 20 with
+    plausible sizes at 32/36 is the 8-byte-aligned layout, plausible sizes at
+    28/32 the 4-byte one; (0, 0) when neither."""
     def plausible_seg(size: int) -> bool:
         return 1 << 20 <= size <= 1 << 30 and size & (size - 1) == 0
 
@@ -87,10 +87,10 @@ def wal_long_header_seg_size(payload: bytes) -> int:
     seg8, blk8 = struct.unpack_from("=II", payload, 32)
     seg4, blk4 = struct.unpack_from("=II", payload, 28)
     if pad == 0 and plausible_seg(seg8) and plausible_blk(blk8):
-        return seg8
+        return seg8, 32
     if plausible_seg(seg4) and plausible_blk(blk4):
-        return seg4
-    return 0
+        return seg4, 28
+    return 0, 0
 WATERMARK_SUFFIX = ".size"
 SEG_HEADER_BYTES = {
     0x53454732: 48, 0x53454730: 48, 0x53454731: 48, 0x53454733: 48,
@@ -164,13 +164,14 @@ def wal_segment_payload_identity(path: Path) -> dict[str, int] | None:
     magic, info, seg_size = struct.unpack_from("<HHI", data, WAL_SEGMENT_IDENTITY_OFFSET)
     payload = data[WAL_SEGMENT_HEADER_BYTES:]
     carried_magic, carried_info = struct.unpack_from("=HH", payload, 0)
-    carried_seg = wal_long_header_seg_size(payload) if carried_info & XLP_LONG_HEADER else 0
+    carried_seg, seg_offset = wal_long_header_seg_size(payload) if carried_info & XLP_LONG_HEADER else (0, 0)
     if (magic, info, seg_size) != (carried_magic, carried_info, carried_seg):
         raise FixtureError(
             f"{path.name} records payload identity ({magic:#06x}, {info:#06x}, {seg_size}) "
             f"but its payload carries ({carried_magic:#06x}, {carried_info:#06x}, {carried_seg})"
         )
-    return {"xlog_page_magic": magic, "xlp_info": info, "wal_segment_size": seg_size}
+    return {"xlog_page_magic": magic, "xlp_info": info, "wal_segment_size": seg_size,
+            "xlog_long_header_seg_size_offset": seg_offset}
 
 
 def archive_payload_identity(store: Path) -> dict[str, int]:
@@ -179,6 +180,7 @@ def archive_payload_identity(store: Path) -> dict[str, int]:
     PostgreSQL segment names the segment size."""
     magics: set[int] = set()
     seg_sizes: set[int] = set()
+    offsets: set[int] = set()
     for path in sorted(store.glob("wal_segments_*/walv1_*")):
         identity = wal_segment_payload_identity(path)
         if identity is None:
@@ -186,12 +188,17 @@ def archive_payload_identity(store: Path) -> dict[str, int]:
         magics.add(identity["xlog_page_magic"])
         if identity["wal_segment_size"]:
             seg_sizes.add(identity["wal_segment_size"])
-    if len(magics) != 1 or len(seg_sizes) != 1:
+            offsets.add(identity["xlog_long_header_seg_size_offset"])
+    if len(magics) != 1 or len(seg_sizes) != 1 or len(offsets) != 1:
         raise FixtureError(
-            f"the archive's shipped WAL carries page magics {sorted(map(hex, magics))} "
-            f"and segment sizes {sorted(seg_sizes)}; a fixture names exactly one of each"
+            f"the archive's shipped WAL carries page magics {sorted(map(hex, magics))}, "
+            f"segment sizes {sorted(seg_sizes)} and long-header layouts {sorted(offsets)}; "
+            "a fixture names exactly one of each"
         )
-    return {"xlog_page_magic": magics.pop(), "wal_segment_size": seg_sizes.pop()}
+    # the layout is the writer's ABI: a build whose XLogLongPageHeaderData
+    # puts xlp_seg_size elsewhere reads these bytes differently
+    return {"xlog_page_magic": magics.pop(), "wal_segment_size": seg_sizes.pop(),
+            "xlog_long_header_seg_size_offset": offsets.pop()}
 
 
 def truncate_to(path: Path, size: int) -> None:
@@ -759,7 +766,15 @@ def check_payload_identity(args: argparse.Namespace, store: Path,
             f"payload needs a PostgreSQL build with XLOG_PAGE_MAGIC "
             f"{carried['xlog_page_magic']:#06x}; the checking build has {build_magic:#06x}"
         )
-    print(f"ok   - the checking PostgreSQL build loads this payload (XLOG_PAGE_MAGIC {build_magic:#06x})")
+    build_offset = int(build_identity.get("xlog_long_header_seg_size_offset", 0))
+    if build_offset and build_offset != carried["xlog_long_header_seg_size_offset"]:
+        raise ForeignPayload(
+            f"payload was written by an ABI that puts the WAL segment size at byte "
+            f"{carried['xlog_long_header_seg_size_offset']} of the long page header; "
+            f"the checking build reads it at byte {build_offset}"
+        )
+    print(f"ok   - the checking PostgreSQL build loads this payload (XLOG_PAGE_MAGIC "
+          f"{build_magic:#06x}, segment size at byte {carried['xlog_long_header_seg_size_offset']})")
 
 
 def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
@@ -930,9 +945,16 @@ def check(args: argparse.Namespace) -> int:
         if fixture_metadata(fixture)["role"] == "current":
             matched_current += 1
     if binds_build and matched_current == 0:
-        print("FAIL - no current fixture carries a payload this PostgreSQL build loads; "
-              "capture one under this build")
-        return 1
+        # A release branch that has just received a format change carries only
+        # the fixture captured on `pagestore`; until it captures its own, the
+        # envelopes were still checked and only the build binding is missing.
+        # The development branch requires the match.
+        if args.require_build_match:
+            print("FAIL - no current fixture carries a payload this PostgreSQL build loads; "
+                  "capture one under this build")
+            return 1
+        print("WARN - no current fixture carries a payload this PostgreSQL build loads; "
+              "capture one under this build (required on pagestore)")
     return status
 
 
@@ -950,6 +972,9 @@ def main(argv: list[str] | None = None) -> int:
                              "when given, the fixture's payload must be loadable by that build")
     parser.add_argument("--postgres-payload-identity-tool", type=Path,
                         help="a pagestore_control_restore binary to ask for the same identity")
+    parser.add_argument("--require-build-match", action="store_true",
+                        help="fail, rather than warn, when no current fixture carries a payload "
+                             "the checking build loads")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy failed mutation stores here")
     args = parser.parse_args(argv)

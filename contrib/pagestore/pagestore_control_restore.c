@@ -311,20 +311,24 @@ main(int argc, char **argv)
 	 * --payload-identity prints the PostgreSQL identity this build gives the
 	 * payloads the store wraps: the version constants and the layout
 	 * parameters a control image must match here, plus the WAL page magic
-	 * pagestore_walrestore --xlog-magic checks, so a controller can bind
-	 * envelopes to the recovering build without a running server.
+	 * pagestore_walrestore checks and the WAL long-header layout its ABI
+	 * gives (where xlp_seg_size sits), so the fixture check can tell whether
+	 * a captured payload is one this build loads without a running server.
 	 */
 	if (argc == 2 && strcmp(argv[1], "--payload-identity") == 0)
 	{
 		printf("{\"pg_control_version\": %u, \"catalog_version_no\": %u, "
-			   "\"xlog_page_magic\": %u, \"page_layout_version\": %u, "
+			   "\"xlog_page_magic\": %u, \"xlog_long_header_seg_size_offset\": %u, "
+			   "\"xlog_long_header_bytes\": %u, \"page_layout_version\": %u, "
 			   "\"blcksz\": %u, \"relseg_size\": %u, \"xlog_blcksz\": %u, "
 			   "\"slru_pages_per_segment\": %u, \"namedatalen\": %u, "
 			   "\"index_max_keys\": %u, \"toast_max_chunk_size\": %u, "
 			   "\"loblksize\": %u, \"maxalign\": %u, \"float_format\": %.1f, "
 			   "\"float8_by_val\": %s}\n",
 			   (unsigned) PG_CONTROL_VERSION, (unsigned) CATALOG_VERSION_NO,
-			   (unsigned) XLOG_PAGE_MAGIC, (unsigned) PG_PAGE_LAYOUT_VERSION,
+			   (unsigned) XLOG_PAGE_MAGIC,
+			   (unsigned) offsetof(XLogLongPageHeaderData, xlp_seg_size),
+			   (unsigned) SizeOfXLogLongPHD, (unsigned) PG_PAGE_LAYOUT_VERSION,
 			   (unsigned) BLCKSZ, (unsigned) RELSEG_SIZE, (unsigned) XLOG_BLCKSZ,
 			   (unsigned) SLRU_PAGES_PER_SEGMENT, (unsigned) NAMEDATALEN,
 			   (unsigned) INDEX_MAX_KEYS, (unsigned) TOAST_MAX_CHUNK_SIZE,

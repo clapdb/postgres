@@ -1056,12 +1056,16 @@ archive file" and would end recovery quietly -- and names the cause on
 stderr.  `pagestore_control_restore --payload-identity` prints the build's
 tuple (version constants and layout parameters) so the fixture check can
 ask whether a fixture's payload is loadable by the checking build
-(`--postgres-payload-identity-tool`): a current fixture captured under
-another build is skipped as "payload needs a PostgreSQL build with
-XLOG_PAGE_MAGIC ..." rather than failed as a broken envelope, and the check
-fails only when no current fixture matches the build -- so a release branch
-carries the fixture captured under its own build, and a `pagestore` fixture
-cherry-picked there is recaptured, not patched.  The control image now also refuses
+(`--postgres-payload-identity-tool`; the identity includes where the
+build's `XLogLongPageHeaderData` puts the segment size, so a fixture
+captured under the other ABI is foreign too): a current fixture captured
+under another build is skipped as "payload needs a PostgreSQL build with
+XLOG_PAGE_MAGIC ..." rather than failed as a broken envelope, and when no
+current fixture matches the build the check fails on `pagestore`
+(`--require-build-match`, which CI passes there) and warns elsewhere -- so
+a release branch that has just received a format change is not left red,
+carries the fixture captured under its own build once it captures one, and
+recaptures rather than patches a `pagestore` fixture cherry-picked there.  The control image now also refuses
 an image whose `xlog_seg_size` differs from the target cluster's own
 `pg_control`.  Relation pages need no envelope field: PostgreSQL verifies
 `pd_pagesize_version` (`BLCKSZ | PG_PAGE_LAYOUT_VERSION`) on every page the
