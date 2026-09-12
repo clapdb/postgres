@@ -19,7 +19,10 @@
  * them with the running build and cluster, and the fixture check reads them
  * from the envelope without parsing WAL.  A version 1 envelope carries zeros
  * there and records no payload identity.  Bytes 56..63 were reserved in
- * version 1, so the layout and every offset are unchanged.
+ * version 1, so the layout and every offset are unchanged.  The page header
+ * fields are read in the byte order PostgreSQL wrote them -- the host's,
+ * since WAL is not moved between byte orders -- while the envelope itself
+ * is little-endian on every host.
  */
 #define PS_WAL_SEGMENT_MAGIC 0x57534731u /* "WSG1" */
 #define PS_WAL_SEGMENT_VERSION 2u

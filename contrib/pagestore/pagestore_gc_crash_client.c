@@ -1143,23 +1143,20 @@ fixture_seed(void)
 		if (lsn % RECLAIM_SEGMENT == 0)
 		{
 			unsigned char *page = ch->data;
+			uint16_t	magic = FIXTURE_XLP_MAGIC;
 			uint16_t	info = lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0;
 
+			/* in host byte order, as PostgreSQL writes its page headers */
 			memset(page, 0, 40);
-			page[0] = (unsigned char) FIXTURE_XLP_MAGIC;
-			page[1] = (unsigned char) (FIXTURE_XLP_MAGIC >> 8);
-			page[2] = (unsigned char) info;
-			page[3] = (unsigned char) (info >> 8);
+			memcpy(page, &magic, sizeof(magic));
+			memcpy(page + 2, &info, sizeof(info));
 			if (info != 0)
 			{
 				uint32_t	seg = FIXTURE_XLP_SEG_SIZE;
 				uint32_t	blcksz = FIXTURE_XLP_BLCKSZ;
 
-				for (int b = 0; b < 4; b++)
-				{
-					page[32 + b] = (unsigned char) (seg >> (8 * b));
-					page[36 + b] = (unsigned char) (blcksz >> (8 * b));
-				}
+				memcpy(page + 32, &seg, sizeof(seg));
+				memcpy(page + 36, &blcksz, sizeof(blcksz));
 			}
 		}
 		if (execute()->status != PS_STATUS_OK)
@@ -1257,25 +1254,26 @@ fixture_wal_check(uint64_t lsn)
 	 * that is filler throughout.  Either way the bytes are what the seed
 	 * wrote, and a header, once present, must keep its magic, flags, and
 	 * the long header's segment size at LSN 0. */
-	if (ch->data[0] == (unsigned char) FIXTURE_XLP_MAGIC &&
-		ch->data[1] == (unsigned char) (FIXTURE_XLP_MAGIC >> 8))
 	{
-		if (ch->data[2] != (lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0) ||
-			ch->data[3] != 0)
-			die("fixture shipped WAL lost its page header flags");
-		if (lsn % FIXTURE_XLP_SEG_SIZE == 0)
-		{
-			uint32_t	seg = 0;
+		uint16_t	magic;
+		uint16_t	info;
+		uint32_t	seg;
 
-			for (int b = 3; b >= 0; b--)
-				seg = seg << 8 | ch->data[32 + b];
-			if (seg != FIXTURE_XLP_SEG_SIZE)
+		/* in host byte order, as the seed stamped them */
+		memcpy(&magic, ch->data, sizeof(magic));
+		memcpy(&info, ch->data + 2, sizeof(info));
+		memcpy(&seg, ch->data + 32, sizeof(seg));
+		if (magic == FIXTURE_XLP_MAGIC)
+		{
+			if (info != (lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0))
+				die("fixture shipped WAL lost its page header flags");
+			if (lsn % FIXTURE_XLP_SEG_SIZE == 0 && seg != FIXTURE_XLP_SEG_SIZE)
 				die("fixture shipped WAL lost its segment size");
+			for (uint32_t i = 40; i < 64; i++)
+				if (ch->data[i] != expected)
+					die("fixture shipped WAL returned the wrong bytes");
+			return;
 		}
-		for (uint32_t i = 40; i < 64; i++)
-			if (ch->data[i] != expected)
-				die("fixture shipped WAL returned the wrong bytes");
-		return;
 	}
 	for (uint32_t i = 0; i < 64; i++)
 		if (ch->data[i] != expected)

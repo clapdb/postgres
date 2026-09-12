@@ -19,8 +19,12 @@
  * different LSN range by the same file name), and whose xlp_magic must be
  * the XLOG_PAGE_MAGIC of the recovering build when --xlog-magic names it
  * (pagestore_control_restore --payload-identity prints that build's
- * value).  A mismatch is a hard error (exit 2) that names the payload
- * identity, never a silent "no more WAL".
+ * value).  A mismatch is fatal to recovery: PostgreSQL treats a
+ * restore_command exit status above 125 (like a signal) as a hard error
+ * that aborts recovery, while any other nonzero status only means "no such
+ * archive file" -- which for a foreign-format segment would end recovery
+ * quietly and start the database.  So the mismatch exits with
+ * PS_WALRESTORE_EXIT_FATAL and names the payload identity on stderr.
  *
  * Freestanding: only pagestore_ipc.h and libc.
  *
@@ -189,6 +193,9 @@ wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
 	return ch->result;
 }
 
+/* an exit status PostgreSQL's RestoreArchivedFile() treats as fatal */
+#define PS_WALRESTORE_EXIT_FATAL 126
+
 /*
  * The segment's first page header, in the byte order PostgreSQL wrote it
  * (the store does not move WAL between byte orders).  XLogPageHeaderData:
@@ -212,7 +219,7 @@ check_payload_identity(const unsigned char *page, uint32_t len,
 	{
 		fprintf(stderr, "segment start is %u bytes, shorter than a WAL page header\n",
 				len);
-		return 2;
+		return PS_WALRESTORE_EXIT_FATAL;
 	}
 	memcpy(&magic, page, sizeof(magic));
 	memcpy(&info, page + 2, sizeof(info));
@@ -220,13 +227,13 @@ check_payload_identity(const unsigned char *page, uint32_t len,
 	{
 		fprintf(stderr, "payload needs a PostgreSQL build with XLOG_PAGE_MAGIC 0x%04x; "
 				"this build expects 0x%04x\n", magic, xlog_magic);
-		return 2;
+		return PS_WALRESTORE_EXIT_FATAL;
 	}
 	if ((info & XLP_LONG_HEADER_FLAG) == 0)
 	{
 		fprintf(stderr, "segment start carries no long WAL page header "
 				"(xlp_info 0x%04x); not a PostgreSQL WAL segment boundary\n", info);
-		return 2;
+		return PS_WALRESTORE_EXIT_FATAL;
 	}
 	memcpy(&seg_size, page + 32, sizeof(seg_size));
 	if (seg_size != segsize)
@@ -234,7 +241,7 @@ check_payload_identity(const unsigned char *page, uint32_t len,
 		fprintf(stderr, "payload was written by a cluster with a %u-byte WAL "
 				"segment size; --segsize %llu names a different LSN range\n",
 				seg_size, (unsigned long long) segsize);
-		return 2;
+		return PS_WALRESTORE_EXIT_FATAL;
 	}
 	return 0;
 }

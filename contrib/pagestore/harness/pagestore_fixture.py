@@ -57,10 +57,11 @@ FIXTURE_LAYER_ROOT = "/nonexistent/pagestore-fixture/layers"
 WALIDX_MAGICS = {0x57494458, 0x57495047}      # "WIDX" records, "WIPG" progress
 # The shipped-WAL envelope (pagestore_wal_segment.h): a version-2 header
 # records the payload's PostgreSQL identity at bytes 56..63 -- xlp_magic u16,
-# xlp_info u16, xlp_seg_size u32 -- copied from the WAL page header the
-# payload begins with at byte 64 (magic at 0, info at 2, and a long header's
-# segment size at 32).  The header CRC at 44 is FNV-1a over the 64 bytes with
-# the CRC field zeroed.
+# xlp_info u16, xlp_seg_size u32, little-endian like the rest of the envelope
+# -- copied from the WAL page header the payload begins with at byte 64
+# (magic at 0, info at 2, and a long header's segment size at 32), which
+# PostgreSQL wrote in host byte order.  The header CRC at 44 is FNV-1a over
+# the 64 bytes with the CRC field zeroed.
 WAL_SEGMENT_HEADER_BYTES = 64
 WAL_SEGMENT_VERSION = 2
 WAL_SEGMENT_IDENTITY_OFFSET = 56
@@ -134,8 +135,8 @@ def wal_segment_payload_identity(path: Path) -> dict[str, int] | None:
         return None
     magic, info, seg_size = struct.unpack_from("<HHI", data, WAL_SEGMENT_IDENTITY_OFFSET)
     payload = data[WAL_SEGMENT_HEADER_BYTES:]
-    carried_magic, carried_info = struct.unpack_from("<HH", payload, 0)
-    carried_seg = struct.unpack_from("<I", payload, XLP_SEG_SIZE_OFFSET)[0] if carried_info & XLP_LONG_HEADER else 0
+    carried_magic, carried_info = struct.unpack_from("=HH", payload, 0)
+    carried_seg = struct.unpack_from("=I", payload, XLP_SEG_SIZE_OFFSET)[0] if carried_info & XLP_LONG_HEADER else 0
     if (magic, info, seg_size) != (carried_magic, carried_info, carried_seg):
         raise FixtureError(
             f"{path.name} records payload identity ({magic:#06x}, {info:#06x}, {seg_size}) "
@@ -904,8 +905,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy failed mutation stores here")
     args = parser.parse_args(argv)
-    for name in ("daemon_binary", "client_binary", "inspect_binary", "format_tool"):
-        setattr(args, name, getattr(args, name).resolve())
+    for name in ("daemon_binary", "client_binary", "inspect_binary", "format_tool",
+                 "postgres_payload_identity_tool", "postgres_payload_identity"):
+        if getattr(args, name) is not None:
+            setattr(args, name, getattr(args, name).resolve())
     try:
         return capture(args) if args.capture else check(args)
     except FixtureError as error:

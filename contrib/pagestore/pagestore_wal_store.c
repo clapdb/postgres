@@ -523,7 +523,7 @@ random_suffix(char suffix[7])
 }
 
 static int read_validated_segment_range(PsWalStore *store,
-																const PsWalStoreEntry *entry,
+																PsWalStoreEntry *entry,
 																uint64_t range_off, unsigned char *out,
 																const unsigned char *compare,
 																size_t range_len);
@@ -800,6 +800,9 @@ load_segment(PsWalStore *store, uint64_t segment_no)
 	store->entries[store->nentries].header = header;
 	store->entries[store->nentries].chunk_hashes = hashes;
 	store->entries[store->nentries].nchunks = nchunks;
+	/* a segment found at open is served only after its payload identity
+	 * has been checked against the envelope once */
+	store->entries[store->nentries].identity_verified = 0;
 	hashes = NULL;
 	store->nentries++;
 	store->next_segment_no++;
@@ -1428,7 +1431,7 @@ validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
 			 store->segment_size); i < store->nentries && done < prefix; i++)
 	{
-		const PsWalStoreEntry *entry = &store->entries[i];
+		PsWalStoreEntry *entry = &store->entries[i];
 		const PsWalSegmentHeader *header = &entry->header;
 		uint64_t segment_end = header->start_lsn + header->payload_len;
 		uint64_t overlap_start = start_lsn > header->start_lsn ?
@@ -1542,6 +1545,9 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 		store->entries[store->nentries].header = header;
 		store->entries[store->nentries].chunk_hashes = chunk_hashes;
 		store->entries[store->nentries].nchunks = nchunks;
+		/* this process sealed the segment from the bytes it just hashed: the
+		 * identity the envelope records was read from that payload */
+		store->entries[store->nentries].identity_verified = 1;
 		store->nentries++;
 		store->next_segment_no++;
 		store->end_lsn += chunk;
@@ -1556,7 +1562,7 @@ done_append:
 
 static int
 read_validated_segment_range(PsWalStore *store,
-							 const PsWalStoreEntry *entry,
+							 PsWalStoreEntry *entry,
 						 uint64_t range_off, unsigned char *out,
 						 const unsigned char *compare, size_t range_len)
 {
@@ -1604,6 +1610,36 @@ read_validated_segment_range(PsWalStore *store,
 		entry->nchunks != (actual.payload_len + PS_WAL_STORE_VERIFY_CHUNK_BYTES - 1) /
 			PS_WAL_STORE_VERIFY_CHUNK_BYTES || last_chunk >= entry->nchunks)
 		goto cleanup;
+	/*
+	 * The envelope's recorded payload identity must be what the payload
+	 * starts with: a version-2 header that names one WAL page magic or
+	 * segment size over bytes that carry another is not the segment it
+	 * claims to be, whatever the chunk hashes say about the bytes.  The
+	 * first chunk is checked once per open, before any range of the segment
+	 * -- interior included -- is served, and the hash check below still
+	 * covers it when the range begins there.
+	 */
+	if (!entry->identity_verified)
+	{
+		if (actual.version != PS_WAL_SEGMENT_LEGACY_VERSION)
+		{
+			size_t amount = actual.payload_len < sizeof(buf) ?
+				(size_t) actual.payload_len : sizeof(buf);
+			uint16_t xlp_magic;
+			uint16_t xlp_info;
+			uint32_t xlp_seg_size;
+
+			if (read_all_at(fd, buf, amount, PS_WAL_SEGMENT_HEADER_BYTES) != 0 ||
+				wal_payload_hash(2166136261u, buf, amount) != entry->chunk_hashes[0] ||
+				ps_wal_segment_payload_identity(buf, (uint32_t) amount,
+												&xlp_magic, &xlp_info,
+												&xlp_seg_size) != 0 ||
+				xlp_magic != actual.xlp_magic || xlp_info != actual.xlp_info ||
+				xlp_seg_size != actual.xlp_seg_size)
+				goto cleanup;
+		}
+		entry->identity_verified = 1;
+	}
 	for (uint32_t chunk_no = first_chunk; chunk_no <= last_chunk; chunk_no++)
 	{
 		uint64_t chunk_start = (uint64_t) chunk_no *
@@ -1619,25 +1655,6 @@ read_validated_segment_range(PsWalStore *store,
 			wal_payload_hash(2166136261u, buf, amount) !=
 				entry->chunk_hashes[chunk_no])
 			goto cleanup;
-		/*
-		 * The envelope's recorded payload identity must be what the payload
-		 * starts with: a version-2 header that names one WAL page magic or
-		 * segment size over bytes that carry another is not the segment it
-		 * claims to be, whatever the chunk hashes say about the bytes.
-		 */
-		if (chunk_start == 0 && actual.version != PS_WAL_SEGMENT_LEGACY_VERSION)
-		{
-			uint16_t xlp_magic;
-			uint16_t xlp_info;
-			uint32_t xlp_seg_size;
-
-			if (ps_wal_segment_payload_identity(buf, (uint32_t) amount,
-												&xlp_magic, &xlp_info,
-												&xlp_seg_size) != 0 ||
-				xlp_magic != actual.xlp_magic || xlp_info != actual.xlp_info ||
-				xlp_seg_size != actual.xlp_seg_size)
-				goto cleanup;
-		}
 		if (copy_start < copy_end)
 		{
 			size_t copy_len = (size_t) (copy_end - copy_start);
@@ -1682,7 +1699,7 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
 			 store->segment_size); i < store->nentries && done < len; i++)
 	{
-		const PsWalStoreEntry *entry = &store->entries[i];
+		PsWalStoreEntry *entry = &store->entries[i];
 		const PsWalSegmentHeader *header = &entry->header;
 		uint64_t segment_end = header->start_lsn + header->payload_len;
 		uint64_t overlap_start = start_lsn > header->start_lsn ?

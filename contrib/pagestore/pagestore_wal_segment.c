@@ -28,6 +28,25 @@ get_le16(const unsigned char *p)
 	return (uint16_t) ((uint32_t) p[0] | (uint32_t) p[1] << 8);
 }
 
+/* the payload's page header fields, in the byte order PostgreSQL wrote them */
+static uint16_t
+get_native16(const unsigned char *p)
+{
+	uint16_t	v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static uint32_t
+get_native32(const unsigned char *p)
+{
+	uint32_t	v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
 static void
 put_le16(unsigned char *p, uint16_t v)
 {
@@ -92,12 +111,12 @@ ps_wal_segment_payload_identity(const void *payload, uint32_t payload_len,
 
 	if (payload == NULL || payload_len < PS_WAL_XLP_SHORT_HEADER_BYTES)
 		return -1;
-	*xlp_magic = get_le16(bytes);
-	*xlp_info = get_le16(bytes + 2);
+	*xlp_magic = get_native16(bytes);
+	*xlp_info = get_native16(bytes + 2);
 	*xlp_seg_size = 0;
 	if ((*xlp_info & PS_WAL_XLP_LONG_HEADER) != 0 &&
 		payload_len >= PS_WAL_XLP_LONG_HEADER_BYTES)
-		*xlp_seg_size = get_le32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET);
+		*xlp_seg_size = get_native32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET);
 	return 0;
 }
 

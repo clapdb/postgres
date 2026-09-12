@@ -49,14 +49,16 @@ main(void)
 
 	for (size_t i = 0; i < sizeof(payload); i++)
 		payload[i] = (unsigned char) i;
-	payload[0] = 0x20;
-	payload[1] = 0xd1;			/* xlp_magic 0xD120 */
-	payload[2] = 0x02;
-	payload[3] = 0x00;			/* xlp_info XLP_LONG_HEADER */
-	payload[32] = 0x00;
-	payload[33] = 0x00;
-	payload[34] = 0x00;
-	payload[35] = 0x01;			/* xlp_seg_size 16 MiB */
+	{
+		/* PostgreSQL writes its page header in host byte order */
+		uint16_t	xlp_magic = 0xd120;
+		uint16_t	xlp_info = 0x0002;	/* XLP_LONG_HEADER */
+		uint32_t	xlp_seg_size = 16 * 1024 * 1024;
+
+		memcpy(payload, &xlp_magic, sizeof(xlp_magic));
+		memcpy(payload + 2, &xlp_info, sizeof(xlp_info));
+		memcpy(payload + 32, &xlp_seg_size, sizeof(xlp_seg_size));
+	}
 	check(ps_wal_segment_seal(&header, 7, 11, 0xb000000, 16 * 1024 * 1024, payload,
 						  sizeof(payload)) == 0,
 		  "seal a complete segment payload");
@@ -78,7 +80,7 @@ main(void)
 	check(encoded[56] == 0x20 && encoded[57] == 0xd1 &&
 		  encoded[58] == 0x02 && encoded[59] == 0x00 &&
 		  encoded[60] == 0x00 && encoded[63] == 0x01,
-		  "the payload identity occupies the bytes version 1 reserved");
+		  "the payload identity occupies the bytes version 1 reserved, little-endian");
 	check(ps_wal_segment_decode(&decoded, v1_fixture, sizeof(v1_fixture)) == 0 &&
 		  decoded.version == PS_WAL_SEGMENT_LEGACY_VERSION &&
 		  decoded.segment_size == 16 * 1024 * 1024 &&
@@ -142,7 +144,8 @@ main(void)
 		unsigned char swapped[sizeof(payload)];
 
 		memcpy(swapped, payload, sizeof(swapped));
-		swapped[1] = 0xd2;
+		swapped[0] ^= 0x01;
+		swapped[1] ^= 0x01;
 		check(ps_wal_segment_validate(&header, swapped, sizeof(swapped)) != 0,
 			  "a payload that no longer matches the envelope is rejected");
 	}

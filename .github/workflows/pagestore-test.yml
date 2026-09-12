@@ -370,6 +370,22 @@ jobs:
             --materializer-supervisor \
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
+      - name: Check persisted-format fixtures against this PostgreSQL build
+        # the standalone lane checks the envelopes; only a lane with a
+        # PostgreSQL build can ask whether the fixture's payload (its WAL page
+        # magic) is one this build loads, so an upstream XLOG_PAGE_MAGIC bump
+        # demands a recapture here instead of passing on a stale fixture
+        run: |
+          python3 contrib/pagestore/harness/pagestore_fixture.py \
+            --check contrib/pagestore/fixtures/posix-mvp-baseline \
+                    contrib/pagestore/fixtures/posix-forkmeta-crc \
+                    contrib/pagestore/fixtures/posix-wal-payload-identity \
+            --daemon-binary build/contrib/pagestore/pagestore_daemon \
+            --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
+            --inspect-binary build/contrib/pagestore/pagestore_inspect \
+            --format-tool build/contrib/pagestore/pagestore_format_versions \
+            --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore
+
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
 

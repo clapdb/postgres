@@ -257,8 +257,9 @@ if [ -n "$seg" ] && "$BUILD/contrib/pagestore/pagestore_walrestore" \
 		--shm "$SHM" --timeline 0 --incarnation 1 --segsize 16777216 "$seg" "$out"; then
 	assert "$(stat -c %s "$out")" "16777216" "restored WAL segment $seg is a full standard segment"
 	# The payload's own identity gates the hand-off to recovery: the build's
-	# WAL page magic passes, a foreign one and a different segment size are
-	# hard errors (exit 2) that name the payload, never a silent archive miss.
+	# WAL page magic passes, a foreign one and a different segment size exit
+	# with a status above 125, which RestoreArchivedFile() treats as fatal
+	# rather than as an archive miss that would end recovery quietly.
 	xlog_magic=$("$BUILD/contrib/pagestore/pagestore_control_restore" --payload-identity | sed -n 's/.*"xlog_page_magic": \([0-9]*\).*/\1/p')
 	ident_out=$(mktemp)
 	if "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --incarnation 1 \
@@ -270,16 +271,16 @@ if [ -n "$seg" ] && "$BUILD/contrib/pagestore/pagestore_walrestore" \
 	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --incarnation 1 \
 		--segsize 16777216 --xlog-magic 0xd11f "$seg" "$ident_out" >"$ident_out.err" 2>&1
 	ident_rc=$?
-	if [ "$ident_rc" -eq 2 ] && grep -q "payload needs a PostgreSQL build with XLOG_PAGE_MAGIC" "$ident_out.err" && [ ! -e "$ident_out" ]; then
-		echo "ok   - walrestore refuses a payload for another WAL page magic as a hard error naming it"
+	if [ "$ident_rc" -eq 126 ] && grep -q "payload needs a PostgreSQL build with XLOG_PAGE_MAGIC" "$ident_out.err" && [ ! -e "$ident_out" ]; then
+		echo "ok   - walrestore refuses a payload for another WAL page magic with a status recovery treats as fatal"
 	else
 		echo "FAIL - walrestore under a foreign WAL page magic returned $ident_rc: $(cat "$ident_out.err")"; fail=1
 	fi
 	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --incarnation 1 \
 		--segsize 33554432 "$seg" "$ident_out" >"$ident_out.err" 2>&1
 	ident_rc=$?
-	if [ "$ident_rc" -eq 2 ] && grep -q "WAL segment size" "$ident_out.err" && [ ! -e "$ident_out" ]; then
-		echo "ok   - walrestore refuses a segment size the payload was not written for"
+	if [ "$ident_rc" -eq 126 ] && grep -q "WAL segment size" "$ident_out.err" && [ ! -e "$ident_out" ]; then
+		echo "ok   - walrestore refuses a segment size the payload was not written for with a status recovery treats as fatal"
 	else
 		echo "FAIL - walrestore under a foreign segment size returned $ident_rc: $(cat "$ident_out.err")"; fail=1
 	fi
