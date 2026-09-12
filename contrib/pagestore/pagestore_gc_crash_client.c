@@ -124,6 +124,29 @@
 #define FIXTURE_XLP_LONG_HEADER 0x0002u
 #define FIXTURE_XLP_SEG_SIZE (16u * 1024u * 1024u)
 #define FIXTURE_XLP_BLCKSZ 8192u
+
+/*
+ * PostgreSQL's WAL page headers, declared with the same member types so the
+ * host ABI lays them out exactly as the PostgreSQL build on this host does
+ * (a 4-byte-aligned uint64 packs the long header differently from an
+ * 8-byte-aligned one).  This client has no PostgreSQL headers.
+ */
+typedef struct FixtureXLogPageHeaderData
+{
+	uint16_t	xlp_magic;
+	uint16_t	xlp_info;
+	uint32_t	xlp_tli;
+	uint64_t	xlp_pageaddr;
+	uint32_t	xlp_rem_len;
+} FixtureXLogPageHeaderData;
+
+typedef struct FixtureXLogLongPageHeaderData
+{
+	FixtureXLogPageHeaderData std;
+	uint64_t	xlp_sysid;
+	uint32_t	xlp_seg_size;
+	uint32_t	xlp_xlog_blcksz;
+} FixtureXLogLongPageHeaderData;
 #define FIXTURE_BRANCH 1u
 #define FIXTURE_DELETED_BRANCH 2u
 /* Above the WAL end: maintenance may publish the parent's WAL-index frontier
@@ -1143,21 +1166,23 @@ fixture_seed(void)
 		if (lsn % RECLAIM_SEGMENT == 0)
 		{
 			unsigned char *page = ch->data;
-			uint16_t	magic = FIXTURE_XLP_MAGIC;
-			uint16_t	info = lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0;
+			FixtureXLogLongPageHeaderData header;
 
-			/* in host byte order, as PostgreSQL writes its page headers */
-			memset(page, 0, 40);
-			memcpy(page, &magic, sizeof(magic));
-			memcpy(page + 2, &info, sizeof(info));
-			if (info != 0)
+			/* laid out and byte-ordered as this host's PostgreSQL would */
+			memset(&header, 0, sizeof(header));
+			header.std.xlp_magic = FIXTURE_XLP_MAGIC;
+			header.std.xlp_info = lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0;
+			header.std.xlp_pageaddr = lsn;
+			memset(page, 0, sizeof(header));
+			if (header.std.xlp_info != 0)
 			{
-				uint32_t	seg = FIXTURE_XLP_SEG_SIZE;
-				uint32_t	blcksz = FIXTURE_XLP_BLCKSZ;
-
-				memcpy(page + 32, &seg, sizeof(seg));
-				memcpy(page + 36, &blcksz, sizeof(blcksz));
+				header.xlp_sysid = UINT64_C(0x7061676573746f72);	/* "pagestor" */
+				header.xlp_seg_size = FIXTURE_XLP_SEG_SIZE;
+				header.xlp_xlog_blcksz = FIXTURE_XLP_BLCKSZ;
+				memcpy(page, &header, sizeof(header));
 			}
+			else
+				memcpy(page, &header.std, sizeof(header.std));
 		}
 		if (execute()->status != PS_STATUS_OK)
 			die("WAL append failed");
@@ -1255,21 +1280,17 @@ fixture_wal_check(uint64_t lsn)
 	 * wrote, and a header, once present, must keep its magic, flags, and
 	 * the long header's segment size at LSN 0. */
 	{
-		uint16_t	magic;
-		uint16_t	info;
-		uint32_t	seg;
+		FixtureXLogLongPageHeaderData header;
 
-		/* in host byte order, as the seed stamped them */
-		memcpy(&magic, ch->data, sizeof(magic));
-		memcpy(&info, ch->data + 2, sizeof(info));
-		memcpy(&seg, ch->data + 32, sizeof(seg));
-		if (magic == FIXTURE_XLP_MAGIC)
+		/* laid out and byte-ordered as the seed stamped it */
+		memcpy(&header, ch->data, sizeof(header));
+		if (header.std.xlp_magic == FIXTURE_XLP_MAGIC)
 		{
-			if (info != (lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0))
+			if (header.std.xlp_info != (lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0))
 				die("fixture shipped WAL lost its page header flags");
-			if (lsn % FIXTURE_XLP_SEG_SIZE == 0 && seg != FIXTURE_XLP_SEG_SIZE)
+			if (lsn % FIXTURE_XLP_SEG_SIZE == 0 && header.xlp_seg_size != FIXTURE_XLP_SEG_SIZE)
 				die("fixture shipped WAL lost its segment size");
-			for (uint32_t i = 40; i < 64; i++)
+			for (uint32_t i = sizeof(header); i < 64; i++)
 				if (ch->data[i] != expected)
 					die("fixture shipped WAL returned the wrong bytes");
 			return;

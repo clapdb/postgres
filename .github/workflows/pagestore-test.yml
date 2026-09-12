@@ -28,6 +28,8 @@ on:
       - 'src/backend/storage/ipc/procarray.c'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/access/xlog.h'
+      - 'src/include/access/xlog_internal.h'
+      - 'src/include/catalog/pg_control.h'
       - 'src/include/access/slru.h'
       - 'src/include/postmaster/walredo.h'
       - 'src/include/storage/smgr.h'
@@ -49,6 +51,8 @@ on:
       - 'src/backend/storage/ipc/procarray.c'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/access/xlog.h'
+      - 'src/include/access/xlog_internal.h'
+      - 'src/include/catalog/pg_control.h'
       - 'src/include/access/slru.h'
       - 'src/include/postmaster/walredo.h'
       - 'src/include/storage/smgr.h'
@@ -389,7 +393,7 @@ jobs:
             --inspect-binary build/contrib/pagestore/pagestore_inspect \
             --format-tool build/contrib/pagestore/pagestore_format_versions \
             --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
-            ${{ github.ref_name == 'pagestore' && '--require-build-match' || '' }}
+            ${{ (github.ref_name == 'pagestore' || (github.event_name == 'pull_request' && github.base_ref == 'pagestore')) && '--require-build-match' || '' }}
 
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"

@@ -53,6 +53,7 @@
 #include <unistd.h>
 
 #include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
 
 static void *shm;
@@ -152,31 +153,96 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 	sigaddset(&claimset, SIGQUIT);
 	sigprocmask(SIG_BLOCK, &claimset, &oldset);
 
-	for (uint32_t i = 0; i < hdr->nchannels; i++)
-		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
-		{
-			chan = (int) i;
-			sigprocmask(SIG_SETMASK, &oldset, NULL);
-			return;
-		}
+	/*
+	 * Claim a channel of the control key's owner shard: with a sharded
+	 * daemon the channel index selects the serving worker, and the control
+	 * image this tool reads before mapping the segment name lives in that
+	 * shard's index.  Shipped-WAL reads are not sharded and run on any
+	 * channel.  Same stride walk as pagestore_control_restore.
+	 */
+	{
+		PsKey		key;
+		uint32_t	nshards = hdr->nshards ? hdr->nshards : 1;
+		uint32_t	target;
 
-	/* Reuse abandoned mailboxes only after no daemon write can still arrive. */
-	for (uint32_t i = 0; i < hdr->nchannels; i++)
-		if (ps_cas(&ps_channel(shm, i)->claimed, 2, 1))
-		{
-			uint32_t	state = ps_load_acquire(&ps_channel(shm, i)->state);
+		memset(&key, 0, sizeof(key));
+		key.klass = PS_KLASS_CONTROL;
+		target = ps_key_shard(&key, nshards);
 
-			if (state == PS_STATE_DONE || state == PS_STATE_IDLE)
+		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
+			if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
 			{
 				chan = (int) i;
+				ps_channel(shm, chan)->shard = target;
 				sigprocmask(SIG_SETMASK, &oldset, NULL);
 				return;
 			}
-			ps_store_release(&ps_channel(shm, i)->claimed, 2);
-		}
+
+		/* Reuse abandoned mailboxes only after no daemon write can still arrive. */
+		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
+			if (ps_cas(&ps_channel(shm, i)->claimed, 2, 1))
+			{
+				uint32_t	state = ps_load_acquire(&ps_channel(shm, i)->state);
+
+				if (state == PS_STATE_DONE || state == PS_STATE_IDLE)
+				{
+					chan = (int) i;
+					ps_channel(shm, chan)->shard = target;
+					sigprocmask(SIG_SETMASK, &oldset, NULL);
+					return;
+				}
+				ps_store_release(&ps_channel(shm, i)->claimed, 2);
+			}
+	}
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
 	fprintf(stderr, "no free channel\n");
 	exit(2);
+}
+
+/*
+ * The WAL segment size the cluster that shipped this timeline's WAL was
+ * initialized with, from the newest control image on the timeline's
+ * ancestry (the writer mirrors pg_control at every ship point).  Returns 0
+ * when no control image is mirrored, -1 when the store refused the read or
+ * the image is not a control file this build can read.  This is checked
+ * before a segment name is turned into an LSN: a --segsize the cluster was
+ * not initialized with maps the name to the wrong range, where the store
+ * legitimately has nothing, and an ordinary "no such archive file" would
+ * then end recovery quietly.
+ */
+static int64_t
+control_wal_segment_size(uint32_t tl, uint64_t incarnation)
+{
+	PsChannel  *ch = ps_channel(shm, chan);
+	ControlFileData control;
+	pg_crc32c	crc;
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->timeline = tl;
+	ch->incarnation = incarnation;
+	ch->blocknum = 0;
+	ch->req_lsn = UINT64_MAX;	/* newest */
+	ch->req_seq = 0;
+	ch->opcode = PS_OP_READ_AT;
+	request_in_flight = 1;
+	ps_request_generation_next(ch);
+	ps_store_release(&ch->state, PS_STATE_REQUEST);
+	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
+		;
+	request_in_flight = 0;
+	if (ch->status != PS_STATUS_OK)
+		return -1;
+	if (ch->result != 1)
+		return 0;
+	memcpy(&control, (const void *) ch->data, sizeof(control));
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, (char *) &control, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, control.crc) ||
+		control.pg_control_version != PG_CONTROL_VERSION)
+		return -1;
+	return control.xlog_seg_size;
 }
 
 /* Read up to len WAL bytes from start_lsn on a timeline; returns bytes read. */
@@ -353,11 +419,38 @@ main(int argc, char **argv)
 		fprintf(stderr, "bad segment name \"%s\"\n", segname);
 		return 2;
 	}
+	client_attach(shm_name, 0);
+
+	/*
+	 * Establish the stored geometry before mapping the name: the cluster's
+	 * mirrored control image names the segment size its WAL files are
+	 * numbered by, and a --segsize that differs would compute an LSN the
+	 * store has nothing at.
+	 */
+	{
+		int64_t		stored = control_wal_segment_size(timeline, incarnation);
+
+		if (stored < 0)
+		{
+			fprintf(stderr, "store refused the control image of timeline %u "
+					"incarnation %llu, or it is not a control file this build "
+					"reads; cannot confirm the WAL segment size\n",
+					timeline, (unsigned long long) incarnation);
+			return PS_WALRESTORE_EXIT_FATAL;
+		}
+		if (stored > 0 && (uint64_t) stored != segsize)
+		{
+			fprintf(stderr, "the cluster that shipped this WAL was initialized "
+					"with a %lld-byte WAL segment size; --segsize %llu would map "
+					"\"%s\" to the wrong LSN range\n", (long long) stored,
+					(unsigned long long) segsize, segname);
+			return PS_WALRESTORE_EXIT_FATAL;
+		}
+	}
+
 	segs_per_id = 0x100000000ULL / segsize;
 	segno = (uint64_t) hi * segs_per_id + lo;
 	start_lsn = segno * segsize;
-
-	client_attach(shm_name, 0);
 
 	buf = malloc(PS_IO_UNIT);
 	if (buf == NULL)

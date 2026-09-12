@@ -1045,10 +1045,15 @@ once per open before serving any range of a segment, interior ranges
 included: an envelope whose recorded identity is not what its payload
 carries fails the read, whatever the chunk hashes say about the bytes.
 `pagestore_walrestore` is the loader, built with the PostgreSQL headers so
-it reads the page header with this build's `XLogLongPageHeaderData`: before
-handing a reconstructed segment to recovery it requires `xlp_magic` to be
-this build's `XLOG_PAGE_MAGIC` and `xlp_seg_size` to be the `--segsize` the
-LSN was computed from.  A mismatch, and a store that refuses the read (a
+it reads the page header with this build's `XLogLongPageHeaderData`.  Before
+it turns a segment name into an LSN it reads the timeline's newest mirrored
+control image and requires its `xlog_seg_size` to be `--segsize` -- a size
+the cluster was not initialized with maps the name to a range the store
+legitimately has nothing at, which would otherwise read as an archive miss
+-- and before handing a reconstructed segment to recovery it requires
+`xlp_magic` to be this build's `XLOG_PAGE_MAGIC` and the long page header's
+`xlp_seg_size` to be that same size.  A mismatch, and a store that refuses
+the read (a
 corrupt or resealed segment, WAL reclaimed below the frontier, a fenced
 incarnation), exits with a status above 125, which `RestoreArchivedFile()`
 treats as fatal to recovery -- any other nonzero status means "no such
