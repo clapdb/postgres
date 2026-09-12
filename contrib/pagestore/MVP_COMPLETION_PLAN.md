@@ -508,16 +508,40 @@ Expected scope: one or two PRs.
 ### R4b. Compact and reclaim fork metadata
 
 Status: **runtime implementation, the POSIX crash matrix, and the composed
-H1 publication scenarios are implemented; the acceptance matrix remains
-incomplete on its concurrency clause**.  Per-horizon existence/size
+H1 publication scenarios are implemented, and the acceptance matrix's
+concurrency clause is closed on POSIX**.  Per-horizon existence/size
 equivalence across compaction is exercised by the R6 soak's reader and
 branch verifications, every publication boundary by the composed daemon
-scenarios, and crash recovery by the matrix; but acknowledged concurrent
-mutations are verified exactly-once only at the source-rewrite boundary
-(the matrix's deterministic concurrent appender), while the composed
-workload's post-cutoff trickle is untracked by its oracle.  Prepare,
-manifest-commit, and snapshot-GC still need a concurrent-append oracle;
-SPDK remains outside the claim.
+scenarios, and crash recovery by the matrix; and acknowledged concurrent
+mutations are verified exactly once at every publication boundary, two
+ways.  The matrix's deterministic concurrent appender -- which holds
+admission-rd until the maintenance pass has entered its blocking
+admission-wr behind it, then completes its append and records the ack --
+now runs at prepare, manifest-commit and snapshot-GC as well as
+source-rewrite (every boundary sits under that admission-wr, so at each
+the acknowledged mutations are the last before the frozen sequence).  It
+creates a relation of its own and grows it, under one admission-rd hold,
+with both acks entered in its ledger before the hold is released, so the
+crash cannot land between a mutation and its ack; recovery must show the
+relation at exactly the acknowledged size and -- since a SET or GROW is
+idempotent, and neither existence nor size can tell one application from
+two -- carry each acknowledged event's record exactly once across what
+recovery composes (the selected snapshot's checkpoint and tail parts and
+the source records after its base marker, or the whole source when
+nothing is selected).  The composed `forkmeta` workload's post-cutoff
+trickle is tracked by its oracle: the seed enters every trickle create
+and growth in a ledger (`--ack-file`) twice, as pending before the
+request is sent and as acknowledged once the daemon has answered, each
+entry fsynced before the next step; the first eight relations are
+acknowledged while maintenance is still paused, so the ledger is never
+empty at the crash; the verify after recovery, and again after the
+additional restart, requires every acknowledged create to exist and every
+acknowledged growth to show exactly two blocks, allows a pending,
+unacknowledged step either outcome (the daemon may have answered without
+the client recording it), holds a growth never sent to zero, and nothing
+else; and the harness counts each acknowledged event's record across the
+selected generation's parts and the source behind its marker, requiring
+exactly one.  SPDK remains outside the claim.
 
 The pure forkmeta keep-planner and exhaustive unit/property coverage now define
 the event visibility, exact-fence base retention, legacy sequence handling, and
@@ -543,9 +567,8 @@ fault report and exit 88, and covers deterministic concurrent append overlap
 plus four configured POSIX shards. This work does not claim coverage of every
 internal unlink/fsync instruction, SPDK hardware, or the remaining composed H1
 crash scenarios at the time it landed; the composed `forkmeta` daemon
-scenarios now cover those boundaries (without a concurrent-append oracle
-at prepare, manifest commit, and snapshot GC), and SPDK stays outside the
-claim.
+scenarios now cover those boundaries, with the acknowledged-append ledger
+as their concurrent-mutation oracle, and SPDK stays outside the claim.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
@@ -1003,10 +1026,9 @@ daemon through a `forkmeta` gc_seed workload: the page-pruning history and
 cutoff pin prove the cutoff, thirty-two relations carry persisted fork-size
 events on both sides of it, and a post-cutoff trickle publishes the second
 generation that retires the first.  This covers the R4b acceptance item that
-H1 exercise each publication boundary in a composed process-crash scenario;
-the concurrent-mutation clause stays open at the prepare, manifest-commit,
-and snapshot-GC boundaries because the trickle relations are not in the
-oracle.
+H1 exercise each publication boundary in a composed process-crash scenario,
+and the trickle relations are in the oracle through the acknowledged-append
+ledger, so the concurrent-mutation clause is closed at every boundary.
 
 Acceptance:
 
@@ -1516,7 +1538,7 @@ packaging do not block MVP completion.
 The default sequence was:
 
 1. R3b retained-base foundation, then the WAL reclaimer enabled by replacement-base compaction -- done;
-2. R4b forkmeta compaction/reclamation and publication crash tests -- done except the concurrency clause;
+2. R4b forkmeta compaction/reclamation and publication crash tests -- done;
 3. R5 timeline deletion -- done;
 4. R5b reclaimer backpressure controllers -- done;
 5. H0 fault/inspection primitives -- done;
@@ -1525,8 +1547,8 @@ The default sequence was:
 8. R6 bounded-space acceptance and final MVP status update -- soak and nightly lane done; the
    final status update follows the first scheduled nightly runs.
 
-What remains, in order: the R4b concurrent-append oracle, then the final
-MVP status update once the nightly lane has a run history.
+What remains: the final MVP status update once the nightly lane has a run
+history.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
@@ -1568,6 +1590,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-12 | Registered the POSIX and SPDK container identities and made the SPDK superblock fail closed and durable: `pagestore_spdk_super.c` (no SPDK dependency) decodes the checksummed v2 and both legacy struct images, refuses truncated, overlong, foreign, newer, corrupt, differently sized or differently sharded superblocks instead of zeroing the segment counts, publishes v2 through NVMe flush, temp/fsync/rename/dir-fsync with failures returned to `spdk_sync()`; `posix_container` and `spdk_container` join `pagestore_format_versions` and the current fixture's identity table | `pagestore_spdk_super_test` (69 checks) in meson and the standalone lane; the fixture check passes against both fixtures; the SPDK daemon links with the module |
 | 2026-09-12 | Bound the PostgreSQL payload identity on the paths that hand bytes to PostgreSQL: shipped-WAL envelope version 2 records `xlp_magic`, `xlp_info` and the WAL segment size from the payload's page header (read in host byte order, as PostgreSQL wrote it) in the bytes version 1 reserved, the store re-derives them from the first chunk once per open before serving any range, `pagestore_walrestore` (now built with the PostgreSQL headers) refuses a WAL page magic or segment size the payload was not written for, and a read the store refuses, with an exit status recovery treats as fatal, `pagestore_control_restore --payload-identity` prints the build's tuple and the control install refuses an image whose WAL segment size differs from the target cluster's; `posix-wal-payload-identity` is the current fixture, its predecessor legacy | `pagestore_wal_segment_test` (25 checks), fixture check across three fixtures with the new use-rejected mutation, meson fixture check against the build's identity, integration test with accept/refuse assertions for the restore command, golden scenario and managed materializer smoke with bound restore commands |
 | 2026-09-12 | Bound the SLRU seed pages' PostgreSQL identity on every seeding path (`pagestore_seed_branch_slrus_impl` resolves the control image at the base cutoff, refuses a cutoff with none, and checks its compatibility tuple; the controller's horizon derivation checks it too) and proved the seeders' replay against recovery: `pagestore.seed_reference_slru_dir` compares every reconstructed page with the paused materializer's before writing it, the branch controller sets it with `--verify-seed-against-materializer`, and the golden scenario requires pages of all four SLRUs to have been compared equal | Golden scenario (4 reconstructed pages equal), integration test (fail-closed base cutoff, forged-reference mismatch and missing-segment refusals, nothing published), branch boot test |
+| 2026-09-13 | Closed the R4b concurrency clause: the crash matrix's deterministic concurrent appender runs at every publication boundary (prepare, manifest commit, source rewrite, snapshot GC) creating and growing a relation of its own with the acks published before its admission-rd is released, and recovery must show the acknowledged size and carry each acknowledged event's record exactly once across the selected snapshot parts and the source suffix; the composed `forkmeta` workload records every trickle create and growth in a ledger (`--ack-file`) as pending and then acknowledged, the first eight relations acknowledged before maintenance may run, its verify oracle holds recovery, and the additional restart, to each acknowledged step exactly once while allowing an in-flight step either outcome, and the harness counts each acknowledged event's record in the durable set, requiring one | `pagestore_forkmeta_crash_matrix_test` (273 checks, repeated runs), the four composed forkmeta scenarios (58--66 acknowledged appends verified each, twice, one in flight; every acknowledged record counted once), harness unit tests, standalone suite |
 | 2026-09-12 | Gave the controller's and supervisor's JSON artifacts their identities and fixture: `pagestore_artifact_schema.py` holds each kind's schema, accepted/refused schemas, checksum rule and key set, both tools stamp and judge through it (the retention authorities and the supervisor status gain a schema member and `crc32`, their previous layouts read as legacy), and `fixtures/controller-json`, captured from the golden scenario and the managed materializer smoke, is checked by `harness/pagestore_controller_fixture.py` in the standalone lane | controller fixture check (6 artifacts load, 40 mutations refused or accepted as declared), both tools' unit suites, golden scenario and managed materializer smoke with the capture hooks |
 | 2026-09-12 | Gave the backend's data-directory artifacts their identities and fixture: `pagestore_artifact_format.h` names and lays out the prepared branch's manifest and bootstrap, the prepared reader's manifest, snapshot and catalog provenance, the reader-map intent marker and the SLRU mirror's primed marker (both now value at 0 with an identity trailer at 8, legacy read, foreign fails closed), the backend's structs are pinned to them, `pagestore_format_versions` reports the `pgdata` family, `pagestore_pgdata_artifact_check()` loads an artifact through its production loader, `integration_test.sh` captures a real backend's artifacts, and `fixtures/pgdata-artifacts` is checked by `harness/pagestore_pgdata_fixture.py` -- identities in the standalone lane, loaders and twenty-one mutations in a scratch cluster in the integration lane | pgdata fixture check (8 artifacts load, 21 mutations rejected or accepted as declared), store fixture check across four fixtures, standalone suite, integration test (with the capture hook), golden scenario, branch boot test |
 | 2026-09-12 | Gave the backend's store-object payloads their identities: `pagestore_artifact_format.h` (freestanding) holds the layouts of the redo note, SLRU watermark and tombstone (value at 0, identity trailer at 8, zero for legacy), the materializer marker and release and writer checkpoint blocks, and the five reader snapshot objects, plus PostgreSQL's CRC-32C; the backend stamps and checks the trailers, the daemon's WAL floor fails closed on a note it cannot read, `pagestore_format_versions` reports all twelve identities, the fixture workload seeds one of each and verifies them on reopen, `posix-backend-objects` is the current fixture and `posix-wal-payload-identity` legacy | `pagestore_control_prune_test` (legacy note counts, foreign trailer makes the floor unknown), fixture check across four fixtures, standalone suite, integration test, golden scenario, materializer smoke; `--payload-identity` proves the header's CRC-32C against `pg_crc32c` |

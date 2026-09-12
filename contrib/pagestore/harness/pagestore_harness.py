@@ -3255,9 +3255,99 @@ def _check_forkmeta_crash_snapshot(
     return selected
 
 
+FORKMETA_EVENT_GROW = 0
+FORKMETA_EVENT_SET = 1
+FORKMETA_TRICKLE_REL = 7000
+FORKMETA_TRICKLE_CREATE_LSN = 6000
+FORKMETA_TRICKLE_GROW_LSN = 7000
+FORKMETA_TRICKLE_NBLOCKS = 2
+
+
+def _forkmeta_event_records(store: Path, selected: dict[str, Any] | None,
+                            rel: int, kind: int, lsn: int, nblocks: int) -> int:
+    """How many records of one fork event (relation, kind, LSN) the durable
+    set recovery composes carries: the selected generation's checkpoint and
+    tail parts and the source records after that generation's base marker,
+    or the whole source when no generation is selected.  A record of the
+    event with another size is the event rewritten, not a copy of it."""
+    count = 0
+
+    def scan(data: bytes, offset: int) -> None:
+        nonlocal count
+        while offset + FORKMETA_RECORD_BYTES <= len(data):
+            magic, rec_len = struct.unpack_from("=II", data, offset)
+            if rec_len != FORKMETA_RECORD_BYTES or magic & 0x00FFFFFF != 0x4D4B46:
+                raise OracleMismatch("forkmeta record stream is malformed")
+            rel_number = struct.unpack_from("=I", data, offset + 20)[0]
+            record_lsn = struct.unpack_from("=Q", data, offset + 32)[0]
+            record_nblocks = struct.unpack_from("=I", data, offset + 56)[0]
+            if data[offset + 60] == kind and rel_number == rel and record_lsn == lsn:
+                if record_nblocks != nblocks:
+                    raise OracleMismatch(
+                        f"a record of relation {rel}'s event at {lsn} carries {record_nblocks} "
+                        f"blocks, acknowledged {nblocks}"
+                    )
+                count += 1
+            offset += rec_len
+
+    if selected is not None:
+        for part in ("checkpoint", "tail"):
+            data = (store / FORKMETA_SNAPSHOTS /
+                    _forkmeta_part_name(selected["generation"], part)).read_bytes()
+            if len(data) < 80 or struct.unpack_from("=I", data, 0)[0] != FORKMETA_PAYLOAD_MAGIC:
+                raise OracleMismatch(f"selected forkmeta {part} part is malformed")
+            scan(data, 80)
+    source = (store / "forkmeta").read_bytes()
+    # with a selected generation the source's first record is its base
+    # marker (_forkmeta_marker_matches held), and only what follows counts
+    scan(source, FORKMETA_RECORD_BYTES if selected is not None else 0)
+    return count
+
+
+def _check_forkmeta_acked_records(store: Path, selected: dict[str, Any] | None,
+                                  ack_file: Path, stage: str) -> None:
+    """The representation-level exactly-once oracle for the trickle: a fork
+    event is an idempotent maximum or set, whose visible outcome cannot tell
+    one application from two, so every acknowledged create and growth in
+    the workload's ledger must be recorded exactly once in what recovery
+    composes."""
+    acked: dict[tuple[int, str], bool] = {}
+    text = ack_file.read_text(encoding="utf-8")
+    # the seed is killed once the daemon has crashed, possibly mid-entry: an
+    # unterminated final line is a torn entry, not a record, and the step it
+    # would have named stays pending (it can never be the eight required
+    # ones, which are complete before maintenance may run)
+    lines = text.split("\n")
+    if lines and lines[-1] != "":
+        lines = lines[:-1]
+    for line in lines:
+        if line == "":
+            continue
+        fields = line.split()
+        if len(fields) != 3:
+            raise OracleMismatch(f"malformed ledger entry {line!r}")
+        rel, op, state = int(fields[0]), fields[1], fields[2]
+        if state == "ok":
+            acked[(rel, op)] = True
+    if not acked:
+        raise OracleMismatch(f"after_{stage} the acknowledged-append ledger is empty")
+    for (rel, op) in sorted(acked):
+        j = rel - FORKMETA_TRICKLE_REL
+        kind, lsn, nblocks = (
+            (FORKMETA_EVENT_SET, FORKMETA_TRICKLE_CREATE_LSN + j, 0) if op == "create"
+            else (FORKMETA_EVENT_GROW, FORKMETA_TRICKLE_GROW_LSN + j, FORKMETA_TRICKLE_NBLOCKS))
+        records = _forkmeta_event_records(store, selected, rel, kind, lsn, nblocks)
+        if records != 1:
+            raise OracleMismatch(
+                f"after_{stage} recovery carries {records} record(s) of the acknowledged "
+                f"{op} of relation {rel}, expected exactly one"
+            )
+
+
 def _check_forkmeta_recovery(
     store: Path, stage: str, timeout: float,
     crash_state: dict[str, Any] | None = None,
+    ack_file: Path | None = None,
 ) -> dict[str, Any]:
     """Recovery selects one durable generation whose parts are valid, finishes
     any staged or retired file cleanup, and serves the source behind that
@@ -3290,6 +3380,8 @@ def _check_forkmeta_recovery(
                     f"after_{stage} recovery settled on {selected!r} instead of "
                     f"the generation the crash had selected, {crash_selected!r}"
                 )
+            if ack_file is not None:
+                _check_forkmeta_acked_records(store, selected, ack_file, stage)
             return selected
         now = time.monotonic()
         if now >= deadline:
@@ -4025,6 +4117,7 @@ def _check_gc_recovery(
     stage: str,
     timeout: float,
     crash_state: dict[str, Any] | None = None,
+    ack_file: Path | None = None,
 ) -> dict[str, Any] | None:
     """After recovery the manifest is sane, the retired sources are gone once
     cleanup has resumed (only the replacement remains, in the manifest and on
@@ -4076,7 +4169,7 @@ def _check_gc_recovery(
             f"{timeline.get('retained_horizon')!r}, expected {expected_horizon}"
         )
     if workload == "forkmeta":
-        return _check_forkmeta_recovery(store, stage, timeout, crash_state)
+        return _check_forkmeta_recovery(store, stage, timeout, crash_state, ack_file)
     return None
 
 
@@ -4244,7 +4337,7 @@ def _check_layer_manifest_after_restart(
 def _start_layer_client(
     client: Path, shm: str, mode: str, log: Path, arm_marker: Path | None = None,
     workload: str | None = None, resume_file: Path | None = None,
-    cutoff_seq_file: Path | None = None,
+    cutoff_seq_file: Path | None = None, ack_file: Path | None = None,
 ) -> subprocess.Popen[str]:
     command = [str(client.resolve()), "--shm", shm, "--mode", mode]
     if workload is not None:
@@ -4255,6 +4348,8 @@ def _start_layer_client(
         command.extend(["--resume-file", str(resume_file)])
     if cutoff_seq_file is not None:
         command.extend(["--cutoff-seq-file", str(cutoff_seq_file)])
+    if ack_file is not None:
+        command.extend(["--ack-file", str(ack_file)])
     with log.open("a", encoding="utf-8") as output:
         return subprocess.Popen(
             command,
@@ -4265,10 +4360,13 @@ def _start_layer_client(
 
 def _verify_layer_client(
     client: Path, shm: str, log: Path, timeout: float, workload: str | None = None,
+    ack_file: Path | None = None,
 ) -> None:
     command = [str(client.resolve()), "--shm", shm, "--mode", "verify"]
     if workload is not None:
         command.extend(["--workload", workload])
+    if ack_file is not None:
+        command.extend(["--ack-file", str(ack_file)])
     with log.open("a", encoding="utf-8") as output:
         result = subprocess.run(
             command,
@@ -4401,6 +4499,10 @@ def run_daemon_fault_recovery(
     release = control / "release"
     pause_file = control / "maintenance-pause"
     cutoff_seq_file = control / "cutoff-seq"
+    # the workload's ledger of acknowledged concurrent appends, which its
+    # verify oracle holds recovery to (the forkmeta workload's trickle);
+    # under trace, since the fault control directory is removed at the crash
+    ack_file = trace / "acks"
     # The seed installs the cutoff that makes pruning due and then arms the
     # fault; maintenance stays paused across both, so no pass can run against
     # the old floor and none can outrun arming either.
@@ -4558,6 +4660,7 @@ def run_daemon_fault_recovery(
                 workload=gc_workload,
                 resume_file=pause_file if gc_pauses_maintenance else None,
                 cutoff_seq_file=cutoff_seq_file if gc_seed_actions else None,
+                ack_file=ack_file if gc_seed_actions else None,
             )
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
@@ -4745,10 +4848,10 @@ def run_daemon_fault_recovery(
         recovered_state = None
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
-                                 workload=gc_workload)
+                                 workload=gc_workload, ack_file=ack_file)
             recovered_state = _check_gc_recovery(inspector, shm, inspection_schema,
                                                  store, gc_workload, gc_stage, timeout,
-                                                 crash_state)
+                                                 crash_state, ack_file)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
@@ -4773,9 +4876,10 @@ def run_daemon_fault_recovery(
             )
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
-                                 workload=gc_workload)
+                                 workload=gc_workload, ack_file=ack_file)
             restarted_state = _check_gc_recovery(inspector, shm, inspection_schema,
-                                                 store, gc_workload, gc_stage, timeout)
+                                                 store, gc_workload, gc_stage, timeout,
+                                                 ack_file=ack_file)
             # nothing mutates the store between the two starts, so a restart
             # that republishes a generation is not idempotent
             if restarted_state != recovered_state:

@@ -35,6 +35,9 @@
 #define TEST_FEV_SEG_GROW_BOUND 7
 #define TEST_FEV_SEG_COMMIT_BOUND 8
 #define ACK_CAPACITY 16
+/* the concurrent appender's own relation, created by it during the overlap
+ * (a relation number no matrix key reaches) */
+#define APPENDER_REL 2000000u
 
 typedef enum CrashCase
 {
@@ -59,9 +62,31 @@ typedef struct TestForkMetaRecV2
 	uint8_t pad[3];
 } TestForkMetaRecV2;
 
+/* Keep in lockstep with ForkMetaSnapshotPayloadHeader in pagestore_core.c:
+ * each immutable snapshot part is this header, then records. */
+typedef struct TestForkMetaSnapshotPayloadHeader
+{
+	uint32_t magic;
+	uint16_t version;
+	uint16_t header_bytes;
+	uint32_t part;
+	uint32_t record_bytes;
+	uint64_t generation;
+	uint64_t cutoff_lsn;
+	uint64_t cutoff_admission_seq;
+	uint64_t freeze_admission_seq;
+	uint64_t checkpoint_records;
+	uint64_t tail_records;
+	uint64_t checkpoint_bytes;
+	uint64_t tail_bytes;
+} TestForkMetaSnapshotPayloadHeader;
+#define TEST_FORK_META_SNAPSHOT_PAYLOAD_MAGIC UINT32_C(0x31534d46)
+
 typedef struct ConcurrentAppend
 {
 	PsKey *keys;
+	uint32_t nblocks;			/* the size the overlapping append grows key 0 to */
+	uint64_t lsn;
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
 	int admission_entered;
@@ -76,8 +101,10 @@ typedef struct ConcurrentAppend
 
 typedef struct AckEntry
 {
-	uint32_t key_index;
+	uint32_t key_index;			/* MATRIX_KEYS: the appender's own key */
 	uint32_t nblocks;
+	uint64_t lsn;
+	uint8_t kind;				/* the event's record kind: SET (a create) or GROW */
 } AckEntry;
 
 typedef struct AckLedger
@@ -772,7 +799,8 @@ done:
 }
 
 static int
-record_ack(AckLedger *ledger, uint32_t key_index, uint32_t nblocks)
+record_ack(AckLedger *ledger, uint32_t key_index, uint32_t nblocks, uint64_t lsn,
+		   uint8_t kind)
 {
 	uint32_t index = __atomic_load_n(&ledger->count, __ATOMIC_RELAXED);
 
@@ -780,6 +808,8 @@ record_ack(AckLedger *ledger, uint32_t key_index, uint32_t nblocks)
 		return 0;
 	ledger->entries[index].key_index = key_index;
 	ledger->entries[index].nblocks = nblocks;
+	ledger->entries[index].lsn = lsn;
+	ledger->entries[index].kind = kind;
 	__atomic_store_n(&ledger->count, index + 1, __ATOMIC_RELEASE);
 	return 1;
 }
@@ -867,13 +897,48 @@ admission_coordinator(void *arg)
 	return NULL;
 }
 
+/*
+ * The appender's mutations: a CREATE of its own relation and a GROW of it
+ * -- so recovery is held to a lifecycle event as well as a size event --
+ * under one admission-rd hold, since a second acquisition would queue
+ * behind the maintenance writer and never return.  Both acks are entered in
+ * the ledger before admission-rd is released: the moment maintenance can
+ * take its wrlock, the ledger already names what it must preserve, so its
+ * crash cannot land between the mutation and the ack.
+ */
+static int
+create_and_grow_own_key(ConcurrentAppend *append)
+{
+	PsKey key = append->keys[MATRIX_KEYS];
+	uint32_t shard = ps_shard_of(&key);
+	PsChannel ch;
+	int ok;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_CREATE;
+	ch.timeline = 0;
+	ch.key = key;
+	ch.req_lsn = append->lsn - 10;
+	ch.status = PS_STATUS_OK;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(shard);
+	(void) ps_handle_meta(&ch);
+	ok = ch.status == PS_STATUS_OK &&
+		record_ack(append->ledger, MATRIX_KEYS, 0, append->lsn - 10, TEST_FEV_SET) &&
+		fork_grow(0, &key, append->nblocks, append->lsn) == 0 &&
+		record_ack(append->ledger, MATRIX_KEYS, append->nblocks, append->lsn,
+				   TEST_FEV_GROW);
+	ps_unlock_shard(shard);
+	ps_admission_read_unlock();
+	return ok;
+}
+
 static void *
 concurrent_appender(void *arg)
 {
 	ConcurrentAppend *append = arg;
 
-	append->ok = grow_key(&append->keys[0], 2, 350) &&
-		record_ack(append->ledger, 0, 2);
+	append->ok = create_and_grow_own_key(append);
 	(void) pthread_mutex_lock(&append->mutex);
 	if (append->ok)
 	{
@@ -886,17 +951,173 @@ concurrent_appender(void *arg)
 	return NULL;
 }
 
+static void
+appender_key(PsKey *key)
+{
+	PsKey own = {17, 29, APPENDER_REL, 0, PS_KLASS_RELATION};
+
+	*key = own;
+}
+
+/* Count records of the acknowledged event (key, kind, lsn) in one snapshot
+ * part; -1 when the part is not what this build writes. */
+static int
+count_event_in_part(int fd, const PsKey *key, uint8_t kind, uint64_t lsn,
+					uint32_t nblocks, uint64_t *count)
+{
+	TestForkMetaSnapshotPayloadHeader header;
+	TestForkMetaRecV2 rec;
+	struct stat st;
+	off_t offset;
+
+	if (fd < 0 || fstat(fd, &st) != 0 ||
+		pread(fd, &header, sizeof(header), 0) != (ssize_t) sizeof(header) ||
+		header.magic != TEST_FORK_META_SNAPSHOT_PAYLOAD_MAGIC ||
+		header.header_bytes != sizeof(header) ||
+		header.record_bytes != sizeof(rec) ||
+		(st.st_size - (off_t) sizeof(header)) % (off_t) sizeof(rec) != 0)
+		return -1;
+	for (offset = sizeof(header); offset < st.st_size; offset += sizeof(rec))
+	{
+		if (pread(fd, &rec, sizeof(rec), offset) != (ssize_t) sizeof(rec) ||
+			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec))
+			return -1;
+		if (rec.kind == kind && rec.lsn == lsn &&
+			memcmp(&rec.key, key, sizeof(*key)) == 0)
+		{
+			if (rec.nblocks != nblocks)
+				return -1;
+			(*count)++;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The representation-level exactly-once oracle.  A GROW is an idempotent
+ * maximum, so the size after recovery cannot tell one application from
+ * two; count the acknowledged event's record across what recovery
+ * composes instead -- the selected snapshot's checkpoint and tail parts,
+ * and the source records after that snapshot's base marker (the whole
+ * source when no snapshot is selected, or when the source still names an
+ * older epoch, which recovery then ignores: its records are not counted).
+ * Returns 0 and the count, -1 when the durable set is not readable.
+ */
+static int
+count_acked_event(const char *store, const char *snapshots, const PsKey *key,
+				  uint8_t kind, uint64_t lsn, uint32_t nblocks, uint64_t *count)
+{
+	PsForkmetaSnapshot selected = {
+		.directory_fd = -1, .checkpoint_fd = -1, .tail_fd = -1
+	};
+	TestForkMetaRecV2 rec;
+	char path[1600];
+	struct stat st;
+	off_t offset = 0;
+	int have_selected;
+	int fd = -1;
+	int rc = -1;
+
+	*count = 0;
+	have_selected = ps_forkmeta_snapshot_open(&selected, snapshots) == 0;
+	if (have_selected &&
+		(count_event_in_part(selected.checkpoint_fd, key, kind, lsn, nblocks, count) != 0 ||
+		 count_event_in_part(selected.tail_fd, key, kind, lsn, nblocks, count) != 0))
+		goto done;
+	if (snprintf(path, sizeof(path), "%s/forkmeta", store) < 0 ||
+		stat(path, &st) != 0 || st.st_size % (off_t) sizeof(rec) != 0)
+		goto done;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		goto done;
+	if (have_selected)
+	{
+		/* the source counts only through the selected generation's marker;
+		 * an older epoch is superseded by the snapshot entirely */
+		if (st.st_size < (off_t) sizeof(rec) ||
+			pread(fd, &rec, sizeof(rec), 0) != (ssize_t) sizeof(rec))
+			goto done;
+		if (rec.kind != TEST_FEV_SNAPSHOT_BASE ||
+			rec.order_id != selected.generation)
+		{
+			rc = 0;
+			goto done;
+		}
+		offset = sizeof(rec);
+	}
+	for (; offset < st.st_size; offset += sizeof(rec))
+	{
+		if (pread(fd, &rec, sizeof(rec), offset) != (ssize_t) sizeof(rec) ||
+			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec))
+			goto done;
+		if (rec.kind == kind && rec.lsn == lsn &&
+			memcmp(&rec.key, key, sizeof(*key)) == 0)
+		{
+			if (rec.nblocks != nblocks)
+				goto done;
+			(*count)++;
+		}
+	}
+	rc = 0;
+done:
+	if (fd >= 0)
+		(void) close(fd);
+	if (have_selected)
+		ps_forkmeta_snapshot_close(&selected);
+	return rc;
+}
+
+/*
+ * Start the deterministic concurrent appender before the maintenance pass
+ * that will crash: it takes admission-rd and holds it until the pass has
+ * entered its blocking admission-wr (the coordinator observes that through
+ * the exact wrlock replacement), then completes its append and records the
+ * ack.  Every publication boundary runs under that admission-wr, so at each
+ * of them the acknowledged append is the last mutation before the frozen
+ * sequence, and recovery must show it exactly once.  Returns once the
+ * appender is inside admission-rd, so the caller's maintenance pass is the
+ * one that queues behind it.
+ */
+static int
+start_overlapping_appender(ConcurrentAppend *appender, PsKey *keys,
+						   AckLedger *ledger, uint32_t nblocks, uint64_t lsn,
+						   pthread_t *thread, pthread_t *coordinator)
+{
+	memset(appender, 0, sizeof(*appender));
+	appender->keys = keys;
+	appender->ledger = ledger;
+	appender->nblocks = nblocks;
+	appender->lsn = lsn;
+	if (pthread_mutex_init(&appender->mutex, NULL) != 0 ||
+		pthread_cond_init(&appender->cond, NULL) != 0)
+		return 0;
+	ps_test_set_admission_read_hook(admission_read_hook, appender);
+	ps_test_set_admission_write_lock_hook(admission_write_lock_hook, appender);
+	if (pthread_create(thread, NULL, concurrent_appender, appender) != 0)
+		return 0;
+	if (pthread_create(coordinator, NULL, admission_coordinator, appender) != 0)
+		return 0;
+	(void) pthread_mutex_lock(&appender->mutex);
+	while (!appender->admission_entered && !appender->operation_failed)
+		(void) pthread_cond_wait(&appender->cond, &appender->mutex);
+	if (!appender->admission_entered || appender->operation_failed)
+	{
+		(void) pthread_mutex_unlock(&appender->mutex);
+		return 0;
+	}
+	(void) pthread_mutex_unlock(&appender->mutex);
+	return 1;
+}
+
 static int
 run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 				   AckLedger *ledger)
 {
-	PsKey keys[MATRIX_KEYS];
+	PsKey keys[MATRIX_KEYS + 1];
 	char snapshots[1600];
 	ConcurrentAppend appender;
 	pthread_t thread;
 	pthread_t coordinator;
-	int thread_started = 0;
-	int coordinator_started = 0;
 
 	if (!configure_fault(store, fault_dir, case_fault_name(which)) ||
 		ps_core_open(store) != 0 || !populate_store(store, keys))
@@ -904,6 +1125,7 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 		dprintf(STDERR_FILENO, "child setup failed case=%s\n", case_fault_name(which));
 		_exit(2);
 	}
+	appender_key(&keys[MATRIX_KEYS]);
 	if (setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) != 0)
 	{
 		dprintf(STDERR_FILENO, "child trigger setup failed case=%s\n", case_fault_name(which));
@@ -938,38 +1160,19 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 		if (unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") != 0)
 			_exit(2);
 		ps_test_forkmeta_snapshot_gc_retry_now();
+		/* the overlapping append grows key 0 past the two blocks every key
+		 * reached before generation 2, so the GC pass queues behind it */
+		if (!start_overlapping_appender(&appender, keys, ledger, 3, 700,
+										&thread, &coordinator))
+			_exit(2);
 		if (!arm_fault(fault_dir))
 			_exit(2);
 		(void) ps_core_maintenance();
 		_exit(3);
 	}
-	if (which == CASE_AFTER_SOURCE_REWRITE)
-	{
-		memset(&appender, 0, sizeof(appender));
-		appender.keys = keys;
-		appender.ledger = ledger;
-		if (pthread_mutex_init(&appender.mutex, NULL) != 0 ||
-			pthread_cond_init(&appender.cond, NULL) != 0)
-			_exit(2);
-		ps_test_set_admission_read_hook(admission_read_hook, &appender);
-		ps_test_set_admission_write_lock_hook(admission_write_lock_hook,
-										  &appender);
-		if (pthread_create(&thread, NULL, concurrent_appender, &appender) != 0)
-			_exit(2);
-		thread_started = 1;
-		if (pthread_create(&coordinator, NULL, admission_coordinator, &appender) != 0)
-			_exit(2);
-		coordinator_started = 1;
-		(void) pthread_mutex_lock(&appender.mutex);
-		while (!appender.admission_entered && !appender.operation_failed)
-			(void) pthread_cond_wait(&appender.cond, &appender.mutex);
-		if (!appender.admission_entered || appender.operation_failed)
-		{
-			(void) pthread_mutex_unlock(&appender.mutex);
-			_exit(2);
-		}
-		(void) pthread_mutex_unlock(&appender.mutex);
-	}
+	if (!start_overlapping_appender(&appender, keys, ledger, 2, 350,
+									&thread, &coordinator))
+		_exit(2);
 	if (snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) < 0 ||
 		!arm_fault(fault_dir))
 	{
@@ -977,14 +1180,10 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 		_exit(2);
 	}
 	(void) ps_core_maintenance();
-	if (thread_started)
-	{
-		(void) pthread_join(thread, NULL);
-		if (coordinator_started)
-			(void) pthread_join(coordinator, NULL);
-		ps_test_set_admission_read_hook(NULL, NULL);
-		ps_test_set_admission_write_lock_hook(NULL, NULL);
-	}
+	(void) pthread_join(thread, NULL);
+	(void) pthread_join(coordinator, NULL);
+	ps_test_set_admission_read_hook(NULL, NULL);
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	dprintf(STDERR_FILENO, "child maintenance returned case=%s\n", case_fault_name(which));
 	_exit(3);
 }
@@ -1038,6 +1237,8 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 		(which == CASE_AFTER_SNAPSHOT_GC ? 2 : 1);
 	int selected_ok;
 
+	if (snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) < 0)
+		return 0;
 	selected_ok = selected_generation(store, &generation) == 0;
 	check(selected_ok == (expected_generation != 0),
 		  "recovery selects old-or-new complete snapshot generation");
@@ -1047,8 +1248,7 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 			  "recovery selected the expected generation");
 		if (selected_ok)
 		{
-			if (snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) >= 0 &&
-				ps_forkmeta_snapshot_open(&selected, snapshots) == 0)
+			if (ps_forkmeta_snapshot_open(&selected, snapshots) == 0)
 			{
 				check(selected.cutoff_lsn != 0 &&
 					  selected.cutoff_admission_seq != 0,
@@ -1120,26 +1320,56 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 					  "cross-shard relation size does not roll back");
 		}
 	}
-	if (which == CASE_AFTER_SOURCE_REWRITE)
+	/*
+	 * The concurrent-append oracle, at every boundary: the append the
+	 * appender was acknowledged for while maintenance queued behind it must
+	 * be visible after recovery exactly once -- not lost with a prepared or
+	 * committed generation, not applied twice by replaying a suffix the
+	 * snapshot already carries.
+	 */
 	{
 		uint32_t ack_count = __atomic_load_n(&ledger->count, __ATOMIC_ACQUIRE);
+		PsKey own;
 
+		appender_key(&own);
 		check(__atomic_load_n(&ledger->overlap_observed, __ATOMIC_ACQUIRE) == 1,
 			  "maintenance entered the real blocking wrlock behind admitted writer");
-		check(ack_count != 0 && ack_count <= ACK_CAPACITY,
-			  "concurrent appender recorded every acknowledged append");
+		check(ack_count == 2,
+			  "concurrent appender recorded its acknowledged create and growth");
+		check(meta_request(PS_OP_EXISTS, &own, 0, 0, &reply) && reply.result == 1,
+			  "acknowledged create's relation exists after fresh recovery");
 		for (uint32_t i = 0; i < ack_count && i < ACK_CAPACITY; i++)
 		{
 			const AckEntry *ack = &ledger->entries[i];
+			uint64_t records = 0;
+			int counted;
 
-			check(ack->key_index < MATRIX_KEYS &&
-				  meta_request(PS_OP_EXISTS, &keys[ack->key_index], 0, 0,
-							   &reply) && reply.result == 1,
-				  "acknowledged append relation exists after fresh recovery");
-			check(ack->key_index < MATRIX_KEYS &&
-				  meta_request(PS_OP_NBLOCKS, &keys[ack->key_index], 0, 0,
-							   &reply) && reply.result >= ack->nblocks,
-				  "acknowledged append size survives fresh recovery");
+			check(ack->key_index == MATRIX_KEYS, "acknowledged event names the appender's key");
+			if (ack->kind == TEST_FEV_GROW)
+			{
+				if (meta_request(PS_OP_NBLOCKS, &own, 0, 0, &reply) &&
+					reply.result == ack->nblocks)
+					check(1, "acknowledged growth's size survives fresh recovery");
+				else
+				{
+					dprintf(STDERR_FILENO, "ack size failure case=%d status=%u result=%u acked=%u\n",
+							(int) which, reply.status, reply.result, ack->nblocks);
+					check(0, "acknowledged growth's size survives fresh recovery");
+				}
+			}
+			/* neither existence nor size can tell one application of an
+			 * idempotent SET or GROW from two: the durable set recovery
+			 * composes must carry each acknowledged event's record exactly
+			 * once */
+			counted = count_acked_event(store, snapshots, &own, ack->kind,
+										ack->lsn, ack->nblocks, &records) == 0;
+			if (!counted || records != 1)
+				dprintf(STDERR_FILENO, "ack record count case=%d kind=%u counted=%d records=%llu\n",
+						(int) which, ack->kind, counted, (unsigned long long) records);
+			check(counted && records == 1,
+				  ack->kind == TEST_FEV_GROW ?
+				  "acknowledged growth is recorded exactly once in what recovery composes" :
+				  "acknowledged create is recorded exactly once in what recovery composes");
 		}
 	}
 	close_runtime();
