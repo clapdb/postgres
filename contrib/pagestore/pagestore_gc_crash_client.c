@@ -111,6 +111,9 @@
 #define FORKMETA_RELS 32u
 #define FORKMETA_TRICKLE_REL 7000u
 #define FORKMETA_TRICKLE_RELS 400u
+/* trickle relations acknowledged before maintenance may run at all, so the
+ * ledger is never empty at a crash boundary */
+#define FORKMETA_TRICKLE_LEDGER_MIN 8u
 
 /* fixture workload: every persisted family on one store, then a clean exit.
  * The shipped WAL keeps one sealed segment because the control note's redo
@@ -223,6 +226,9 @@ static const char *resume_file;
 /* where the seed records the admission sequence its reservation was granted,
  * so the oracle can require the durable frontier to carry it */
 static const char *cutoff_seq_file;
+/* forkmeta workload: where the seed records each trickle append the daemon
+ * acknowledged, so the verify oracle can hold recovery to every one of them */
+static const char *ack_file;
 static const char *workload = "page_prune";
 
 static void
@@ -515,32 +521,145 @@ forkmeta_events_seed(void)
 	}
 }
 
+/*
+ * The concurrent-append ledger.  Every trickle event the daemon acknowledges
+ * is appended here and fsynced before the next request, so whatever the
+ * crash boundary, the verify oracle knows exactly which appends were
+ * acknowledged and holds recovery to each of them, once: an acknowledged
+ * create must exist, an acknowledged growth must show exactly that size.
+ */
+static void
+forkmeta_trickle_ack(uint32_t rel, uint32_t nblocks)
+{
+	FILE	   *out;
+
+	if (ack_file == NULL)
+		return;
+	out = fopen(ack_file, "a");
+	if (out == NULL || fprintf(out, "%u %u\n", rel, nblocks) < 0 ||
+		fflush(out) != 0 || fsync(fileno(out)) != 0 || fclose(out) != 0)
+		die("cannot record an acknowledged trickle append");
+}
+
+/* One trickle relation: a create and a growth to two blocks, each entered
+ * in the ledger once the daemon has acknowledged it. */
+static void
+forkmeta_trickle_one(uint32_t j)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint32_t	rel = FORKMETA_TRICKLE_REL + j;
+
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = 6000 + j;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork create failed");
+	forkmeta_trickle_ack(rel, 0);
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_ZEROEXTEND;
+	ch->blocknum = 0;
+	ch->nblocks = 2;
+	ch->req_lsn = 7000 + j;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork zero-extend failed");
+	forkmeta_trickle_ack(rel, 2);
+}
+
 static void
 forkmeta_seed(void)
 {
 	unsigned char *page = malloc(page_size);
+	uint32_t	j = 0;
 
 	if (page == NULL)
 		die("out of memory");
 	page_history_seed(page);
 	forkmeta_events_seed();
 	free(page);
+	/* The first trickle relations are acknowledged while maintenance is
+	 * still paused, so whichever boundary the crash lands on, the ledger
+	 * holds appends the oracle must find; the rest overlap the passes. */
+	for (; j < FORKMETA_TRICKLE_LEDGER_MIN; j++)
+		forkmeta_trickle_one(j);
 	arm_fault();
 	page_cutoff_pin();
 	/* Keep appending fork-size events after the cutoff is proven, so a
 	 * second generation is published and the first one is retired; this is
-	 * the only way the snapshot GC boundary is reached.  Relations created
-	 * here are not part of the oracle. */
+	 * the only way the snapshot GC boundary is reached.  Each acknowledged
+	 * event goes into the ledger, so the crash lands amid appends the oracle
+	 * tracks. */
 	{
 		struct timespec pause_interval = {0, 20000000};
 
-		for (uint32_t j = 0; j < FORKMETA_TRICKLE_RELS; j++)
+		for (; j < FORKMETA_TRICKLE_RELS; j++)
 		{
-			forkmeta_create_grow(FORKMETA_TRICKLE_REL + j, 6000 + j, 2);
+			forkmeta_trickle_one(j);
 			nanosleep(&pause_interval, NULL);
 		}
 	}
 	wait_forever();
+}
+
+/* Hold recovery to the ledger: every acknowledged trickle append, exactly
+ * once.  A relation with an acknowledged growth must show that size, one
+ * with only an acknowledged create must exist at zero blocks. */
+static void
+forkmeta_check_acks(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	FILE	   *in;
+	uint32_t	rel;
+	uint32_t	nblocks;
+	uint32_t	expected[FORKMETA_TRICKLE_RELS];
+	unsigned char acked[FORKMETA_TRICKLE_RELS];
+	uint32_t	verified = 0;
+
+	if (ack_file == NULL)
+		return;
+	in = fopen(ack_file, "r");
+	if (in == NULL)
+		die("the acknowledged-append ledger is missing");
+	memset(acked, 0, sizeof(acked));
+	while (fscanf(in, "%u %u", &rel, &nblocks) == 2)
+	{
+		if (rel < FORKMETA_TRICKLE_REL || rel >= FORKMETA_TRICKLE_REL + FORKMETA_TRICKLE_RELS)
+			die("the acknowledged-append ledger names a relation outside the trickle");
+		acked[rel - FORKMETA_TRICKLE_REL] = 1;
+		expected[rel - FORKMETA_TRICKLE_REL] = nblocks;
+	}
+	fclose(in);
+	for (uint32_t j = 0; j < FORKMETA_TRICKLE_LEDGER_MIN; j++)
+		if (!acked[j] || expected[j] != 2)
+			die("the acknowledged-append ledger lacks the appends made before the fault");
+	for (uint32_t j = 0; j < FORKMETA_TRICKLE_RELS; j++)
+	{
+		if (!acked[j])
+			continue;
+		set_relation(ch);
+		ch->key.relNumber = FORKMETA_TRICKLE_REL + j;
+		ch->opcode = PS_OP_EXISTS;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1)
+		{
+			fprintf(stderr, "pagestore_gc_crash_client: acknowledged relation %u "
+					"does not exist after recovery\n", FORKMETA_TRICKLE_REL + j);
+			exit(1);
+		}
+		set_relation(ch);
+		ch->key.relNumber = FORKMETA_TRICKLE_REL + j;
+		ch->opcode = PS_OP_NBLOCKS;
+		if (execute()->status != PS_STATUS_OK || ch->result != expected[j])
+		{
+			fprintf(stderr, "pagestore_gc_crash_client: acknowledged relation %u "
+					"has %u blocks after recovery, acknowledged %u\n",
+					FORKMETA_TRICKLE_REL + j, (unsigned) ch->result, expected[j]);
+			exit(1);
+		}
+		verified++;
+	}
+	fprintf(stderr, "pagestore_gc_crash_client: %u acknowledged trickle "
+			"appends verified after recovery\n", verified);
 }
 
 static void
@@ -583,6 +702,7 @@ forkmeta_verify(void)
 {
 	verify();
 	forkmeta_check();
+	forkmeta_check_acks();
 }
 
 /* ---- wal_index workload ------------------------------------------------ */
@@ -2481,11 +2601,14 @@ main(int argc, char **argv)
 			resume_file = argv[++i];
 		else if (strcmp(argv[i], "--cutoff-seq-file") == 0 && i + 1 < argc)
 			cutoff_seq_file = argv[++i];
+		else if (strcmp(argv[i], "--ack-file") == 0 && i + 1 < argc)
+			ack_file = argv[++i];
 		else
 			die("usage: --shm NAME --mode seed|verify "
 				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
 				"timeline_delete_abort|manifest_compact|forkmeta|fixture] "
-				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH] "
+				"[--ack-file PATH]");
 	}
 	if (shm == NULL || mode == NULL ||
 		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0 &&

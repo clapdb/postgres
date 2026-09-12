@@ -4244,7 +4244,7 @@ def _check_layer_manifest_after_restart(
 def _start_layer_client(
     client: Path, shm: str, mode: str, log: Path, arm_marker: Path | None = None,
     workload: str | None = None, resume_file: Path | None = None,
-    cutoff_seq_file: Path | None = None,
+    cutoff_seq_file: Path | None = None, ack_file: Path | None = None,
 ) -> subprocess.Popen[str]:
     command = [str(client.resolve()), "--shm", shm, "--mode", mode]
     if workload is not None:
@@ -4255,6 +4255,8 @@ def _start_layer_client(
         command.extend(["--resume-file", str(resume_file)])
     if cutoff_seq_file is not None:
         command.extend(["--cutoff-seq-file", str(cutoff_seq_file)])
+    if ack_file is not None:
+        command.extend(["--ack-file", str(ack_file)])
     with log.open("a", encoding="utf-8") as output:
         return subprocess.Popen(
             command,
@@ -4265,10 +4267,13 @@ def _start_layer_client(
 
 def _verify_layer_client(
     client: Path, shm: str, log: Path, timeout: float, workload: str | None = None,
+    ack_file: Path | None = None,
 ) -> None:
     command = [str(client.resolve()), "--shm", shm, "--mode", "verify"]
     if workload is not None:
         command.extend(["--workload", workload])
+    if ack_file is not None:
+        command.extend(["--ack-file", str(ack_file)])
     with log.open("a", encoding="utf-8") as output:
         result = subprocess.run(
             command,
@@ -4401,6 +4406,10 @@ def run_daemon_fault_recovery(
     release = control / "release"
     pause_file = control / "maintenance-pause"
     cutoff_seq_file = control / "cutoff-seq"
+    # the workload's ledger of acknowledged concurrent appends, which its
+    # verify oracle holds recovery to (the forkmeta workload's trickle);
+    # under trace, since the fault control directory is removed at the crash
+    ack_file = trace / "acks"
     # The seed installs the cutoff that makes pruning due and then arms the
     # fault; maintenance stays paused across both, so no pass can run against
     # the old floor and none can outrun arming either.
@@ -4558,6 +4567,7 @@ def run_daemon_fault_recovery(
                 workload=gc_workload,
                 resume_file=pause_file if gc_pauses_maintenance else None,
                 cutoff_seq_file=cutoff_seq_file if gc_seed_actions else None,
+                ack_file=ack_file if gc_seed_actions else None,
             )
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
@@ -4745,7 +4755,7 @@ def run_daemon_fault_recovery(
         recovered_state = None
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
-                                 workload=gc_workload)
+                                 workload=gc_workload, ack_file=ack_file)
             recovered_state = _check_gc_recovery(inspector, shm, inspection_schema,
                                                  store, gc_workload, gc_stage, timeout,
                                                  crash_state)
@@ -4773,7 +4783,7 @@ def run_daemon_fault_recovery(
             )
         if gc_seed_actions:
             _verify_layer_client(gc_client, shm, trace / "layer-client.log", timeout,
-                                 workload=gc_workload)
+                                 workload=gc_workload, ack_file=ack_file)
             restarted_state = _check_gc_recovery(inspector, shm, inspection_schema,
                                                  store, gc_workload, gc_stage, timeout)
             # nothing mutates the store between the two starts, so a restart

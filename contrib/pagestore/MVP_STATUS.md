@@ -736,13 +736,12 @@ it; the integration test models exactly that.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  Gates 1-4 are implemented for the local POSIX
 deployment, with the dropped-artifact limitation gate 4 documents above;
-gate 5 has its crash coverage composed and its format fixtures complete.
-What remains before the MVP is declared complete is:
+gate 5 has its crash coverage composed, its concurrency clause closed (the
+crash matrix's concurrent appender at every publication boundary, and the
+composed forkmeta workload's acknowledged-append ledger), and its format
+fixtures complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
-2. Close the R4b concurrency clause: a concurrent-append oracle at the
-   prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
-   crash matrix already has at the source rewrite.
 
 Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit

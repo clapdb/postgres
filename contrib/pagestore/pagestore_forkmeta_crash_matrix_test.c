@@ -62,6 +62,8 @@ typedef struct TestForkMetaRecV2
 typedef struct ConcurrentAppend
 {
 	PsKey *keys;
+	uint32_t nblocks;			/* the size the overlapping append grows key 0 to */
+	uint64_t lsn;
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
 	int admission_entered;
@@ -872,8 +874,8 @@ concurrent_appender(void *arg)
 {
 	ConcurrentAppend *append = arg;
 
-	append->ok = grow_key(&append->keys[0], 2, 350) &&
-		record_ack(append->ledger, 0, 2);
+	append->ok = grow_key(&append->keys[0], append->nblocks, append->lsn) &&
+		record_ack(append->ledger, 0, append->nblocks);
 	(void) pthread_mutex_lock(&append->mutex);
 	if (append->ok)
 	{
@@ -886,6 +888,48 @@ concurrent_appender(void *arg)
 	return NULL;
 }
 
+/*
+ * Start the deterministic concurrent appender before the maintenance pass
+ * that will crash: it takes admission-rd and holds it until the pass has
+ * entered its blocking admission-wr (the coordinator observes that through
+ * the exact wrlock replacement), then completes its append and records the
+ * ack.  Every publication boundary runs under that admission-wr, so at each
+ * of them the acknowledged append is the last mutation before the frozen
+ * sequence, and recovery must show it exactly once.  Returns once the
+ * appender is inside admission-rd, so the caller's maintenance pass is the
+ * one that queues behind it.
+ */
+static int
+start_overlapping_appender(ConcurrentAppend *appender, PsKey *keys,
+						   AckLedger *ledger, uint32_t nblocks, uint64_t lsn,
+						   pthread_t *thread, pthread_t *coordinator)
+{
+	memset(appender, 0, sizeof(*appender));
+	appender->keys = keys;
+	appender->ledger = ledger;
+	appender->nblocks = nblocks;
+	appender->lsn = lsn;
+	if (pthread_mutex_init(&appender->mutex, NULL) != 0 ||
+		pthread_cond_init(&appender->cond, NULL) != 0)
+		return 0;
+	ps_test_set_admission_read_hook(admission_read_hook, appender);
+	ps_test_set_admission_write_lock_hook(admission_write_lock_hook, appender);
+	if (pthread_create(thread, NULL, concurrent_appender, appender) != 0)
+		return 0;
+	if (pthread_create(coordinator, NULL, admission_coordinator, appender) != 0)
+		return 0;
+	(void) pthread_mutex_lock(&appender->mutex);
+	while (!appender->admission_entered && !appender->operation_failed)
+		(void) pthread_cond_wait(&appender->cond, &appender->mutex);
+	if (!appender->admission_entered || appender->operation_failed)
+	{
+		(void) pthread_mutex_unlock(&appender->mutex);
+		return 0;
+	}
+	(void) pthread_mutex_unlock(&appender->mutex);
+	return 1;
+}
+
 static int
 run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 				   AckLedger *ledger)
@@ -895,8 +939,6 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 	ConcurrentAppend appender;
 	pthread_t thread;
 	pthread_t coordinator;
-	int thread_started = 0;
-	int coordinator_started = 0;
 
 	if (!configure_fault(store, fault_dir, case_fault_name(which)) ||
 		ps_core_open(store) != 0 || !populate_store(store, keys))
@@ -938,38 +980,19 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 		if (unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") != 0)
 			_exit(2);
 		ps_test_forkmeta_snapshot_gc_retry_now();
+		/* the overlapping append grows key 0 past the two blocks every key
+		 * reached before generation 2, so the GC pass queues behind it */
+		if (!start_overlapping_appender(&appender, keys, ledger, 3, 700,
+										&thread, &coordinator))
+			_exit(2);
 		if (!arm_fault(fault_dir))
 			_exit(2);
 		(void) ps_core_maintenance();
 		_exit(3);
 	}
-	if (which == CASE_AFTER_SOURCE_REWRITE)
-	{
-		memset(&appender, 0, sizeof(appender));
-		appender.keys = keys;
-		appender.ledger = ledger;
-		if (pthread_mutex_init(&appender.mutex, NULL) != 0 ||
-			pthread_cond_init(&appender.cond, NULL) != 0)
-			_exit(2);
-		ps_test_set_admission_read_hook(admission_read_hook, &appender);
-		ps_test_set_admission_write_lock_hook(admission_write_lock_hook,
-										  &appender);
-		if (pthread_create(&thread, NULL, concurrent_appender, &appender) != 0)
-			_exit(2);
-		thread_started = 1;
-		if (pthread_create(&coordinator, NULL, admission_coordinator, &appender) != 0)
-			_exit(2);
-		coordinator_started = 1;
-		(void) pthread_mutex_lock(&appender.mutex);
-		while (!appender.admission_entered && !appender.operation_failed)
-			(void) pthread_cond_wait(&appender.cond, &appender.mutex);
-		if (!appender.admission_entered || appender.operation_failed)
-		{
-			(void) pthread_mutex_unlock(&appender.mutex);
-			_exit(2);
-		}
-		(void) pthread_mutex_unlock(&appender.mutex);
-	}
+	if (!start_overlapping_appender(&appender, keys, ledger, 2, 350,
+									&thread, &coordinator))
+		_exit(2);
 	if (snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) < 0 ||
 		!arm_fault(fault_dir))
 	{
@@ -977,14 +1000,10 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 		_exit(2);
 	}
 	(void) ps_core_maintenance();
-	if (thread_started)
-	{
-		(void) pthread_join(thread, NULL);
-		if (coordinator_started)
-			(void) pthread_join(coordinator, NULL);
-		ps_test_set_admission_read_hook(NULL, NULL);
-		ps_test_set_admission_write_lock_hook(NULL, NULL);
-	}
+	(void) pthread_join(thread, NULL);
+	(void) pthread_join(coordinator, NULL);
+	ps_test_set_admission_read_hook(NULL, NULL);
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	dprintf(STDERR_FILENO, "child maintenance returned case=%s\n", case_fault_name(which));
 	_exit(3);
 }
@@ -1101,8 +1120,12 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 			  reply.result == 1,
 			  "cross-shard relation existence survives restart");
 		{
+			/* key 0 is the concurrent appender's; its size is judged below,
+			 * against the ack, exactly */
 			uint32_t expected_nblocks = which == CASE_AFTER_SNAPSHOT_GC ? 2 : 1;
 
+			if (i == 0)
+				continue;
 			if (!meta_request(PS_OP_NBLOCKS, &keys[i], 0, 0, &reply) ||
 				(which == CASE_AFTER_SNAPSHOT_GC ?
 				 reply.result != expected_nblocks : reply.result < expected_nblocks))
@@ -1120,14 +1143,20 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 					  "cross-shard relation size does not roll back");
 		}
 	}
-	if (which == CASE_AFTER_SOURCE_REWRITE)
+	/*
+	 * The concurrent-append oracle, at every boundary: the append the
+	 * appender was acknowledged for while maintenance queued behind it must
+	 * be visible after recovery exactly once -- not lost with a prepared or
+	 * committed generation, not applied twice by replaying a suffix the
+	 * snapshot already carries.
+	 */
 	{
 		uint32_t ack_count = __atomic_load_n(&ledger->count, __ATOMIC_ACQUIRE);
 
 		check(__atomic_load_n(&ledger->overlap_observed, __ATOMIC_ACQUIRE) == 1,
 			  "maintenance entered the real blocking wrlock behind admitted writer");
-		check(ack_count != 0 && ack_count <= ACK_CAPACITY,
-			  "concurrent appender recorded every acknowledged append");
+		check(ack_count == 1,
+			  "concurrent appender recorded exactly its one acknowledged append");
 		for (uint32_t i = 0; i < ack_count && i < ACK_CAPACITY; i++)
 		{
 			const AckEntry *ack = &ledger->entries[i];
@@ -1136,10 +1165,17 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 				  meta_request(PS_OP_EXISTS, &keys[ack->key_index], 0, 0,
 							   &reply) && reply.result == 1,
 				  "acknowledged append relation exists after fresh recovery");
-			check(ack->key_index < MATRIX_KEYS &&
-				  meta_request(PS_OP_NBLOCKS, &keys[ack->key_index], 0, 0,
-							   &reply) && reply.result >= ack->nblocks,
-				  "acknowledged append size survives fresh recovery");
+			if (ack->key_index < MATRIX_KEYS &&
+				meta_request(PS_OP_NBLOCKS, &keys[ack->key_index], 0, 0, &reply) &&
+				reply.result == ack->nblocks)
+				check(1, "acknowledged append size survives fresh recovery exactly once");
+			else
+			{
+				dprintf(STDERR_FILENO, "ack size failure case=%d key=%u status=%u result=%u acked=%u\n",
+						(int) which, ack->key_index, reply.status, reply.result,
+						ack->nblocks);
+				check(0, "acknowledged append size survives fresh recovery exactly once");
+			}
 		}
 	}
 	close_runtime();
