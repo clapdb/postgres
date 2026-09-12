@@ -29,7 +29,8 @@
   "payload_identity": {
     "xlog_page_magic": 53536,
     "wal_segment_size": 16777216,
-    "xlog_long_header_seg_size_offset": 32
+    "xlog_long_header_seg_size_offset": 32,
+    "xlog_blcksz": 8192
   },
   "captured": "2026-09-12",
   "description": "POSIX fixture whose shipped-WAL envelopes are version 2 and record the payload's PostgreSQL identity (the WAL page magic and, at a PostgreSQL segment boundary, the WAL segment size) copied from the page header the payload begins with; the current fixture that pins the compiled identities and takes every mutation.",

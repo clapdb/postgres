@@ -116,14 +116,52 @@
  * sits inside it, so the WAL segment format is part of the fixture. */
 #define FIXTURE_WAL_END (RECLAIM_SEGMENT + 64u * 1024u)
 #define FIXTURE_WAL_REDO (RECLAIM_SEGMENT / 2)
-/* the PostgreSQL identity the fixture's shipped WAL carries: a 16 MiB WAL
- * segment size and the WAL page magic of the build this fixture was
- * captured under (XLOG_PAGE_MAGIC 0xD120), in a long page header at LSN 0
- * and a short one at every later page boundary the store seals on */
-#define FIXTURE_XLP_MAGIC 0xD120u
+/* The PostgreSQL identity the fixture's shipped WAL carries: a 16 MiB WAL
+ * segment size, and the WAL page magic and WAL block size of the build the
+ * fixture is captured under, in a long page header at LSN 0 and a short one
+ * at every later page boundary the store seals on.  The fixture tool passes
+ * the capturing build's values (pagestore_control_restore --payload-identity)
+ * through PAGESTORE_FIXTURE_XLOG_MAGIC and PAGESTORE_FIXTURE_XLOG_BLCKSZ, and
+ * the same values from fixture.json when it verifies a captured store; the
+ * defaults are the pagestore branch's at the time of writing. */
+#define FIXTURE_XLP_MAGIC_DEFAULT 0xD120u
 #define FIXTURE_XLP_LONG_HEADER 0x0002u
 #define FIXTURE_XLP_SEG_SIZE (16u * 1024u * 1024u)
-#define FIXTURE_XLP_BLCKSZ 8192u
+#define FIXTURE_XLP_BLCKSZ_DEFAULT 8192u
+
+static void die(const char *message);
+
+static uint32_t
+fixture_env_u32(const char *name, uint32_t fallback)
+{
+	const char *value = getenv(name);
+	char	   *end;
+	unsigned long parsed;
+
+	if (value == NULL || *value == '\0')
+		return fallback;
+	errno = 0;
+	parsed = strtoul(value, &end, 0);
+	if (errno != 0 || *end != '\0' || parsed == 0 || parsed > UINT32_MAX)
+		die("invalid fixture identity in the environment");
+	return (uint32_t) parsed;
+}
+
+static uint16_t
+fixture_xlp_magic(void)
+{
+	uint32_t	magic = fixture_env_u32("PAGESTORE_FIXTURE_XLOG_MAGIC", FIXTURE_XLP_MAGIC_DEFAULT);
+
+	if (magic > 0xffffu)
+		die("PAGESTORE_FIXTURE_XLOG_MAGIC does not fit xlp_magic");
+	return (uint16_t) magic;
+}
+
+static uint32_t
+fixture_xlp_blcksz(void)
+{
+	return fixture_env_u32("PAGESTORE_FIXTURE_XLOG_BLCKSZ", FIXTURE_XLP_BLCKSZ_DEFAULT);
+}
 
 /*
  * PostgreSQL's WAL page headers, declared with the same member types so the
@@ -1170,7 +1208,7 @@ fixture_seed(void)
 
 			/* laid out and byte-ordered as this host's PostgreSQL would */
 			memset(&header, 0, sizeof(header));
-			header.std.xlp_magic = FIXTURE_XLP_MAGIC;
+			header.std.xlp_magic = fixture_xlp_magic();
 			header.std.xlp_info = lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0;
 			header.std.xlp_pageaddr = lsn;
 			memset(page, 0, sizeof(header));
@@ -1178,7 +1216,7 @@ fixture_seed(void)
 			{
 				header.xlp_sysid = UINT64_C(0x7061676573746f72);	/* "pagestor" */
 				header.xlp_seg_size = FIXTURE_XLP_SEG_SIZE;
-				header.xlp_xlog_blcksz = FIXTURE_XLP_BLCKSZ;
+				header.xlp_xlog_blcksz = fixture_xlp_blcksz();
 				memcpy(page, &header, sizeof(header));
 			}
 			else
@@ -1284,12 +1322,14 @@ fixture_wal_check(uint64_t lsn)
 
 		/* laid out and byte-ordered as the seed stamped it */
 		memcpy(&header, ch->data, sizeof(header));
-		if (header.std.xlp_magic == FIXTURE_XLP_MAGIC)
+		if (header.std.xlp_magic == fixture_xlp_magic())
 		{
 			if (header.std.xlp_info != (lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0))
 				die("fixture shipped WAL lost its page header flags");
-			if (lsn % FIXTURE_XLP_SEG_SIZE == 0 && header.xlp_seg_size != FIXTURE_XLP_SEG_SIZE)
-				die("fixture shipped WAL lost its segment size");
+			if (lsn % FIXTURE_XLP_SEG_SIZE == 0 &&
+				(header.xlp_seg_size != FIXTURE_XLP_SEG_SIZE ||
+				 header.xlp_xlog_blcksz != fixture_xlp_blcksz()))
+				die("fixture shipped WAL lost its segment or block size");
 			for (uint32_t i = sizeof(header); i < 64; i++)
 				if (ch->data[i] != expected)
 					die("fixture shipped WAL returned the wrong bytes");

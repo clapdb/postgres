@@ -1062,8 +1062,11 @@ stderr.  `pagestore_control_restore --payload-identity` prints the build's
 tuple (version constants and layout parameters) so the fixture check can
 ask whether a fixture's payload is loadable by the checking build
 (`--postgres-payload-identity-tool`; the identity includes where the
-build's `XLogLongPageHeaderData` puts the segment size, so a fixture
-captured under the other ABI is foreign too): a current fixture captured
+build's `XLogLongPageHeaderData` puts the segment size and the build's WAL
+block size, so a fixture captured under the other ABI or another
+`--with-wal-blocksize` is foreign too, and a capture stamps its shipped WAL
+with the capturing build's magic and block size so a release branch can
+capture the fixture that matches it): a current fixture captured
 under another build is skipped as "payload needs a PostgreSQL build with
 XLOG_PAGE_MAGIC ..." rather than failed as a broken envelope, and when no
 current fixture matches the build the check fails on `pagestore`
