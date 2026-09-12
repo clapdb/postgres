@@ -59,6 +59,26 @@ typedef struct TestForkMetaRecV2
 	uint8_t pad[3];
 } TestForkMetaRecV2;
 
+/* Keep in lockstep with ForkMetaSnapshotPayloadHeader in pagestore_core.c:
+ * each immutable snapshot part is this header, then records. */
+typedef struct TestForkMetaSnapshotPayloadHeader
+{
+	uint32_t magic;
+	uint16_t version;
+	uint16_t header_bytes;
+	uint32_t part;
+	uint32_t record_bytes;
+	uint64_t generation;
+	uint64_t cutoff_lsn;
+	uint64_t cutoff_admission_seq;
+	uint64_t freeze_admission_seq;
+	uint64_t checkpoint_records;
+	uint64_t tail_records;
+	uint64_t checkpoint_bytes;
+	uint64_t tail_bytes;
+} TestForkMetaSnapshotPayloadHeader;
+#define TEST_FORK_META_SNAPSHOT_PAYLOAD_MAGIC UINT32_C(0x31534d46)
+
 typedef struct ConcurrentAppend
 {
 	PsKey *keys;
@@ -80,6 +100,7 @@ typedef struct AckEntry
 {
 	uint32_t key_index;
 	uint32_t nblocks;
+	uint64_t lsn;
 } AckEntry;
 
 typedef struct AckLedger
@@ -774,7 +795,7 @@ done:
 }
 
 static int
-record_ack(AckLedger *ledger, uint32_t key_index, uint32_t nblocks)
+record_ack(AckLedger *ledger, uint32_t key_index, uint32_t nblocks, uint64_t lsn)
 {
 	uint32_t index = __atomic_load_n(&ledger->count, __ATOMIC_RELAXED);
 
@@ -782,6 +803,7 @@ record_ack(AckLedger *ledger, uint32_t key_index, uint32_t nblocks)
 		return 0;
 	ledger->entries[index].key_index = key_index;
 	ledger->entries[index].nblocks = nblocks;
+	ledger->entries[index].lsn = lsn;
 	__atomic_store_n(&ledger->count, index + 1, __ATOMIC_RELEASE);
 	return 1;
 }
@@ -875,7 +897,7 @@ concurrent_appender(void *arg)
 	ConcurrentAppend *append = arg;
 
 	append->ok = grow_key(&append->keys[0], append->nblocks, append->lsn) &&
-		record_ack(append->ledger, 0, append->nblocks);
+		record_ack(append->ledger, 0, append->nblocks, append->lsn);
 	(void) pthread_mutex_lock(&append->mutex);
 	if (append->ok)
 	{
@@ -886,6 +908,114 @@ concurrent_appender(void *arg)
 	(void) pthread_cond_broadcast(&append->cond);
 	(void) pthread_mutex_unlock(&append->mutex);
 	return NULL;
+}
+
+/* Count records of the acknowledged event (key, GROW, lsn) in one snapshot
+ * part; -1 when the part is not what this build writes. */
+static int
+count_event_in_part(int fd, const PsKey *key, uint64_t lsn, uint32_t nblocks,
+					uint64_t *count)
+{
+	TestForkMetaSnapshotPayloadHeader header;
+	TestForkMetaRecV2 rec;
+	struct stat st;
+	off_t offset;
+
+	if (fd < 0 || fstat(fd, &st) != 0 ||
+		pread(fd, &header, sizeof(header), 0) != (ssize_t) sizeof(header) ||
+		header.magic != TEST_FORK_META_SNAPSHOT_PAYLOAD_MAGIC ||
+		header.header_bytes != sizeof(header) ||
+		header.record_bytes != sizeof(rec) ||
+		(st.st_size - (off_t) sizeof(header)) % (off_t) sizeof(rec) != 0)
+		return -1;
+	for (offset = sizeof(header); offset < st.st_size; offset += sizeof(rec))
+	{
+		if (pread(fd, &rec, sizeof(rec), offset) != (ssize_t) sizeof(rec) ||
+			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec))
+			return -1;
+		if (rec.kind == TEST_FEV_GROW && rec.lsn == lsn &&
+			memcmp(&rec.key, key, sizeof(*key)) == 0)
+		{
+			if (rec.nblocks != nblocks)
+				return -1;
+			(*count)++;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The representation-level exactly-once oracle.  A GROW is an idempotent
+ * maximum, so the size after recovery cannot tell one application from
+ * two; count the acknowledged event's record across what recovery
+ * composes instead -- the selected snapshot's checkpoint and tail parts,
+ * and the source records after that snapshot's base marker (the whole
+ * source when no snapshot is selected, or when the source still names an
+ * older epoch, which recovery then ignores: its records are not counted).
+ * Returns 0 and the count, -1 when the durable set is not readable.
+ */
+static int
+count_acked_event(const char *store, const char *snapshots, const PsKey *key,
+				  uint64_t lsn, uint32_t nblocks, uint64_t *count)
+{
+	PsForkmetaSnapshot selected = {
+		.directory_fd = -1, .checkpoint_fd = -1, .tail_fd = -1
+	};
+	TestForkMetaRecV2 rec;
+	char path[1600];
+	struct stat st;
+	off_t offset = 0;
+	int have_selected;
+	int fd = -1;
+	int rc = -1;
+
+	*count = 0;
+	have_selected = ps_forkmeta_snapshot_open(&selected, snapshots) == 0;
+	if (have_selected &&
+		(count_event_in_part(selected.checkpoint_fd, key, lsn, nblocks, count) != 0 ||
+		 count_event_in_part(selected.tail_fd, key, lsn, nblocks, count) != 0))
+		goto done;
+	if (snprintf(path, sizeof(path), "%s/forkmeta", store) < 0 ||
+		stat(path, &st) != 0 || st.st_size % (off_t) sizeof(rec) != 0)
+		goto done;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		goto done;
+	if (have_selected)
+	{
+		/* the source counts only through the selected generation's marker;
+		 * an older epoch is superseded by the snapshot entirely */
+		if (st.st_size < (off_t) sizeof(rec) ||
+			pread(fd, &rec, sizeof(rec), 0) != (ssize_t) sizeof(rec))
+			goto done;
+		if (rec.kind != TEST_FEV_SNAPSHOT_BASE ||
+			rec.order_id != selected.generation)
+		{
+			rc = 0;
+			goto done;
+		}
+		offset = sizeof(rec);
+	}
+	for (; offset < st.st_size; offset += sizeof(rec))
+	{
+		if (pread(fd, &rec, sizeof(rec), offset) != (ssize_t) sizeof(rec) ||
+			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec))
+			goto done;
+		if (rec.kind == TEST_FEV_GROW && rec.lsn == lsn &&
+			memcmp(&rec.key, key, sizeof(*key)) == 0)
+		{
+			if (rec.nblocks != nblocks)
+				goto done;
+			(*count)++;
+		}
+	}
+	rc = 0;
+done:
+	if (fd >= 0)
+		(void) close(fd);
+	if (have_selected)
+		ps_forkmeta_snapshot_close(&selected);
+	return rc;
 }
 
 /*
@@ -1057,6 +1187,8 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 		(which == CASE_AFTER_SNAPSHOT_GC ? 2 : 1);
 	int selected_ok;
 
+	if (snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) < 0)
+		return 0;
 	selected_ok = selected_generation(store, &generation) == 0;
 	check(selected_ok == (expected_generation != 0),
 		  "recovery selects old-or-new complete snapshot generation");
@@ -1066,8 +1198,7 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 			  "recovery selected the expected generation");
 		if (selected_ok)
 		{
-			if (snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) >= 0 &&
-				ps_forkmeta_snapshot_open(&selected, snapshots) == 0)
+			if (ps_forkmeta_snapshot_open(&selected, snapshots) == 0)
 			{
 				check(selected.cutoff_lsn != 0 &&
 					  selected.cutoff_admission_seq != 0,
@@ -1168,13 +1299,28 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 			if (ack->key_index < MATRIX_KEYS &&
 				meta_request(PS_OP_NBLOCKS, &keys[ack->key_index], 0, 0, &reply) &&
 				reply.result == ack->nblocks)
-				check(1, "acknowledged append size survives fresh recovery exactly once");
+				check(1, "acknowledged append size survives fresh recovery");
 			else
 			{
 				dprintf(STDERR_FILENO, "ack size failure case=%d key=%u status=%u result=%u acked=%u\n",
 						(int) which, ack->key_index, reply.status, reply.result,
 						ack->nblocks);
-				check(0, "acknowledged append size survives fresh recovery exactly once");
+				check(0, "acknowledged append size survives fresh recovery");
+			}
+			/* the size alone cannot tell one application of an idempotent
+			 * GROW from two: the durable set recovery composes must carry
+			 * the acknowledged event's record exactly once */
+			{
+				uint64_t records = 0;
+				int counted = ack->key_index < MATRIX_KEYS &&
+					count_acked_event(store, snapshots, &keys[ack->key_index],
+									  ack->lsn, ack->nblocks, &records) == 0;
+
+				if (!counted || records != 1)
+					dprintf(STDERR_FILENO, "ack record count case=%d counted=%d records=%llu\n",
+							(int) which, counted, (unsigned long long) records);
+				check(counted && records == 1,
+					  "acknowledged append is recorded exactly once in what recovery composes");
 			}
 		}
 	}

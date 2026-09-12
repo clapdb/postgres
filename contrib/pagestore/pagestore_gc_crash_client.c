@@ -522,40 +522,47 @@ forkmeta_events_seed(void)
 }
 
 /*
- * The concurrent-append ledger.  Every trickle event the daemon acknowledges
- * is appended here and fsynced before the next request, so whatever the
- * crash boundary, the verify oracle knows exactly which appends were
- * acknowledged and holds recovery to each of them, once: an acknowledged
- * create must exist, an acknowledged growth must show exactly that size.
+ * The concurrent-append ledger.  Every trickle event is entered here twice
+ * -- as pending before its request is sent, as acknowledged once the daemon
+ * has answered -- each entry fsynced before the next step, so whatever the
+ * crash boundary the verify oracle knows which appends were acknowledged and
+ * holds recovery to each of them, once: an acknowledged create must exist,
+ * an acknowledged growth must show exactly that size.  A pending entry with
+ * no acknowledgement is an append the daemon may or may not have applied
+ * before it died (it can have answered without this client recording it):
+ * recovery may show either outcome, and nothing else.
  */
 static void
-forkmeta_trickle_ack(uint32_t rel, uint32_t nblocks)
+forkmeta_ledger(uint32_t rel, const char *op, const char *state)
 {
 	FILE	   *out;
 
 	if (ack_file == NULL)
 		return;
 	out = fopen(ack_file, "a");
-	if (out == NULL || fprintf(out, "%u %u\n", rel, nblocks) < 0 ||
+	if (out == NULL || fprintf(out, "%u %s %s\n", rel, op, state) < 0 ||
 		fflush(out) != 0 || fsync(fileno(out)) != 0 || fclose(out) != 0)
-		die("cannot record an acknowledged trickle append");
+		die("cannot record a trickle append in the ledger");
 }
 
 /* One trickle relation: a create and a growth to two blocks, each entered
- * in the ledger once the daemon has acknowledged it. */
+ * in the ledger before it is sent and again once the daemon has
+ * acknowledged it. */
 static void
 forkmeta_trickle_one(uint32_t j)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
 	uint32_t	rel = FORKMETA_TRICKLE_REL + j;
 
+	forkmeta_ledger(rel, "create", "pending");
 	set_relation(ch);
 	ch->key.relNumber = rel;
 	ch->opcode = PS_OP_CREATE;
 	ch->req_lsn = 6000 + j;
 	if (execute()->status != PS_STATUS_OK)
 		die("fork create failed");
-	forkmeta_trickle_ack(rel, 0);
+	forkmeta_ledger(rel, "create", "ok");
+	forkmeta_ledger(rel, "grow", "pending");
 	set_relation(ch);
 	ch->key.relNumber = rel;
 	ch->opcode = PS_OP_ZEROEXTEND;
@@ -564,7 +571,7 @@ forkmeta_trickle_one(uint32_t j)
 	ch->req_lsn = 7000 + j;
 	if (execute()->status != PS_STATUS_OK)
 		die("fork zero-extend failed");
-	forkmeta_trickle_ack(rel, 2);
+	forkmeta_ledger(rel, "grow", "ok");
 }
 
 static void
@@ -602,64 +609,105 @@ forkmeta_seed(void)
 	wait_forever();
 }
 
-/* Hold recovery to the ledger: every acknowledged trickle append, exactly
- * once.  A relation with an acknowledged growth must show that size, one
- * with only an acknowledged create must exist at zero blocks. */
+/* a trickle relation's ledger state: how far its create and growth got */
+#define TRICKLE_UNSENT 0
+#define TRICKLE_PENDING 1
+#define TRICKLE_ACKED 2
+
+/*
+ * Hold recovery to the ledger.  An acknowledged create must exist; an
+ * acknowledged growth must show exactly two blocks; a pending, unacknowledged
+ * step may have landed or not -- so a pending create may or may not exist,
+ * and a pending growth shows zero or two blocks -- and no relation shows
+ * anything else.
+ */
 static void
 forkmeta_check_acks(void)
 {
 	PsChannel  *ch = ps_channel(shm_base, channel);
 	FILE	   *in;
 	uint32_t	rel;
-	uint32_t	nblocks;
-	uint32_t	expected[FORKMETA_TRICKLE_RELS];
-	unsigned char acked[FORKMETA_TRICKLE_RELS];
+	char		op[16];
+	char		state[16];
+	unsigned char create[FORKMETA_TRICKLE_RELS];
+	unsigned char grow[FORKMETA_TRICKLE_RELS];
 	uint32_t	verified = 0;
+	uint32_t	pending = 0;
 
 	if (ack_file == NULL)
 		return;
 	in = fopen(ack_file, "r");
 	if (in == NULL)
 		die("the acknowledged-append ledger is missing");
-	memset(acked, 0, sizeof(acked));
-	while (fscanf(in, "%u %u", &rel, &nblocks) == 2)
+	memset(create, TRICKLE_UNSENT, sizeof(create));
+	memset(grow, TRICKLE_UNSENT, sizeof(grow));
+	while (fscanf(in, "%u %15s %15s", &rel, op, state) == 3)
 	{
+		unsigned char *slot;
+		unsigned char value;
+
 		if (rel < FORKMETA_TRICKLE_REL || rel >= FORKMETA_TRICKLE_REL + FORKMETA_TRICKLE_RELS)
 			die("the acknowledged-append ledger names a relation outside the trickle");
-		acked[rel - FORKMETA_TRICKLE_REL] = 1;
-		expected[rel - FORKMETA_TRICKLE_REL] = nblocks;
+		if (strcmp(op, "create") == 0)
+			slot = &create[rel - FORKMETA_TRICKLE_REL];
+		else if (strcmp(op, "grow") == 0)
+			slot = &grow[rel - FORKMETA_TRICKLE_REL];
+		else
+			die("the acknowledged-append ledger names an unknown operation");
+		if (strcmp(state, "pending") == 0)
+			value = TRICKLE_PENDING;
+		else if (strcmp(state, "ok") == 0)
+			value = TRICKLE_ACKED;
+		else
+			die("the acknowledged-append ledger names an unknown state");
+		if (value <= *slot)
+			die("the acknowledged-append ledger is out of order");
+		*slot = value;
 	}
 	fclose(in);
 	for (uint32_t j = 0; j < FORKMETA_TRICKLE_LEDGER_MIN; j++)
-		if (!acked[j] || expected[j] != 2)
+		if (grow[j] != TRICKLE_ACKED)
 			die("the acknowledged-append ledger lacks the appends made before the fault");
 	for (uint32_t j = 0; j < FORKMETA_TRICKLE_RELS; j++)
 	{
-		if (!acked[j])
+		uint32_t	exists;
+		uint32_t	nblocks = 0;
+
+		if (create[j] == TRICKLE_UNSENT)
 			continue;
 		set_relation(ch);
 		ch->key.relNumber = FORKMETA_TRICKLE_REL + j;
 		ch->opcode = PS_OP_EXISTS;
-		if (execute()->status != PS_STATUS_OK || ch->result != 1)
+		if (execute()->status != PS_STATUS_OK)
+			die("existence query failed after recovery");
+		exists = ch->result;
+		if (exists)
 		{
-			fprintf(stderr, "pagestore_gc_crash_client: acknowledged relation %u "
-					"does not exist after recovery\n", FORKMETA_TRICKLE_REL + j);
+			set_relation(ch);
+			ch->key.relNumber = FORKMETA_TRICKLE_REL + j;
+			ch->opcode = PS_OP_NBLOCKS;
+			if (execute()->status != PS_STATUS_OK)
+				die("size query failed after recovery");
+			nblocks = ch->result;
+		}
+		if ((create[j] == TRICKLE_ACKED && !exists) ||
+			(grow[j] == TRICKLE_ACKED && nblocks != 2) ||
+			(grow[j] != TRICKLE_ACKED && nblocks != 0 && nblocks != 2) ||
+			(!exists && nblocks != 0))
+		{
+			fprintf(stderr, "pagestore_gc_crash_client: relation %u after recovery: "
+					"exists=%u blocks=%u, ledger create=%u grow=%u\n",
+					FORKMETA_TRICKLE_REL + j, exists, nblocks, create[j], grow[j]);
 			exit(1);
 		}
-		set_relation(ch);
-		ch->key.relNumber = FORKMETA_TRICKLE_REL + j;
-		ch->opcode = PS_OP_NBLOCKS;
-		if (execute()->status != PS_STATUS_OK || ch->result != expected[j])
-		{
-			fprintf(stderr, "pagestore_gc_crash_client: acknowledged relation %u "
-					"has %u blocks after recovery, acknowledged %u\n",
-					FORKMETA_TRICKLE_REL + j, (unsigned) ch->result, expected[j]);
-			exit(1);
-		}
-		verified++;
+		if (grow[j] == TRICKLE_ACKED)
+			verified++;
+		else
+			pending++;
 	}
 	fprintf(stderr, "pagestore_gc_crash_client: %u acknowledged trickle "
-			"appends verified after recovery\n", verified);
+			"appends verified after recovery, %u in flight at the crash\n",
+			verified, pending);
 }
 
 static void
