@@ -41,7 +41,8 @@
 #define PS_REDO_NOTE_MAGIC			0x4e525350u	/* "PSRN" */
 #define PS_REDO_NOTE_VERSION		1u
 
-/* block 2: the admission fence (PS_ADMISSION_FENCE_* in pagestore_ipc.h) */
+/* block 2: the admission fence (PsAdmissionFence in pagestore_ipc.h) */
+#define PS_ADMISSION_FENCE_BLOCK		2u
 
 /* block 3: the materializer's durable materialized-through marker */
 #define PS_MATERIALIZER_MARKER_BLOCK	3u

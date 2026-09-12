@@ -1841,6 +1841,26 @@ ps_slru_rearm_interrupt(void)
 }
 
 /*
+ * A reader found a watermark or tombstone object whose identity trailer
+ * names a format this build does not know.  Unlike a store outage, that is
+ * not transient: the writer now publishes visibility metadata this reader
+ * cannot interpret, so the watermark and tombstones it fetched earlier no
+ * longer bound what the writer has done since.  Forget the last successful
+ * fetch before raising, so cache-hit revalidation and the freshness gate
+ * fail closed at once instead of trusting the old pair for the staleness
+ * window; a later compatible fetch stamps it again.
+ */
+pg_noreturn static void
+ps_slru_reader_foreign_identity(const char *what)
+{
+	if (ps_slru_wm != NULL)
+		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, 0);
+	ereport(ERROR,
+			(errmsg("pagestore: %s carries an identity this build does not know",
+					what)));
+}
+
+/*
  * Fetch the newest published watermark -- and each in-scope SLRU's newest
  * tombstone, which can advance independently of it (truncations publish
  * between checkpoints) -- from the store.  TTL-bounded across all backends
@@ -1880,8 +1900,7 @@ ps_slru_reader_fetch_wm(void)
 			if (ps_artifact_trailer_check((const unsigned char *) page,
 										  PS_SLRU_WATERMARK_MAGIC,
 										  PS_SLRU_WATERMARK_VERSION) != 0)
-				ereport(ERROR,
-						(errmsg("pagestore: the SLRU mirror watermark object carries an identity this build does not know")));
+				ps_slru_reader_foreign_identity("the SLRU mirror watermark object");
 			memcpy(&w, page, sizeof(uint64));
 		}
 
@@ -1899,8 +1918,7 @@ ps_slru_reader_fetch_wm(void)
 				if (ps_artifact_trailer_check((const unsigned char *) page,
 											  PS_SLRU_TOMBSTONE_MAGIC,
 											  PS_SLRU_TOMBSTONE_VERSION) != 0)
-					ereport(ERROR,
-							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
+					ps_slru_reader_foreign_identity("an SLRU truncation tombstone object");
 				memcpy(&cutoff, page, sizeof(int64));
 				ps_slru_tomb_note(i, cutoff, resolved);
 			}
@@ -2218,8 +2236,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 				if (ps_artifact_trailer_check((const unsigned char *) tpage,
 											  PS_SLRU_TOMBSTONE_MAGIC,
 											  PS_SLRU_TOMBSTONE_VERSION) != 0)
-					ereport(ERROR,
-							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
+					ps_slru_reader_foreign_identity("an SLRU truncation tombstone object");
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
 			}
@@ -2525,8 +2542,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 				if (ps_artifact_trailer_check((const unsigned char *) tpage,
 											  PS_SLRU_TOMBSTONE_MAGIC,
 											  PS_SLRU_TOMBSTONE_VERSION) != 0)
-					ereport(ERROR,
-							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
+					ps_slru_reader_foreign_identity("an SLRU truncation tombstone object");
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
 			}

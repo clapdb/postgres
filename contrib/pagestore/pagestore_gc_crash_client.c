@@ -1734,6 +1734,19 @@ fixture_backend_objects_seed(void)
 	PsKey		key;
 	uint64_t	v = FIXTURE_BACKEND_VERSION;
 
+	/* control block 2: the admission fence, paired with the image and note
+	 * (pagestore_ipc.h); seeded before the higher blocks so extending to
+	 * them never leaves a zero filler where the fence belongs */
+	{
+		PsAdmissionFence fence = {0};
+
+		fence.magic = PS_ADMISSION_FENCE_MAGIC;
+		fence.version = PS_ADMISSION_FENCE_VERSION;
+		fence.redo_lsn = FIXTURE_WAL_REDO;
+		fence.admission_seq = 1;
+		control_key(&key);
+		write_object_block(&key, PS_ADMISSION_FENCE_BLOCK, v, (const unsigned char *) &fence, sizeof(fence));
+	}
 	/* control block 3: materializer marker */
 	{
 		PsMaterializerMarkerFormat m = {0};
@@ -1872,6 +1885,16 @@ fixture_backend_objects_check(void)
 		ps_artifact_trailer_check(page, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION) != 0)
 		die("fixture redo note lost its identity");
 	{
+		PsAdmissionFence fence;
+
+		if (read_object_block(&key, PS_ADMISSION_FENCE_BLOCK, page) != 1)
+			die("fixture admission fence is not readable");
+		memcpy(&fence, page, sizeof(fence));
+		if (fence.magic != PS_ADMISSION_FENCE_MAGIC || fence.version != PS_ADMISSION_FENCE_VERSION ||
+			fence.redo_lsn != FIXTURE_WAL_REDO || fence.admission_seq == 0)
+			die("fixture admission fence is not intact");
+	}
+	{
 		PsMaterializerMarkerFormat m;
 
 		if (read_object_block(&key, PS_MATERIALIZER_MARKER_BLOCK, page) != 1)
@@ -1940,11 +1963,14 @@ fixture_backend_objects_check(void)
 		if (read_object_block(&key, 0, page) != 1)
 			die("fixture reader snapshot is not readable");
 		memcpy(&header, page, sizeof(header));
+		/* the count sizes the checksummed span: judge it before trusting it
+		 * as a length, or a mutated header reads past the page */
+		if (header.magic != PS_READER_SNAPSHOT_MAGIC || header.format != PS_READER_SNAPSHOT_FORMAT ||
+			header.count != 2)
+			die("fixture reader snapshot is not intact");
 		c = ps_crc32c_update(PS_CRC32C_INIT, &header, offsetof(PsReaderSnapshotHeaderFormat, crc));
 		c = ps_crc32c_update(c, page + sizeof(header), header.count * sizeof(uint32_t));
-		if (header.magic != PS_READER_SNAPSHOT_MAGIC || header.format != PS_READER_SNAPSHOT_FORMAT ||
-			header.count != 2 || header.crc != PS_CRC32C_FIN(c) ||
-			header.crc != manifest.artifact_crc)
+		if (header.crc != PS_CRC32C_FIN(c) || header.crc != manifest.artifact_crc)
 			die("fixture reader snapshot is not intact");
 
 		reader_key(&key, PS_READER_SNAPSHOT_READY_OBJECT);
