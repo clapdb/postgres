@@ -5587,6 +5587,11 @@ ps_slru_seg_path(char *buf, size_t buflen, const char *dir, int64 segno,
  */
 static char *pagestore_seed_reference_slru_dir = NULL;
 static int64 pagestore_seed_reference_pages_compared = 0;
+/* per SLRU class, so a scenario can require that each one was compared */
+static int64 pagestore_seed_reference_compared_xact = 0;
+static int64 pagestore_seed_reference_compared_commit_ts = 0;
+static int64 pagestore_seed_reference_compared_mxoffsets = 0;
+static int64 pagestore_seed_reference_compared_mxmembers = 0;
 
 static void
 pagestore_seed_reference_check(const char *slru_dir, bool long_names,
@@ -5641,6 +5646,14 @@ pagestore_seed_reference_check(const char *slru_dir, bool long_names,
 						(unsigned char) page[at], (unsigned char) refpage[at])));
 	}
 	pagestore_seed_reference_pages_compared++;
+	if (strcmp(slru_dir, "pg_xact") == 0)
+		pagestore_seed_reference_compared_xact++;
+	else if (strcmp(slru_dir, "pg_commit_ts") == 0)
+		pagestore_seed_reference_compared_commit_ts++;
+	else if (strcmp(slru_dir, "offsets") == 0)
+		pagestore_seed_reference_compared_mxoffsets++;
+	else if (strcmp(slru_dir, "members") == 0)
+		pagestore_seed_reference_compared_mxmembers++;
 }
 
 static void
@@ -6756,6 +6769,10 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 		pagestore_control_image_compatible(&seed_control, "branch SLRU seed");
 	}
 	pagestore_seed_reference_pages_compared = 0;
+	pagestore_seed_reference_compared_xact = 0;
+	pagestore_seed_reference_compared_commit_ts = 0;
+	pagestore_seed_reference_compared_mxoffsets = 0;
+	pagestore_seed_reference_compared_mxmembers = 0;
 
 	pathlen = snprintf(staging_root, sizeof(staging_root),
 					   "%s/.pagestore-branch-seed.%ld",
@@ -6900,9 +6917,13 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 		 * make no claim about recovery's state and are not compared.
 		 */
 		ereport(NOTICE,
-				(errmsg("seeded SLRU pages compared with recovery's at \"%s\": %lld reconstructed pages equal, %lld zero bootstrap pages not compared",
+				(errmsg("seeded SLRU pages compared with recovery's at \"%s\": %lld reconstructed pages equal (pg_xact %lld, pg_commit_ts %lld, pg_multixact/offsets %lld, pg_multixact/members %lld), %lld zero bootstrap pages not compared",
 						pagestore_seed_reference_slru_dir,
 						(long long) pagestore_seed_reference_pages_compared,
+						(long long) pagestore_seed_reference_compared_xact,
+						(long long) pagestore_seed_reference_compared_commit_ts,
+						(long long) pagestore_seed_reference_compared_mxoffsets,
+						(long long) pagestore_seed_reference_compared_mxmembers,
 						(long long) (seeded - pagestore_seed_reference_pages_compared))));
 	}
 

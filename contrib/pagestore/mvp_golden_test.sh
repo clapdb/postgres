@@ -414,7 +414,12 @@ seed_compare=$(grep -o "seeded SLRU pages compared with recovery's at .*" "$TMPR
 seed_compared=$(printf '%s\n' "$seed_compare" | sed -n 's/.*: \([0-9]*\) reconstructed pages equal.*/\1/p')
 [ "${seed_compared:-0}" -gt 0 ] ||
 	fail "no reconstructed SLRU page was compared with recovery's: $seed_compare"
-echo "ok   - every reconstructed SLRU page equals the page PostgreSQL recovery produced ($seed_compared pages)"
+# every class the seeders reconstruct must have been compared, not just one
+for slru in pg_xact pg_commit_ts pg_multixact/offsets pg_multixact/members; do
+	n=$(printf '%s\n' "$seed_compare" | sed -n "s|.*$slru \([0-9]*\).*|\1|p")
+	[ "${n:-0}" -gt 0 ] || fail "no reconstructed $slru page was compared with recovery's: $seed_compare"
+done
+echo "ok   - every reconstructed SLRU page equals the page PostgreSQL recovery produced ($seed_compared pages across pg_xact, pg_commit_ts and both pg_multixact halves)"
 python3 - "$BRANCH_FAULT_CONTROL/report.jsonl" <<'PY' || fail "branch crash report is not authentic"
 import json
 import sys
