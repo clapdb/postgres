@@ -205,6 +205,22 @@ typedef struct PsReaderDatabaseEntryFormat
 	uint32_t	tablespace_oid;
 } PsReaderDatabaseEntryFormat;
 
+/* ---- binding a producer's struct to a layout here ----------------------- */
+
+/*
+ * The backend keeps its own structs for these objects (PostgreSQL types,
+ * flexible members); each is pinned field by field to the layout restated
+ * here, so a change there that this header does not follow fails to
+ * compile instead of shipping a new layout under the old identity.
+ */
+#define PS_ARTIFACT_LAYOUT_SIZE(prod, shared) \
+	_Static_assert(sizeof(prod) == sizeof(shared), \
+				   #prod " must match pagestore_artifact_format.h")
+#define PS_ARTIFACT_LAYOUT_FIELD(prod, shared, field) \
+	_Static_assert(offsetof(prod, field) == offsetof(shared, field) && \
+				   sizeof(((prod *) 0)->field) == sizeof(((shared *) 0)->field), \
+				   #prod "." #field " must match pagestore_artifact_format.h")
+
 /* ---- the raw-value trailer ---------------------------------------------- */
 
 #define PS_ARTIFACT_TRAILER_OFFSET 8u

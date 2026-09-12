@@ -422,10 +422,12 @@ typedef struct PsSlruWatermarkShm
 										 * but must not let cached pages
 										 * revalidate against stale
 										 * tombstones forever */
-	pg_atomic_uint32 reader_foreign;	/* the last fetch met an object whose
-										 * identity this build does not know:
-										 * every read fails until a fetch
-										 * succeeds, backoff or not */
+	pg_atomic_uint32 reader_foreign;	/* generation: bumped whenever a
+										 * reader meets an object whose
+										 * identity this build does not know */
+	pg_atomic_uint32 reader_known;	/* the newest foreign generation a
+									 * completed fetch has since cleared;
+									 * reads fail while it lags behind */
 	pg_atomic_uint64 read_served;	/* live reads served from the mirror --
 									 * shared, so stats read from any backend
 									 * see the whole cluster's counts */
@@ -913,6 +915,7 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_at, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_ok_at, 0);
 		pg_atomic_init_u32(&ps_slru_wm->reader_foreign, 0);
+		pg_atomic_init_u32(&ps_slru_wm->reader_known, 0);
 		pg_atomic_init_u64(&ps_slru_wm->read_served, 0);
 		pg_atomic_init_u64(&ps_slru_wm->read_fallback, 0);
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
@@ -1847,12 +1850,14 @@ ps_slru_rearm_interrupt(void)
  * longer bound what the writer has done since.  Before raising, forget the
  * last successful fetch -- so cache-hit revalidation and the freshness gate
  * fail closed at once instead of trusting the old pair for the staleness
- * window -- and mark the state foreign, so the fetch's backoff fast path
- * keeps failing every read instead of handing out the cached watermark
+ * window -- and advance the foreign generation, so the fetch's backoff fast
+ * path keeps failing every read instead of handing out the cached watermark
  * for a TTL between probes (ps_slru_reader_require_known, which the read
  * hooks apply after every fetch; the fetch itself stays silent, since the
- * transaction-boundary refresh may not raise).  A later compatible fetch
- * clears both.
+ * transaction-boundary refresh may not raise).  A generation rather than a
+ * flag: a fetch clears only the generation it observed when it began, so
+ * one that read compatible objects while another backend met the foreign
+ * one cannot erase that sighting and resurrect the pair it fetched.
  */
 pg_noreturn static void
 ps_slru_reader_foreign_identity(const char *what)
@@ -1860,7 +1865,7 @@ ps_slru_reader_foreign_identity(const char *what)
 	if (ps_slru_wm != NULL)
 	{
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, 0);
-		pg_atomic_write_u32(&ps_slru_wm->reader_foreign, 1);
+		pg_atomic_fetch_add_u32(&ps_slru_wm->reader_foreign, 1);
 	}
 	ereport(ERROR,
 			(errmsg("pagestore: %s carries an identity this build does not know",
@@ -1880,10 +1885,14 @@ ps_slru_reader_fetch_wm(void)
 	TimestampTz now = GetCurrentTimestamp();
 	MemoryContext cxt = CurrentMemoryContext;
 	uint64		at;
+	uint32		foreign_seen;
 
 	if (ps_slru_wm == NULL)
 		return 0;
 
+	/* the foreign generation this fetch can vouch against: what it reads
+	 * from here on postdates anything that raised it up to now */
+	foreign_seen = pg_atomic_read_u32(&ps_slru_wm->reader_foreign);
 	at = pg_atomic_read_u64(&ps_slru_wm->reader_wm_at);
 	if (at != 0 &&
 		!TimestampDifferenceExceeds((TimestampTz) at, now,
@@ -1961,7 +1970,21 @@ ps_slru_reader_fetch_wm(void)
 		now = GetCurrentTimestamp();
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at, (uint64) now);
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, (uint64) now);
-		pg_atomic_write_u32(&ps_slru_wm->reader_foreign, 0);
+
+		/*
+		 * Clear only the foreign generation observed when this fetch began:
+		 * a sighting since then is of an object this fetch may not have
+		 * read, and stands until a fetch that began after it completes.
+		 */
+		for (;;)
+		{
+			uint32		known = pg_atomic_read_u32(&ps_slru_wm->reader_known);
+
+			if (foreign_seen <= known ||
+				pg_atomic_compare_exchange_u32(&ps_slru_wm->reader_known,
+											   &known, foreign_seen))
+				break;
+		}
 	}
 	PG_CATCH();
 	{
@@ -1990,7 +2013,8 @@ ps_slru_reader_fetch_wm(void)
 static void
 ps_slru_reader_require_known(void)
 {
-	if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) != 0)
+	if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) !=
+		pg_atomic_read_u32(&ps_slru_wm->reader_known))
 		ereport(ERROR,
 				(errmsg("pagestore: the SLRU mirror's visibility metadata carries an identity this build does not know")));
 }

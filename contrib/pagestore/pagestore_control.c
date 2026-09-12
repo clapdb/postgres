@@ -107,8 +107,12 @@ typedef struct PsWriterCheckpoint
 	uint64		checkpoint_lsn_complement;
 } PsWriterCheckpoint;
 
-StaticAssertDecl(sizeof(PsWriterCheckpoint) == sizeof(PsWriterCheckpointFormat),
-				 "writer checkpoint layout must match pagestore_artifact_format.h");
+PS_ARTIFACT_LAYOUT_SIZE(PsWriterCheckpoint, PsWriterCheckpointFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PsWriterCheckpoint, PsWriterCheckpointFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PsWriterCheckpoint, PsWriterCheckpointFormat, version);
+PS_ARTIFACT_LAYOUT_FIELD(PsWriterCheckpoint, PsWriterCheckpointFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PsWriterCheckpoint, PsWriterCheckpointFormat, checkpoint_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PsWriterCheckpoint, PsWriterCheckpointFormat, checkpoint_lsn_complement);
 
 typedef struct PsControlPending
 {
