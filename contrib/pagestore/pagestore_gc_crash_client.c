@@ -618,8 +618,8 @@ forkmeta_seed(void)
  * Hold recovery to the ledger.  An acknowledged create must exist; an
  * acknowledged growth must show exactly two blocks; a pending, unacknowledged
  * step may have landed or not -- so a pending create may or may not exist,
- * and a pending growth shows zero or two blocks -- and no relation shows
- * anything else.
+ * and a pending growth shows zero or two blocks -- a growth never sent shows
+ * zero, and no relation shows anything else.
  */
 static void
 forkmeta_check_acks(void)
@@ -692,7 +692,8 @@ forkmeta_check_acks(void)
 		}
 		if ((create[j] == TRICKLE_ACKED && !exists) ||
 			(grow[j] == TRICKLE_ACKED && nblocks != 2) ||
-			(grow[j] != TRICKLE_ACKED && nblocks != 0 && nblocks != 2) ||
+			(grow[j] == TRICKLE_PENDING && nblocks != 0 && nblocks != 2) ||
+			(grow[j] == TRICKLE_UNSENT && nblocks != 0) ||
 			(!exists && nblocks != 0))
 		{
 			fprintf(stderr, "pagestore_gc_crash_client: relation %u after recovery: "
