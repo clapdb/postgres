@@ -579,19 +579,13 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 	return false;
 }
 
-/* Stable per-SLRU object id from its directory name (FNV-1a; libc-only). */
+/* Stable per-SLRU object id from its directory name (FNV-1a; libc-only).
+ * The derivation is part of the persisted format: pagestore_artifact_format.h
+ * holds it so a fixture can seed at the ids a reader asks for. */
 uint32
 pagestore_slru_klass_id(const char *name)
 {
-	uint32		h = 2166136261u;
-	const unsigned char *p;
-
-	for (p = (const unsigned char *) name; *p != '\0'; p++)
-	{
-		h ^= *p;
-		h *= 16777619u;
-	}
-	return h;
+	return ps_slru_object_id(name);
 }
 
 /* Index of an SLRU dir in the scope table; -1 = out of scope. */

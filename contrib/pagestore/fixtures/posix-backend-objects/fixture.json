@@ -33,7 +33,7 @@
     "xlog_blcksz": 8192
   },
   "captured": "2026-09-12",
-  "description": "POSIX fixture that also carries the backend's own object payloads: the redo note, admission fence, SLRU watermark and tombstone with their identity trailers, the materializer marker and release and writer checkpoint control blocks, and the reader snapshot objects at the keys the backend's loaders read them from (global and per-database); the current fixture that pins the compiled identities and takes every mutation.",
+  "description": "POSIX fixture that also carries the backend's own object payloads: the redo note, admission fence, SLRU watermark and pg_xact tombstone with their identity trailers, the materializer marker and release and writer checkpoint control blocks, and the reader snapshot objects at the keys the backend's loaders read them from (global and per-database); the current fixture that pins the compiled identities and takes every mutation.",
   "files": [
     ".pagestore-nshards",
     "forkmeta",

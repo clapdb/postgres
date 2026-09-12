@@ -101,6 +101,24 @@ typedef struct PsWriterCheckpointFormat
 #define PS_SLRU_TOMBSTONE_MAGIC		0x42545350u	/* "PSTB" */
 #define PS_SLRU_TOMBSTONE_VERSION	1u
 
+/*
+ * The object an SLRU's mirror pages and tombstone live under is derived from
+ * its directory name (FNV-1a), so the keys a reader asks for are part of the
+ * persisted format too; a fixture seeds a tombstone at the id of "pg_xact".
+ */
+static inline uint32_t
+ps_slru_object_id(const char *dir)
+{
+	uint32_t	h = 2166136261u;
+
+	for (const unsigned char *p = (const unsigned char *) dir; *p != '\0'; p++)
+	{
+		h ^= *p;
+		h *= 16777619u;
+	}
+	return h;
+}
+
 /* ---- reader snapshot objects (PS_KLASS_READER_SNAPSHOT) ---------------- */
 
 #define PS_READER_SNAPSHOT_MANIFEST_OBJECT	0u
@@ -208,6 +226,18 @@ ps_artifact_trailer_set(unsigned char *page, uint32_t magic, uint32_t version)
 	memcpy(page + PS_ARTIFACT_TRAILER_OFFSET, &trailer, sizeof(trailer));
 }
 
+/* Does the object carry exactly this identity?  (A fixture captured under
+ * this build must; a reader also accepts the legacy zero trailer below.) */
+static inline int
+ps_artifact_trailer_is(const unsigned char *page, uint32_t magic,
+					   uint32_t version)
+{
+	PsArtifactTrailer trailer;
+
+	memcpy(&trailer, page + PS_ARTIFACT_TRAILER_OFFSET, sizeof(trailer));
+	return trailer.magic == magic && trailer.version == version;
+}
+
 /*
  * Check a raw-value object's identity.  A zero trailer is a legacy object
  * that recorded none and is accepted; a trailer naming another format, or a
@@ -222,7 +252,7 @@ ps_artifact_trailer_check(const unsigned char *page, uint32_t magic,
 	memcpy(&trailer, page + PS_ARTIFACT_TRAILER_OFFSET, sizeof(trailer));
 	if (trailer.magic == 0 && trailer.version == 0)
 		return 0;
-	return trailer.magic == magic && trailer.version == version ? 0 : -1;
+	return ps_artifact_trailer_is(page, magic, version) ? 0 : -1;
 }
 
 /* ---- CRC-32C, as PostgreSQL's pg_crc32c computes it -------------------- */
