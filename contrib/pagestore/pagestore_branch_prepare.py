@@ -1443,6 +1443,7 @@ class BranchPreparer:
             raise BranchPrepareError(
                 f"branch journal state {state!r} has no safe idempotent recovery path"
             )
+        entered_state = state
         if state == "fork_captured":
             if self.journal.get("intent") not in (None, "prepare_branch"):
                 raise BranchPrepareError("branch journal has a contradictory prepare intent")
@@ -1491,12 +1492,16 @@ class BranchPreparer:
                 archived_through_lsn=self.journal["switch_lsn"],
             )
             state = "branch_prepared"
-        if state in ("branch_prepared", "prepared") and self.verify_seed_against_materializer:
+        if (entered_state in ("branch_prepared", "prepared")
+                and self.verify_seed_against_materializer):
             # Prepared before verification was requested (or by a run whose
             # verification we cannot see): the materializer is still paused
             # at the fork LSN in these states, so re-seed under verification
             # now -- the server reconstructs and compares every page again
-            # instead of reusing the manifest -- before carrying on.
+            # instead of reusing the manifest -- before carrying on.  A
+            # journal that entered at fork_captured was just seeded and
+            # verified above; seeding it again would only unlink and rebuild
+            # a manifest that already stands.
             seeded = self.prepare_branch(
                 self.journal["base_lsn"],
                 self.journal["checkpoint_redo_lsn"],
