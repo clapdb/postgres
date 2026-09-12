@@ -1052,8 +1052,11 @@ the cluster was not initialized with maps the name to a range the store
 legitimately has nothing at, which would otherwise read as an archive miss
 -- and before handing a reconstructed segment to recovery it requires
 `xlp_magic` to be this build's `XLOG_PAGE_MAGIC`, `xlp_xlog_blcksz` to be
-its `XLOG_BLCKSZ`, and the long page header's `xlp_seg_size` to be that
-same size.  A mismatch, and a store that refuses
+its `XLOG_BLCKSZ`, the long page header's `xlp_seg_size` to be that same
+size, `xlp_sysid` to be the control image's system identifier, and
+`xlp_pageaddr` to be the segment start the name maps to -- the checks
+`XLogReaderValidatePageHeader()` would make next, whose failure outside
+standby mode ends recovery quietly.  A mismatch, and a store that refuses
 the read (a
 corrupt or resealed segment, WAL reclaimed below the frontier, a fenced
 incarnation), exits with a status above 125, which `RestoreArchivedFile()`

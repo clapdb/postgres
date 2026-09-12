@@ -18,7 +18,9 @@
  * whose xlp_xlog_blcksz must be this build's XLOG_BLCKSZ, and whose
  * xlp_seg_size must be the --segsize the LSN was computed from (a cluster
  * initialized with another --wal-segsize names a different LSN range by
- * the same file name).  The header is read with this build's
+ * the same file name), whose xlp_sysid must be the system identifier of
+ * the control image the store mirrors for the timeline, and whose
+ * xlp_pageaddr must be the segment start the name maps to.  The header is read with this build's
  * XLogLongPageHeaderData layout, so the field offsets follow the target
  * ABI.  A mismatch, like a store that refuses the read (a corrupt or
  * reclaimed segment, a fenced incarnation), is fatal to recovery:
@@ -201,18 +203,18 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 }
 
 /*
- * The WAL segment size the cluster that shipped this timeline's WAL was
- * initialized with, from the newest control image on the timeline's
+ * The WAL segment size and system identifier of the cluster that shipped
+ * this timeline's WAL, from the newest control image on the timeline's
  * ancestry (the writer mirrors pg_control at every ship point).  Returns 0
  * when no control image is mirrored, -1 when the store refused the read or
- * the image is not a control file this build can read.  This is checked
- * before a segment name is turned into an LSN: a --segsize the cluster was
- * not initialized with maps the name to the wrong range, where the store
- * legitimately has nothing, and an ordinary "no such archive file" would
- * then end recovery quietly.
+ * the image is not a control file this build can read, else the segment
+ * size, with *sysid set.  The size is checked before a segment name is
+ * turned into an LSN: a --segsize the cluster was not initialized with maps
+ * the name to the wrong range, where the store legitimately has nothing,
+ * and an ordinary "no such archive file" would then end recovery quietly.
  */
 static int64_t
-control_wal_segment_size(uint32_t tl, uint64_t incarnation)
+control_wal_segment_size(uint32_t tl, uint64_t incarnation, uint64_t *sysid)
 {
 	PsChannel  *ch = ps_channel(shm, chan);
 	ControlFileData control;
@@ -243,6 +245,7 @@ control_wal_segment_size(uint32_t tl, uint64_t incarnation)
 	if (!EQ_CRC32C(crc, control.crc) ||
 		control.pg_control_version != PG_CONTROL_VERSION)
 		return -1;
+	*sysid = control.system_identifier;
 	return control.xlog_seg_size;
 }
 
@@ -284,7 +287,8 @@ wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
  */
 static int
 check_payload_identity(const unsigned char *page, uint32_t len,
-					   uint64_t segsize, unsigned xlog_magic)
+					   uint64_t segsize, unsigned xlog_magic,
+					   uint64_t start_lsn, uint64_t system_identifier)
 {
 	XLogLongPageHeaderData header;
 
@@ -328,6 +332,28 @@ check_payload_identity(const unsigned char *page, uint32_t len,
 				header.xlp_xlog_blcksz, (unsigned) XLOG_BLCKSZ);
 		return PS_WALRESTORE_EXIT_FATAL;
 	}
+	/*
+	 * The same checks XLogReaderValidatePageHeader() makes next, which
+	 * outside standby mode end recovery quietly when they fail: the page
+	 * must belong to the cluster whose control image the store mirrors,
+	 * and must be the page the segment name asked for.
+	 */
+	if (system_identifier != 0 && header.xlp_sysid != system_identifier)
+	{
+		fprintf(stderr, "payload belongs to database system %llu; the timeline's "
+				"control image names %llu\n",
+				(unsigned long long) header.xlp_sysid,
+				(unsigned long long) system_identifier);
+		return PS_WALRESTORE_EXIT_FATAL;
+	}
+	if (header.std.xlp_pageaddr != start_lsn)
+	{
+		fprintf(stderr, "payload's first page is at %X/%08X, not the segment "
+				"start %X/%08X the name maps to\n",
+				LSN_FORMAT_ARGS(header.std.xlp_pageaddr),
+				LSN_FORMAT_ARGS(start_lsn));
+		return PS_WALRESTORE_EXIT_FATAL;
+	}
 	return 0;
 }
 
@@ -340,6 +366,7 @@ main(int argc, char **argv)
 	int			have_incarnation = 0;
 	uint64_t	segsize = 16 * 1024 * 1024;
 	unsigned long xlog_magic = XLOG_PAGE_MAGIC;
+	uint64_t	system_identifier = 0;
 	const char *segname = NULL;
 	const char *outpath = NULL;
 	uint32_t	tli,
@@ -442,7 +469,8 @@ main(int argc, char **argv)
 	 * store has nothing at.
 	 */
 	{
-		int64_t		stored = control_wal_segment_size(timeline, incarnation);
+		int64_t		stored = control_wal_segment_size(timeline, incarnation,
+													  &system_identifier);
 
 		if (stored < 0)
 		{
@@ -508,8 +536,9 @@ main(int argc, char **argv)
 			break;				/* not in the store: segment unavailable */
 		if (off == 0)
 		{
-			int			rc = check_payload_identity(buf, got, segsize,
-													(unsigned) xlog_magic);
+			int			rc = check_payload_identity(buf, (uint32_t) got, segsize,
+													(unsigned) xlog_magic,
+													start_lsn, system_identifier);
 
 			if (rc != 0)
 			{
