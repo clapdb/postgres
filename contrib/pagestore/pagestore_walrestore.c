@@ -12,11 +12,21 @@
  * Exit 0 if the whole segment was available, non-zero otherwise (which tells
  * recovery there is no more WAL) -- standard restore_command semantics.
  *
+ * The bytes are handed to PostgreSQL untouched, so the one thing this tool
+ * checks about them is their PostgreSQL identity: the segment begins with a
+ * long WAL page header whose xlp_seg_size must be the --segsize the LSN was
+ * computed from (a cluster initialized with another --wal-segsize names a
+ * different LSN range by the same file name), and whose xlp_magic must be
+ * the XLOG_PAGE_MAGIC of the recovering build when --xlog-magic names it
+ * (pagestore_control_restore --payload-identity prints that build's
+ * value).  A mismatch is a hard error (exit 2) that names the payload
+ * identity, never a silent "no more WAL".
+ *
  * Freestanding: only pagestore_ipc.h and libc.
  *
  * Usage (as restore_command):
  *   pagestore_walrestore --shm NAME --timeline N --incarnation N \
- *       --segsize BYTES %f %p
+ *       --segsize BYTES [--xlog-magic 0xD120] %f %p
  *
  * src/../contrib/pagestore/pagestore_walrestore.c
  *
@@ -179,6 +189,56 @@ wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
 	return ch->result;
 }
 
+/*
+ * The segment's first page header, in the byte order PostgreSQL wrote it
+ * (the store does not move WAL between byte orders).  XLogPageHeaderData:
+ * xlp_magic u16, xlp_info u16, xlp_tli u32, xlp_pageaddr u64, xlp_rem_len
+ * u32, padding; XLogLongPageHeaderData adds xlp_sysid u64 at 24,
+ * xlp_seg_size u32 at 32, xlp_xlog_blcksz u32 at 36.
+ */
+#define XLP_LONG_HEADER_FLAG	0x0002
+#define XLP_LONG_HEADER_BYTES	40
+
+static int
+check_payload_identity(const unsigned char *page, uint32_t len,
+					   uint64_t segsize, int have_xlog_magic,
+					   unsigned xlog_magic)
+{
+	uint16_t	magic;
+	uint16_t	info;
+	uint32_t	seg_size;
+
+	if (len < XLP_LONG_HEADER_BYTES)
+	{
+		fprintf(stderr, "segment start is %u bytes, shorter than a WAL page header\n",
+				len);
+		return 2;
+	}
+	memcpy(&magic, page, sizeof(magic));
+	memcpy(&info, page + 2, sizeof(info));
+	if (have_xlog_magic && magic != xlog_magic)
+	{
+		fprintf(stderr, "payload needs a PostgreSQL build with XLOG_PAGE_MAGIC 0x%04x; "
+				"this build expects 0x%04x\n", magic, xlog_magic);
+		return 2;
+	}
+	if ((info & XLP_LONG_HEADER_FLAG) == 0)
+	{
+		fprintf(stderr, "segment start carries no long WAL page header "
+				"(xlp_info 0x%04x); not a PostgreSQL WAL segment boundary\n", info);
+		return 2;
+	}
+	memcpy(&seg_size, page + 32, sizeof(seg_size));
+	if (seg_size != segsize)
+	{
+		fprintf(stderr, "payload was written by a cluster with a %u-byte WAL "
+				"segment size; --segsize %llu names a different LSN range\n",
+				seg_size, (unsigned long long) segsize);
+		return 2;
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -187,6 +247,8 @@ main(int argc, char **argv)
 	uint64_t	incarnation = 0;
 	int			have_incarnation = 0;
 	uint64_t	segsize = 16 * 1024 * 1024;
+	unsigned long xlog_magic = 0;
+	int			have_xlog_magic = 0;
 	const char *segname = NULL;
 	const char *outpath = NULL;
 	uint32_t	tli,
@@ -227,6 +289,19 @@ main(int argc, char **argv)
 		}
 		else if (strcmp(argv[i], "--segsize") == 0 && i + 1 < argc)
 			segsize = strtoull(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--xlog-magic") == 0 && i + 1 < argc)
+		{
+			char	   *end;
+
+			errno = 0;
+			xlog_magic = strtoul(argv[++i], &end, 0);
+			if (errno != 0 || *end != '\0' || xlog_magic == 0 || xlog_magic > 0xffff)
+			{
+				fprintf(stderr, "invalid --xlog-magic \"%s\"\n", argv[i]);
+				return 2;
+			}
+			have_xlog_magic = 1;
+		}
 		else if (!segname)
 			segname = argv[i];
 		else if (!outpath)
@@ -234,7 +309,7 @@ main(int argc, char **argv)
 	}
 	if (!shm_name || !segname || !outpath || !have_incarnation)
 	{
-		fprintf(stderr, "usage: %s --shm NAME [--timeline N] --incarnation N [--segsize B] <segfile> <outpath>\n",
+		fprintf(stderr, "usage: %s --shm NAME [--timeline N] --incarnation N [--segsize B] [--xlog-magic M] <segfile> <outpath>\n",
 				argv[0]);
 		return 2;
 	}
@@ -296,6 +371,19 @@ main(int argc, char **argv)
 
 		if (got == 0)
 			break;				/* not in the store: segment unavailable */
+		if (off == 0)
+		{
+			int			rc = check_payload_identity(buf, got, segsize,
+													have_xlog_magic,
+													(unsigned) xlog_magic);
+
+			if (rc != 0)
+			{
+				close(outfd);
+				unlink(outpath);
+				return rc;
+			}
+		}
 		if (write(outfd, buf, got) != (ssize_t) got)
 		{
 			perror("write");

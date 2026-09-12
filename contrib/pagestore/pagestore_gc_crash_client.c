@@ -116,6 +116,14 @@
  * sits inside it, so the WAL segment format is part of the fixture. */
 #define FIXTURE_WAL_END (RECLAIM_SEGMENT + 64u * 1024u)
 #define FIXTURE_WAL_REDO (RECLAIM_SEGMENT / 2)
+/* the PostgreSQL identity the fixture's shipped WAL carries: a 16 MiB WAL
+ * segment size and the WAL page magic of the build this fixture was
+ * captured under (XLOG_PAGE_MAGIC 0xD120), in a long page header at LSN 0
+ * and a short one at every later page boundary the store seals on */
+#define FIXTURE_XLP_MAGIC 0xD120u
+#define FIXTURE_XLP_LONG_HEADER 0x0002u
+#define FIXTURE_XLP_SEG_SIZE (16u * 1024u * 1024u)
+#define FIXTURE_XLP_BLCKSZ 8192u
 #define FIXTURE_BRANCH 1u
 #define FIXTURE_DELETED_BRANCH 2u
 /* Above the WAL end: maintenance may publish the parent's WAL-index frontier
@@ -1130,6 +1138,30 @@ fixture_seed(void)
 		ch->req_lsn = lsn;
 		ch->datalen = RECLAIM_CHUNK;
 		memset(ch->data, (int) (1 + lsn / RECLAIM_SEGMENT), RECLAIM_CHUNK);
+		/* a WAL page header where a sealed store segment will begin, so the
+		 * envelope records a payload identity the way it does for real WAL */
+		if (lsn % RECLAIM_SEGMENT == 0)
+		{
+			unsigned char *page = ch->data;
+			uint16_t	info = lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0;
+
+			memset(page, 0, 40);
+			page[0] = (unsigned char) FIXTURE_XLP_MAGIC;
+			page[1] = (unsigned char) (FIXTURE_XLP_MAGIC >> 8);
+			page[2] = (unsigned char) info;
+			page[3] = (unsigned char) (info >> 8);
+			if (info != 0)
+			{
+				uint32_t	seg = FIXTURE_XLP_SEG_SIZE;
+				uint32_t	blcksz = FIXTURE_XLP_BLCKSZ;
+
+				for (int b = 0; b < 4; b++)
+				{
+					page[32 + b] = (unsigned char) (seg >> (8 * b));
+					page[36 + b] = (unsigned char) (blcksz >> (8 * b));
+				}
+			}
+		}
 		if (execute()->status != PS_STATUS_OK)
 			die("WAL append failed");
 		lsn += RECLAIM_CHUNK;
@@ -1220,6 +1252,31 @@ fixture_wal_check(uint64_t lsn)
 		die("fixture shipped WAL is not readable");
 	if (ch->result != 64)
 		die("fixture shipped WAL returned a short read");
+	/* A fixture seeded since the envelope records payload identity stamps
+	 * a WAL page header where each store segment begins; one seeded before
+	 * that is filler throughout.  Either way the bytes are what the seed
+	 * wrote, and a header, once present, must keep its magic, flags, and
+	 * the long header's segment size at LSN 0. */
+	if (ch->data[0] == (unsigned char) FIXTURE_XLP_MAGIC &&
+		ch->data[1] == (unsigned char) (FIXTURE_XLP_MAGIC >> 8))
+	{
+		if (ch->data[2] != (lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0) ||
+			ch->data[3] != 0)
+			die("fixture shipped WAL lost its page header flags");
+		if (lsn % FIXTURE_XLP_SEG_SIZE == 0)
+		{
+			uint32_t	seg = 0;
+
+			for (int b = 3; b >= 0; b--)
+				seg = seg << 8 | ch->data[32 + b];
+			if (seg != FIXTURE_XLP_SEG_SIZE)
+				die("fixture shipped WAL lost its segment size");
+		}
+		for (uint32_t i = 40; i < 64; i++)
+			if (ch->data[i] != expected)
+				die("fixture shipped WAL returned the wrong bytes");
+		return;
+	}
 	for (uint32_t i = 0; i < 64; i++)
 		if (ch->data[i] != expected)
 			die("fixture shipped WAL returned the wrong bytes");

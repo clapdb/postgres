@@ -1125,6 +1125,21 @@ def pagestore_build_program(build: Path, name: str) -> Path:
     return program
 
 
+def pagestore_payload_identity(build: Path) -> dict[str, Any]:
+    """The PostgreSQL identity this build gives the payloads the store wraps
+    (version constants and layout parameters), from
+    ``pagestore_control_restore --payload-identity``."""
+    program = pagestore_build_program(build, "pagestore_control_restore")
+    output = subprocess.run(
+        [str(program), "--payload-identity"], check=True, capture_output=True,
+        text=True,
+    ).stdout
+    identity = json.loads(output)
+    if not isinstance(identity, dict) or "xlog_page_magic" not in identity:
+        raise PlanError(f"{program} --payload-identity returned {output!r}")
+    return identity
+
+
 def postgres_runtime_settings(major: int) -> str:
     """Settings whose availability differs across supported PostgreSQL releases."""
     return "io_method = sync\n" if major >= 18 else ""
@@ -5781,9 +5796,11 @@ def run_materializer_smoke(
         archive_current_wal()
         restore_program = str(walrestore).replace("%", "%%")
         restore_shm = str(shm).replace("%", "%%")
+        # bind the shipped WAL to the recovering build's WAL page magic
+        xlog_magic = pagestore_payload_identity(build)["xlog_page_magic"]
         restore_command = (
             f"{shlex.quote(restore_program)} --shm {shlex.quote(restore_shm)} "
-            "--timeline 0 --incarnation 1 --segsize 16777216 %f %p"
+            f"--timeline 0 --incarnation 1 --segsize 16777216 --xlog-magic {xlog_magic} %f %p"
         )
         restore_command_setting = postgresql_conf_string(restore_command)
         with (materializer_data / "postgresql.conf").open(

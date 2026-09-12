@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "name": "posix-forkmeta-crc",
-  "role": "legacy",
+  "name": "posix-wal-payload-identity",
+  "role": "current",
   "workload": "fixture",
   "daemon_args": [
     "--page-size",
@@ -26,6 +26,12 @@
   "daemon_env": {
     "PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES": "1024"
   },
+  "payload_identity": {
+    "xlog_page_magic": 53536,
+    "wal_segment_size": 16777216
+  },
+  "captured": "2026-09-12",
+  "description": "POSIX fixture whose shipped-WAL envelopes are version 2 and record the payload's PostgreSQL identity (the WAL page magic and, at a PostgreSQL segment boundary, the WAL segment size) copied from the page header the payload begins with; the current fixture that pins the compiled identities and takes every mutation.",
   "files": [
     ".pagestore-nshards",
     "forkmeta",
@@ -33,8 +39,8 @@
     "forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
     "forkmeta_snapshots/forkmeta_manifest_v1",
     "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001",
-    "layer_0_000000000000000a",
-    "layer_0_000000000000000b",
+    "layer_0_0000000000000006",
+    "layer_0_0000000000000007",
     "layers.manifest",
     "page-prune.frontiers",
     "retention.initialized",
@@ -58,7 +64,5 @@
     "walidx_snapshots_0",
     "walidx_snapshots_0/walidx_manifest_v1",
     "walidx_snapshots_0/walidxg1_00000000000000000001_000"
-  ],
-  "captured": "2026-09-10",
-  "description": "POSIX fixture with forkmeta source and snapshot payload records sealed as FKM3 (FKM2 layout plus a CRC-24 in the former pad bytes); a legacy fixture: its shipped-WAL envelopes are version 1 and record no payload identity, which the daemon still reads."
+  ]
 }

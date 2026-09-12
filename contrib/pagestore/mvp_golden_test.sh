@@ -29,6 +29,11 @@ IMPORT="$BUILD/contrib/pagestore/pagestore_import"
 INSPECT="$BUILD/contrib/pagestore/pagestore_inspect"
 WALRESTORE="$BUILD/contrib/pagestore/pagestore_walrestore"
 CONTROLRESTORE="$BUILD/contrib/pagestore/pagestore_control_restore"
+# The WAL page magic of the build that will recover the shipped WAL: the
+# restore command refuses a payload written for another WAL format instead of
+# handing it to recovery.
+XLOG_MAGIC=$("$CONTROLRESTORE" --payload-identity | sed -n 's/.*"xlog_page_magic": \([0-9]*\).*/\1/p')
+[ -n "$XLOG_MAGIC" ] || { echo "FAIL - could not read the build's payload identity"; exit 1; }
 BRANCHPREP="$BIN/pagestore_branch_prepare"
 
 TMPROOT=$(mktemp -d)
@@ -269,7 +274,7 @@ archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $MPORT
 hot_standby = on
-restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize $materializer_wal_segment_size %f %p'
+restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize $materializer_wal_segment_size --xlog-magic $XLOG_MAGIC %f %p'
 EOF
 touch "$MATERIALIZER/standby.signal"
 find "$MATERIALIZER/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete ||
@@ -551,7 +556,7 @@ io_method = sync
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $BPORT
-restore_command = '$WALRESTORE --shm $SHM --timeline 1 --incarnation 1 --segsize $branch_wal_segment_size %f %p'
+restore_command = '$WALRESTORE --shm $SHM --timeline 1 --incarnation 1 --segsize $branch_wal_segment_size --xlog-magic $XLOG_MAGIC %f %p'
 recovery_target_lsn = '$checkpoint_lsn'
 recovery_target_inclusive = on
 recovery_target_action = 'promote'

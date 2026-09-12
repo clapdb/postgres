@@ -1587,7 +1587,11 @@ read_validated_segment_range(PsWalStore *store,
 		actual.start_lsn != expected->start_lsn ||
 		actual.payload_len != expected->payload_len ||
 		actual.segment_size != expected->segment_size ||
-		actual.payload_crc != expected->payload_crc)
+		actual.payload_crc != expected->payload_crc ||
+		actual.version != expected->version ||
+		actual.xlp_magic != expected->xlp_magic ||
+		actual.xlp_info != expected->xlp_info ||
+		actual.xlp_seg_size != expected->xlp_seg_size)
 		goto cleanup;
 	if (range_len == 0 || range_off + range_len < range_off ||
 		range_off + range_len > actual.payload_len)
@@ -1615,6 +1619,25 @@ read_validated_segment_range(PsWalStore *store,
 			wal_payload_hash(2166136261u, buf, amount) !=
 				entry->chunk_hashes[chunk_no])
 			goto cleanup;
+		/*
+		 * The envelope's recorded payload identity must be what the payload
+		 * starts with: a version-2 header that names one WAL page magic or
+		 * segment size over bytes that carry another is not the segment it
+		 * claims to be, whatever the chunk hashes say about the bytes.
+		 */
+		if (chunk_start == 0 && actual.version != PS_WAL_SEGMENT_LEGACY_VERSION)
+		{
+			uint16_t xlp_magic;
+			uint16_t xlp_info;
+			uint32_t xlp_seg_size;
+
+			if (ps_wal_segment_payload_identity(buf, (uint32_t) amount,
+												&xlp_magic, &xlp_info,
+												&xlp_seg_size) != 0 ||
+				xlp_magic != actual.xlp_magic || xlp_info != actual.xlp_info ||
+				xlp_seg_size != actual.xlp_seg_size)
+				goto cleanup;
+		}
 		if (copy_start < copy_end)
 		{
 			size_t copy_len = (size_t) (copy_end - copy_start);

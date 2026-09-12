@@ -31,7 +31,12 @@ main(void)
 		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 	};
-	unsigned char payload[32];
+	/*
+	 * A payload that begins like a PostgreSQL WAL segment: a long page header
+	 * (xlp_magic 0xD120, xlp_info with XLP_LONG_HEADER, a 16 MiB
+	 * xlp_seg_size at offset 32) followed by arbitrary bytes.
+	 */
+	unsigned char payload[64];
 	PsWalSegmentHeader header;
 	PsWalSegmentHeader damaged;
 	PsWalSegmentHeader decoded;
@@ -44,6 +49,14 @@ main(void)
 
 	for (size_t i = 0; i < sizeof(payload); i++)
 		payload[i] = (unsigned char) i;
+	payload[0] = 0x20;
+	payload[1] = 0xd1;			/* xlp_magic 0xD120 */
+	payload[2] = 0x02;
+	payload[3] = 0x00;			/* xlp_info XLP_LONG_HEADER */
+	payload[32] = 0x00;
+	payload[33] = 0x00;
+	payload[34] = 0x00;
+	payload[35] = 0x01;			/* xlp_seg_size 16 MiB */
 	check(ps_wal_segment_seal(&header, 7, 11, 0xb000000, 16 * 1024 * 1024, payload,
 						  sizeof(payload)) == 0,
 		  "seal a complete segment payload");
@@ -51,15 +64,49 @@ main(void)
 		  header.start_lsn == 0xb000000 &&
 		  ps_wal_segment_validate(&header, payload, sizeof(payload)) == 0,
 		  "validate persisted identity and checksums");
+	check(header.version == PS_WAL_SEGMENT_VERSION &&
+		  header.xlp_magic == 0xd120 && header.xlp_info == 0x0002 &&
+		  header.xlp_seg_size == 16 * 1024 * 1024,
+		  "the envelope records the payload's page magic, flags and segment size");
 	check(ps_wal_segment_encode(&header, encoded) == 0 &&
 		  ps_wal_segment_decode(&decoded, encoded, sizeof(encoded)) == 0 &&
 		  decoded.timeline == 7 && decoded.segment_no == 11 &&
-		  decoded.start_lsn == 0xb000000,
+		  decoded.start_lsn == 0xb000000 &&
+		  decoded.xlp_magic == 0xd120 && decoded.xlp_info == 0x0002 &&
+		  decoded.xlp_seg_size == 16 * 1024 * 1024,
 		  "fixed little-endian header round-trips");
-	check(memcmp(encoded, v1_fixture, sizeof(encoded)) == 0 &&
-		  ps_wal_segment_decode(&decoded, v1_fixture, sizeof(v1_fixture)) == 0 &&
-		  decoded.segment_size == 16 * 1024 * 1024,
-		  "version-1 header matches and independently decodes its golden fixture");
+	check(encoded[56] == 0x20 && encoded[57] == 0xd1 &&
+		  encoded[58] == 0x02 && encoded[59] == 0x00 &&
+		  encoded[60] == 0x00 && encoded[63] == 0x01,
+		  "the payload identity occupies the bytes version 1 reserved");
+	check(ps_wal_segment_decode(&decoded, v1_fixture, sizeof(v1_fixture)) == 0 &&
+		  decoded.version == PS_WAL_SEGMENT_LEGACY_VERSION &&
+		  decoded.segment_size == 16 * 1024 * 1024 &&
+		  decoded.xlp_magic == 0 && decoded.xlp_seg_size == 0,
+		  "a version-1 golden header still decodes, with no payload identity");
+	{
+		unsigned char v1_nonzero[PS_WAL_SEGMENT_HEADER_BYTES];
+		PsWalSegmentHeader v1_header;
+		unsigned char short_payload[PS_WAL_XLP_SHORT_HEADER_BYTES];
+
+		memcpy(v1_nonzero, v1_fixture, sizeof(v1_nonzero));
+		v1_nonzero[56] = 0x20;
+		check(ps_wal_segment_decode(&decoded, v1_nonzero, sizeof(v1_nonzero)) != 0,
+			  "a version-1 header with bytes in the reserved area is rejected");
+		check(ps_wal_segment_decode(&v1_header, v1_fixture, sizeof(v1_fixture)) == 0 &&
+			  ps_wal_segment_validate(&v1_header, payload, 32) != 0,
+			  "a version-1 header validates its checksums, not a payload identity");
+		memcpy(short_payload, payload, sizeof(short_payload));
+		short_payload[2] = 0x00;	/* short page header: no segment size */
+		check(ps_wal_segment_seal(&damaged, 7, 11, 0xb000000, 16 * 1024 * 1024,
+								  short_payload, sizeof(short_payload)) == 0 &&
+			  damaged.xlp_magic == 0xd120 && damaged.xlp_info == 0 &&
+			  damaged.xlp_seg_size == 0,
+			  "a payload starting with a short page header records no segment size");
+		check(ps_wal_segment_seal(&damaged, 7, 11, 0xb000000, 16 * 1024 * 1024,
+								  short_payload, 8) != 0,
+			  "a payload shorter than a page header cannot be sealed");
+	}
 	check(ps_wal_segment_seal(&damaged, 7, 11, 11 * 1024 * 1024,
 						  1024 * 1024, payload, sizeof(payload)) == 0 &&
 		  damaged.segment_size == 1024 * 1024,
@@ -88,10 +135,17 @@ main(void)
 	check(ps_wal_segment_validate(&damaged, payload, sizeof(payload)) != 0,
 		  "header checksum rejects identity corruption");
 	damaged = header;
-	damaged.reserved64 = 1;
-	damaged.header_crc = header.header_crc;
+	damaged.xlp_magic = 0xd121;
 	check(ps_wal_segment_validate(&damaged, payload, sizeof(payload)) != 0,
-		  "reserved format fields must remain zero");
+		  "header checksum rejects a changed payload identity");
+	{
+		unsigned char swapped[sizeof(payload)];
+
+		memcpy(swapped, payload, sizeof(swapped));
+		swapped[1] = 0xd2;
+		check(ps_wal_segment_validate(&header, swapped, sizeof(swapped)) != 0,
+			  "a payload that no longer matches the envelope is rejected");
+	}
 	payload[5] ^= 0xff;
 	check(ps_wal_segment_validate(&header, payload, sizeof(payload)) != 0,
 		  "payload checksum rejects byte corruption");

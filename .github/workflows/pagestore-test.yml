@@ -182,7 +182,7 @@ jobs:
         working-directory: contrib/pagestore
         run: |
           python3 harness/pagestore_fixture.py \
-            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc \
+            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity \
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \

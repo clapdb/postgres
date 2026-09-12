@@ -22,6 +22,19 @@ payload_crc(const void *payload, uint32_t payload_len)
 	return fnv1a(2166136261u, payload, payload_len);
 }
 
+static uint16_t
+get_le16(const unsigned char *p)
+{
+	return (uint16_t) ((uint32_t) p[0] | (uint32_t) p[1] << 8);
+}
+
+static void
+put_le16(unsigned char *p, uint16_t v)
+{
+	p[0] = (unsigned char) v;
+	p[1] = (unsigned char) (v >> 8);
+}
+
 static uint32_t
 get_le32(const unsigned char *p)
 {
@@ -65,7 +78,53 @@ encode_fields(const PsWalSegmentHeader *header, unsigned char *out,
 	put_le32(out + 40, header->payload_crc);
 	put_le32(out + 44, include_crc ? header->header_crc : 0);
 	put_le64(out + 48, header->segment_size);
-	put_le64(out + 56, header->reserved64);
+	put_le16(out + 56, header->xlp_magic);
+	put_le16(out + 58, header->xlp_info);
+	put_le32(out + 60, header->xlp_seg_size);
+}
+
+int
+ps_wal_segment_payload_identity(const void *payload, uint32_t payload_len,
+								uint16_t *xlp_magic, uint16_t *xlp_info,
+								uint32_t *xlp_seg_size)
+{
+	const unsigned char *bytes = payload;
+
+	if (payload == NULL || payload_len < PS_WAL_XLP_SHORT_HEADER_BYTES)
+		return -1;
+	*xlp_magic = get_le16(bytes);
+	*xlp_info = get_le16(bytes + 2);
+	*xlp_seg_size = 0;
+	if ((*xlp_info & PS_WAL_XLP_LONG_HEADER) != 0 &&
+		payload_len >= PS_WAL_XLP_LONG_HEADER_BYTES)
+		*xlp_seg_size = get_le32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET);
+	return 0;
+}
+
+/* The envelope's recorded payload identity is what the payload carries. */
+static int
+payload_identity_matches(const PsWalSegmentHeader *header, const void *payload,
+						 uint32_t payload_len)
+{
+	uint16_t	magic;
+	uint16_t	info;
+	uint32_t	seg_size;
+
+	if (header->version == PS_WAL_SEGMENT_LEGACY_VERSION)
+		return header->xlp_magic == 0 && header->xlp_info == 0 &&
+			header->xlp_seg_size == 0;
+	if (ps_wal_segment_payload_identity(payload, payload_len, &magic, &info,
+										&seg_size) != 0)
+		return 0;
+	return header->xlp_magic == magic && header->xlp_info == info &&
+		header->xlp_seg_size == seg_size;
+}
+
+static int
+version_known(uint32_t version)
+{
+	return version == PS_WAL_SEGMENT_VERSION ||
+		version == PS_WAL_SEGMENT_LEGACY_VERSION;
 }
 
 static uint32_t
@@ -113,7 +172,10 @@ ps_wal_segment_seal_with_crc(PsWalSegmentHeader *header, uint32_t timeline,
 	header->start_lsn = start_lsn;
 	header->payload_len = payload_len;
 	header->segment_size = segment_size;
-	if (!segment_identity_valid(header))
+	if (!segment_identity_valid(header) ||
+		ps_wal_segment_payload_identity(payload, payload_len, &header->xlp_magic,
+										&header->xlp_info,
+										&header->xlp_seg_size) != 0)
 		return -1;
 	header->payload_crc = stored_payload_crc;
 	header->header_crc = header_crc(header);
@@ -143,12 +205,13 @@ ps_wal_segment_validate(const PsWalSegmentHeader *header,
 {
 	if (header == NULL || payload == NULL ||
 		header->magic != PS_WAL_SEGMENT_MAGIC ||
-		header->version != PS_WAL_SEGMENT_VERSION ||
+		!version_known(header->version) ||
 		header->header_len != PS_WAL_SEGMENT_HEADER_BYTES || header->flags != 0 ||
 		header->payload_len == 0 ||
 		header->payload_len != payload_len ||
 		!segment_identity_valid(header) ||
-		header->reserved64 != 0 || header->header_crc != header_crc(header))
+		!payload_identity_matches(header, payload, payload_len) ||
+		header->header_crc != header_crc(header))
 		return -1;
 	return header->payload_crc == payload_crc(payload, payload_len) ? 0 : -1;
 }
@@ -189,13 +252,17 @@ ps_wal_segment_decode(PsWalSegmentHeader *header, const unsigned char *input,
 	decoded.payload_crc = get_le32(encoded + 40);
 	decoded.header_crc = get_le32(encoded + 44);
 	decoded.segment_size = get_le64(encoded + 48);
-	decoded.reserved64 = get_le64(encoded + 56);
+	decoded.xlp_magic = get_le16(encoded + 56);
+	decoded.xlp_info = get_le16(encoded + 58);
+	decoded.xlp_seg_size = get_le32(encoded + 60);
 	if (decoded.magic != PS_WAL_SEGMENT_MAGIC ||
-		decoded.version != PS_WAL_SEGMENT_VERSION ||
+		!version_known(decoded.version) ||
 		decoded.header_len != PS_WAL_SEGMENT_HEADER_BYTES ||
 		decoded.flags != 0 || decoded.payload_len == 0 ||
 		!segment_identity_valid(&decoded) ||
-		decoded.reserved64 != 0 ||
+		(decoded.version == PS_WAL_SEGMENT_LEGACY_VERSION &&
+		 (decoded.xlp_magic != 0 || decoded.xlp_info != 0 ||
+		  decoded.xlp_seg_size != 0)) ||
 		decoded.header_crc != header_crc(&decoded))
 		return -1;
 	*header = decoded;

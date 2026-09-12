@@ -744,12 +744,16 @@ test('pagestore_persisted_format_fixture',
   args: [files('harness/pagestore_fixture.py'),
          '--check', meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline',
          meson.current_source_dir() / 'fixtures' / 'posix-forkmeta-crc',
+         meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
          '--daemon-binary', pagestore_daemon,
          '--client-binary', pagestore_gc_crash_client,
          '--inspect-binary', pagestore_inspect,
-         '--format-tool', pagestore_format_versions],
+         '--format-tool', pagestore_format_versions,
+         # this build's PostgreSQL payload identity: the fixture's shipped WAL
+         # must be loadable by the build that checks it
+         '--postgres-payload-identity-tool', pagestore_control_restore],
   depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect,
-            pagestore_format_versions],
+            pagestore_format_versions, pagestore_control_restore],
   suite: ['pagestore'],
   timeout: 300,
 )
