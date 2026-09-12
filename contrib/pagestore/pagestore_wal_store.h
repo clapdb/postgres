@@ -11,6 +11,10 @@ typedef struct PsWalStoreEntry
 	PsWalSegmentHeader header;
 	uint32_t   *chunk_hashes;
 	uint32_t	nchunks;
+	/* the payload's first chunk has been read and found to carry the
+	 * identity the envelope records (or the envelope is version 1 and
+	 * records none); set once per open, before any range is served */
+	int			identity_verified;
 } PsWalStoreEntry;
 
 #define PS_WAL_STORE_VERIFY_CHUNK_BYTES (64u * 1024u)

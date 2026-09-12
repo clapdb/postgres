@@ -155,9 +155,12 @@ pagestore_import = executable('pagestore_import',
 contrib_targets += pagestore_import
 
 # Reconstruct a standard WAL segment from the store's shipped WAL; usable as a
-# restore_command so a recovery instance can replay store-resident WAL.
+# restore_command so a recovery instance can replay store-resident WAL.  A
+# frontend program: it checks the payload's page header with this build's
+# XLogLongPageHeaderData layout and XLOG_PAGE_MAGIC before handing it on.
 pagestore_walrestore = executable('pagestore_walrestore',
   files('pagestore_walrestore.c'),
+  dependencies: [frontend_code],
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_walrestore
@@ -744,12 +747,17 @@ test('pagestore_persisted_format_fixture',
   args: [files('harness/pagestore_fixture.py'),
          '--check', meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline',
          meson.current_source_dir() / 'fixtures' / 'posix-forkmeta-crc',
+         meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
          '--daemon-binary', pagestore_daemon,
          '--client-binary', pagestore_gc_crash_client,
          '--inspect-binary', pagestore_inspect,
-         '--format-tool', pagestore_format_versions],
+         '--format-tool', pagestore_format_versions,
+         # this build's PostgreSQL payload identity: a current fixture whose
+         # shipped WAL this build cannot load is skipped, and CI on
+         # `pagestore` requires one it can
+         '--postgres-payload-identity-tool', pagestore_control_restore],
   depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect,
-            pagestore_format_versions],
+            pagestore_format_versions, pagestore_control_restore],
   suite: ['pagestore'],
   timeout: 300,
 )

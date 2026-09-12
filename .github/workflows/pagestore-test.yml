@@ -28,6 +28,8 @@ on:
       - 'src/backend/storage/ipc/procarray.c'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/access/xlog.h'
+      - 'src/include/access/xlog_internal.h'
+      - 'src/include/catalog/pg_control.h'
       - 'src/include/access/slru.h'
       - 'src/include/postmaster/walredo.h'
       - 'src/include/storage/smgr.h'
@@ -49,6 +51,8 @@ on:
       - 'src/backend/storage/ipc/procarray.c'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/access/xlog.h'
+      - 'src/include/access/xlog_internal.h'
+      - 'src/include/catalog/pg_control.h'
       - 'src/include/access/slru.h'
       - 'src/include/postmaster/walredo.h'
       - 'src/include/storage/smgr.h'
@@ -182,7 +186,7 @@ jobs:
         working-directory: contrib/pagestore
         run: |
           python3 harness/pagestore_fixture.py \
-            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc \
+            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity \
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \
@@ -369,6 +373,27 @@ jobs:
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Check persisted-format fixtures against this PostgreSQL build
+        # the standalone lane checks the envelopes; only a lane with a
+        # PostgreSQL build can ask whether the fixture's payload (its WAL page
+        # magic and long-header layout) is one this build loads.  On
+        # `pagestore` a fixture for this build is required, so an upstream
+        # XLOG_PAGE_MAGIC bump demands a recapture instead of passing on a
+        # stale fixture; a release branch that has just received the change
+        # carries only the `pagestore` fixture and is warned until it
+        # captures its own.
+        run: |
+          python3 contrib/pagestore/harness/pagestore_fixture.py \
+            --check contrib/pagestore/fixtures/posix-mvp-baseline \
+                    contrib/pagestore/fixtures/posix-forkmeta-crc \
+                    contrib/pagestore/fixtures/posix-wal-payload-identity \
+            --daemon-binary build/contrib/pagestore/pagestore_daemon \
+            --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
+            --inspect-binary build/contrib/pagestore/pagestore_inspect \
+            --format-tool build/contrib/pagestore/pagestore_format_versions \
+            --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
+            ${{ (github.ref_name == 'pagestore' || (github.event_name == 'pull_request' && github.base_ref == 'pagestore')) && '--require-build-match' || '' }}
 
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"

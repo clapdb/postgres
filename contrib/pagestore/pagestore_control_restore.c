@@ -57,6 +57,7 @@
 #include "catalog/catversion.h"
 #include "common/file_perm.h"
 #include "catalog/pg_control.h"
+#include "storage/bufpage.h"
 #include "pagestore_ipc.h"
 
 static void *shm = NULL;
@@ -306,6 +307,36 @@ main(int argc, char **argv)
 	sigset_t	installmask;
 	int			fd;
 
+	/*
+	 * --payload-identity prints the PostgreSQL identity this build gives the
+	 * payloads the store wraps: the version constants and the layout
+	 * parameters a control image must match here, plus the WAL page magic
+	 * pagestore_walrestore checks and the WAL long-header layout its ABI
+	 * gives (where xlp_seg_size sits), so the fixture check can tell whether
+	 * a captured payload is one this build loads without a running server.
+	 */
+	if (argc == 2 && strcmp(argv[1], "--payload-identity") == 0)
+	{
+		printf("{\"pg_control_version\": %u, \"catalog_version_no\": %u, "
+			   "\"xlog_page_magic\": %u, \"xlog_long_header_seg_size_offset\": %u, "
+			   "\"xlog_long_header_bytes\": %u, \"page_layout_version\": %u, "
+			   "\"blcksz\": %u, \"relseg_size\": %u, \"xlog_blcksz\": %u, "
+			   "\"slru_pages_per_segment\": %u, \"namedatalen\": %u, "
+			   "\"index_max_keys\": %u, \"toast_max_chunk_size\": %u, "
+			   "\"loblksize\": %u, \"maxalign\": %u, \"float_format\": %.1f, "
+			   "\"float8_by_val\": %s}\n",
+			   (unsigned) PG_CONTROL_VERSION, (unsigned) CATALOG_VERSION_NO,
+			   (unsigned) XLOG_PAGE_MAGIC,
+			   (unsigned) offsetof(XLogLongPageHeaderData, xlp_seg_size),
+			   (unsigned) SizeOfXLogLongPHD, (unsigned) PG_PAGE_LAYOUT_VERSION,
+			   (unsigned) BLCKSZ, (unsigned) RELSEG_SIZE, (unsigned) XLOG_BLCKSZ,
+			   (unsigned) SLRU_PAGES_PER_SEGMENT, (unsigned) NAMEDATALEN,
+			   (unsigned) INDEX_MAX_KEYS, (unsigned) TOAST_MAX_CHUNK_SIZE,
+			   (unsigned) (BLCKSZ / 4), (unsigned) MAXIMUM_ALIGNOF,
+			   FLOATFORMAT_VALUE, FLOAT8PASSBYVAL ? "true" : "false");
+		return 0;
+	}
+
 	for (int i = 1; i < argc; i++)
 	{
 		if (strcmp(argv[i], "--shm") == 0 && i + 1 < argc)
@@ -397,8 +428,9 @@ main(int argc, char **argv)
 	}
 	if (!shm_name || !have_timeline || !have_incarnation || !datadir)
 	{
-		fprintf(stderr, "usage: %s --shm NAME --timeline N --incarnation N [--lsn X/Y] [--archive-bootstrap] <datadir>\n",
-				argv[0]);
+		fprintf(stderr, "usage: %s --shm NAME --timeline N --incarnation N [--lsn X/Y] [--archive-bootstrap] <datadir>\n"
+				"       %s --payload-identity\n",
+				argv[0], argv[0]);
 		return 2;
 	}
 	if (read_lsn == 0)
@@ -539,6 +571,44 @@ main(int argc, char **argv)
 		fprintf(stderr, "pagestore_control_restore: control image WAL segment size %u is invalid\n",
 				control.xlog_seg_size);
 		return 1;
+	}
+
+	/*
+	 * The cluster that will run on this image names WAL segment files by
+	 * its own segment size: the restore command turns a file name into an
+	 * LSN range with it, and the skeleton's remaining WAL was laid out with
+	 * it.  When the target already has a readable pg_control (a fresh
+	 * initdb, or the cluster whose image this is), its segment size is the
+	 * requesting cluster's, and an image written for another size is a
+	 * payload for a different cluster geometry, not this one.
+	 */
+	{
+		char		curpath[MAXPGPATH];
+		int			curfd;
+
+		if (snprintf(curpath, sizeof(curpath), "%s/global/pg_control", datadir) < (int) sizeof(curpath) &&
+			(curfd = open(curpath, O_RDONLY | PG_BINARY)) >= 0)
+		{
+			ControlFileData current;
+			ssize_t		got = read(curfd, &current, sizeof(current));
+			pg_crc32c	curcrc;
+
+			close(curfd);
+			if (got == (ssize_t) sizeof(current))
+			{
+				INIT_CRC32C(curcrc);
+				COMP_CRC32C(curcrc, (char *) &current, offsetof(ControlFileData, crc));
+				FIN_CRC32C(curcrc);
+				if (EQ_CRC32C(curcrc, current.crc) &&
+					current.pg_control_version == PG_CONTROL_VERSION &&
+					current.xlog_seg_size != control.xlog_seg_size)
+				{
+					fprintf(stderr, "pagestore_control_restore: control image was written by a cluster with a %u-byte WAL segment size; this cluster uses %u\n",
+							control.xlog_seg_size, current.xlog_seg_size);
+					return 1;
+				}
+			}
+		}
 	}
 
 	/*

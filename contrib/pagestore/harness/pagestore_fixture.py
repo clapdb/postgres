@@ -55,6 +55,42 @@ FNV_INIT = 2166136261
 # that cannot exist rather than under whichever directory captured them.
 FIXTURE_LAYER_ROOT = "/nonexistent/pagestore-fixture/layers"
 WALIDX_MAGICS = {0x57494458, 0x57495047}      # "WIDX" records, "WIPG" progress
+# The shipped-WAL envelope (pagestore_wal_segment.h): a version-2 header
+# records the payload's PostgreSQL identity at bytes 56..63 -- xlp_magic u16,
+# xlp_info u16, xlp_seg_size u32, little-endian like the rest of the envelope
+# -- copied from the WAL page header the payload begins with at byte 64
+# (magic at 0, info at 2, and a long header's segment size where the
+# writer's ABI put it: at 32 with 8-byte-aligned uint64, at 28 with 4-byte
+# alignment; the store tells the layouts apart the way
+# ps_wal_segment_payload_identity() does), which PostgreSQL wrote in host
+# byte order.  The header CRC at 44 is FNV-1a over the 64 bytes with the CRC
+# field zeroed.
+WAL_SEGMENT_HEADER_BYTES = 64
+WAL_SEGMENT_VERSION = 2
+WAL_SEGMENT_IDENTITY_OFFSET = 56
+WAL_SEGMENT_HEADER_CRC_OFFSET = 44
+XLP_LONG_HEADER = 0x0002
+
+
+def wal_long_header_sizes(payload: bytes) -> tuple[int, int, int]:
+    """The (segment size, offset it sits at, WAL block size) a long WAL page
+    header carries, recognizing the writer's ABI by the bytes: zeroed padding
+    at 20 with plausible sizes at 32/36 is the 8-byte-aligned layout,
+    plausible sizes at 28/32 the 4-byte one; (0, 0, 0) when neither."""
+    def plausible_seg(size: int) -> bool:
+        return 1 << 20 <= size <= 1 << 30 and size & (size - 1) == 0
+
+    def plausible_blk(size: int) -> bool:
+        return 1024 <= size <= 65536 and size & (size - 1) == 0
+
+    pad, = struct.unpack_from("=I", payload, 20)
+    seg8, blk8 = struct.unpack_from("=II", payload, 32)
+    seg4, blk4 = struct.unpack_from("=II", payload, 28)
+    if pad == 0 and plausible_seg(seg8) and plausible_blk(blk8):
+        return seg8, 32, blk8
+    if plausible_seg(seg4) and plausible_blk(blk4):
+        return seg4, 28, blk4
+    return 0, 0, 0
 WATERMARK_SUFFIX = ".size"
 SEG_HEADER_BYTES = {
     0x53454732: 48, 0x53454730: 48, 0x53454731: 48, 0x53454733: 48,
@@ -79,6 +115,11 @@ ACCEPTED = "accepted"                # it opens and the oracle passes
 CRASHED = "daemon_crashed"           # the daemon died of a signal or exited under use; never expected
 
 
+class ForeignPayload(Exception):
+    """The fixture's payload was written for another PostgreSQL build: not a
+    broken envelope, but not a fixture this build can check either."""
+
+
 class FixtureError(Exception):
     pass
 
@@ -96,6 +137,72 @@ def flip_byte(path: Path, offset: int) -> None:
         offset += len(data)
     data[offset] ^= 0xFF
     path.write_bytes(data)
+
+
+def reseal_wal_segment_header(path: Path, mutate: Callable[[bytearray], None]) -> None:
+    """Change a shipped-WAL envelope and recompute its header CRC, so the
+    change is not caught by the checksum but by what it now claims."""
+    data = bytearray(path.read_bytes())
+    header = data[:WAL_SEGMENT_HEADER_BYTES]
+    mutate(header)
+    header[WAL_SEGMENT_HEADER_CRC_OFFSET:WAL_SEGMENT_HEADER_CRC_OFFSET + 4] = b"\0\0\0\0"
+    crc = fnv1a(bytes(header))
+    header[WAL_SEGMENT_HEADER_CRC_OFFSET:WAL_SEGMENT_HEADER_CRC_OFFSET + 4] = struct.pack("<I", crc)
+    data[:WAL_SEGMENT_HEADER_BYTES] = header
+    path.write_bytes(bytes(data))
+
+
+def wal_segment_payload_identity(path: Path) -> dict[str, int] | None:
+    """The (recorded, carried) payload identity of one shipped-WAL segment,
+    or None for a version-1 envelope, which records none."""
+    data = path.read_bytes()
+    if len(data) < WAL_SEGMENT_HEADER_BYTES + 40:
+        raise FixtureError(f"{path} is shorter than a WAL envelope and page header")
+    version = struct.unpack_from("<I", data, 4)[0]
+    if version != WAL_SEGMENT_VERSION:
+        return None
+    magic, info, seg_size = struct.unpack_from("<HHI", data, WAL_SEGMENT_IDENTITY_OFFSET)
+    payload = data[WAL_SEGMENT_HEADER_BYTES:]
+    carried_magic, carried_info = struct.unpack_from("=HH", payload, 0)
+    carried_seg, seg_offset, carried_blk = (
+        wal_long_header_sizes(payload) if carried_info & XLP_LONG_HEADER else (0, 0, 0))
+    if (magic, info, seg_size) != (carried_magic, carried_info, carried_seg):
+        raise FixtureError(
+            f"{path.name} records payload identity ({magic:#06x}, {info:#06x}, {seg_size}) "
+            f"but its payload carries ({carried_magic:#06x}, {carried_info:#06x}, {carried_seg})"
+        )
+    return {"xlog_page_magic": magic, "xlp_info": info, "wal_segment_size": seg_size,
+            "xlog_long_header_seg_size_offset": seg_offset, "xlog_blcksz": carried_blk}
+
+
+def archive_payload_identity(store: Path) -> dict[str, int]:
+    """The PostgreSQL identity the archive's shipped WAL carries: every
+    version-2 envelope agrees on the page magic, and the one that begins a
+    PostgreSQL segment names the segment size."""
+    magics: set[int] = set()
+    seg_sizes: set[int] = set()
+    offsets: set[int] = set()
+    blcksz: set[int] = set()
+    for path in sorted(store.glob("wal_segments_*/walv1_*")):
+        identity = wal_segment_payload_identity(path)
+        if identity is None:
+            continue
+        magics.add(identity["xlog_page_magic"])
+        if identity["wal_segment_size"]:
+            seg_sizes.add(identity["wal_segment_size"])
+            offsets.add(identity["xlog_long_header_seg_size_offset"])
+            blcksz.add(identity["xlog_blcksz"])
+    if len(magics) != 1 or len(seg_sizes) != 1 or len(offsets) != 1 or len(blcksz) != 1:
+        raise FixtureError(
+            f"the archive's shipped WAL carries page magics {sorted(map(hex, magics))}, "
+            f"segment sizes {sorted(seg_sizes)}, long-header layouts {sorted(offsets)} and "
+            f"block sizes {sorted(blcksz)}; a fixture names exactly one of each"
+        )
+    # the layout is the writer's ABI: a build whose XLogLongPageHeaderData
+    # puts xlp_seg_size elsewhere reads these bytes differently; the block
+    # size is a build option XLogReaderValidatePageHeader() rejects on
+    return {"xlog_page_magic": magics.pop(), "wal_segment_size": seg_sizes.pop(),
+            "xlog_long_header_seg_size_offset": offsets.pop(), "xlog_blcksz": blcksz.pop()}
 
 
 def truncate_to(path: Path, size: int) -> None:
@@ -147,6 +254,14 @@ MUTATIONS = [
              lambda p: flip_byte(p, 4096), OPEN_REJECTED),
     mutation("wal_segment.truncated", "wal_segments_0/walv1_1_*",
              lambda p: truncate_to(p, -4096), OPEN_REJECTED),
+    # a resealed envelope that names another WAL page magic than its payload
+    # carries: the checksums hold, the identity does not, and the read that
+    # would hand the bytes on refuses them
+    mutation("wal_segment.payload_identity", "wal_segments_0/walv1_1_*",
+             lambda p: reseal_wal_segment_header(
+                 p, lambda h: h.__setitem__(WAL_SEGMENT_IDENTITY_OFFSET,
+                                            h[WAL_SEGMENT_IDENTITY_OFFSET] ^ 0x01)),
+             USE_REJECTED),
     mutation("retention.state.newer_version", "retention.state",
              lambda p: bump_le32(p, 4), OPEN_REJECTED),
     mutation("retention.state.crc", "retention.state",
@@ -511,19 +626,28 @@ class Daemon:
         return code
 
 
-def run_client(client: Path, shm: str, mode: str, log: Path) -> subprocess.CompletedProcess[str]:
+def run_client(client: Path, shm: str, mode: str, log: Path,
+               payload_identity: dict[str, Any] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run the fixture workload; ``payload_identity`` (the capturing build's
+    on capture, the fixture's own on check) tells it which WAL page magic
+    and block size the shipped WAL carries."""
+    env = harness.private_environment()
+    if payload_identity is not None:
+        env["PAGESTORE_FIXTURE_XLOG_MAGIC"] = str(int(payload_identity["xlog_page_magic"]))
+        env["PAGESTORE_FIXTURE_XLOG_BLCKSZ"] = str(int(payload_identity["xlog_blcksz"]))
     with log.open("a", encoding="utf-8") as output:
         return subprocess.run(
             [str(client), "--shm", shm, "--mode", mode, "--workload", "fixture"],
             stdout=output, stderr=subprocess.STDOUT, text=True,
-            env=harness.private_environment(), check=False,
+            env=env, check=False,
         )
 
 
-def verify_until(client: Path, shm: str, log: Path, timeout: float, expect_tail: bool = True) -> None:
+def verify_until(client: Path, shm: str, log: Path, timeout: float, expect_tail: bool = True,
+                 payload_identity: dict[str, Any] | None = None) -> None:
     deadline = time.monotonic() + timeout
     while True:
-        result = run_client(client, shm, "verify", log)
+        result = run_client(client, shm, "verify", log, payload_identity)
         if result.returncode == 0:
             return
         if not expect_tail:
@@ -555,6 +679,10 @@ def wait_for_forkmeta_cutover(store: Path, timeout: float) -> None:
 def capture(args: argparse.Namespace) -> int:
     fixture = args.capture
     fixture.mkdir(parents=True, exist_ok=True)
+    # the shipped WAL is stamped with the capturing build's page magic and
+    # block size, so the fixture is one that build loads; without a build
+    # identity the workload's defaults (the pagestore branch's) apply
+    stamp = build_payload_identity(args)
     with tempfile.TemporaryDirectory(prefix="pagestore-fixture-") as temp:
         root = Path(temp)
         # The capture directory is private to this process, so concurrent or
@@ -568,7 +696,7 @@ def capture(args: argparse.Namespace) -> int:
         try:
             if daemon.start() != "ready":
                 raise FixtureError(f"daemon refused a fresh store; see {log}")
-            seed = run_client(args.client_binary, shm, "seed", root / "client.log")
+            seed = run_client(args.client_binary, shm, "seed", root / "client.log", stamp)
             if seed.returncode != 0:
                 tail = (root / "client.log").read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
                 daemon_tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
@@ -578,7 +706,8 @@ def capture(args: argparse.Namespace) -> int:
             # maintenance publishes the frontiers, snapshots, and deletion
             # asynchronously; the seed oracle passes only once every family
             # settled, and the extension then lands in the settled source tail
-            verify_until(args.client_binary, shm, root / "client.log", 60.0, expect_tail=False)
+            verify_until(args.client_binary, shm, root / "client.log", 60.0, expect_tail=False,
+                         payload_identity=stamp)
             wait_for_forkmeta_cutover(store, 60.0)
         finally:
             code = daemon.stop()
@@ -590,13 +719,13 @@ def capture(args: argparse.Namespace) -> int:
         try:
             if daemon.start() != "ready":
                 raise FixtureError(f"daemon refused the seeded store; see {log}")
-            extend = run_client(args.client_binary, shm, "extend", root / "client.log")
+            extend = run_client(args.client_binary, shm, "extend", root / "client.log", stamp)
             if extend.returncode != 0:
                 tail = (root / "client.log").read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
                 raise FixtureError(f"fixture extension failed: {tail!r}")
-            verify_until(args.client_binary, shm, root / "client.log", 30.0)
+            verify_until(args.client_binary, shm, root / "client.log", 30.0, payload_identity=stamp)
             time.sleep(1.0)
-            verify_until(args.client_binary, shm, root / "client.log", 10.0)
+            verify_until(args.client_binary, shm, root / "client.log", 10.0, payload_identity=stamp)
         finally:
             code = daemon.stop()
         if code != 0:
@@ -604,6 +733,7 @@ def capture(args: argparse.Namespace) -> int:
         identities = format_identities(args.format_tool)
         check_segment_formats(store, identities)
         check_archived_identities(store, identities)
+        payload_identity = archive_payload_identity(store)
         canonicalize_manifest(store)
         names = deterministic_tar(store, fixture / STORE_TAR)
     (fixture / FORMAT_JSON).write_text(json.dumps(identities, indent=2) + "\n", encoding="utf-8")
@@ -614,10 +744,69 @@ def capture(args: argparse.Namespace) -> int:
         "workload": "fixture",
         "daemon_args": DAEMON_ARGS,
         "daemon_env": DAEMON_ENV,
+        # the PostgreSQL identity of the payloads inside: a build with another
+        # WAL page magic needs a fixture captured under it, not this one
+        "payload_identity": payload_identity,
         "files": names,
     }, indent=2) + "\n", encoding="utf-8")
     print(f"captured {fixture} ({len(names)} entries)")
     return 0
+
+
+def build_payload_identity(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The checking (or capturing) PostgreSQL build's payload identity, from
+    a JSON file or from pagestore_control_restore --payload-identity."""
+    if args.postgres_payload_identity is not None:
+        return json.loads(args.postgres_payload_identity.read_text(encoding="utf-8"))
+    if args.postgres_payload_identity_tool is not None:
+        return json.loads(subprocess.run(
+            [str(args.postgres_payload_identity_tool), "--payload-identity"],
+            check=True, capture_output=True, text=True).stdout)
+    return None
+
+
+def check_payload_identity(args: argparse.Namespace, store: Path,
+                           metadata: dict[str, Any]) -> None:
+    """The archive's shipped WAL carries the payload identity fixture.json
+    records, and, when the checking build's identity is given, that build can
+    load it -- otherwise the fixture is for another PostgreSQL, which is a
+    different finding from a broken envelope."""
+    recorded = metadata.get("payload_identity")
+    if not isinstance(recorded, dict):
+        raise FixtureError("a current fixture records the payload identity of its shipped WAL")
+    carried = archive_payload_identity(store)
+    if carried != recorded:
+        raise FixtureError(
+            f"fixture.json records payload identity {recorded} but the archive carries {carried}"
+        )
+    print(f"ok   - shipped WAL carries the recorded payload identity "
+          f"(XLOG_PAGE_MAGIC {carried['xlog_page_magic']:#06x}, "
+          f"segment size {carried['wal_segment_size']})")
+    build_identity = build_payload_identity(args)
+    if build_identity is None:
+        return
+    build_magic = int(build_identity["xlog_page_magic"])
+    if build_magic != carried["xlog_page_magic"]:
+        raise ForeignPayload(
+            f"payload needs a PostgreSQL build with XLOG_PAGE_MAGIC "
+            f"{carried['xlog_page_magic']:#06x}; the checking build has {build_magic:#06x}"
+        )
+    build_offset = int(build_identity.get("xlog_long_header_seg_size_offset", 0))
+    if build_offset and build_offset != carried["xlog_long_header_seg_size_offset"]:
+        raise ForeignPayload(
+            f"payload was written by an ABI that puts the WAL segment size at byte "
+            f"{carried['xlog_long_header_seg_size_offset']} of the long page header; "
+            f"the checking build reads it at byte {build_offset}"
+        )
+    build_blcksz = int(build_identity.get("xlog_blcksz", 0))
+    if build_blcksz and build_blcksz != carried["xlog_blcksz"]:
+        raise ForeignPayload(
+            f"payload was written with a {carried['xlog_blcksz']}-byte WAL block size; "
+            f"the checking build uses {build_blcksz}"
+        )
+    print(f"ok   - the checking PostgreSQL build loads this payload (XLOG_PAGE_MAGIC "
+          f"{build_magic:#06x}, segment size at byte {carried['xlog_long_header_seg_size_offset']}, "
+          f"WAL block size {carried['xlog_blcksz']})")
 
 
 def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
@@ -628,6 +817,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
     if identities is not None:
         check_segment_formats(store, identities)
         check_archived_identities(store, identities)
+        check_payload_identity(args, store, metadata)
     log = root / "reopen-daemon.log"
     for generation in range(2):
         shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_{generation}"
@@ -638,7 +828,8 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
             if status != "ready":
                 tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-4:]
                 raise FixtureError(f"fixture reopen {generation} refused: {status}; daemon: {tail!r}")
-            result = run_client(args.client_binary, shm, "verify", root / "reopen-client.log")
+            result = run_client(args.client_binary, shm, "verify", root / "reopen-client.log",
+                                metadata.get("payload_identity"))
             if result.returncode != 0:
                 tail = (root / "reopen-client.log").read_text(
                     encoding="utf-8", errors="replace").splitlines()[-3:]
@@ -668,14 +859,16 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
         if status != "ready":
             return OPEN_REJECTED
         client_log = root / "mutations" / f"{case['name']}.client.log"
-        result = run_client(args.client_binary, shm, "verify", client_log)
+        result = run_client(args.client_binary, shm, "verify", client_log,
+                            metadata.get("payload_identity"))
         # A mutation the store repairs (a torn append-only tail) resumes the
         # transition it interrupted asynchronously, so the oracle is retried
         # while that can still land; a rejection stays a rejection.
         deadline = time.monotonic() + (30.0 if case["expect"] == ACCEPTED else 0.0)
         while result.returncode != 0 and time.monotonic() < deadline and daemon.alive():
             time.sleep(0.5)
-            result = run_client(args.client_binary, shm, "verify", client_log)
+            result = run_client(args.client_binary, shm, "verify", client_log,
+                            metadata.get("payload_identity"))
         if not daemon.alive():
             code = daemon.process.returncode if daemon.process else None
             return f"{CRASHED} (daemon exited {code} under use)"
@@ -705,10 +898,12 @@ def fixture_metadata(fixture: Path) -> dict[str, Any]:
     return metadata
 
 
-def check_one(args: argparse.Namespace, fixture: Path) -> int:
+def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
     """A "current" fixture pins the compiled identities and takes every
     mutation; a "legacy" fixture records a format the daemon still reads, so
-    it only has to reopen with its oracle intact (an upgrade path)."""
+    it only has to reopen with its oracle intact (an upgrade path).  Returns
+    None for a current fixture whose payload is for another PostgreSQL build:
+    it is skipped, and the caller requires some current fixture to match."""
     metadata = fixture_metadata(fixture)
     role = metadata["role"]
     print(f"--- fixture {fixture.name} ({role})")
@@ -722,8 +917,15 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int:
         # and it must still open before the identity table is judged.  Only a
         # current fixture must carry every advertised format; a legacy one
         # records formats the daemon has since moved past.
-        check_reopen(args, root, fixture, metadata,
-                     current if role == "current" else None)
+        try:
+            check_reopen(args, root, fixture, metadata,
+                         current if role == "current" else None)
+        except ForeignPayload as foreign:
+            # a release branch carries the fixture captured under its own
+            # build; one captured under another build is neither broken
+            # nor checkable here
+            print(f"skip - {foreign} (a fixture for another PostgreSQL release)")
+            return None
         if role == "current":
             if current != expected:
                 print("FAIL - compiled persisted-format identities differ from the fixture:")
@@ -767,8 +969,27 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int:
 
 def check(args: argparse.Namespace) -> int:
     status = 0
+    binds_build = (args.postgres_payload_identity is not None or
+                   args.postgres_payload_identity_tool is not None)
+    matched_current = 0
     for fixture in args.check:
-        status |= check_one(args, fixture)
+        result = check_one(args, fixture)
+        if result is None:
+            continue
+        status |= result
+        if fixture_metadata(fixture)["role"] == "current":
+            matched_current += 1
+    if binds_build and matched_current == 0:
+        # A release branch that has just received a format change carries only
+        # the fixture captured on `pagestore`; until it captures its own, the
+        # envelopes were still checked and only the build binding is missing.
+        # The development branch requires the match.
+        if args.require_build_match:
+            print("FAIL - no current fixture carries a payload this PostgreSQL build loads; "
+                  "capture one under this build")
+            return 1
+        print("WARN - no current fixture carries a payload this PostgreSQL build loads; "
+              "capture one under this build (required on pagestore)")
     return status
 
 
@@ -781,11 +1002,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--client-binary", type=Path, required=True)
     parser.add_argument("--inspect-binary", type=Path, required=True)
     parser.add_argument("--format-tool", type=Path, required=True)
+    parser.add_argument("--postgres-payload-identity", type=Path,
+                        help="JSON from pagestore_control_restore --payload-identity; "
+                             "when given, the fixture's payload must be loadable by that build")
+    parser.add_argument("--postgres-payload-identity-tool", type=Path,
+                        help="a pagestore_control_restore binary to ask for the same identity")
+    parser.add_argument("--require-build-match", action="store_true",
+                        help="fail, rather than warn, when no current fixture carries a payload "
+                             "the checking build loads")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy failed mutation stores here")
     args = parser.parse_args(argv)
-    for name in ("daemon_binary", "client_binary", "inspect_binary", "format_tool"):
-        setattr(args, name, getattr(args, name).resolve())
+    for name in ("daemon_binary", "client_binary", "inspect_binary", "format_tool",
+                 "postgres_payload_identity_tool", "postgres_payload_identity"):
+        if getattr(args, name) is not None:
+            setattr(args, name, getattr(args, name).resolve())
     try:
         return capture(args) if args.capture else check(args)
     except FixtureError as error:

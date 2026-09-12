@@ -631,14 +631,20 @@ supported older versions and fail-closed otherwise; container formats are
 registered per provider; backend artifacts follow the same envelope/payload
 split).  Every
 daemon-side record format reports its compiled magic and version through
-`pagestore_format_versions` (the POSIX and SPDK container identities are
-still to be registered); `fixtures/posix-mvp-baseline` holds a captured
+`pagestore_format_versions`, the POSIX and SPDK container identities
+included; the fixtures (`posix-mvp-baseline` and `posix-forkmeta-crc`, now
+legacy, and `posix-wal-payload-identity`, current) each hold a captured
 store carrying page history and its cutoff, fork-size events on both sides of
 the cutoff plus a post-cutover source tail, a sealed shipped-WAL segment
 with a control note inside it, a compacted WAL-index interval with a fixed
 reader, a live branch with one record of every page-segment format the daemon
 writes (an ordinary versioned record, a below-floor copy clamped to the branch
-point, and a zero-version WAL-less record), and a deleted branch.
+point, and a zero-version WAL-less record), and a deleted branch; the current
+one's shipped WAL begins with a genuine long WAL page header, and its
+`fixture.json` records the payload identity (WAL page magic and segment
+size) the archive's version-2 envelopes carry, which the check verifies
+against the payload bytes and, given the checking build's identity, against
+that build.
 `harness/pagestore_fixture.py
 --check` fails when the compiled identities differ from the fixture (a
 format change without a fixture update) and when the archive's own bytes do
@@ -720,9 +726,7 @@ gate 5 has its crash coverage composed and its daemon-side format fixtures,
 but is not complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
-2. Finish H2 under the decided D5 policy: bind the PostgreSQL payload
-   identity into the envelopes (the control tuple plus the native header
-   identities the control image does not carry), validate the control
+2. Finish H2 under the decided D5 policy: validate the control
    tuple in the public and
    legacy SLRU seeding entrypoints and compare their output with
    independently recovered SLRUs, then add the backend-side
