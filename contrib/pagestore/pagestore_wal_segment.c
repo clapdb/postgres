@@ -102,6 +102,20 @@ encode_fields(const PsWalSegmentHeader *header, unsigned char *out,
 	put_le32(out + 60, header->xlp_seg_size);
 }
 
+/* PostgreSQL's own bounds: a WAL segment is a power of two in [1 MiB, 1 GiB],
+ * a WAL block a power of two in [1 KiB, 64 KiB]. */
+static int
+wal_seg_size_plausible(uint32_t size)
+{
+	return size >= (1u << 20) && size <= (1u << 30) && (size & (size - 1)) == 0;
+}
+
+static int
+wal_blcksz_plausible(uint32_t size)
+{
+	return size >= 1024u && size <= 65536u && (size & (size - 1)) == 0;
+}
+
 int
 ps_wal_segment_payload_identity(const void *payload, uint32_t payload_len,
 								uint16_t *xlp_magic, uint16_t *xlp_info,
@@ -109,14 +123,27 @@ ps_wal_segment_payload_identity(const void *payload, uint32_t payload_len,
 {
 	const unsigned char *bytes = payload;
 
-	if (payload == NULL || payload_len < PS_WAL_XLP_SHORT_HEADER_BYTES)
+	if (payload == NULL || payload_len < PS_WAL_XLP_MIN_HEADER_BYTES)
 		return -1;
 	*xlp_magic = get_native16(bytes);
 	*xlp_info = get_native16(bytes + 2);
 	*xlp_seg_size = 0;
 	if ((*xlp_info & PS_WAL_XLP_LONG_HEADER) != 0 &&
 		payload_len >= PS_WAL_XLP_LONG_HEADER_BYTES)
-		*xlp_seg_size = get_native32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET);
+	{
+		/* see the header comment: the writer's ABI decides where the
+		 * segment size sits, and the bytes say which ABI wrote them */
+		uint32_t seg8 = get_native32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET_ALIGN8);
+		uint32_t blk8 = get_native32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET_ALIGN8 + 4);
+		uint32_t seg4 = get_native32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET_ALIGN4);
+		uint32_t blk4 = get_native32(bytes + PS_WAL_XLP_SEG_SIZE_OFFSET_ALIGN4 + 4);
+		int		pad8_zero = get_native32(bytes + 20) == 0;
+
+		if (pad8_zero && wal_seg_size_plausible(seg8) && wal_blcksz_plausible(blk8))
+			*xlp_seg_size = seg8;
+		else if (wal_seg_size_plausible(seg4) && wal_blcksz_plausible(blk4))
+			*xlp_seg_size = seg4;
+	}
 	return 0;
 }
 

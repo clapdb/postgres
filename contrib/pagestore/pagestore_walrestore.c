@@ -14,28 +14,35 @@
  *
  * The bytes are handed to PostgreSQL untouched, so the one thing this tool
  * checks about them is their PostgreSQL identity: the segment begins with a
- * long WAL page header whose xlp_seg_size must be the --segsize the LSN was
- * computed from (a cluster initialized with another --wal-segsize names a
- * different LSN range by the same file name), and whose xlp_magic must be
- * the XLOG_PAGE_MAGIC of the recovering build when --xlog-magic names it
- * (pagestore_control_restore --payload-identity prints that build's
- * value).  A mismatch is fatal to recovery: PostgreSQL treats a
- * restore_command exit status above 125 (like a signal) as a hard error
- * that aborts recovery, while any other nonzero status only means "no such
- * archive file" -- which for a foreign-format segment would end recovery
- * quietly and start the database.  So the mismatch exits with
- * PS_WALRESTORE_EXIT_FATAL and names the payload identity on stderr.
+ * long WAL page header whose xlp_magic must be this build's XLOG_PAGE_MAGIC
+ * and whose xlp_seg_size must be the --segsize the LSN was computed from (a
+ * cluster initialized with another --wal-segsize names a different LSN
+ * range by the same file name).  The header is read with this build's
+ * XLogLongPageHeaderData layout, so the field offsets follow the target
+ * ABI.  A mismatch, like a store that refuses the read (a corrupt or
+ * reclaimed segment, a fenced incarnation), is fatal to recovery:
+ * PostgreSQL treats a restore_command exit status above 125 (like a signal)
+ * as a hard error that aborts recovery, while any other nonzero status only
+ * means "no such archive file" -- which for a foreign-format or refused
+ * segment would end recovery quietly and start the database.  So those
+ * cases exit with PS_WALRESTORE_EXIT_FATAL and name the cause on stderr.
+ * --xlog-magic overrides the expected magic; it exists so a test can prove
+ * the refusal without a foreign build.
  *
- * Freestanding: only pagestore_ipc.h and libc.
+ * Built with the PostgreSQL headers (for the WAL page header layout and
+ * XLOG_PAGE_MAGIC); it links nothing but libc and talks to the daemon through
+ * pagestore_ipc.h.
  *
  * Usage (as restore_command):
  *   pagestore_walrestore --shm NAME --timeline N --incarnation N \
- *       --segsize BYTES [--xlog-magic 0xD120] %f %p
+ *       --segsize BYTES %f %p
  *
  * src/../contrib/pagestore/pagestore_walrestore.c
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -45,6 +52,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "access/xlog_internal.h"
 #include "pagestore_ipc.h"
 
 static void *shm;
@@ -172,7 +180,9 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 }
 
 /* Read up to len WAL bytes from start_lsn on a timeline; returns bytes read. */
-static uint32_t
+static uint32_t got_status;
+
+static int64_t
 wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
 			 uint32_t len, void *out)
 {
@@ -189,6 +199,9 @@ wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;
 	request_in_flight = 0;
+	got_status = ch->status;
+	if (ch->status != PS_STATUS_OK)
+		return -1;				/* the store refused; result carries nothing */
 	memcpy(out, ch->data, len);
 	return ch->result;
 }
@@ -197,50 +210,42 @@ wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
 #define PS_WALRESTORE_EXIT_FATAL 126
 
 /*
- * The segment's first page header, in the byte order PostgreSQL wrote it
- * (the store does not move WAL between byte orders).  XLogPageHeaderData:
- * xlp_magic u16, xlp_info u16, xlp_tli u32, xlp_pageaddr u64, xlp_rem_len
- * u32, padding; XLogLongPageHeaderData adds xlp_sysid u64 at 24,
- * xlp_seg_size u32 at 32, xlp_xlog_blcksz u32 at 36.
+ * The segment's first page header, read with this build's
+ * XLogLongPageHeaderData layout in the byte order PostgreSQL wrote it (the
+ * store does not move WAL between byte orders, and the field offsets follow
+ * the target ABI -- a 32-bit build packs the header differently).
  */
-#define XLP_LONG_HEADER_FLAG	0x0002
-#define XLP_LONG_HEADER_BYTES	40
-
 static int
 check_payload_identity(const unsigned char *page, uint32_t len,
-					   uint64_t segsize, int have_xlog_magic,
-					   unsigned xlog_magic)
+					   uint64_t segsize, unsigned xlog_magic)
 {
-	uint16_t	magic;
-	uint16_t	info;
-	uint32_t	seg_size;
+	XLogLongPageHeaderData header;
 
-	if (len < XLP_LONG_HEADER_BYTES)
+	if (len < SizeOfXLogLongPHD)
 	{
 		fprintf(stderr, "segment start is %u bytes, shorter than a WAL page header\n",
 				len);
 		return PS_WALRESTORE_EXIT_FATAL;
 	}
-	memcpy(&magic, page, sizeof(magic));
-	memcpy(&info, page + 2, sizeof(info));
-	if (have_xlog_magic && magic != xlog_magic)
+	memcpy(&header, page, sizeof(header));
+	if (header.std.xlp_magic != xlog_magic)
 	{
 		fprintf(stderr, "payload needs a PostgreSQL build with XLOG_PAGE_MAGIC 0x%04x; "
-				"this build expects 0x%04x\n", magic, xlog_magic);
+				"this build expects 0x%04x\n", header.std.xlp_magic, xlog_magic);
 		return PS_WALRESTORE_EXIT_FATAL;
 	}
-	if ((info & XLP_LONG_HEADER_FLAG) == 0)
+	if ((header.std.xlp_info & XLP_LONG_HEADER) == 0)
 	{
 		fprintf(stderr, "segment start carries no long WAL page header "
-				"(xlp_info 0x%04x); not a PostgreSQL WAL segment boundary\n", info);
+				"(xlp_info 0x%04x); not a PostgreSQL WAL segment boundary\n",
+				header.std.xlp_info);
 		return PS_WALRESTORE_EXIT_FATAL;
 	}
-	memcpy(&seg_size, page + 32, sizeof(seg_size));
-	if (seg_size != segsize)
+	if (header.xlp_seg_size != segsize)
 	{
 		fprintf(stderr, "payload was written by a cluster with a %u-byte WAL "
 				"segment size; --segsize %llu names a different LSN range\n",
-				seg_size, (unsigned long long) segsize);
+				header.xlp_seg_size, (unsigned long long) segsize);
 		return PS_WALRESTORE_EXIT_FATAL;
 	}
 	return 0;
@@ -254,8 +259,7 @@ main(int argc, char **argv)
 	uint64_t	incarnation = 0;
 	int			have_incarnation = 0;
 	uint64_t	segsize = 16 * 1024 * 1024;
-	unsigned long xlog_magic = 0;
-	int			have_xlog_magic = 0;
+	unsigned long xlog_magic = XLOG_PAGE_MAGIC;
 	const char *segname = NULL;
 	const char *outpath = NULL;
 	uint32_t	tli,
@@ -307,7 +311,6 @@ main(int argc, char **argv)
 				fprintf(stderr, "invalid --xlog-magic \"%s\"\n", argv[i]);
 				return 2;
 			}
-			have_xlog_magic = 1;
 		}
 		else if (!segname)
 			segname = argv[i];
@@ -373,15 +376,32 @@ main(int argc, char **argv)
 	{
 		uint32_t	want = (uint32_t) ((segsize - off) < PS_IO_UNIT ?
 									   (segsize - off) : PS_IO_UNIT);
-		uint32_t	got = wal_read(timeline, incarnation, start_lsn + off,
+		int64_t		got = wal_read(timeline, incarnation, start_lsn + off,
 							 want, buf);
 
+		if (got < 0)
+		{
+			/*
+			 * The store refused the read: a corrupt or resealed segment, WAL
+			 * reclaimed below the retention frontier, an unknown timeline or
+			 * a fenced incarnation.  None of these is "no such archive
+			 * file"; recovery must abort rather than conclude the WAL ends
+			 * here.
+			 */
+			fprintf(stderr, "store refused WAL at %llX/%08X on timeline %u "
+					"incarnation %llu (status %u): corrupt, reclaimed, or fenced\n",
+					(unsigned long long) ((start_lsn + off) >> 32),
+					(unsigned) (start_lsn + off), timeline,
+					(unsigned long long) incarnation, (unsigned) got_status);
+			close(outfd);
+			unlink(outpath);
+			return PS_WALRESTORE_EXIT_FATAL;
+		}
 		if (got == 0)
 			break;				/* not in the store: segment unavailable */
 		if (off == 0)
 		{
 			int			rc = check_payload_identity(buf, got, segsize,
-													have_xlog_magic,
 													(unsigned) xlog_magic);
 
 			if (rc != 0)
@@ -391,14 +411,14 @@ main(int argc, char **argv)
 				return rc;
 			}
 		}
-		if (write(outfd, buf, got) != (ssize_t) got)
+		if (write(outfd, buf, (size_t) got) != (ssize_t) got)
 		{
 			perror("write");
 			close(outfd);
 			return 2;
 		}
-		off += got;
-		if (got < want)
+		off += (uint64_t) got;
+		if ((uint32_t) got < want)
 			break;
 	}
 	close(outfd);

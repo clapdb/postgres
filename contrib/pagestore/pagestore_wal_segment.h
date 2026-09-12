@@ -30,11 +30,23 @@
 #define PS_WAL_SEGMENT_HEADER_BYTES 64u
 #define PS_WAL_SEGMENT_MIN_BYTES (1u * 1024u * 1024u)
 #define PS_WAL_SEGMENT_MAX_BYTES (1024u * 1024u * 1024u)
-/* the PostgreSQL WAL page header fields the envelope copies */
+/*
+ * The PostgreSQL WAL page header fields the envelope copies.  xlp_magic and
+ * xlp_info sit at bytes 0 and 2 on every ABI.  The long header's
+ * xlp_seg_size follows xlp_sysid, whose alignment the writer's ABI decides:
+ * with 8-byte alignment of uint64 the short header is 24 bytes and the
+ * segment size sits at 32 (blcksz at 36); with 4-byte alignment (i386) the
+ * short header is 20 bytes and the segment size sits at 28 (blcksz at 32).
+ * The store does not know the writer's ABI, so it recognizes the layout by
+ * its contents: the 8-byte layout leaves bytes 20..23 as zeroed padding and
+ * a valid segment size and block size at 32/36, the 4-byte layout has the
+ * system identifier there and the sizes at 28/32.
+ */
 #define PS_WAL_XLP_LONG_HEADER 0x0002u	/* XLP_LONG_HEADER */
-#define PS_WAL_XLP_SHORT_HEADER_BYTES 24u
-#define PS_WAL_XLP_LONG_HEADER_BYTES 40u
-#define PS_WAL_XLP_SEG_SIZE_OFFSET 32u
+#define PS_WAL_XLP_MIN_HEADER_BYTES 20u	/* the shorter short header */
+#define PS_WAL_XLP_LONG_HEADER_BYTES 40u	/* the longer long header */
+#define PS_WAL_XLP_SEG_SIZE_OFFSET_ALIGN8 32u
+#define PS_WAL_XLP_SEG_SIZE_OFFSET_ALIGN4 28u
 
 typedef struct PsWalSegmentHeader
 {

@@ -264,7 +264,7 @@ if [ -n "$seg" ] && "$BUILD/contrib/pagestore/pagestore_walrestore" \
 	ident_out=$(mktemp)
 	if "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --incarnation 1 \
 			--segsize 16777216 --xlog-magic "$xlog_magic" "$seg" "$ident_out" >/dev/null 2>&1; then
-		echo "ok   - walrestore accepts the payload under this build's WAL page magic"
+		echo "ok   - walrestore accepts the payload under this build's WAL page magic (the compiled default and --payload-identity agree)"
 	else
 		echo "FAIL - walrestore refused the payload under this build's WAL page magic ($xlog_magic)"; fail=1
 	fi
@@ -314,8 +314,10 @@ rm -f "$out"
 	--timeline 0 --incarnation 2 --segsize 16777216 "$seg" "$out" \
 	>/dev/null 2>&1
 stale_incarnation_rc=$?
-assert "$stale_incarnation_rc" "1" \
-	"walrestore fences a stale or mismatched immutable incarnation"
+# a fenced incarnation is the store refusing the read, which recovery must
+# treat as fatal (status above 125), not as the end of the archive
+assert "$stale_incarnation_rc" "126" \
+	"walrestore fences a stale or mismatched immutable incarnation as a fatal restore"
 assert "$([ ! -e "$out" ] && echo absent || echo present)" "absent" \
 	"failed stale-incarnation restore leaves no WAL output"
 

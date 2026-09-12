@@ -59,15 +59,38 @@ WALIDX_MAGICS = {0x57494458, 0x57495047}      # "WIDX" records, "WIPG" progress
 # records the payload's PostgreSQL identity at bytes 56..63 -- xlp_magic u16,
 # xlp_info u16, xlp_seg_size u32, little-endian like the rest of the envelope
 # -- copied from the WAL page header the payload begins with at byte 64
-# (magic at 0, info at 2, and a long header's segment size at 32), which
-# PostgreSQL wrote in host byte order.  The header CRC at 44 is FNV-1a over
-# the 64 bytes with the CRC field zeroed.
+# (magic at 0, info at 2, and a long header's segment size where the
+# writer's ABI put it: at 32 with 8-byte-aligned uint64, at 28 with 4-byte
+# alignment; the store tells the layouts apart the way
+# ps_wal_segment_payload_identity() does), which PostgreSQL wrote in host
+# byte order.  The header CRC at 44 is FNV-1a over the 64 bytes with the CRC
+# field zeroed.
 WAL_SEGMENT_HEADER_BYTES = 64
 WAL_SEGMENT_VERSION = 2
 WAL_SEGMENT_IDENTITY_OFFSET = 56
 WAL_SEGMENT_HEADER_CRC_OFFSET = 44
 XLP_LONG_HEADER = 0x0002
-XLP_SEG_SIZE_OFFSET = 32
+
+
+def wal_long_header_seg_size(payload: bytes) -> int:
+    """The segment size a long WAL page header carries, recognizing the
+    writer's ABI by the bytes: zeroed padding at 20 with plausible sizes at
+    32/36 is the 8-byte-aligned layout, plausible sizes at 28/32 the 4-byte
+    one; 0 when neither."""
+    def plausible_seg(size: int) -> bool:
+        return 1 << 20 <= size <= 1 << 30 and size & (size - 1) == 0
+
+    def plausible_blk(size: int) -> bool:
+        return 1024 <= size <= 65536 and size & (size - 1) == 0
+
+    pad, = struct.unpack_from("=I", payload, 20)
+    seg8, blk8 = struct.unpack_from("=II", payload, 32)
+    seg4, blk4 = struct.unpack_from("=II", payload, 28)
+    if pad == 0 and plausible_seg(seg8) and plausible_blk(blk8):
+        return seg8
+    if plausible_seg(seg4) and plausible_blk(blk4):
+        return seg4
+    return 0
 WATERMARK_SUFFIX = ".size"
 SEG_HEADER_BYTES = {
     0x53454732: 48, 0x53454730: 48, 0x53454731: 48, 0x53454733: 48,
@@ -90,6 +113,11 @@ OPEN_REJECTED = "open_rejected"      # the daemon refuses to open the store
 USE_REJECTED = "use_rejected"        # it opens, but the oracle or inspection fails closed
 ACCEPTED = "accepted"                # it opens and the oracle passes
 CRASHED = "daemon_crashed"           # the daemon died of a signal or exited under use; never expected
+
+
+class ForeignPayload(Exception):
+    """The fixture's payload was written for another PostgreSQL build: not a
+    broken envelope, but not a fixture this build can check either."""
 
 
 class FixtureError(Exception):
@@ -136,7 +164,7 @@ def wal_segment_payload_identity(path: Path) -> dict[str, int] | None:
     magic, info, seg_size = struct.unpack_from("<HHI", data, WAL_SEGMENT_IDENTITY_OFFSET)
     payload = data[WAL_SEGMENT_HEADER_BYTES:]
     carried_magic, carried_info = struct.unpack_from("=HH", payload, 0)
-    carried_seg = struct.unpack_from("=I", payload, XLP_SEG_SIZE_OFFSET)[0] if carried_info & XLP_LONG_HEADER else 0
+    carried_seg = wal_long_header_seg_size(payload) if carried_info & XLP_LONG_HEADER else 0
     if (magic, info, seg_size) != (carried_magic, carried_info, carried_seg):
         raise FixtureError(
             f"{path.name} records payload identity ({magic:#06x}, {info:#06x}, {seg_size}) "
@@ -727,10 +755,9 @@ def check_payload_identity(args: argparse.Namespace, store: Path,
         return
     build_magic = int(build_identity["xlog_page_magic"])
     if build_magic != carried["xlog_page_magic"]:
-        raise FixtureError(
+        raise ForeignPayload(
             f"payload needs a PostgreSQL build with XLOG_PAGE_MAGIC "
-            f"{carried['xlog_page_magic']:#06x}; the checking build has {build_magic:#06x} "
-            f"(recapture the fixture under it)"
+            f"{carried['xlog_page_magic']:#06x}; the checking build has {build_magic:#06x}"
         )
     print(f"ok   - the checking PostgreSQL build loads this payload (XLOG_PAGE_MAGIC {build_magic:#06x})")
 
@@ -821,10 +848,12 @@ def fixture_metadata(fixture: Path) -> dict[str, Any]:
     return metadata
 
 
-def check_one(args: argparse.Namespace, fixture: Path) -> int:
+def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
     """A "current" fixture pins the compiled identities and takes every
     mutation; a "legacy" fixture records a format the daemon still reads, so
-    it only has to reopen with its oracle intact (an upgrade path)."""
+    it only has to reopen with its oracle intact (an upgrade path).  Returns
+    None for a current fixture whose payload is for another PostgreSQL build:
+    it is skipped, and the caller requires some current fixture to match."""
     metadata = fixture_metadata(fixture)
     role = metadata["role"]
     print(f"--- fixture {fixture.name} ({role})")
@@ -838,8 +867,15 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int:
         # and it must still open before the identity table is judged.  Only a
         # current fixture must carry every advertised format; a legacy one
         # records formats the daemon has since moved past.
-        check_reopen(args, root, fixture, metadata,
-                     current if role == "current" else None)
+        try:
+            check_reopen(args, root, fixture, metadata,
+                         current if role == "current" else None)
+        except ForeignPayload as foreign:
+            # a release branch carries the fixture captured under its own
+            # build; one captured under another build is neither broken
+            # nor checkable here
+            print(f"skip - {foreign} (a fixture for another PostgreSQL release)")
+            return None
         if role == "current":
             if current != expected:
                 print("FAIL - compiled persisted-format identities differ from the fixture:")
@@ -883,8 +919,20 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int:
 
 def check(args: argparse.Namespace) -> int:
     status = 0
+    binds_build = (args.postgres_payload_identity is not None or
+                   args.postgres_payload_identity_tool is not None)
+    matched_current = 0
     for fixture in args.check:
-        status |= check_one(args, fixture)
+        result = check_one(args, fixture)
+        if result is None:
+            continue
+        status |= result
+        if fixture_metadata(fixture)["role"] == "current":
+            matched_current += 1
+    if binds_build and matched_current == 0:
+        print("FAIL - no current fixture carries a payload this PostgreSQL build loads; "
+              "capture one under this build")
+        return 1
     return status
 
 

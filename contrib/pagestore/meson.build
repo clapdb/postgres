@@ -155,9 +155,12 @@ pagestore_import = executable('pagestore_import',
 contrib_targets += pagestore_import
 
 # Reconstruct a standard WAL segment from the store's shipped WAL; usable as a
-# restore_command so a recovery instance can replay store-resident WAL.
+# restore_command so a recovery instance can replay store-resident WAL.  A
+# frontend program: it checks the payload's page header with this build's
+# XLogLongPageHeaderData layout and XLOG_PAGE_MAGIC before handing it on.
 pagestore_walrestore = executable('pagestore_walrestore',
   files('pagestore_walrestore.c'),
+  dependencies: [frontend_code],
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_walrestore
