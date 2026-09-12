@@ -1247,6 +1247,27 @@ autoSeeded=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
 assert "$([ "${autoSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"control-derived prepare seeded all branch SLRUs ($autoSeeded page(s))"
+# The persisted-format fixture for data-directory artifacts
+# (harness/pagestore_pgdata_fixture.py --capture) takes the prepared branch a
+# real backend wrote, with the identity its loaders bind it to.
+if [ -n "${PAGESTORE_PGDATA_FIXTURE_CAPTURE:-}" ]; then
+	mkdir -p "$PAGESTORE_PGDATA_FIXTURE_CAPTURE/branch"
+	cp "$AUTOSEED/pagestore_branch.manifest" "$AUTOSEED/pagestore_branch.bootstrap" \
+		"$PAGESTORE_PGDATA_FIXTURE_CAPTURE/branch/"
+	# the loaders bind the bootstrap to the checkpoint redo the prepare was
+	# given and to the checkpoint record end it derived from the mirrored
+	# control image; the latter is read back from the artifact it wrote
+	python3 - "$PAGESTORE_PGDATA_FIXTURE_CAPTURE" "$autoL" "$autoFork" <<'PY'
+import json, struct, sys
+root, redo, fork = sys.argv[1], sys.argv[2], sys.argv[3]
+header = open(f"{root}/branch/pagestore_branch.bootstrap", "rb").read(24)
+_, recovery, _ = struct.unpack("<3Q", header)
+json.dump({"new_timeline": 3, "parent_timeline": 0, "checkpoint_redo": redo,
+           "recovery_lsn": f"{recovery >> 32:X}/{recovery & 0xffffffff:08X}",
+           "fork_lsn": fork}, open(f"{root}/branch.json", "w"))
+PY
+	echo "ok   - captured the prepared branch artifacts for the pgdata fixture"
+fi
 assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'oldest_xid')::text;")" \
 	"$autoOldestXid" "control-derived prepare records checkpoint oldestXid"
 assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'next_xid')::text;")" \
@@ -1718,6 +1739,37 @@ else
 fi
 $P -c "SELECT pagestore_mark_reader_catalog_snapshot('$READERDATA', 0, '$readerR');" >/dev/null
 $P -c "SELECT pagestore_install_prepared_reader('$READERPREP', '$READERDATA', 0, '$readerR');" >/dev/null
+# ... and the prepared reader, the catalog provenance stamp, and the two
+# raw-value markers, published by the backend into the capture directory
+# (they are transient in a live cluster: an intent removed on adoption, a
+# stamp renewed at every checkpoint).
+if [ -n "${PAGESTORE_PGDATA_FIXTURE_CAPTURE:-}" ]; then
+	mkdir -p "$PAGESTORE_PGDATA_FIXTURE_CAPTURE/reader" "$PAGESTORE_PGDATA_FIXTURE_CAPTURE/markers"
+	cp "$READERPREP/pagestore_reader.manifest" "$READERPREP/pagestore_reader.snapshot" \
+		"$PAGESTORE_PGDATA_FIXTURE_CAPTURE/reader/"
+	cp "$READERDATA/pagestore_reader.catalog" "$PAGESTORE_PGDATA_FIXTURE_CAPTURE/reader/"
+	$P -c "CREATE FUNCTION pagestore_pgdata_marker_write(text, text, pg_lsn) RETURNS void
+	        AS 'pagestore','pagestore_pgdata_marker_write' LANGUAGE C STRICT;
+	       SELECT pagestore_pgdata_marker_write('reader_map_pending',
+	        '$PAGESTORE_PGDATA_FIXTURE_CAPTURE/markers', '$readerR');
+	       SELECT pagestore_pgdata_marker_write('slru_primed',
+	        '$PAGESTORE_PGDATA_FIXTURE_CAPTURE/markers', '$bc');" >/dev/null
+	reader_sysid=$("$BIN/pg_controldata" -D "$DATA" | sed -n 's/^Database system identifier: *//p')
+	cat > "$PAGESTORE_PGDATA_FIXTURE_CAPTURE/reader.json" <<EOF
+{"timeline": 0, "read_lsn": "$readerR", "system_identifier": "$reader_sysid"}
+EOF
+	python3 - "$PAGESTORE_PGDATA_FIXTURE_CAPTURE" "$readerR" "$bc" <<'PY'
+import json, sys
+root, horizon, stamp = sys.argv[1], sys.argv[2], sys.argv[3]
+identity = {
+    "branch": json.load(open(f"{root}/branch.json")),
+    "reader": json.load(open(f"{root}/reader.json")),
+    "markers": {"reader_map_pending_horizon": horizon, "slru_primed_stamp": stamp},
+}
+json.dump(identity, open(f"{root}/identity.json", "w"), indent=2)
+PY
+	echo "ok   - captured the prepared reader artifacts and markers for the pgdata fixture"
+fi
 # Emulate local recovery having replayed the later commit: newest pg_xact says
 # committed, but the fixed running-XID snapshot must retain R's visibility.
 cp "$DATA/pg_xact/"* "$READERDATA/pg_xact/"

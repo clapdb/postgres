@@ -762,6 +762,21 @@ test('pagestore_persisted_format_fixture',
   suite: ['pagestore'],
   timeout: 300,
 )
+# The data-directory artifacts a compute leaves for another to load
+# (pagestore_artifact_format.h, family "pgdata"): here only the compiled
+# identities are held to the fixture; the integration lane, which has a
+# PostgreSQL build, also loads every artifact through the backend's loaders
+# and applies the declared mutations (harness/pagestore_pgdata_fixture.py
+# --build).
+test('pagestore_pgdata_format_fixture',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_pgdata_fixture.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
+         '--format-tool', pagestore_format_versions],
+  depends: [pagestore_format_versions],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 endif
 foreach prune_fault_scenario : [
   'page_prune_after_frontier',

@@ -457,7 +457,7 @@ typedef struct PsSlruWatermarkShm
  * forgotten with the shared memory.  Lives in the data directory; removed
  * only by pagestore_slru_mirror_reset_debt().
  */
-#define PS_SLRU_DEBT_FILE	"pagestore.slru_mirror_debt"
+#define PS_SLRU_DEBT_FILE	PS_SLRU_DEBT_FILE_NAME
 
 /*
  * Primed marker: proof that an operator has ever declared this mirror
@@ -467,7 +467,104 @@ typedef struct PsSlruWatermarkShm
  * clean local segments are never flushed again, so they are captured only
  * by an explicit priming (seeding) step.  Absent marker = boot debt.
  */
-#define PS_SLRU_PRIMED_FILE	"pagestore.slru_mirror_primed"
+#define PS_SLRU_PRIMED_FILE	PS_SLRU_PRIMED_FILE_NAME
+
+/*
+ * The primed marker's bytes: the continuity stamp at 0, the marker's
+ * identity trailer at 8 (pagestore_artifact_format.h).  A marker written
+ * before the trailer existed is the stamp alone, or empty (the original,
+ * stampless marker); both read as legacy.  One naming another identity is
+ * a marker some other build left: it proves nothing to this one, so it
+ * reads as debt.
+ */
+static void
+ps_slru_primed_marker_image(unsigned char *marker, uint64 stamp)
+{
+	memset(marker, 0, PS_RAW_MARKER_SIZE);
+	memcpy(marker, &stamp, sizeof(stamp));
+	ps_artifact_trailer_set(marker, PS_SLRU_PRIMED_MAGIC, PS_SLRU_PRIMED_VERSION);
+}
+
+PagestoreSlruPrimedMarker
+pagestore_slru_primed_marker_read(const char *dir, uint64 *stamp)
+{
+	unsigned char marker[PS_RAW_MARKER_SIZE];
+	char		path[MAXPGPATH];
+	struct stat st;
+	ssize_t		n = -1;
+	int			fd;
+
+	*stamp = 0;
+	snprintf(path, sizeof(path), "%s/%s", dir, PS_SLRU_PRIMED_FILE);
+	fd = open(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		return errno == ENOENT ? PAGESTORE_SLRU_PRIMED_ABSENT
+			: PAGESTORE_SLRU_PRIMED_INVALID;
+	/* exactly one of the three layouts: a longer file is not a marker this
+	 * build wrote, whatever its first bytes say */
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		(st.st_size != 0 && st.st_size != PS_RAW_MARKER_LEGACY_SIZE &&
+		 st.st_size != PS_RAW_MARKER_SIZE))
+	{
+		close(fd);
+		return PAGESTORE_SLRU_PRIMED_INVALID;
+	}
+	memset(marker, 0, sizeof(marker));
+	n = read(fd, marker, sizeof(marker));
+	close(fd);
+	if (n != st.st_size)
+		return PAGESTORE_SLRU_PRIMED_INVALID;
+	if (n == 0)
+		return PAGESTORE_SLRU_PRIMED_STAMPLESS;
+	if (n == (ssize_t) PS_RAW_MARKER_LEGACY_SIZE)
+	{
+		memcpy(stamp, marker, sizeof(*stamp));
+		return PAGESTORE_SLRU_PRIMED_LEGACY;
+	}
+	if (n != (ssize_t) PS_RAW_MARKER_SIZE ||
+		!ps_artifact_trailer_is(marker, PS_SLRU_PRIMED_MAGIC, PS_SLRU_PRIMED_VERSION))
+		return PAGESTORE_SLRU_PRIMED_INVALID;
+	memcpy(stamp, marker, sizeof(*stamp));
+	return PAGESTORE_SLRU_PRIMED_STAMPED;
+}
+
+/*
+ * Publish the marker at 'stamp' into 'dir': written to a temporary file,
+ * fsynced, renamed over the old copy, and the directory fsynced, so a crash
+ * never leaves a torn stamp.  Returns false with errno set on failure.
+ */
+bool
+pagestore_slru_primed_marker_write(const char *dir, uint64 stamp)
+{
+	unsigned char marker[PS_RAW_MARKER_SIZE];
+	char		path[MAXPGPATH];
+	char		tmppath[MAXPGPATH];
+	int			fd;
+	bool		ok;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, PS_SLRU_PRIMED_FILE);
+	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+	ps_slru_primed_marker_image(marker, stamp);
+	fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+			  pg_file_create_mode);
+	if (fd < 0)
+		return false;
+	ok = (write(fd, marker, sizeof(marker)) == (ssize_t) sizeof(marker) &&
+		  fsync(fd) == 0);
+	close(fd);
+	if (!ok || rename(tmppath, path) != 0)
+		return false;
+	{
+		int			dfd = open(dir, O_RDONLY);
+
+		if (dfd >= 0)
+		{
+			(void) fsync(dfd);
+			close(dfd);
+		}
+	}
+	return true;
+}
 
 static PsSlruWatermarkShm *ps_slru_wm = NULL;
 static int	ps_slru_wm_nprocs = 0;
@@ -835,9 +932,8 @@ ps_slru_boot_debt(void)
 	ControlFileData *cf;
 	bool		crc_ok;
 	bool		debt;
-	int			fd;
 	uint64		stamped = 0;
-	ssize_t		n = -1;
+	PagestoreSlruPrimedMarker marker;
 
 	if (stat(PS_SLRU_DEBT_FILE, &st) == 0)
 		return true;
@@ -853,20 +949,17 @@ ps_slru_boot_debt(void)
 	 * mirror off, so that run's SLRU writes were never captured, and
 	 * "primed + clean shutdown" must not read as debt-free.  An old
 	 * stampless marker reads as 0 = always discontinuous, which only
-	 * costs one operator re-prime.
+	 * costs one operator re-prime; so does one whose identity this build
+	 * does not know.
 	 */
-	fd = open(PS_SLRU_PRIMED_FILE, O_RDONLY | PG_BINARY);
-	if (fd >= 0)
-	{
-		n = read(fd, &stamped, sizeof(stamped));
-		close(fd);
-	}
+	marker = pagestore_slru_primed_marker_read(".", &stamped);
 
 	cf = get_controlfile(DataDir, &crc_ok);
 	debt = !crc_ok ||
 		(cf->state != DB_SHUTDOWNED &&
 		 cf->state != DB_SHUTDOWNED_IN_RECOVERY) ||
-		n != (ssize_t) sizeof(stamped) ||
+		(marker != PAGESTORE_SLRU_PRIMED_LEGACY &&
+		 marker != PAGESTORE_SLRU_PRIMED_STAMPED) ||
 		stamped < (uint64) cf->checkPointCopy.redo;
 	pfree(cf);
 	return debt;
@@ -1324,11 +1417,8 @@ static void
 ps_slru_primed_refresh(XLogRecPtr redo)
 {
 	static uint64 last_stamp = 0;
-	char		tmppath[MAXPGPATH];
 	struct stat st;
 	uint64		stamp = (uint64) redo;
-	int			fd;
-	bool		ok;
 
 	if (ps_slru_wm == NULL || stamp == 0 || stamp == last_stamp)
 		return;
@@ -1340,33 +1430,15 @@ ps_slru_primed_refresh(XLogRecPtr redo)
 	if (stat(PS_SLRU_PRIMED_FILE, &st) != 0)
 		return;					/* not primed: nothing to keep alive */
 
-	snprintf(tmppath, sizeof(tmppath), "%s.tmp", PS_SLRU_PRIMED_FILE);
-	fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
-			  pg_file_create_mode);
-	if (fd < 0)
-		goto fail;
-	ok = (write(fd, &stamp, sizeof(stamp)) == (ssize_t) sizeof(stamp) &&
-		  fsync(fd) == 0);
-	close(fd);
-	if (!ok || rename(tmppath, PS_SLRU_PRIMED_FILE) != 0)
-		goto fail;
+	if (!pagestore_slru_primed_marker_write(".", stamp))
 	{
-		int			dfd = open(".", O_RDONLY);
-
-		if (dfd >= 0)
-		{
-			(void) fsync(dfd);
-			close(dfd);
-		}
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("pagestore: could not refresh the SLRU mirror primed marker \"%s\": %m",
+						PS_SLRU_PRIMED_FILE)));
+		return;
 	}
 	last_stamp = stamp;
-	return;
-
-fail:
-	ereport(WARNING,
-			(errcode_for_file_access(),
-			 errmsg("pagestore: could not refresh the SLRU mirror primed marker \"%s\": %m",
-					PS_SLRU_PRIMED_FILE)));
 }
 
 static bool
@@ -4361,12 +4433,13 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 * reset's snapshot even if the final total_lost CAS would miss it.
 	 */
 	{
-		uint64		stamp = (uint64) GetRedoRecPtr();
+		unsigned char marker[PS_RAW_MARKER_SIZE];
 
+		ps_slru_primed_marker_image(marker, (uint64) GetRedoRecPtr());
 		fd = OpenTransientFile(PS_SLRU_PRIMED_FILE,
 							   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
 		if (fd < 0 ||
-			write(fd, &stamp, sizeof(stamp)) != (ssize_t) sizeof(stamp) ||
+			write(fd, marker, sizeof(marker)) != (ssize_t) sizeof(marker) ||
 			pg_fsync(fd) != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),

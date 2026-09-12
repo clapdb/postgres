@@ -705,9 +705,18 @@ layer=9 seg=0` on a reopened fixture).  The segment readers are still
 exercised -- every open replays the uncovered tail to rebuild the index, and a
 record whose framing is wrong fails that scan -- but a mutation inside one
 cannot be observed through a read while the layer carries the same version.
-Backend-side artifacts (reader manifests, branch bootstrap,
-materializer markers, the writer checkpoint block) remain for the next fixture
-slice.
+The backend's own artifacts followed: the store objects it writes (the
+redo note, materializer markers, writer checkpoint, SLRU watermark and
+tombstone, reader snapshot objects) are in `posix-backend-objects`, and
+the files it leaves in a data directory (the prepared branch's manifest
+and bootstrap, the prepared reader's manifest, snapshot and catalog
+provenance, the reader-map intent marker and the SLRU mirror's primed
+marker) are in `fixtures/pgdata-artifacts`, captured from a real backend
+by `integration_test.sh` and loaded back through the backend's own loaders
+in a scratch cluster by `harness/pagestore_pgdata_fixture.py --check
+--build` (twenty-one mutations rejected or accepted as declared).  The
+branch controller's and materializer supervisor's JSON files remain for
+the last fixture slice.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it
@@ -722,17 +731,14 @@ it; the integration test models exactly that.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  Gates 1-4 are implemented for the local POSIX
 deployment, with the dropped-artifact limitation gate 4 documents above;
-gate 5 has its crash coverage composed and its daemon-side format fixtures,
+gate 5 has its crash coverage composed and its daemon- and backend-side format fixtures,
 but is not complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
-2. Finish H2 under the decided D5 policy: add the backend-side
-   persisted-format fixtures for the PGDATA artifacts (the reader
-   and branch manifests, branch bootstrap, reader snapshot/catalog files,
-   the reader-map intent marker, the branch controller's configuration,
-   journal, and authority files, the materializer supervisor's
-   configuration, status, and generation-authority file, and the SLRU
-   mirror continuity markers in PGDATA).
+2. Finish H2 under the decided D5 policy: add the persisted-format
+   fixtures for the branch controller's configuration, journal, and
+   authority files and the materializer supervisor's configuration,
+   status, and generation-authority file.
 3. Close the R4b concurrency clause: a concurrent-append oracle at the
    prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
    crash matrix already has at the source rewrite.

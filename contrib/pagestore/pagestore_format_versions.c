@@ -55,6 +55,24 @@ static const PsFormatIdentity header_identities[] = {
 	 PS_READER_RELMAP_FORMAT},
 	{"reader_snapshot", "object 4 database barrier",
 	 PS_READER_DATABASE_BARRIER_MAGIC, PS_READER_DATABASE_BARRIER_FORMAT},
+	/* the files a compute leaves in a data directory (D5 rule 4); the JSON
+	 * manifests carry their format in a member and have no magic */
+	{"pgdata", PS_BRANCH_MANIFEST_FILE " (JSON text with a format member; 1 accepted legacy)",
+	 0, PS_BRANCH_MANIFEST_FORMAT},
+	{"pgdata", PS_BRANCH_BOOTSTRAP_FILE, PS_BRANCH_BOOTSTRAP_MAGIC,
+	 PS_BRANCH_BOOTSTRAP_FORMAT},
+	{"pgdata", PS_READER_MANIFEST_FILE " (JSON text with a format member; 2 accepted legacy)",
+	 0, PS_READER_MANIFEST_FORMAT},
+	{"pgdata", PS_READER_SNAPSHOT_FILE, PS_READER_SNAPSHOT_MAGIC,
+	 PS_READER_SNAPSHOT_FORMAT},
+	{"pgdata", PS_READER_CATALOG_FILE, PS_READER_CATALOG_MAGIC,
+	 PS_READER_CATALOG_FORMAT},
+	{"pgdata", PS_READER_MAP_PENDING_FILE " (value at 0, identity trailer)",
+	 PS_READER_MAP_PENDING_MAGIC, PS_READER_MAP_PENDING_VERSION},
+	{"pgdata", PS_SLRU_PRIMED_FILE_NAME " (value at 0, identity trailer)",
+	 PS_SLRU_PRIMED_MAGIC, PS_SLRU_PRIMED_VERSION},
+	{"pgdata", "reader handoff token (SQL bytea)", PS_READER_HANDOFF_MAGIC,
+	 PS_READER_HANDOFF_FORMAT},
 };
 
 static int

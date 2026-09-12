@@ -2,9 +2,10 @@
  *
  * pagestore_artifact_format.h
  *	  The page-store-defined payloads a PostgreSQL compute stores as objects
- *	  in the daemon: their layouts and identities, in one freestanding header
- *	  shared by the backend that writes and loads them, the daemon that
- *	  reads the few it interprets, the fixture workload that seeds them, and
+ *	  in the daemon, and the files it leaves in a data directory: their
+ *	  layouts and identities, in one freestanding header shared by the
+ *	  backend that writes and loads them, the daemon that reads the few it
+ *	  interprets, the fixture workloads that seed them, and
  *	  pagestore_format_versions, which reports their identities.
  *
  * D5 rule 4: these are page-store envelopes -- the store wraps them like any
@@ -209,6 +210,104 @@ typedef struct PsReaderDatabaseEntryFormat
 	uint32_t	tablespace_oid;
 } PsReaderDatabaseEntryFormat;
 
+/* ---- data-directory artifacts (D5 rule 4) ------------------------------- */
+
+/*
+ * The files a compute leaves in a data directory for another compute -- a
+ * prepared branch or reader, or itself after a restart -- to load.  Text
+ * manifests carry their format in a "format" member; binary artifacts a
+ * magic and format at a fixed offset; the two raw-value markers a value at
+ * 0 and an identity trailer at 8 like the raw store objects above (a legacy
+ * marker is 8 bytes long and carries none).
+ */
+
+/* prepared branch: a JSON manifest and the CRC-bound bootstrap bundle */
+#define PS_BRANCH_MANIFEST_FILE			"pagestore_branch.manifest"
+#define PS_BRANCH_MANIFEST_FORMAT		2u	/* format 1 accepted, legacy */
+#define PS_BRANCH_BOOTSTRAP_FILE		"pagestore_branch.bootstrap"
+#define PS_BRANCH_BOOTSTRAP_MAGIC		0x50534242u	/* "PSBB" */
+#define PS_BRANCH_BOOTSTRAP_FORMAT		1u
+#define PS_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES 0x00000001u
+
+/* the header; map_count relation maps follow, each a map header and the
+ * pg_filenode.map bytes (PostgreSQL's); crc is CRC-32C of the whole
+ * artifact with crc zero */
+typedef struct PsBranchBootstrapHeaderFormat
+{
+	uint64_t	checkpoint_redo;
+	uint64_t	recovery_lsn;
+	uint64_t	fork_lsn;
+	uint64_t	system_identifier;
+	uint64_t	artifact_size;
+	uint32_t	magic;
+	uint32_t	format;
+	uint32_t	new_timeline;
+	uint32_t	parent_timeline;
+	uint32_t	map_count;
+	uint32_t	flags;
+	uint32_t	crc;
+	uint32_t	manifest_crc;	/* CRC-32C of the manifest text it binds */
+} PsBranchBootstrapHeaderFormat;
+
+typedef struct PsBranchBootstrapMapHeaderFormat
+{
+	uint32_t	database_oid;
+	uint32_t	size;
+} PsBranchBootstrapMapHeaderFormat;
+
+/* prepared reader: a JSON manifest, the snapshot file (a
+ * PsReaderSnapshotHeaderFormat and its xids, as the store object), and the
+ * catalog provenance stamp on the data directory the catalog was copied to */
+#define PS_READER_MANIFEST_FILE			"pagestore_reader.manifest"
+#define PS_READER_MANIFEST_FORMAT		3u	/* format 2 accepted, legacy */
+#define PS_READER_SNAPSHOT_FILE			"pagestore_reader.snapshot"
+#define PS_READER_CATALOG_FILE			"pagestore_reader.catalog"
+#define PS_READER_CATALOG_MAGIC			0x50534350u	/* "PSCP" */
+#define PS_READER_CATALOG_FORMAT		1u
+
+typedef struct PsReaderCatalogProvenanceFormat
+{
+	uint64_t	read_lsn;
+	uint64_t	system_identifier;
+	uint32_t	magic;
+	uint32_t	format;
+	uint32_t	timeline;
+	uint32_t	reserved;
+	uint32_t	crc;			/* CRC-32C of the bytes before it */
+	uint32_t	padding;
+} PsReaderCatalogProvenanceFormat;
+
+/* the reader's relation-map intent marker, in global/ and each database
+ * directory while a map is published but not yet adopted: the horizon
+ * (a uint64 LSN) at 0, identity trailer at 8 */
+#define PS_READER_MAP_PENDING_FILE		".pagestore-reader-map-pending"
+#define PS_READER_MAP_PENDING_MAGIC		0x504d5350u	/* "PSMP" */
+#define PS_READER_MAP_PENDING_VERSION	1u
+
+/* the SLRU mirror's continuity markers at the data directory root: the
+ * primed marker, stamped with the redo (a uint64 LSN at 0, identity trailer
+ * at 8; an older marker is 8 bytes or empty) of the newest checkpoint the
+ * mirror durably shipped, and the debt marker, whose presence is its
+ * meaning */
+#define PS_SLRU_PRIMED_FILE_NAME		"pagestore.slru_mirror_primed"
+#define PS_SLRU_PRIMED_MAGIC			0x4d505350u	/* "PSPM" */
+#define PS_SLRU_PRIMED_VERSION			1u
+#define PS_SLRU_DEBT_FILE_NAME			"pagestore.slru_mirror_debt"
+
+/* the writer-to-reader handoff token (a bytea a SQL caller carries; not a
+ * file, but an envelope another build must recognize or refuse) */
+#define PS_READER_HANDOFF_MAGIC			0x50534854u	/* "PSHT" */
+#define PS_READER_HANDOFF_FORMAT		1u
+
+typedef struct PsReaderHandoffTokenFormat
+{
+	uint32_t	magic;
+	uint32_t	format;
+	uint32_t	timeline;
+	uint32_t	reserved;
+	uint64_t	lsn;
+} PsReaderHandoffTokenFormat;
+
 /* ---- binding a producer's struct to a layout here ----------------------- */
 
 /*
@@ -228,6 +327,10 @@ typedef struct PsReaderDatabaseEntryFormat
 /* ---- the raw-value trailer ---------------------------------------------- */
 
 #define PS_ARTIFACT_TRAILER_OFFSET 8u
+/* a raw-value marker FILE: the value, then the trailer; a legacy one stops
+ * at the value */
+#define PS_RAW_MARKER_SIZE 16u
+#define PS_RAW_MARKER_LEGACY_SIZE 8u
 
 typedef struct PsArtifactTrailer
 {
