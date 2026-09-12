@@ -167,6 +167,8 @@ typedef struct PsReaderRelmapFormat
 	/* followed by size bytes: a pg_filenode.map, PostgreSQL's */
 } PsReaderRelmapFormat;
 
+/* the barrier header is followed by database_count entries, spanning
+ * block_count blocks; the CRC covers the header before it and the entries */
 typedef struct PsReaderDatabaseBarrierFormat
 {
 	uint64_t	read_lsn;
@@ -175,9 +177,15 @@ typedef struct PsReaderDatabaseBarrierFormat
 	uint32_t	timeline;
 	uint32_t	database_count;
 	uint32_t	block_count;
-	uint32_t	crc;			/* CRC-32C of the bytes before it */
+	uint32_t	crc;			/* CRC-32C of the bytes before it, then the entries */
 	uint32_t	reserved;
 } PsReaderDatabaseBarrierFormat;
+
+typedef struct PsReaderDatabaseEntryFormat
+{
+	uint32_t	database_oid;
+	uint32_t	tablespace_oid;
+} PsReaderDatabaseEntryFormat;
 
 /* ---- the raw-value trailer ---------------------------------------------- */
 

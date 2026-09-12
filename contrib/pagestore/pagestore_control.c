@@ -314,6 +314,9 @@ ps_control_drain(void)
 				memset(page, 0, sizeof(page));
 				memcpy(page, &p->image.checkPointCopy.redo,
 					   sizeof(XLogRecPtr));
+				ps_artifact_trailer_set((unsigned char *) page,
+										PS_REDO_NOTE_MAGIC,
+										PS_REDO_NOTE_VERSION);
 				nb = pagestore_localsvc_obj_write_prepare_timeout(
 					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
 				(void) pagestore_localsvc_obj_write_post_timeout(
