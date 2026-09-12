@@ -567,9 +567,8 @@ fault report and exit 88, and covers deterministic concurrent append overlap
 plus four configured POSIX shards. This work does not claim coverage of every
 internal unlink/fsync instruction, SPDK hardware, or the remaining composed H1
 crash scenarios at the time it landed; the composed `forkmeta` daemon
-scenarios now cover those boundaries (without a concurrent-append oracle
-at prepare, manifest commit, and snapshot GC), and SPDK stays outside the
-claim.
+scenarios now cover those boundaries, with the acknowledged-append ledger
+as their concurrent-mutation oracle, and SPDK stays outside the claim.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
