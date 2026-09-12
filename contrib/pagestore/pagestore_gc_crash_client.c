@@ -1646,6 +1646,8 @@ write_control(uint32_t block, uint64_t version, uint64_t redo)
  * values are arbitrary but internally consistent (complements, CRC-32C).
  */
 #define FIXTURE_BACKEND_VERSION FIXTURE_WAL_END
+#define FIXTURE_BACKEND_TIMELINE 0u	/* every headed object names the timeline */
+#define FIXTURE_FIRST_NORMAL_XID 3u	/* FirstNormalTransactionId */
 #define FIXTURE_TOMBSTONE_SLRU "pg_xact"	/* the tombstone's object: its id */
 #define FIXTURE_READER_GLOBAL 0u	/* InvalidOid */
 #define FIXTURE_READER_DB 1u
@@ -1810,7 +1812,7 @@ fixture_backend_objects_seed(void)
 
 		m.magic = PS_MATERIALIZER_MARKER_MAGIC;
 		m.version = PS_MATERIALIZER_MARKER_VERSION;
-		m.timeline = 0;
+		m.timeline = FIXTURE_BACKEND_TIMELINE;
 		m.materialized_lsn = FIXTURE_WAL_REDO;
 		m.materialized_lsn_complement = ~m.materialized_lsn;
 		control_key(&key);
@@ -1823,6 +1825,7 @@ fixture_backend_objects_seed(void)
 
 		r.magic = PS_MATERIALIZER_RELEASE_MAGIC;
 		r.version = PS_MATERIALIZER_RELEASE_VERSION;
+		r.timeline = FIXTURE_BACKEND_TIMELINE;
 		r.materialized_lsn = FIXTURE_WAL_REDO;
 		r.materialized_lsn_complement = ~r.materialized_lsn;
 		/* a release names a checkpoint completed after the materialized
@@ -1839,6 +1842,7 @@ fixture_backend_objects_seed(void)
 
 		c.magic = PS_WRITER_CHECKPOINT_MAGIC;
 		c.version = PS_WRITER_CHECKPOINT_VERSION;
+		c.timeline = FIXTURE_BACKEND_TIMELINE;
 		c.checkpoint_lsn = FIXTURE_WAL_REDO;
 		c.checkpoint_lsn_complement = ~c.checkpoint_lsn;
 		control_key(&key);
@@ -1878,6 +1882,7 @@ fixture_backend_objects_seed(void)
 		header.read_lsn = FIXTURE_WAL_END;
 		header.magic = PS_READER_SNAPSHOT_MAGIC;
 		header.format = PS_READER_SNAPSHOT_FORMAT;
+		header.timeline = FIXTURE_BACKEND_TIMELINE;
 		header.count = 2;
 		header.xmin = 700;
 		header.xmax = 704;
@@ -1921,6 +1926,7 @@ fixture_backend_objects_seed(void)
 		barrier.read_lsn = FIXTURE_WAL_END;
 		barrier.magic = PS_READER_DATABASE_BARRIER_MAGIC;
 		barrier.format = PS_READER_DATABASE_BARRIER_FORMAT;
+		barrier.timeline = FIXTURE_BACKEND_TIMELINE;
 		barrier.database_count = 1;
 		barrier.block_count = 1;
 		entry.database_oid = FIXTURE_READER_DB;
@@ -1938,6 +1944,7 @@ fixture_backend_objects_seed(void)
 		manifest.artifact_size = sizeof(header) + sizeof(xids);
 		manifest.magic = PS_READER_SNAPSHOT_MANIFEST_MAGIC;
 		manifest.format = PS_READER_SNAPSHOT_MANIFEST_FORMAT;
+		manifest.timeline = FIXTURE_BACKEND_TIMELINE;
 		manifest.block_count = 1;
 		manifest.artifact_crc = header.crc;
 		manifest.global_relmap_crc = global_relmap_crc;
@@ -1980,6 +1987,7 @@ fixture_backend_objects_check(void)
 		read_seeded_block(&key, PS_MATERIALIZER_MARKER_BLOCK, page, "materializer marker");
 		memcpy(&m, page, sizeof(m));
 		if (m.magic != PS_MATERIALIZER_MARKER_MAGIC || m.version != PS_MATERIALIZER_MARKER_VERSION ||
+			m.timeline != FIXTURE_BACKEND_TIMELINE ||
 			m.materialized_lsn != FIXTURE_WAL_REDO ||
 			m.materialized_lsn_complement != ~m.materialized_lsn)
 			die("fixture materializer marker is not intact");
@@ -1990,6 +1998,7 @@ fixture_backend_objects_check(void)
 		read_seeded_block(&key, PS_MATERIALIZER_RELEASE_BLOCK, page, "materializer release");
 		memcpy(&r, page, sizeof(r));
 		if (r.magic != PS_MATERIALIZER_RELEASE_MAGIC || r.version != PS_MATERIALIZER_RELEASE_VERSION ||
+			r.timeline != FIXTURE_BACKEND_TIMELINE ||
 			r.materialized_lsn != FIXTURE_WAL_REDO ||
 			r.materialized_lsn_complement != ~r.materialized_lsn ||
 			r.checkpoint_lsn_complement != ~r.checkpoint_lsn ||
@@ -2002,6 +2011,7 @@ fixture_backend_objects_check(void)
 		read_seeded_block(&key, PS_WRITER_CHECKPOINT_BLOCK, page, "writer checkpoint");
 		memcpy(&c, page, sizeof(c));
 		if (c.magic != PS_WRITER_CHECKPOINT_MAGIC || c.version != PS_WRITER_CHECKPOINT_VERSION ||
+			c.timeline != FIXTURE_BACKEND_TIMELINE ||
 			c.checkpoint_lsn != FIXTURE_WAL_REDO ||
 			c.checkpoint_lsn_complement != ~c.checkpoint_lsn)
 			die("fixture writer checkpoint is not intact");
@@ -2049,7 +2059,10 @@ fixture_backend_objects_check(void)
 			memcpy(m, page, sizeof(*m));
 			if (m->magic != PS_READER_SNAPSHOT_MANIFEST_MAGIC ||
 				m->format != PS_READER_SNAPSHOT_MANIFEST_FORMAT ||
-				m->read_lsn != FIXTURE_WAL_END || m->block_count == 0 ||
+				m->timeline != FIXTURE_BACKEND_TIMELINE ||
+				m->read_lsn != FIXTURE_WAL_END ||
+				m->artifact_size < sizeof(PsReaderSnapshotHeaderFormat) ||
+				m->block_count != (m->artifact_size + page_size - 1) / page_size ||
 				m->crc != crc32c_of(m, offsetof(PsReaderSnapshotManifestFormat, crc)))
 				die("fixture reader manifest is not intact");
 		}
@@ -2060,12 +2073,35 @@ fixture_backend_objects_check(void)
 		/* the count sizes the checksummed span: judge it before trusting it
 		 * as a length, or a mutated header reads past the page */
 		if (header.magic != PS_READER_SNAPSHOT_MAGIC || header.format != PS_READER_SNAPSHOT_FORMAT ||
-			header.read_lsn != FIXTURE_WAL_END || header.count != 2)
+			header.timeline != FIXTURE_BACKEND_TIMELINE ||
+			header.read_lsn != FIXTURE_WAL_END || header.reserved != 0 ||
+			header.count != 2)
 			die("fixture reader snapshot is not intact");
 		c = ps_crc32c_update(PS_CRC32C_INIT, &header, offsetof(PsReaderSnapshotHeaderFormat, crc));
 		c = ps_crc32c_update(c, page + sizeof(header), header.count * sizeof(uint32_t));
 		if (header.crc != PS_CRC32C_FIN(c))
 			die("fixture reader snapshot is not intact");
+		/* what pagestore_validate_reader_snapshot() demands of the xids:
+		 * normal, within [xmin, xmax), ascending -- plain comparisons
+		 * suffice for the fixture's small, unwrapped ids */
+		if (header.xmin < FIXTURE_FIRST_NORMAL_XID || header.xmax < header.xmin)
+			die("fixture reader snapshot has an invalid xid range");
+		for (uint32_t i = 0; i < header.count; i++)
+		{
+			uint32_t	xid;
+
+			memcpy(&xid, page + sizeof(header) + i * sizeof(xid), sizeof(xid));
+			if (xid < FIXTURE_FIRST_NORMAL_XID || xid < header.xmin || xid >= header.xmax)
+				die("fixture reader snapshot has an invalid xid");
+			if (i > 0)
+			{
+				uint32_t	prev;
+
+				memcpy(&prev, page + sizeof(header) + (i - 1) * sizeof(prev), sizeof(prev));
+				if (prev >= xid)
+					die("fixture reader snapshot xids are not ascending");
+			}
+		}
 		for (int global = 1; global >= 0; global--)
 			if (manifest[global].artifact_crc != header.crc ||
 				manifest[global].artifact_size !=
@@ -2077,7 +2113,11 @@ fixture_backend_objects_check(void)
 		memcpy(&ready, page, sizeof(ready));
 		if (ready.header.magic != PS_READER_SNAPSHOT_MAGIC ||
 			ready.header.format != PS_READER_SNAPSHOT_FORMAT ||
-			ready.header.read_lsn != FIXTURE_WAL_END || ready.block_count == 0 ||
+			ready.header.timeline != FIXTURE_BACKEND_TIMELINE ||
+			ready.header.read_lsn != FIXTURE_WAL_END ||
+			ready.header.count != header.count ||
+			ready.block_count != (sizeof(ready.header) + ready.header.count * sizeof(uint32_t) +
+								  page_size - 1) / page_size ||
 			ready.reserved != 0 ||
 			ready.crc != crc32c_of(&ready, offsetof(PsReaderSnapshotReadyFormat, crc)))
 			die("fixture reader ready record is not intact");
@@ -2090,7 +2130,10 @@ fixture_backend_objects_check(void)
 			read_seeded_block(&key, 0, page, "reader relation map");
 			memcpy(&relmap, page, sizeof(relmap));
 			if (relmap.magic != PS_READER_RELMAP_MAGIC || relmap.format != PS_READER_RELMAP_FORMAT ||
-				relmap.dbid != db || relmap.size != FIXTURE_READER_RELMAP_BYTES ||
+				relmap.dbid != db ||
+				relmap.tsid != (global ? FIXTURE_READER_GLOBAL_TS : FIXTURE_READER_TS) ||
+				relmap.size != FIXTURE_READER_RELMAP_BYTES ||
+				relmap.size > page_size - sizeof(relmap) ||
 				relmap.crc != crc32c_of(&relmap, offsetof(PsReaderRelmapFormat, crc)) ||
 				relmap.data_crc != crc32c_of(page + sizeof(relmap), relmap.size))
 				die("fixture reader relation map is not intact");
@@ -2108,6 +2151,7 @@ fixture_backend_objects_check(void)
 		 * over the header and the entries it announces */
 		if (barrier.magic != PS_READER_DATABASE_BARRIER_MAGIC ||
 			barrier.format != PS_READER_DATABASE_BARRIER_FORMAT ||
+			barrier.timeline != FIXTURE_BACKEND_TIMELINE ||
 			barrier.read_lsn != FIXTURE_WAL_END || barrier.reserved != 0 ||
 			barrier.database_count != 1 || barrier.block_count != 1)
 			die("fixture reader database barrier is not intact");
