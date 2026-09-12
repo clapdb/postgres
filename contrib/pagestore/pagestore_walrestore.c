@@ -14,10 +14,11 @@
  *
  * The bytes are handed to PostgreSQL untouched, so the one thing this tool
  * checks about them is their PostgreSQL identity: the segment begins with a
- * long WAL page header whose xlp_magic must be this build's XLOG_PAGE_MAGIC
- * and whose xlp_seg_size must be the --segsize the LSN was computed from (a
- * cluster initialized with another --wal-segsize names a different LSN
- * range by the same file name).  The header is read with this build's
+ * long WAL page header whose xlp_magic must be this build's XLOG_PAGE_MAGIC,
+ * whose xlp_xlog_blcksz must be this build's XLOG_BLCKSZ, and whose
+ * xlp_seg_size must be the --segsize the LSN was computed from (a cluster
+ * initialized with another --wal-segsize names a different LSN range by
+ * the same file name).  The header is read with this build's
  * XLogLongPageHeaderData layout, so the field offsets follow the target
  * ABI.  A mismatch, like a store that refuses the read (a corrupt or
  * reclaimed segment, a fenced incarnation), is fatal to recovery:
@@ -312,6 +313,19 @@ check_payload_identity(const unsigned char *page, uint32_t len,
 		fprintf(stderr, "payload was written by a cluster with a %u-byte WAL "
 				"segment size; --segsize %llu names a different LSN range\n",
 				header.xlp_seg_size, (unsigned long long) segsize);
+		return PS_WALRESTORE_EXIT_FATAL;
+	}
+	/*
+	 * The WAL block size is a build option: XLogReaderValidatePageHeader()
+	 * rejects a page header carrying another, and outside standby mode an
+	 * invalid page header ends recovery quietly -- the very outcome the
+	 * fatal status exists to prevent.
+	 */
+	if (header.xlp_xlog_blcksz != XLOG_BLCKSZ)
+	{
+		fprintf(stderr, "payload was written by a PostgreSQL build with a %u-byte "
+				"WAL block size; this build uses %u\n",
+				header.xlp_xlog_blcksz, (unsigned) XLOG_BLCKSZ);
 		return PS_WALRESTORE_EXIT_FATAL;
 	}
 	return 0;
