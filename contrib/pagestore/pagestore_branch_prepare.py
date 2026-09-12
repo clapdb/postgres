@@ -1323,6 +1323,17 @@ class BranchPreparer:
             raise BranchPrepareError(f"unexpected branch prepare result: {output}") from error
         if seeded < 0:
             raise BranchPrepareError("branch prepare returned a negative page count")
+        if self.verify_seed_against_materializer and self.seed_reference_report is None:
+            # The server's idempotent fast path reused a prepared directory
+            # whose manifest already matched (a previous prepare whose reply
+            # was lost) without seeding or comparing a page.  Verification
+            # was asked for and did not happen; say so rather than report a
+            # verified preparation.
+            raise BranchPrepareError(
+                "branch prepare reused an already prepared directory without comparing "
+                "its SLRUs against the materializer; remove the prepared directory to "
+                "re-seed under verification"
+            )
         return seeded
 
     def writer_is_normal(self) -> bool:

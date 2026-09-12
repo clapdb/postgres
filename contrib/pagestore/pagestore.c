@@ -6685,6 +6685,30 @@ rollback_seeded_slru_dir(const char *target_root, const char *backup_root,
  * bootstrap helper can derive these horizons from the fork manifest and call
  * this single function.
  */
+/*
+ * The seed pages at the base cutoff and the WAL replayed onto them are
+ * PostgreSQL payloads whose identity the timeline's control image carries;
+ * every entrypoint -- the serialized controller, the public function with
+ * caller-supplied horizons, the legacy prepare (before its idempotent
+ * fast path, so a prepared directory kept across a build change is not
+ * reused unchecked either) -- resolves that image at the cutoff and refuses
+ * to interpret a page this build cannot load.  A cutoff with no mirrored
+ * image at or below it has no identity to bind and fails closed.
+ */
+static void
+pagestore_bind_seed_identity(XLogRecPtr base)
+{
+	ControlFileData seed_control;
+
+	if (!ps_control_asof_timeout(base, &seed_control,
+								 PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+		ereport(ERROR,
+				(errmsg("no mirrored control image at or below the base cutoff %X/%08X",
+						LSN_FORMAT_ARGS(base)),
+				 errdetail("The seed pages' PostgreSQL identity cannot be bound without one.")));
+	pagestore_control_image_compatible(&seed_control, "branch SLRU seed");
+}
+
 static int64
 pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 								 XLogRecPtr target, TransactionId oldest_xid,
@@ -6748,26 +6772,7 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
 						(long long) oldest_member, (long long) next_member)));
 
-	/*
-	 * The seed pages at the base cutoff and the WAL replayed onto them are
-	 * PostgreSQL payloads whose identity the timeline's control image
-	 * carries; every entrypoint -- the serialized controller, the public
-	 * function with caller-supplied horizons, the legacy prepare -- resolves
-	 * that image at the cutoff and refuses to interpret a page this build
-	 * cannot load.  A cutoff with no mirrored image at or below it has no
-	 * identity to bind and fails closed.
-	 */
-	{
-		ControlFileData seed_control;
-
-		if (!ps_control_asof_timeout(base, &seed_control,
-									 PAGESTORE_READER_HORIZON_TIMEOUT_MS))
-			ereport(ERROR,
-					(errmsg("no mirrored control image at or below the base cutoff %X/%08X",
-							LSN_FORMAT_ARGS(base)),
-					 errdetail("The seed pages' PostgreSQL identity cannot be bound without one.")));
-		pagestore_control_image_compatible(&seed_control, "branch SLRU seed");
-	}
+	pagestore_bind_seed_identity(base);
 	pagestore_seed_reference_pages_compared = 0;
 	pagestore_seed_reference_compared_xact = 0;
 	pagestore_seed_reference_compared_commit_ts = 0;
@@ -6901,20 +6906,14 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 		pagestore_seed_reference_slru_dir[0] != '\0')
 	{
 		/*
-		 * The comparison is only a proof if it compared something: a
-		 * horizon that seeded pages but compared none would mean the
-		 * reference is not where the controller pointed.
-		 */
-		if (seeded > 0 && pagestore_seed_reference_pages_compared == 0)
-			ereport(ERROR,
-					(errmsg("seeded %lld SLRU pages but compared none with the reference \"%s\"",
-							(long long) seeded, pagestore_seed_reference_slru_dir)));
-		/*
 		 * Every reconstructed page inside the horizon was compared and
-		 * found equal (a difference is an ERROR above).  The remaining
-		 * seeded pages are the zero bootstrap pages an empty or
-		 * segment-aligned horizon needs below its first live entry; those
-		 * make no claim about recovery's state and are not compared.
+		 * found equal (a difference is an ERROR inside the staging scope
+		 * above, before anything is published).  The remaining seeded pages
+		 * are the zero bootstrap pages an empty or segment-aligned horizon
+		 * needs below its first live entry; those make no claim about
+		 * recovery's state and are not compared, so a horizon that is empty
+		 * throughout legitimately compares nothing -- the counts below let
+		 * a scenario require what it expects.
 		 */
 		ereport(NOTICE,
 				(errmsg("seeded SLRU pages compared with recovery's at \"%s\": %lld reconstructed pages equal (pg_xact %lld, pg_commit_ts %lld, pg_multixact/offsets %lld, pg_multixact/members %lld), %lld zero bootstrap pages not compared",
@@ -12644,6 +12643,10 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 	ps_commit_ts_normalize_horizons(target, next_xid,
 									&oldest_commit_ts_xid,
 									&next_commit_ts_xid);
+
+	/* a matching manifest reuses seeded SLRUs; they are still this build's
+	 * to interpret only if the payload identity they were seeded under is */
+	pagestore_bind_seed_identity(base);
 
 	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
 												   incarnation, parent_incarnation,
