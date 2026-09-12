@@ -251,6 +251,20 @@ struct ControlFileData;
 extern void pagestore_publish_checkpoint_reader_snapshot(
 	const struct ControlFileData *control);
 extern uint32 pagestore_slru_klass_id(const char *name);
+
+/* the SLRU mirror's primed (continuity) marker, as a data directory holds it */
+typedef enum PagestoreSlruPrimedMarker
+{
+	PAGESTORE_SLRU_PRIMED_ABSENT,	/* never primed */
+	PAGESTORE_SLRU_PRIMED_STAMPLESS,	/* the original empty marker: always debt */
+	PAGESTORE_SLRU_PRIMED_LEGACY,	/* the stamp alone, no identity */
+	PAGESTORE_SLRU_PRIMED_STAMPED,	/* the stamp and this build's identity */
+	PAGESTORE_SLRU_PRIMED_INVALID	/* unreadable, or another build's identity */
+} PagestoreSlruPrimedMarker;
+
+extern PagestoreSlruPrimedMarker pagestore_slru_primed_marker_read(const char *dir,
+																   uint64 *stamp);
+extern bool pagestore_slru_primed_marker_write(const char *dir, uint64 stamp);
 extern uint64 pagestore_localsvc_wal_retain_floor(void);
 /* Returns PS_STATUS_OK, PS_STATUS_STALE, or PS_STATUS_ERROR.  A controller
  * must not treat either non-OK result as a successful ownership change. */

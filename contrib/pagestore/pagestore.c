@@ -7079,13 +7079,14 @@ pagestore_publish_artifact(const char *target_dir, const char *filename,
 
 #define PAGESTORE_READER_SNAPSHOT_MAGIC PS_READER_SNAPSHOT_MAGIC
 #define PAGESTORE_READER_SNAPSHOT_FORMAT PS_READER_SNAPSHOT_FORMAT
-#define PAGESTORE_READER_SNAPSHOT_FILE "pagestore_reader.snapshot"
-#define PAGESTORE_READER_MAP_PENDING_FILE ".pagestore-reader-map-pending"
-#define PAGESTORE_READER_CATALOG_MAGIC UINT32_C(0x50534350)
-#define PAGESTORE_READER_CATALOG_FORMAT 1
-#define PAGESTORE_READER_CATALOG_FILE "pagestore_reader.catalog"
-#define PAGESTORE_READER_HANDOFF_MAGIC UINT32_C(0x50534854)
-#define PAGESTORE_READER_HANDOFF_FORMAT 1
+/* the data-directory artifacts' names and identities are the shared header's */
+#define PAGESTORE_READER_SNAPSHOT_FILE PS_READER_SNAPSHOT_FILE
+#define PAGESTORE_READER_MAP_PENDING_FILE PS_READER_MAP_PENDING_FILE
+#define PAGESTORE_READER_CATALOG_MAGIC PS_READER_CATALOG_MAGIC
+#define PAGESTORE_READER_CATALOG_FORMAT PS_READER_CATALOG_FORMAT
+#define PAGESTORE_READER_CATALOG_FILE PS_READER_CATALOG_FILE
+#define PAGESTORE_READER_HANDOFF_MAGIC PS_READER_HANDOFF_MAGIC
+#define PAGESTORE_READER_HANDOFF_FORMAT PS_READER_HANDOFF_FORMAT
 
 typedef struct PagestoreReaderHandoffToken
 {
@@ -7095,6 +7096,13 @@ typedef struct PagestoreReaderHandoffToken
 	uint32		reserved;
 	uint64		lsn;
 } PagestoreReaderHandoffToken;
+
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreReaderHandoffToken, PsReaderHandoffTokenFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderHandoffToken, PsReaderHandoffTokenFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderHandoffToken, PsReaderHandoffTokenFormat, format);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderHandoffToken, PsReaderHandoffTokenFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderHandoffToken, PsReaderHandoffTokenFormat, reserved);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderHandoffToken, PsReaderHandoffTokenFormat, lsn);
 
 typedef struct PagestoreReaderSnapshotHeader
 {
@@ -7266,6 +7274,16 @@ typedef struct PagestoreReaderCatalogProvenance
 	pg_crc32c	crc;
 	uint32		padding;
 } PagestoreReaderCatalogProvenance;
+
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, read_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, system_identifier);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, format);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, reserved);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderCatalogProvenance, PsReaderCatalogProvenanceFormat, padding);
 
 static bool pagestore_pread_exact(int fd, void *buf, Size size, off_t offset);
 
@@ -7493,6 +7511,81 @@ static bool pagestore_load_reader_relmap(Oid dbid, Oid tsid,
 										 pg_crc32c *data_crc,
 										 char *data, Size *data_size);
 static bool pagestore_install_global_reader_relmap(XLogRecPtr read_lsn);
+
+/*
+ * The reader relation-map intent marker: while a map is published but not
+ * yet adopted at a horizon, the directory carries the horizon (at 0) and
+ * the marker's identity trailer (at 8); a legacy marker is the horizon
+ * alone.  Reading one that names another identity fails closed: the map
+ * next to it was published by a build this one does not understand.
+ */
+typedef enum PagestoreMarkerState
+{
+	PAGESTORE_MARKER_ABSENT,
+	PAGESTORE_MARKER_PRESENT,	/* this build's identity */
+	PAGESTORE_MARKER_LEGACY,	/* the value alone */
+	PAGESTORE_MARKER_INVALID
+} PagestoreMarkerState;
+
+static void
+pagestore_write_reader_map_pending(const char *dir, XLogRecPtr read_lsn,
+								   const char *kind)
+{
+	unsigned char marker[PS_RAW_MARKER_SIZE];
+
+	memset(marker, 0, sizeof(marker));
+	memcpy(marker, &read_lsn, sizeof(read_lsn));
+	ps_artifact_trailer_set(marker, PS_READER_MAP_PENDING_MAGIC,
+							PS_READER_MAP_PENDING_VERSION);
+	pagestore_publish_artifact(dir, PAGESTORE_READER_MAP_PENDING_FILE, kind,
+							   (char *) marker, sizeof(marker));
+}
+
+static PagestoreMarkerState
+pagestore_read_raw_marker(const char *path, uint32 magic, uint32 version,
+						  uint64 *value)
+{
+	unsigned char marker[PS_RAW_MARKER_SIZE];
+	struct stat st;
+	int			fd;
+	bool		ok;
+
+	if (lstat(path, &st) != 0)
+		return errno == ENOENT ? PAGESTORE_MARKER_ABSENT : PAGESTORE_MARKER_INVALID;
+	if (!S_ISREG(st.st_mode) ||
+		(st.st_size != PS_RAW_MARKER_LEGACY_SIZE &&
+		 st.st_size != PS_RAW_MARKER_SIZE))
+		return PAGESTORE_MARKER_INVALID;
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		return PAGESTORE_MARKER_INVALID;
+	memset(marker, 0, sizeof(marker));
+	ok = pagestore_pread_exact(fd, marker, (Size) st.st_size, 0);
+	if (CloseTransientFile(fd) != 0)
+		ok = false;
+	if (!ok || ps_artifact_trailer_check(marker, magic, version) != 0)
+		return PAGESTORE_MARKER_INVALID;
+	memcpy(value, marker, sizeof(*value));
+	return st.st_size == PS_RAW_MARKER_SIZE ? PAGESTORE_MARKER_PRESENT
+		: PAGESTORE_MARKER_LEGACY;
+}
+
+static PagestoreMarkerState
+pagestore_read_reader_map_pending(const char *dir, XLogRecPtr *horizon)
+{
+	char		path[MAXPGPATH];
+	uint64		value = 0;
+	PagestoreMarkerState state;
+	int			len;
+
+	len = snprintf(path, sizeof(path), "%s/%s", dir,
+				   PAGESTORE_READER_MAP_PENDING_FILE);
+	PS_CHECK_PATH_FORMAT(len, path);
+	state = pagestore_read_raw_marker(path, PS_READER_MAP_PENDING_MAGIC,
+									  PS_READER_MAP_PENDING_VERSION, &value);
+	*horizon = (XLogRecPtr) value;
+	return state;
+}
 static bool pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 											   XLogRecPtr read_lsn,
 											   const char *mapdir);
@@ -7939,18 +8032,24 @@ static bool
 pagestore_install_global_reader_relmap(XLogRecPtr read_lsn)
 {
 	char		data[PAGESTORE_READER_RELMAP_MAX_SIZE];
-	char		pending_path[MAXPGPATH];
 	struct stat st;
 	pg_crc32c	data_crc;
 	Size		data_size;
+	XLogRecPtr	pending_horizon;
 	bool		refresh = false;
-	int			len;
 
-	len = snprintf(pending_path, sizeof(pending_path), "global/%s",
-				   PAGESTORE_READER_MAP_PENDING_FILE);
-	PS_CHECK_PATH_FORMAT(len, pending_path);
-	if (lstat("global/pg_filenode.map", &st) != 0 || !S_ISREG(st.st_mode) ||
-		lstat(pending_path, &st) == 0)
+	switch (pagestore_read_reader_map_pending("global", &pending_horizon))
+	{
+		case PAGESTORE_MARKER_ABSENT:
+			break;
+		case PAGESTORE_MARKER_PRESENT:
+		case PAGESTORE_MARKER_LEGACY:
+			refresh = true;
+			break;
+		case PAGESTORE_MARKER_INVALID:
+			return false;
+	}
+	if (lstat("global/pg_filenode.map", &st) != 0 || !S_ISREG(st.st_mode))
 		refresh = true;
 	if (!pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
 			read_lsn, &data_crc, data, &data_size))
@@ -7960,9 +8059,8 @@ pagestore_install_global_reader_relmap(XLogRecPtr read_lsn)
 		refresh = true;
 	if (refresh)
 	{
-		pagestore_publish_artifact("global", PAGESTORE_READER_MAP_PENDING_FILE,
-			"reader global relation-map pending horizon",
-			(char *) &read_lsn, sizeof(read_lsn));
+		pagestore_write_reader_map_pending("global", read_lsn,
+			"reader global relation-map pending horizon");
 		pagestore_publish_artifact("global", "pg_filenode.map",
 			"reader global relation map", data, (int) data_size);
 	}
@@ -7977,7 +8075,6 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 	bool		map_exists = false;
 	bool		pending = false;
 	char		map_path[MAXPGPATH];
-	char		pending_path[MAXPGPATH];
 	char		version_path[MAXPGPATH];
 	char		tablespace_link[MAXPGPATH];
 	char		parent[MAXPGPATH];
@@ -8002,22 +8099,17 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 		if (errno != ENOENT)
 			return false;
 	}
-	len = snprintf(pending_path, sizeof(pending_path), "%s/%s", mapdir,
-				   PAGESTORE_READER_MAP_PENDING_FILE);
-	PS_CHECK_PATH_FORMAT(len, pending_path);
-	if (lstat(pending_path, &st) == 0)
+	switch (pagestore_read_reader_map_pending(mapdir, &pending_lsn))
 	{
-		if (!S_ISREG(st.st_mode) || st.st_size != sizeof(pending_lsn) ||
-			(fd = OpenTransientFile(pending_path, O_RDONLY | PG_BINARY)) < 0)
-			return false;
-		pending = pagestore_pread_exact(fd, &pending_lsn, sizeof(pending_lsn), 0);
-		if (CloseTransientFile(fd) != 0)
-			pending = false;
-		if (!pending)
+		case PAGESTORE_MARKER_ABSENT:
+			break;
+		case PAGESTORE_MARKER_PRESENT:
+		case PAGESTORE_MARKER_LEGACY:
+			pending = true;
+			break;
+		case PAGESTORE_MARKER_INVALID:
 			return false;
 	}
-	else if (errno != ENOENT)
-		return false;
 	if (!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
 								 data, &data_size))
 		return false;
@@ -8086,9 +8178,8 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 		/* Persist intent first.  A crash or later barrier failure then leaves a
 		 * durable indication that this map has never become visible at an adopted
 		 * horizon and must be refreshed on retry. */
-		pagestore_publish_artifact(mapdir, PAGESTORE_READER_MAP_PENDING_FILE,
-								   "reader relation-map pending horizon",
-								   (char *) &read_lsn, sizeof(read_lsn));
+		pagestore_write_reader_map_pending(mapdir, read_lsn,
+										   "reader relation-map pending horizon");
 		pagestore_publish_artifact(mapdir, "pg_filenode.map",
 								   "reader relation map", data, (int) data_size);
 	}
@@ -9602,10 +9693,10 @@ pagestore_reader_handoff_ready(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL((XLogRecPtr) read_lsn >= (XLogRecPtr) token.lsn);
 }
 
-#define PAGESTORE_BRANCH_BOOTSTRAP_FILE "pagestore_branch.bootstrap"
-#define PAGESTORE_BRANCH_BOOTSTRAP_MAGIC UINT32_C(0x50534242)
-#define PAGESTORE_BRANCH_BOOTSTRAP_FORMAT 1
-#define PAGESTORE_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES UINT32_C(0x00000001)
+#define PAGESTORE_BRANCH_BOOTSTRAP_FILE PS_BRANCH_BOOTSTRAP_FILE
+#define PAGESTORE_BRANCH_BOOTSTRAP_MAGIC PS_BRANCH_BOOTSTRAP_MAGIC
+#define PAGESTORE_BRANCH_BOOTSTRAP_FORMAT PS_BRANCH_BOOTSTRAP_FORMAT
+#define PAGESTORE_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES PS_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES
 
 typedef struct PagestoreBranchBootstrapHeader
 {
@@ -9629,6 +9720,24 @@ typedef struct PagestoreBranchBootstrapMapHeader
 	uint32		database_oid;
 	uint32		size;
 } PagestoreBranchBootstrapMapHeader;
+
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, checkpoint_redo);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, recovery_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, fork_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, system_identifier);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, artifact_size);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, format);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, new_timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, parent_timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, map_count);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, flags);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapHeader, PsBranchBootstrapHeaderFormat, manifest_crc);
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreBranchBootstrapMapHeader, PsBranchBootstrapMapHeaderFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapMapHeader, PsBranchBootstrapMapHeaderFormat, database_oid);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreBranchBootstrapMapHeader, PsBranchBootstrapMapHeaderFormat, size);
 
 typedef struct PagestoreBranchBootstrapMap
 {
@@ -10029,7 +10138,7 @@ pagestore_write_branch_manifest(const char *target_dir,
 
 	manifest_len = snprintf(manifest, sizeof(manifest),
 							"{\n"
-							"  \"format\": 2,\n"
+							"  \"format\": %u,\n"
 							"  \"new_timeline\": %d,\n"
 							"  \"parent_timeline\": %d,\n"
 							"  \"incarnation\": %llu,\n"
@@ -10046,6 +10155,7 @@ pagestore_write_branch_manifest(const char *target_dir,
 							"  \"next_member\": \"%lld\",\n"
 							"  \"seeded_slru_pages\": \"%lld\"\n"
 							"}\n",
+							PS_BRANCH_MANIFEST_FORMAT,
 							new_tl, parent_tl,
 							(unsigned long long) incarnation,
 							(unsigned long long) parent_incarnation,
@@ -10104,7 +10214,7 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 
 	manifest_len = snprintf(manifest, sizeof(manifest),
 							"{\n"
-							"  \"format\": 3,\n"
+							"  \"format\": %u,\n"
 							"  \"kind\": \"pinned_reader\",\n"
 							"  \"catalog_provenance\": \"%s\",\n"
 							"  \"timeline\": %d,\n"
@@ -10122,6 +10232,7 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 							"  \"next_member\": \"%lld\",\n"
 							"  \"seeded_slru_pages\": \"%lld\"\n"
 							"}\n",
+							PS_READER_MANIFEST_FORMAT,
 							PAGESTORE_READER_CATALOG_FILE,
 							 timeline, (unsigned long long) incarnation, ancestry,
 							 LSN_FORMAT_ARGS(base),
@@ -10685,7 +10796,7 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 		uint64 parent_incarnation;
 
 		if (!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
-			(format != 1 && format != 2))
+			(format != 1 && format != PS_BRANCH_MANIFEST_FORMAT))
 			return false;
 		if (format == 1)
 		{
@@ -10767,7 +10878,7 @@ pagestore_reader_manifest_get_branch_identity(const char *manifest,
 
 	if (!pagestore_manifest_is_single_object(manifest) ||
 		!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
-		(format != 2 && format != 3) ||
+		(format != 2 && format != PS_READER_MANIFEST_FORMAT) ||
 		!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
 		!pagestore_manifest_has_string_token(manifest, "catalog_provenance",
 										 PAGESTORE_READER_CATALOG_FILE) ||
@@ -10809,7 +10920,7 @@ pagestore_reader_manifest_matches(const char *manifest, int32 timeline,
 		if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn) ||
 			!pagestore_manifest_is_single_object(manifest) ||
 			!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
-			(format != 2 && format != 3) ||
+			(format != 2 && format != PS_READER_MANIFEST_FORMAT) ||
 			!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
 			!pagestore_manifest_has_string_token(manifest, "catalog_provenance",
 												 PAGESTORE_READER_CATALOG_FILE) ||
@@ -11113,7 +11224,7 @@ pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
 		return false;
 
 	if (!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
-		(format != 1 && format != 2) ||
+		(format != 1 && format != PS_BRANCH_MANIFEST_FORMAT) ||
 		!pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) ||
 		*new_tl == 0 ||
 		!pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) ||
@@ -11267,6 +11378,221 @@ pagestore_bind_startup_ancestry(uint32 start_timeline,
  * datadir; it is a guard against pointing a compute at the wrong copied
  * datadir or store timeline.
  */
+/*
+ * pagestore_pgdata_artifact_check(kind, dir, timeline, parent_timeline,
+ *                                 lsn_a, lsn_b, lsn_c, system_identifier)
+ *
+ * Load one data-directory artifact through the loader a compute uses and
+ * report its identity, or raise as that loader would.  For the
+ * persisted-format fixture (harness/pagestore_pgdata_fixture.py), which
+ * proves that this build still loads the artifacts an earlier one captured
+ * and refuses their mutations; needs no page store, only the extension.
+ * The LSN arguments are what each loader binds the artifact to:
+ *   branch_manifest    timeline, parent_timeline, lsn_c = fork
+ *   branch_bootstrap   timeline, parent_timeline, lsn_a = checkpoint redo,
+ *                      lsn_b = recovery, lsn_c = fork; the manifest in dir
+ *   reader_manifest    timeline, lsn_a = read
+ *   reader_snapshot    timeline, lsn_a = read
+ *   reader_catalog     timeline, lsn_a = read, system_identifier
+ *   reader_map_pending (the marker's own horizon is reported)
+ *   slru_primed        (the marker's own stamp is reported)
+ */
+PG_FUNCTION_INFO_V1(pagestore_pgdata_artifact_check);
+Datum
+pagestore_pgdata_artifact_check(PG_FUNCTION_ARGS)
+{
+	char	   *kind = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	int32		timeline = PG_GETARG_INT32(2);
+	int32		parent_timeline = PG_GETARG_INT32(3);
+	XLogRecPtr	lsn_a = PG_GETARG_LSN(4);
+	XLogRecPtr	lsn_b = PG_GETARG_LSN(5);
+	XLogRecPtr	lsn_c = PG_GETARG_LSN(6);
+	char	   *sysid_text = text_to_cstring(PG_GETARG_TEXT_PP(7));
+	uint64		system_identifier;
+	char	   *end;
+	StringInfoData report;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to check pagestore artifacts")));
+	errno = 0;
+	system_identifier = strtoull(sysid_text, &end, 10);
+	if (errno != 0 || *sysid_text == '\0' || *end != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid system identifier \"%s\"", sysid_text)));
+	initStringInfo(&report);
+
+	if (strcmp(kind, "branch_manifest") == 0)
+	{
+		char	   *manifest = pagestore_read_branch_manifest(dir);
+		uint32		format;
+
+		if (manifest == NULL)
+			ereport(ERROR,
+					(errmsg("branch manifest is missing from \"%s\"", dir)));
+		if (timeline <= 0 || parent_timeline < 0 ||
+			!pagestore_manifest_matches(manifest, timeline, parent_timeline, lsn_c) ||
+			!pagestore_manifest_get_uint_token(manifest, "format", &format))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("branch manifest in \"%s\" does not match the requested branch identity",
+							dir)));
+		appendStringInfo(&report, "format=%u", format);
+	}
+	else if (strcmp(kind, "branch_bootstrap") == 0)
+	{
+		PagestoreBranchBootstrapHeader *header;
+		char	   *manifest;
+		char	   *artifact;
+
+		if (timeline <= 0 || parent_timeline < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid branch timeline identity")));
+		manifest = pagestore_read_branch_manifest(dir);
+		if (manifest == NULL)
+			ereport(ERROR,
+					(errmsg("branch manifest is missing from \"%s\"", dir)));
+		artifact = pagestore_load_branch_bootstrap(dir, timeline, parent_timeline,
+												   lsn_a, lsn_b, lsn_c, &header);
+		if (!EQ_CRC32C(header->manifest_crc,
+					   pagestore_branch_manifest_crc(manifest)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("branch bootstrap artifact does not match the prepared branch manifest")));
+		appendStringInfo(&report, "magic=%08x format=%u maps=%u",
+						 header->magic, header->format, header->map_count);
+		pfree(artifact);
+	}
+	else if (strcmp(kind, "reader_manifest") == 0)
+	{
+		char	   *manifest = pagestore_read_reader_manifest(dir);
+		uint32		format;
+
+		if (manifest == NULL)
+			ereport(ERROR,
+					(errmsg("reader manifest is missing from \"%s\"", dir)));
+		if (!pagestore_reader_manifest_matches(manifest, timeline, lsn_a) ||
+			!pagestore_manifest_get_uint_token(manifest, "format", &format))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("reader manifest in \"%s\" does not match the requested reader identity",
+							dir)));
+		appendStringInfo(&report, "format=%u", format);
+	}
+	else if (strcmp(kind, "reader_snapshot") == 0)
+	{
+		PagestoreReaderSnapshot *snapshot;
+
+		if (timeline < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid reader timeline")));
+		snapshot = pagestore_load_reader_snapshot(dir, (uint32) timeline, lsn_a,
+												  CurrentMemoryContext, ERROR);
+		appendStringInfo(&report, "magic=%08x format=%u xids=%u",
+						 snapshot->header.magic, snapshot->header.format,
+						 snapshot->header.count);
+	}
+	else if (strcmp(kind, "reader_catalog") == 0)
+	{
+		if (timeline < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid reader timeline")));
+		pagestore_load_reader_catalog_provenance(dir, (uint32) timeline, lsn_a,
+												 system_identifier, ERROR);
+		appendStringInfo(&report, "magic=%08x format=%u",
+						 PAGESTORE_READER_CATALOG_MAGIC,
+						 PAGESTORE_READER_CATALOG_FORMAT);
+	}
+	else if (strcmp(kind, "reader_map_pending") == 0)
+	{
+		XLogRecPtr	horizon;
+		PagestoreMarkerState state;
+
+		state = pagestore_read_reader_map_pending(dir, &horizon);
+		if (state == PAGESTORE_MARKER_ABSENT)
+			ereport(ERROR,
+					(errmsg("reader relation-map marker is missing from \"%s\"", dir)));
+		if (state == PAGESTORE_MARKER_INVALID)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("reader relation-map marker in \"%s\" is invalid or carries an identity this build does not know",
+							dir)));
+		appendStringInfo(&report, "magic=%08x format=%u %s horizon=%X/%08X",
+						 PS_READER_MAP_PENDING_MAGIC, PS_READER_MAP_PENDING_VERSION,
+						 state == PAGESTORE_MARKER_LEGACY ? "legacy" : "stamped",
+						 LSN_FORMAT_ARGS(horizon));
+	}
+	else if (strcmp(kind, "slru_primed") == 0)
+	{
+		uint64		stamp;
+		PagestoreSlruPrimedMarker marker;
+
+		marker = pagestore_slru_primed_marker_read(dir, &stamp);
+		if (marker == PAGESTORE_SLRU_PRIMED_ABSENT)
+			ereport(ERROR,
+					(errmsg("SLRU mirror primed marker is missing from \"%s\"", dir)));
+		if (marker == PAGESTORE_SLRU_PRIMED_INVALID)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("SLRU mirror primed marker in \"%s\" is invalid or carries an identity this build does not know",
+							dir)));
+		appendStringInfo(&report, "magic=%08x format=%u %s stamp=%X/%08X",
+						 PS_SLRU_PRIMED_MAGIC, PS_SLRU_PRIMED_VERSION,
+						 marker == PAGESTORE_SLRU_PRIMED_STAMPED ? "stamped" :
+						 marker == PAGESTORE_SLRU_PRIMED_LEGACY ? "legacy" : "stampless",
+						 LSN_FORMAT_ARGS((XLogRecPtr) stamp));
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unknown pagestore artifact kind \"%s\"", kind)));
+
+	PG_RETURN_TEXT_P(cstring_to_text(report.data));
+}
+
+/*
+ * pagestore_pgdata_marker_write(kind, dir, lsn): publish one of the raw-value
+ * markers into dir as a compute would, for the fixture capture -- the markers
+ * are transient by design (an intent removed on adoption, a stamp renewed at
+ * every checkpoint), so a fixture cannot copy one from a running cluster at
+ * a known point.  Same bytes, same publish path.
+ */
+PG_FUNCTION_INFO_V1(pagestore_pgdata_marker_write);
+Datum
+pagestore_pgdata_marker_write(PG_FUNCTION_ARGS)
+{
+	char	   *kind = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	XLogRecPtr	lsn = PG_GETARG_LSN(2);
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to write pagestore artifacts")));
+	if (strcmp(kind, "reader_map_pending") == 0)
+		pagestore_write_reader_map_pending(dir, lsn,
+										   "reader relation-map pending horizon");
+	else if (strcmp(kind, "slru_primed") == 0)
+	{
+		if (!pagestore_slru_primed_marker_write(dir, (uint64) lsn))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write the SLRU mirror primed marker into \"%s\": %m",
+							dir)));
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unknown pagestore marker kind \"%s\"", kind)));
+	PG_RETURN_VOID();
+}
+
 PG_FUNCTION_INFO_V1(pagestore_validate_branch_manifest);
 Datum
 pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)

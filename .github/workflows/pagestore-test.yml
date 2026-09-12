@@ -192,6 +192,13 @@ jobs:
             --inspect-binary ./pagestore_inspect \
             --format-tool ./pagestore_format_versions
 
+      - name: Check data-directory artifact identities against the fixture
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_pgdata_fixture.py \
+            --check fixtures/pgdata-artifacts \
+            --format-tool ./pagestore_format_versions
+
       - name: Run image-layer unit test
         working-directory: contrib/pagestore
         run: ./pagestore_layer_test
@@ -395,6 +402,16 @@ jobs:
             --format-tool build/contrib/pagestore/pagestore_format_versions \
             --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
             ${{ (github.ref_name == 'pagestore' || (github.event_name == 'pull_request' && github.base_ref == 'pagestore')) && '--require-build-match' || '' }}
+
+      - name: Check data-directory artifact fixture against this PostgreSQL build
+        # The backend's own loaders, in a scratch cluster of this build, must
+        # load every artifact an earlier build captured and refuse each
+        # declared mutation.
+        run: |
+          python3 contrib/pagestore/harness/pagestore_pgdata_fixture.py \
+            --check contrib/pagestore/fixtures/pgdata-artifacts \
+            --format-tool build/contrib/pagestore/pagestore_format_versions \
+            --build build
 
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
