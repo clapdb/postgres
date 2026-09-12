@@ -305,6 +305,12 @@ check_payload_identity(const unsigned char *page, uint32_t len,
 				"this build expects 0x%04x\n", header.std.xlp_magic, xlog_magic);
 		return PS_WALRESTORE_EXIT_FATAL;
 	}
+	if ((header.std.xlp_info & ~XLP_ALL_FLAGS) != 0)
+	{
+		fprintf(stderr, "segment start carries WAL page header flags this build "
+				"does not know (xlp_info 0x%04x)\n", header.std.xlp_info);
+		return PS_WALRESTORE_EXIT_FATAL;
+	}
 	if ((header.std.xlp_info & XLP_LONG_HEADER) == 0)
 	{
 		fprintf(stderr, "segment start carries no long WAL page header "
