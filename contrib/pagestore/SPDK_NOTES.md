@@ -178,8 +178,12 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
     read + slice.  The shipped **WAL and timeline metadata** stay on the
     filesystem under `--store` (delegated to the POSIX backend) -- small, not hot,
     and awkward to lay out per-timeline on raw blocks; on-device is a later LSM
-    refinement.  Segment count persists in `<store>/spdk_super` so a fresh
-    `--store` dir is a fresh store and a restart continues.
+    refinement.  Segment counts persist in `<store>/spdk_super` so a fresh
+    `--store` dir is a fresh store and a restart continues; the superblock
+    is versioned, checksummed, and published durably by
+    `pagestore_spdk_super.c`, and a store whose superblock is truncated,
+    corrupt, newer, or recorded for another geometry or shard count refuses
+    to open rather than restart every shard at segment zero over its data.
     - **Validated on the control disk**: the SPDK daemon is argument-compatible
       with the standalone harness (PCI via `$PS_SPDK_PCI`), so
       `sudo PS_SPDK_PCI=0000:06:00.0 ./pagestore_test ./pagestore_daemon_spdk`

@@ -722,10 +722,8 @@ but is not complete.  What remains before the MVP is declared complete is:
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
 2. Finish H2 under the decided D5 policy: bind the PostgreSQL payload
    identity into the envelopes (the control tuple plus the native header
-   identities the control image does not carry), register the POSIX and
-   SPDK container identities, make an unknown or corrupt `spdk_super` fail
-   the open instead of zeroing the segment counts and publish it durably
-   with errors propagated, validate the control tuple in the public and
+   identities the control image does not carry), validate the control
+   tuple in the public and
    legacy SLRU seeding entrypoints and compare their output with
    independently recovered SLRUs, then add the backend-side
    persisted-format fixtures (the materializer and

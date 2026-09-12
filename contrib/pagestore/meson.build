@@ -100,9 +100,22 @@ pagestore_format_versions = executable('pagestore_format_versions',
         'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_retention.c',
         'pagestore_wal_store.c', 'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
-        'pagestore_forkmeta_snapshot.c'),
+        'pagestore_forkmeta_snapshot.c', 'pagestore_spdk_super.c'),
   dependencies: [dependency('threads')],
   install: false,
+)
+
+# The SPDK store's container metadata (superblock) is versioned, checksummed
+# and published durably by a module without SPDK dependencies, so its format
+# is proven here on every host.
+pagestore_spdk_super_test = executable('pagestore_spdk_super_test',
+  files('pagestore_spdk_super_test.c', 'pagestore_spdk_super.c'),
+  install: false,
+)
+test('pagestore_spdk_super',
+  pagestore_spdk_super_test,
+  suite: ['pagestore'],
+  timeout: 30,
 )
 
 pagestore_gc_crash_client = executable('pagestore_gc_crash_client',

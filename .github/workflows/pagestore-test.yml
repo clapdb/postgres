@@ -80,7 +80,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_store_test pagestore_layer_store_test.c pagestore_layer_store.c pagestore_layer.c pagestore_fault.c pagestore_store_owner.c -lrt -pthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_crash_client pagestore_layer_crash_client.c -lrt -pthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_gc_crash_client pagestore_gc_crash_client.c -lrt -pthread
-          cc -O2 -Wall -Wextra -Werror -o pagestore_format_versions pagestore_format_versions.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_format_versions pagestore_format_versions.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c pagestore_spdk_super.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_tiering_test pagestore_tiering_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_cutover_test pagestore_forkmeta_cutover_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_crash_matrix_test pagestore_forkmeta_crash_matrix_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
@@ -98,6 +98,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_lifecycle_prune_test pagestore_lifecycle_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o storage_posix_fork_owner_test storage_posix_fork_owner_test.c storage_posix.c pagestore_store_owner.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_fault_test pagestore_fault_test.c pagestore_fault.c -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_spdk_super_test pagestore_spdk_super_test.c pagestore_spdk_super.c
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore
@@ -114,6 +115,10 @@ jobs:
       - name: Run named fault registry unit test
         working-directory: contrib/pagestore
         run: ./pagestore_fault_test
+
+      - name: Run SPDK superblock format unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_spdk_super_test
 
       - name: Run portable bootstrap install oracle unit tests
         run: python3 -B contrib/pagestore/harness/tests/test_bootstrap_install_oracle.py
