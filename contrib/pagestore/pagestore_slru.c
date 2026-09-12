@@ -2031,6 +2031,11 @@ ps_slru_reader_fetch_fresh(void)
 {
 	uint64		ok_at = pg_atomic_read_u64(&ps_slru_wm->reader_wm_ok_at);
 
+	/* a foreign sighting a completed fetch has not cleared outranks the
+	 * timestamp: that fetch may have begun before the sighting */
+	if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) !=
+		pg_atomic_read_u32(&ps_slru_wm->reader_known))
+		return false;
 	return ok_at != 0 &&
 		!TimestampDifferenceExceeds((TimestampTz) ok_at,
 									GetCurrentTimestamp(),
@@ -2767,6 +2772,14 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 			TimestampDifferenceExceeds((TimestampTz) ok_at,
 									   GetCurrentTimestamp(),
 									   PS_SLRU_READER_WM_STALE_MS))
+			return false;
+		/*
+		 * Nor after a foreign sighting no completed fetch has cleared: the
+		 * fetch that stamped ok_at may have begun before it, so the pair it
+		 * left is not one this build may revalidate against.
+		 */
+		if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) !=
+			pg_atomic_read_u32(&ps_slru_wm->reader_known))
 			return false;
 	}
 
