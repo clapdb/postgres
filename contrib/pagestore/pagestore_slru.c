@@ -422,6 +422,10 @@ typedef struct PsSlruWatermarkShm
 										 * but must not let cached pages
 										 * revalidate against stale
 										 * tombstones forever */
+	pg_atomic_uint32 reader_foreign;	/* the last fetch met an object whose
+										 * identity this build does not know:
+										 * every read fails until a fetch
+										 * succeeds, backoff or not */
 	pg_atomic_uint64 read_served;	/* live reads served from the mirror --
 									 * shared, so stats read from any backend
 									 * see the whole cluster's counts */
@@ -908,6 +912,7 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_at, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_ok_at, 0);
+		pg_atomic_init_u32(&ps_slru_wm->reader_foreign, 0);
 		pg_atomic_init_u64(&ps_slru_wm->read_served, 0);
 		pg_atomic_init_u64(&ps_slru_wm->read_fallback, 0);
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
@@ -1839,16 +1844,24 @@ ps_slru_rearm_interrupt(void)
  * names a format this build does not know.  Unlike a store outage, that is
  * not transient: the writer now publishes visibility metadata this reader
  * cannot interpret, so the watermark and tombstones it fetched earlier no
- * longer bound what the writer has done since.  Forget the last successful
- * fetch before raising, so cache-hit revalidation and the freshness gate
+ * longer bound what the writer has done since.  Before raising, forget the
+ * last successful fetch -- so cache-hit revalidation and the freshness gate
  * fail closed at once instead of trusting the old pair for the staleness
- * window; a later compatible fetch stamps it again.
+ * window -- and mark the state foreign, so the fetch's backoff fast path
+ * keeps failing every read instead of handing out the cached watermark
+ * for a TTL between probes (ps_slru_reader_require_known, which the read
+ * hooks apply after every fetch; the fetch itself stays silent, since the
+ * transaction-boundary refresh may not raise).  A later compatible fetch
+ * clears both.
  */
 pg_noreturn static void
 ps_slru_reader_foreign_identity(const char *what)
 {
 	if (ps_slru_wm != NULL)
+	{
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, 0);
+		pg_atomic_write_u32(&ps_slru_wm->reader_foreign, 1);
+	}
 	ereport(ERROR,
 			(errmsg("pagestore: %s carries an identity this build does not know",
 					what)));
@@ -1948,6 +1961,7 @@ ps_slru_reader_fetch_wm(void)
 		now = GetCurrentTimestamp();
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at, (uint64) now);
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, (uint64) now);
+		pg_atomic_write_u32(&ps_slru_wm->reader_foreign, 0);
 	}
 	PG_CATCH();
 	{
@@ -1968,6 +1982,17 @@ ps_slru_reader_fetch_wm(void)
 	PG_END_TRY();
 
 	return pg_atomic_read_u64(&ps_slru_wm->reader_wm);
+}
+
+/* A read hook's gate after a fetch: within the backoff the fetch hands back
+ * the cached watermark without IPC, which after a foreign identity is not
+ * one this build may serve against. */
+static void
+ps_slru_reader_require_known(void)
+{
+	if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) != 0)
+		ereport(ERROR,
+				(errmsg("pagestore: the SLRU mirror's visibility metadata carries an identity this build does not know")));
 }
 
 /*
@@ -2118,6 +2143,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * revalidation epoch.
 		 */
 		w = ps_slru_reader_fetch_wm();
+		ps_slru_reader_require_known();
 
 		/*
 		 * The fetch may have loaded a newer tombstone into the shared cache
@@ -2436,6 +2462,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 
 		/* same newest-wins rule as the read hook; W is only the enable gate */
 		w = ps_slru_reader_fetch_wm();
+		ps_slru_reader_require_known();
 
 		/*
 		 * See the read hook: the fetch may have advanced the tombstone
