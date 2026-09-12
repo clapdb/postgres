@@ -236,6 +236,17 @@ def legacy_marker(path: Path) -> None:
     path.write_bytes(path.read_bytes()[:TRAILER_OFFSET])
 
 
+def zero_trailer(path: Path) -> None:
+    """A full-size marker whose trailer is zero: not the legacy layout."""
+    data = bytearray(path.read_bytes())
+    data[TRAILER_OFFSET:TRAILER_OFFSET + 8] = bytes(8)
+    path.write_bytes(bytes(data))
+
+
+def overlong(path: Path) -> None:
+    path.write_bytes(path.read_bytes() + b"\0")
+
+
 def bump_manifest_format(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     marker = '"format": '
@@ -304,12 +315,20 @@ MUTATIONS: list[dict[str, Any]] = [
      "apply": legacy_marker, "expect": ACCEPTED},
     {"name": "map-pending-truncated", "artifact": "reader_map_pending",
      "apply": truncate_tail, "expect": REJECTED},
+    {"name": "map-pending-zero-trailer", "artifact": "reader_map_pending",
+     "apply": zero_trailer, "expect": REJECTED},
+    {"name": "map-pending-overlong", "artifact": "reader_map_pending",
+     "apply": overlong, "expect": REJECTED},
     {"name": "primed-foreign-identity", "artifact": "slru_primed",
      "apply": foreign_trailer, "expect": REJECTED},
     {"name": "primed-legacy", "artifact": "slru_primed",
      "apply": legacy_marker, "expect": ACCEPTED},
     {"name": "primed-truncated", "artifact": "slru_primed",
      "apply": truncate_tail, "expect": REJECTED},
+    {"name": "primed-zero-trailer", "artifact": "slru_primed",
+     "apply": zero_trailer, "expect": REJECTED},
+    {"name": "primed-overlong", "artifact": "slru_primed",
+     "apply": overlong, "expect": REJECTED},
 ]
 
 

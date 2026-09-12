@@ -490,6 +490,7 @@ pagestore_slru_primed_marker_read(const char *dir, uint64 *stamp)
 {
 	unsigned char marker[PS_RAW_MARKER_SIZE];
 	char		path[MAXPGPATH];
+	struct stat st;
 	ssize_t		n = -1;
 	int			fd;
 
@@ -499,9 +500,20 @@ pagestore_slru_primed_marker_read(const char *dir, uint64 *stamp)
 	if (fd < 0)
 		return errno == ENOENT ? PAGESTORE_SLRU_PRIMED_ABSENT
 			: PAGESTORE_SLRU_PRIMED_INVALID;
+	/* exactly one of the three layouts: a longer file is not a marker this
+	 * build wrote, whatever its first bytes say */
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		(st.st_size != 0 && st.st_size != PS_RAW_MARKER_LEGACY_SIZE &&
+		 st.st_size != PS_RAW_MARKER_SIZE))
+	{
+		close(fd);
+		return PAGESTORE_SLRU_PRIMED_INVALID;
+	}
 	memset(marker, 0, sizeof(marker));
 	n = read(fd, marker, sizeof(marker));
 	close(fd);
+	if (n != st.st_size)
+		return PAGESTORE_SLRU_PRIMED_INVALID;
 	if (n == 0)
 		return PAGESTORE_SLRU_PRIMED_STAMPLESS;
 	if (n == (ssize_t) PS_RAW_MARKER_LEGACY_SIZE)

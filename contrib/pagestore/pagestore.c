@@ -7563,11 +7563,15 @@ pagestore_read_raw_marker(const char *path, uint32 magic, uint32 version,
 	ok = pagestore_pread_exact(fd, marker, (Size) st.st_size, 0);
 	if (CloseTransientFile(fd) != 0)
 		ok = false;
-	if (!ok || ps_artifact_trailer_check(marker, magic, version) != 0)
+	if (!ok)
 		return PAGESTORE_MARKER_INVALID;
 	memcpy(value, marker, sizeof(*value));
-	return st.st_size == PS_RAW_MARKER_SIZE ? PAGESTORE_MARKER_PRESENT
-		: PAGESTORE_MARKER_LEGACY;
+	/* only the 8-byte layout is legacy; a full-size marker must carry
+	 * exactly this build's identity, a zero trailer included */
+	if (st.st_size == PS_RAW_MARKER_LEGACY_SIZE)
+		return PAGESTORE_MARKER_LEGACY;
+	return ps_artifact_trailer_is(marker, magic, version) ? PAGESTORE_MARKER_PRESENT
+		: PAGESTORE_MARKER_INVALID;
 }
 
 static PagestoreMarkerState
