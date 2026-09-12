@@ -153,8 +153,11 @@ def parse(kind: str, value: Any) -> dict[str, Any]:
     spec = ARTIFACTS[kind]
     if not isinstance(value, dict):
         raise ArtifactError(f"{spec.artifact} must be a JSON object")
+    # only an absent member is the legacy, pre-schema layout; a member that
+    # is null, or anything but an integer, names no layout at all
     schema = value.get("schema")
-    if isinstance(schema, bool) or (schema is not None and not isinstance(schema, int)):
+    if "schema" in value and (schema is None or isinstance(schema, bool) or
+                              not isinstance(schema, int)):
         raise ArtifactError(f"{spec.artifact} schema must be {spec.schema}")
     if schema in spec.refused:
         raise ArtifactError(f"{spec.artifact} schema {schema} is unsupported")
@@ -196,11 +199,19 @@ def load(kind: str, path: Path) -> dict[str, Any]:
 
 def identities() -> list[dict[str, Any]]:
     """The persisted-format identity table, in the shape
-    pagestore_format_versions prints (a JSON artifact has no magic)."""
+    pagestore_format_versions prints (a JSON artifact has no magic), plus
+    what each reader still accepts and refuses -- so a fixture pins the
+    compatibility promise as well as the current layout, and a reader that
+    drops a legacy schema fails the fixture instead of shrinking it."""
     return sorted(
         (
             {"family": spec.family, "artifact": spec.artifact, "magic": "0x00000000",
-             "version": spec.schema}
+             "version": spec.schema,
+             "legacy": ["none" if s is None else s
+                        for s in sorted(spec.accepted - {spec.schema},
+                                        key=lambda s: -1 if s is None else s)],
+             "refused": sorted(spec.refused),
+             "checksum": spec.carries_crc(spec.schema)}
             for spec in ARTIFACTS.values()
         ),
         key=lambda item: (item["family"], item["artifact"]),

@@ -785,11 +785,13 @@ test('pagestore_pgdata_format_fixture',
   suite: ['pagestore'],
   timeout: 60,
 )
+endif
 # The JSON artifacts of the branch controller and the materializer
 # supervisor (pagestore_artifact_schema.py): the tools' identities must
 # match the fixture, every captured artifact must load through the shared
 # reader, and each declared mutation must be refused (or, for a legacy
-# layout, accepted).  Python only.
+# layout, accepted).  Python and JSON only, so it runs on every host,
+# whatever its byte order.
 test('pagestore_controller_format_fixture',
   pagestore_harness_python,
   args: [files('harness/pagestore_controller_fixture.py'),
@@ -797,7 +799,6 @@ test('pagestore_controller_format_fixture',
   suite: ['pagestore'],
   timeout: 60,
 )
-endif
 foreach prune_fault_scenario : [
   'page_prune_after_frontier',
   'page_compaction_after_publish',

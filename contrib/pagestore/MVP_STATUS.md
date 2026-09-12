@@ -721,7 +721,7 @@ supervisor's status and the materializer's retention generation authority
 -- have their layouts in `pagestore_artifact_schema.py`, which both tools
 write and read through, and are in `fixtures/controller-json`, captured
 from real runs and checked by `harness/pagestore_controller_fixture.py`
-(thirty-four mutations).  Gate 5's format fixtures are complete.
+(forty mutations).  Gate 5's format fixtures are complete.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it

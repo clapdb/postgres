@@ -127,41 +127,59 @@ def truncate(path: Path) -> None:
     path.write_bytes(path.read_bytes()[:-3])
 
 
+def null_schema(value: dict[str, Any]) -> None:
+    value["schema"] = None
+    value.pop("crc32", None)
+
+
 ACCEPTED = "accepted"
 REJECTED = "rejected"
 
-# name, artifact, mutation (a callable on the file path), expectation
-MUTATIONS: list[dict[str, Any]] = []
 
+def mutations(expected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The cases, from the compatibility promise the FIXTURE records (its
+    format.json: current schema, legacy schemas still read, schemas refused
+    by name, whether a checksum is carried) rather than from the reader
+    under test -- a reader that quietly drops a legacy schema must fail the
+    check, not shrink it.  The identity table was already required to
+    match, so the reader's own promise is the same one."""
+    cases: list[dict[str, Any]] = []
+    by_artifact = {item["artifact"]: item for item in expected}
 
-def declare(name: str, artifact: str, expect: str, apply: Callable[[Path], None]) -> None:
-    MUTATIONS.append({"name": name, "artifact": artifact, "expect": expect, "apply": apply})
+    def declare(name: str, artifact: str, expect: str, apply: Callable[[Path], None]) -> None:
+        cases.append({"name": name, "artifact": artifact, "expect": expect, "apply": apply})
 
-
-for _artifact, (_kind, _) in ARTIFACTS.items():
-    _spec = artifact_schema.ARTIFACTS[_kind]
-    declare(f"{_artifact}.schema-unknown", _artifact, REJECTED,
-            lambda p: edit(p, bump_schema, restamp=True))
-    declare(f"{_artifact}.not-json", _artifact, REJECTED, truncate)
-    if _spec.closed:
-        declare(f"{_artifact}.unknown-member", _artifact, REJECTED,
-                lambda p: edit(p, add_member, restamp=True))
-    if _spec.carries_crc(_spec.schema):
-        declare(f"{_artifact}.crc", _artifact, REJECTED, lambda p: edit(p, corrupt_crc))
-        declare(f"{_artifact}.crc-missing", _artifact, REJECTED, lambda p: edit(p, drop("crc32")))
-        # a member changed under a checksum left as it was
-        declare(f"{_artifact}.edited", _artifact, REJECTED,
-                lambda p: edit(p, lambda v: v.update({next(
-                    k for k in ("retention_generation", "generation", "state") if k in v): 999})))
-    for _legacy in sorted(_spec.accepted - {_spec.schema}, key=lambda s: -1 if s is None else s):
-        # a legacy layout: the schema it names, without the checksum it
-        # predates
-        declare(f"{_artifact}.legacy-{'none' if _legacy is None else _legacy}", _artifact,
-                ACCEPTED,
-                lambda p, s=_legacy: edit(p, lambda v: (set_schema(s)(v), v.pop("crc32", None))))
-    for _refused in sorted(_spec.refused):
-        declare(f"{_artifact}.refused-{_refused}", _artifact, REJECTED,
-                lambda p, s=_refused: edit(p, set_schema(s), restamp=True))
+    for artifact, (kind, _) in ARTIFACTS.items():
+        spec = artifact_schema.ARTIFACTS[kind]
+        promise = by_artifact[spec.artifact]
+        declare(f"{artifact}.schema-unknown", artifact, REJECTED,
+                lambda p: edit(p, bump_schema, restamp=True))
+        declare(f"{artifact}.schema-null", artifact, REJECTED,
+                lambda p: edit(p, null_schema))
+        declare(f"{artifact}.not-json", artifact, REJECTED, truncate)
+        if spec.closed:
+            declare(f"{artifact}.unknown-member", artifact, REJECTED,
+                    lambda p: edit(p, add_member, restamp=True))
+        if promise["checksum"]:
+            declare(f"{artifact}.crc", artifact, REJECTED, lambda p: edit(p, corrupt_crc))
+            declare(f"{artifact}.crc-missing", artifact, REJECTED,
+                    lambda p: edit(p, drop("crc32")))
+            # a member changed under a checksum left as it was
+            declare(f"{artifact}.edited", artifact, REJECTED,
+                    lambda p: edit(p, lambda v: v.update({next(
+                        k for k in ("retention_generation", "generation", "state")
+                        if k in v): 999})))
+        for legacy in promise["legacy"]:
+            # a legacy layout: the schema it names, without the checksum it
+            # predates
+            schema = None if legacy == "none" else int(legacy)
+            declare(f"{artifact}.legacy-{legacy}", artifact, ACCEPTED,
+                    lambda p, s=schema: edit(p, lambda v: (set_schema(s)(v),
+                                                           v.pop("crc32", None))))
+        for refused in promise["refused"]:
+            declare(f"{artifact}.refused-{refused}", artifact, REJECTED,
+                    lambda p, s=int(refused): edit(p, set_schema(s), restamp=True))
+    return cases
 
 
 # ---- capture -------------------------------------------------------------------
@@ -273,7 +291,7 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int:
             else:
                 print(f"ok   - {name} loads: {report}")
         if role == "current":
-            for case in MUTATIONS:
+            for case in mutations(expected):
                 if args.only and case["name"] not in args.only:
                     continue
                 kind, rel = ARTIFACTS[case["artifact"]]
