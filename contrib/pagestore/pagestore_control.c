@@ -275,7 +275,7 @@ ps_control_drain(void)
 			ps_artifact_trailer_set((unsigned char *) page, PS_REDO_NOTE_MAGIC,
 									PS_REDO_NOTE_VERSION);
 			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
-													  1, page,
+													  PS_REDO_NOTE_BLOCK, page,
 													  (uint64) p->update_lsn,
 													  nb,
 													  PS_CONTROL_SHIP_TIMEOUT_MS);
@@ -311,7 +311,7 @@ ps_control_drain(void)
 				nb = pagestore_localsvc_obj_write_prepare_timeout(
 					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
 				(void) pagestore_localsvc_obj_write_post_timeout(
-					PS_KLASS_CONTROL, &key, 0, page,
+					PS_KLASS_CONTROL, &key, PS_CONTROL_IMAGE_BLOCK, page,
 					(uint64) p->image.checkPointCopy.redo, nb,
 					PS_CONTROL_SHIP_TIMEOUT_MS);
 
@@ -324,7 +324,7 @@ ps_control_drain(void)
 				nb = pagestore_localsvc_obj_write_prepare_timeout(
 					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
 				(void) pagestore_localsvc_obj_write_post_timeout(
-					PS_KLASS_CONTROL, &key, 1, page,
+					PS_KLASS_CONTROL, &key, PS_REDO_NOTE_BLOCK, page,
 					(uint64) p->image.checkPointCopy.redo, nb,
 					PS_CONTROL_SHIP_TIMEOUT_MS);
 			}
@@ -336,8 +336,8 @@ ps_control_drain(void)
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
 			(void) pagestore_localsvc_obj_write_post_timeout(
-				PS_KLASS_CONTROL, &key, 0, page, (uint64) p->update_lsn,
-				nb, PS_CONTROL_SHIP_TIMEOUT_MS);
+				PS_KLASS_CONTROL, &key, PS_CONTROL_IMAGE_BLOCK, page,
+				(uint64) p->update_lsn, nb, PS_CONTROL_SHIP_TIMEOUT_MS);
 
 			/* Publish only when the hook established a gate at this checkpoint
 			 * boundary.  The barrier sequence follows every mutation admitted
@@ -356,7 +356,8 @@ ps_control_drain(void)
 				nb = pagestore_localsvc_obj_write_prepare_timeout(
 					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
 				(void) pagestore_localsvc_obj_write_post_timeout(
-					PS_KLASS_CONTROL, &key, 2, page, fence.redo_lsn, nb,
+					PS_KLASS_CONTROL, &key, PS_ADMISSION_FENCE_BLOCK, page,
+					fence.redo_lsn, nb,
 					PS_CONTROL_SHIP_TIMEOUT_MS);
 
 				/* The exact-R version above can sort below the control object's
@@ -366,7 +367,8 @@ ps_control_drain(void)
 				nb = pagestore_localsvc_obj_write_prepare_timeout(
 					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
 				(void) pagestore_localsvc_obj_write_post_timeout(
-					PS_KLASS_CONTROL, &key, 2, page, (uint64) p->update_lsn, nb,
+					PS_KLASS_CONTROL, &key, PS_ADMISSION_FENCE_BLOCK, page,
+					(uint64) p->update_lsn, nb,
 					PS_CONTROL_SHIP_TIMEOUT_MS);
 			}
 
@@ -742,7 +744,7 @@ pagestore_control_image_asof(PG_FUNCTION_ARGS)
 				(errmsg("pagestore: control images are not mirrored on BLCKSZ (%d) < %d builds",
 						BLCKSZ, PG_CONTROL_FILE_SIZE)));
 
-	if (!pagestore_localsvc_obj_read_at(PS_KLASS_CONTROL, &key, 0,
+	if (!pagestore_localsvc_obj_read_at(PS_KLASS_CONTROL, &key, PS_CONTROL_IMAGE_BLOCK,
 										(uint64) lsn, page, &resolved))
 		PG_RETURN_NULL();
 

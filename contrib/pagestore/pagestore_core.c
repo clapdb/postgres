@@ -410,10 +410,9 @@ static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 /* Retention plan for one control block chain.  Blocks 0-2 (image, redo-floor
  * note, admission fence) are written as a same-version group and follow the
  * image block's plan; higher blocks (materializer marker, release and writer
- * checkpoints) are versioned independently and plan their own chain. */
-#define PS_CONTROL_IMAGE_BLOCK 0u
-#define PS_CONTROL_PAIRED_BLOCKS 3u
-#define PS_CONTROL_NOTE_BLOCK 1u
+ * checkpoints) are versioned independently and plan their own chain.  The
+ * block numbers are the persisted keys pagestore_artifact_format.h names. */
+#define PS_CONTROL_NOTE_BLOCK PS_REDO_NOTE_BLOCK
 static int control_note_redo(uint32_t timeline, const PsKey *key,
 							 const PageVer *v, unsigned char *tmp,
 							 uint64_t *redo_out);

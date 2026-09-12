@@ -32,6 +32,7 @@
 /* ---- control object (PS_KLASS_CONTROL, object 0) -------------------- */
 
 /* block 0: the ControlFileData image (PostgreSQL's; not versioned here) */
+#define PS_CONTROL_IMAGE_BLOCK		0u
 
 /*
  * block 1: the retention "floor note" -- the checkpoint redo of the image
@@ -43,6 +44,9 @@
 
 /* block 2: the admission fence (PsAdmissionFence in pagestore_ipc.h) */
 #define PS_ADMISSION_FENCE_BLOCK		2u
+/* blocks 0-2 are written as a same-version group; the daemon retains them
+ * by the image block's plan, and the higher blocks each by their own */
+#define PS_CONTROL_PAIRED_BLOCKS		3u
 
 /* block 3: the materializer's durable materialized-through marker */
 #define PS_MATERIALIZER_MARKER_BLOCK	3u

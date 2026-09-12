@@ -82,14 +82,14 @@ write_control(uint32_t timeline, uint64_t version, uint64_t redo)
 	memset(page, 0, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
 	ps_artifact_trailer_set(page, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION);
-	if (append_page(timeline, &key, 1, page, version, NULL) != 0)
+	if (append_page(timeline, &key, PS_REDO_NOTE_BLOCK, page, version, NULL) != 0)
 	{
 		ps_unlock_shard(ps_shard_of(&key));
 		return 0;
 	}
 	memset(page, 0xC3, sizeof(page));
 	memcpy(page, &version, sizeof(version));
-	if (append_page(timeline, &key, 0, page, version, NULL) != 0)
+	if (append_page(timeline, &key, PS_CONTROL_IMAGE_BLOCK, page, version, NULL) != 0)
 	{
 		ps_unlock_shard(ps_shard_of(&key));
 		return 0;
@@ -111,7 +111,7 @@ write_note(uint32_t timeline, uint64_t version, uint64_t redo)
 	ps_lock_shard_wr(ps_shard_of(&key));
 	memset(page, 0, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
-	rc = append_page(timeline, &key, 1, page, version, NULL);
+	rc = append_page(timeline, &key, PS_REDO_NOTE_BLOCK, page, version, NULL);
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc == 0 && ps_storage->sync() == 0;
 }
@@ -128,7 +128,7 @@ write_foreign_note(uint32_t timeline, uint64_t version, uint64_t redo)
 	memset(page, 0, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
 	ps_artifact_trailer_set(page, 0x41424344u, 7u);
-	rc = append_page(timeline, &key, 1, page, version, NULL);
+	rc = append_page(timeline, &key, PS_REDO_NOTE_BLOCK, page, version, NULL);
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc == 0 && ps_storage->sync() == 0;
 }
@@ -152,22 +152,22 @@ write_checkpoint(uint32_t timeline, uint64_t redo, uint64_t update)
 	ps_lock_shard_wr(ps_shard_of(&key));
 	memset(page, 0, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
-	rc |= append_page(timeline, &key, 1, page, redo, NULL);
+	rc |= append_page(timeline, &key, PS_REDO_NOTE_BLOCK, page, redo, NULL);
 	memset(page, 0xC3, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
-	rc |= append_page(timeline, &key, 0, page, redo, NULL);
+	rc |= append_page(timeline, &key, PS_CONTROL_IMAGE_BLOCK, page, redo, NULL);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &fence, sizeof(fence));
-	rc |= append_page(timeline, &key, 2, page, redo, NULL);
+	rc |= append_page(timeline, &key, PS_ADMISSION_FENCE_BLOCK, page, redo, NULL);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
-	rc |= append_page(timeline, &key, 1, page, update, NULL);
+	rc |= append_page(timeline, &key, PS_REDO_NOTE_BLOCK, page, update, NULL);
 	memset(page, 0xC3, sizeof(page));
 	memcpy(page, &update, sizeof(update));
-	rc |= append_page(timeline, &key, 0, page, update, NULL);
+	rc |= append_page(timeline, &key, PS_CONTROL_IMAGE_BLOCK, page, update, NULL);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &fence, sizeof(fence));
-	rc |= append_page(timeline, &key, 2, page, update, NULL);
+	rc |= append_page(timeline, &key, PS_ADMISSION_FENCE_BLOCK, page, update, NULL);
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc == 0 && ps_storage->sync() == 0;
 }

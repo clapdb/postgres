@@ -3802,7 +3802,8 @@ ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
 
 	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
 		return false;
-	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key, 0,
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key,
+												PS_CONTROL_IMAGE_BLOCK,
 												(uint64) lsn, page, &resolved,
 												timeout_ms))
 		return false;

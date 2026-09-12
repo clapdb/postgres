@@ -245,7 +245,7 @@ control_read_asof(uint32_t timeline, uint64_t incarnation,
 	memset((void *) &ch->key, 0, sizeof(ch->key));
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->timeline = timeline;
-	ch->blocknum = 0;
+	ch->blocknum = PS_CONTROL_IMAGE_BLOCK;
 	ch->req_lsn = read_lsn;
 	ch->req_seq = 0;
 	ch->incarnation = incarnation;
