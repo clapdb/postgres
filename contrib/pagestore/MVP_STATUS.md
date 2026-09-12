@@ -612,7 +612,7 @@ revision is reported in each job summary.  A
 run that cannot write its JSON report fails rather than passing with nothing
 to compare across nights.
 
-### 5. Composed crash and format-compatibility coverage -- crash coverage composed; format fixtures started
+### 5. Composed crash and format-compatibility coverage -- crash coverage composed; format fixtures complete
 
 The POSIX image-layer publication, page-pruning, WAL-index compaction, WAL
 reclaim, timeline deletion, manifest replacement, fork-metadata publication,
@@ -715,8 +715,13 @@ marker) are in `fixtures/pgdata-artifacts`, captured from a real backend
 by `integration_test.sh` and loaded back through the backend's own loaders
 in a scratch cluster by `harness/pagestore_pgdata_fixture.py --check
 --build` (twenty-one mutations rejected or accepted as declared).  The
-branch controller's and materializer supervisor's JSON files remain for
-the last fixture slice.
+controller's and supervisor's JSON files -- each tool's configuration,
+the controller's journal and retention generation authority, the
+supervisor's status and the materializer's retention generation authority
+-- have their layouts in `pagestore_artifact_schema.py`, which both tools
+write and read through, and are in `fixtures/controller-json`, captured
+from real runs and checked by `harness/pagestore_controller_fixture.py`
+(thirty-four mutations).  Gate 5's format fixtures are complete.
 
 An advancing reader's data directory boots from the checkpoint its manifest
 names, and the reader moves its own retention pin above that horizon as it
@@ -731,15 +736,11 @@ it; the integration test models exactly that.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  Gates 1-4 are implemented for the local POSIX
 deployment, with the dropped-artifact limitation gate 4 documents above;
-gate 5 has its crash coverage composed and its daemon- and backend-side format fixtures,
-but is not complete.  What remains before the MVP is declared complete is:
+gate 5 has its crash coverage composed and its format fixtures complete.
+What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
-2. Finish H2 under the decided D5 policy: add the persisted-format
-   fixtures for the branch controller's configuration, journal, and
-   authority files and the materializer supervisor's configuration,
-   status, and generation-authority file.
-3. Close the R4b concurrency clause: a concurrent-append oracle at the
+2. Close the R4b concurrency clause: a concurrent-append oracle at the
    prepare, manifest-commit, and snapshot-GC boundaries, matching the one the
    crash matrix already has at the source rewrite.
 

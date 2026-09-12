@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 PAGESTORE_ROOT = Path(__file__).resolve().parents[2]
+# the supervisor imports pagestore_artifact_schema from beside itself
+sys.path.insert(0, str(PAGESTORE_ROOT))
 SPEC = importlib.util.spec_from_file_location(
     "pagestore_materializer_supervisor",
     PAGESTORE_ROOT / "pagestore_materializer_supervisor.py",

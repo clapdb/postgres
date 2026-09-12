@@ -517,6 +517,19 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_get_wal_replay_pause_state();")" "not paus
 assert_eq "$("${WP[@]}" -c "SELECT NOT pg_is_in_recovery() AND current_setting('listen_addresses') <> ''; ")" "t" \
 	"recovery controller restored the normal public writer"
 echo "ok   - serialized branch window selected C=$base_lsn R=$checkpoint_redo E=$checkpoint_lsn L=$fork_lsn"
+# The persisted-format fixture for the controller's JSON artifacts
+# (harness/pagestore_controller_fixture.py --capture) takes what this real
+# controller run left behind: its configuration, the completed journal and
+# its retention generation authority.
+if [ -n "${PAGESTORE_CONTROLLER_FIXTURE_CAPTURE:-}" ]; then
+	mkdir -p "$PAGESTORE_CONTROLLER_FIXTURE_CAPTURE/controller" ||
+		fail "could not create the controller fixture capture directory"
+	cp "$BRANCH_CONFIG" "$PREPARED/pagestore_branch.prepare.json" \
+		"$TMPROOT/controller-authority/branch-retention-generation-1.json" \
+		"$PAGESTORE_CONTROLLER_FIXTURE_CAPTURE/controller/" ||
+		fail "could not capture the controller artifacts"
+	echo "ok   - captured the controller artifacts for the fixture"
+fi
 
 wait_materializer_note 1 before_fork ||
 	fail "materializer did not produce the fork-visible page"

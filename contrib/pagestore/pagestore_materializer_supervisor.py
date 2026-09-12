@@ -17,46 +17,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pagestore_artifact_schema as artifact_schema
+from pagestore_artifact_schema import ArtifactError
+
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
-CONFIG_SCHEMA = 4
-STATUS_SCHEMA = 2
-CONFIG_FIELDS = {
-    "schema",
-    "pg_ctl",
-    "psql",
-    "data_dir",
-    "socket_dir",
-    "port",
-    "log_file",
-    "state_dir",
-    "retention_authority_dir",
-    "retention_owner_id",
-    "controller_instance_id",
-    "database",
-    "user",
-    "poll_interval_ms",
-    "replay_idle_ms",
-    "progress_timeout_ms",
-    "retry_initial_ms",
-    "retry_max_ms",
-    "max_consecutive_failures",
-    "command_timeout_seconds",
-}
-REQUIRED_CONFIG_FIELDS = {
-    "schema",
-    "pg_ctl",
-    "psql",
-    "data_dir",
-    "socket_dir",
-    "port",
-    "log_file",
-    "state_dir",
-    "retention_authority_dir",
-    "retention_owner_id",
-    "controller_instance_id",
-}
+# the persisted layouts -- schema numbers, checksums, key sets -- are
+# pagestore_artifact_schema's, shared with the persisted-format fixture
+CONFIG_SCHEMA = artifact_schema.ARTIFACTS["supervisor_config"].schema
+STATUS_SCHEMA = artifact_schema.ARTIFACTS["supervisor_status"].schema
+CONFIG_FIELDS = set(artifact_schema.SUPERVISOR_CONFIG_FIELDS)
+REQUIRED_CONFIG_FIELDS = set(artifact_schema.SUPERVISOR_CONFIG_REQUIRED)
 
 
 class ConfigError(ValueError):
@@ -131,31 +103,14 @@ class Config:
 
     @classmethod
     def load(cls, path: Path) -> Config:
+        # the layout (schema, key set) is judged by the shared module; what
+        # the values name is judged here
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            value = artifact_schema.load("supervisor_config", path)
+        except (OSError, ArtifactError) as error:
             raise ConfigError(
-                f"cannot read supervisor config {path}: {error}"
+                f"cannot load supervisor config {path}: {error}"
             ) from error
-        if not isinstance(value, dict):
-            raise ConfigError("supervisor config must be a JSON object")
-        unknown = sorted(set(value) - CONFIG_FIELDS)
-        missing = sorted(REQUIRED_CONFIG_FIELDS - set(value))
-        if unknown:
-            raise ConfigError(
-                f"unknown supervisor config field(s): {', '.join(unknown)}"
-            )
-        if missing:
-            raise ConfigError(
-                f"missing supervisor config field(s): {', '.join(missing)}"
-            )
-        if (
-            value.get("schema") != CONFIG_SCHEMA
-            or isinstance(value.get("schema"), bool)
-        ):
-            raise ConfigError(
-                f"supervisor config schema must be {CONFIG_SCHEMA}"
-            )
 
         paths: dict[str, Path] = {}
         for field in (
@@ -381,16 +336,19 @@ class OwnerLock:
         self.close()
 
 
-def previous_status(path: Path) -> dict[str, Any] | None:
+def previous_artifact(kind: str, path: Path, what: str) -> dict[str, Any] | None:
+    """A persisted status or authority as the last run left it: None when
+    there is none, the object when its layout is one this build reads."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        return artifact_schema.load(kind, path)
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError) as error:
-        raise OwnershipError(f"materializer status is unreadable: {error}") from error
-    if not isinstance(value, dict):
-        raise OwnershipError("materializer status is not a JSON object")
-    return value
+    except (OSError, ArtifactError) as error:
+        raise OwnershipError(f"materializer {what} is unreadable: {error}") from error
+
+
+def previous_status(path: Path) -> dict[str, Any] | None:
+    return previous_artifact("supervisor_status", path, "status")
 
 
 class Supervisor:
@@ -414,7 +372,9 @@ class Supervisor:
             or old_generation < 0
         ):
             old_generation = 0
-        authority_value = previous_status(config.retention_generation_file)
+        authority_value = previous_artifact(
+            "retention_authority", config.retention_generation_file,
+            "retention generation authority")
         authority_exists = authority_value is not None
         authority = authority_value or {}
         authority_generation = authority.get("retention_generation")
@@ -505,7 +465,6 @@ class Supervisor:
         if not self.authority_published:
             return
         status = {
-            "schema": STATUS_SCHEMA,
             "state": state,
             "owner_pid": os.getpid(),
             "owner_epoch": self.owner_epoch,
@@ -519,7 +478,8 @@ class Supervisor:
             "progress": self.progress.as_json() if self.progress else None,
             **fields,
         }
-        atomic_write_json(self.config.status_file, status)
+        atomic_write_json(self.config.status_file,
+                          artifact_schema.stamp("supervisor_status", status))
 
     def command(
         self, command: list[str], check: bool = False, timeout: int | None = None
@@ -652,15 +612,18 @@ class Supervisor:
         namespace_stat = self.config.retention_authority_dir.stat()
         atomic_write_json(
             self.config.retention_generation_file,
-            {
-                "retention_generation": self.retention_generation,
-                "consumer_data_dir": str(self.config.data_dir),
-                "consumer_instance_id": self.config.controller_instance_id,
-                "consumer_data_dev": data_stat.st_dev,
-                "consumer_data_ino": data_stat.st_ino,
-                "authority_namespace_dev": namespace_stat.st_dev,
-                "authority_namespace_ino": namespace_stat.st_ino,
-            },
+            artifact_schema.stamp(
+                "retention_authority",
+                {
+                    "retention_generation": self.retention_generation,
+                    "consumer_data_dir": str(self.config.data_dir),
+                    "consumer_instance_id": self.config.controller_instance_id,
+                    "consumer_data_dev": data_stat.st_dev,
+                    "consumer_data_ino": data_stat.st_ino,
+                    "authority_namespace_dev": namespace_stat.st_dev,
+                    "authority_namespace_ino": namespace_stat.st_ino,
+                },
+            ),
         )
         self.authority_published = True
         self.previous_consumer_data_dir = str(self.config.data_dir)

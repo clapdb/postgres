@@ -199,6 +199,10 @@ jobs:
             --check fixtures/pgdata-artifacts \
             --format-tool ./pagestore_format_versions
 
+      - name: Check the controller and supervisor JSON artifact fixture
+        working-directory: contrib/pagestore
+        run: python3 harness/pagestore_controller_fixture.py --check fixtures/controller-json
+
       - name: Run image-layer unit test
         working-directory: contrib/pagestore
         run: ./pagestore_layer_test

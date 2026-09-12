@@ -1,0 +1,38 @@
+[
+  {
+    "family": "controller",
+    "artifact": "branch controller configuration (JSON, schema member)",
+    "magic": "0x00000000",
+    "version": 2
+  },
+  {
+    "family": "controller",
+    "artifact": "branch-retention-generation-<id>.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 2
+  },
+  {
+    "family": "controller",
+    "artifact": "pagestore_branch.prepare.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 2
+  },
+  {
+    "family": "supervisor",
+    "artifact": "materializer supervisor configuration (JSON, schema member)",
+    "magic": "0x00000000",
+    "version": 4
+  },
+  {
+    "family": "supervisor",
+    "artifact": "retention-owner-<id>.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 1
+  },
+  {
+    "family": "supervisor",
+    "artifact": "status.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 3
+  }
+]

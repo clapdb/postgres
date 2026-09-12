@@ -6493,6 +6493,18 @@ def run_materializer_smoke(
         cleanup_step("writer postmaster", stop_writer_for_cleanup)
         cleanup_step("pagestore daemon", lambda: stop_child(dproc))
         cleanup_step("shared memory", lambda: remove_shm(shm))
+    # The persisted-format fixture for the supervisor's JSON artifacts
+    # (harness/pagestore_controller_fixture.py --capture) takes the files a
+    # real supervisor left behind: its configuration, its last status and
+    # the retention generation authority it published.
+    capture = os.environ.get("PAGESTORE_CONTROLLER_FIXTURE_CAPTURE")
+    if capture and run_error is None:
+        target = Path(capture) / "supervisor"
+        target.mkdir(parents=True, exist_ok=True)
+        for source in (root / "materializer-supervisor.json",
+                       supervisor_state / "status.json",
+                       root / "controller-authority" / "retention-owner-1.json"):
+            shutil.copy2(source, target / source.name)
     cleanup_temporary_root(root, temporary, keep, cleanup_errors)
     if cleanup_errors and run_error is None:
         raise PlanError(

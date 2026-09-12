@@ -56,6 +56,14 @@ if host_system != 'windows'
     install_mode: 'rwxr-xr-x',
     rename: 'pagestore_branch_fault.py',
   )
+  # The layouts of both tools' JSON artifacts (schema numbers, checksums,
+  # key sets), imported beside the installed tools like the fault helper.
+  install_data(
+    'pagestore_artifact_schema.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_artifact_schema.py',
+  )
   # The installed controller resolves the canonical registry beside its
   # helper, just as source-tree tests do.
   install_data(
@@ -774,6 +782,18 @@ test('pagestore_pgdata_format_fixture',
          '--check', meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
          '--format-tool', pagestore_format_versions],
   depends: [pagestore_format_versions],
+  suite: ['pagestore'],
+  timeout: 60,
+)
+# The JSON artifacts of the branch controller and the materializer
+# supervisor (pagestore_artifact_schema.py): the tools' identities must
+# match the fixture, every captured artifact must load through the shared
+# reader, and each declared mutation must be refused (or, for a legacy
+# layout, accepted).  Python only.
+test('pagestore_controller_format_fixture',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_controller_fixture.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'controller-json'],
   suite: ['pagestore'],
   timeout: 60,
 )
