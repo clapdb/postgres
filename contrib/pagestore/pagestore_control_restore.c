@@ -58,6 +58,7 @@
 #include "common/file_perm.h"
 #include "catalog/pg_control.h"
 #include "storage/bufpage.h"
+#include "pagestore_artifact_format.h"
 #include "pagestore_ipc.h"
 
 static void *shm = NULL;
@@ -244,7 +245,7 @@ control_read_asof(uint32_t timeline, uint64_t incarnation,
 	memset((void *) &ch->key, 0, sizeof(ch->key));
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->timeline = timeline;
-	ch->blocknum = 0;
+	ch->blocknum = PS_CONTROL_IMAGE_BLOCK;
 	ch->req_lsn = read_lsn;
 	ch->req_seq = 0;
 	ch->incarnation = incarnation;
@@ -317,6 +318,27 @@ main(int argc, char **argv)
 	 */
 	if (argc == 2 && strcmp(argv[1], "--payload-identity") == 0)
 	{
+		/*
+		 * The freestanding CRC-32C the fixture workload seeds reader objects
+		 * with must be PostgreSQL's: prove it here, where both are linked,
+		 * before reporting an identity a fixture will be checked against.
+		 */
+		{
+			static const char vector[] = "123456789";
+			pg_crc32c	pg;
+			uint32_t	ps;
+
+			INIT_CRC32C(pg);
+			COMP_CRC32C(pg, vector, sizeof(vector) - 1);
+			FIN_CRC32C(pg);
+			ps = PS_CRC32C_FIN(ps_crc32c_update(PS_CRC32C_INIT, vector, sizeof(vector) - 1));
+			if (pg != ps)
+			{
+				fprintf(stderr, "pagestore_control_restore: pagestore_artifact_format.h CRC-32C (%08x) differs from pg_crc32c (%08x)\n",
+						ps, pg);
+				return 3;
+			}
+		}
 		printf("{\"pg_control_version\": %u, \"catalog_version_no\": %u, "
 			   "\"xlog_page_magic\": %u, \"xlog_long_header_seg_size_offset\": %u, "
 			   "\"xlog_long_header_bytes\": %u, \"page_layout_version\": %u, "

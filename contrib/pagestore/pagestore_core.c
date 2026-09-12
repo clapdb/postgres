@@ -46,6 +46,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_artifact_format.h"
 #include "pagestore_core.h"
 #include "pagestore_format.h"
 #include "pagestore_layer_store.h"
@@ -409,10 +410,9 @@ static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 /* Retention plan for one control block chain.  Blocks 0-2 (image, redo-floor
  * note, admission fence) are written as a same-version group and follow the
  * image block's plan; higher blocks (materializer marker, release and writer
- * checkpoints) are versioned independently and plan their own chain. */
-#define PS_CONTROL_IMAGE_BLOCK 0u
-#define PS_CONTROL_PAIRED_BLOCKS 3u
-#define PS_CONTROL_NOTE_BLOCK 1u
+ * checkpoints) are versioned independently and plan their own chain.  The
+ * block numbers are the persisted keys pagestore_artifact_format.h names. */
+#define PS_CONTROL_NOTE_BLOCK PS_REDO_NOTE_BLOCK
 static int control_note_redo(uint32_t timeline, const PsKey *key,
 							 const PageVer *v, unsigned char *tmp,
 							 uint64_t *redo_out);
@@ -14928,6 +14928,14 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 						goto done;
 					}
 				}
+				/* the same for a note naming a format or version this
+				 * build does not know: its requirement is unknowable */
+				if (ps_artifact_trailer_check(tmp, PS_REDO_NOTE_MAGIC,
+											  PS_REDO_NOTE_VERSION) != 0)
+				{
+					rc = -1;
+					goto done;
+				}
 				memcpy(&redo, tmp, sizeof(redo));
 
 				/*
@@ -15004,6 +15012,15 @@ control_note_redo(uint32_t timeline, const PsKey *key, const PageVer *v,
 			layer_lsn != v->lsn)
 			return -1;
 	}
+	/*
+	 * The note is the backend's raw redo LSN at byte 0 with an identity
+	 * trailer after it (pagestore_artifact_format.h); a legacy note has no
+	 * trailer.  A note naming another format or an unknown version is not a
+	 * floor source, whatever its first eight bytes say.
+	 */
+	if (ps_artifact_trailer_check(tmp, PS_REDO_NOTE_MAGIC,
+								  PS_REDO_NOTE_VERSION) != 0)
+		return -1;
 	memcpy(redo_out, tmp, sizeof(*redo_out));
 	return 0;
 }
@@ -15113,6 +15130,11 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 					layer_lsn != v->lsn)
 					return -1;
 			}
+			/* a note this build cannot read makes the floor unknown, and an
+			 * unknown floor reclaims nothing (see control_note_redo) */
+			if (ps_artifact_trailer_check(tmp, PS_REDO_NOTE_MAGIC,
+										  PS_REDO_NOTE_VERSION) != 0)
+				return -1;
 			memcpy(&redo, tmp, sizeof(redo));
 			if (redo == 0)
 			{

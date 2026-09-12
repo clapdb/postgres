@@ -61,6 +61,7 @@
 
 #include <errno.h>
 
+#include "pagestore_artifact_format.h"
 #include "pagestore_ipc.h"
 
 #define TEST_REL 4343u
@@ -145,6 +146,21 @@ fixture_env_u32(const char *name, uint32_t fallback)
 	if (errno != 0 || *end != '\0' || parsed == 0 || parsed > UINT32_MAX)
 		die("invalid fixture identity in the environment");
 	return (uint32_t) parsed;
+}
+
+/* The harness names the fixture's role (PAGESTORE_FIXTURE_ROLE); absent, the
+ * store is held to the current format. */
+static int
+fixture_role_legacy(void)
+{
+	const char *role = getenv("PAGESTORE_FIXTURE_ROLE");
+
+	if (role == NULL || *role == '\0' || strcmp(role, "current") == 0)
+		return 0;
+	if (strcmp(role, "legacy") == 0)
+		return 1;
+	die("PAGESTORE_FIXTURE_ROLE is neither current nor legacy");
+	return 0;
 }
 
 static uint16_t
@@ -1152,6 +1168,11 @@ static void walidx_pin_reader(uint64_t base);
 static void walidx_batch_and_commit(uint64_t base, uint64_t end_lsn);
 static void walidx_check(uint64_t base, uint64_t end);
 static void write_control(uint32_t block, uint64_t version, uint64_t redo);
+static void fixture_backend_objects_seed(void);
+static void fixture_backend_objects_check(void);
+static void control_key(PsKey *key);
+static int read_object_block(const PsKey *key, uint32_t block, uint64_t version,
+							 unsigned char *page, uint64_t *resolved);
 static int wal_read_status(uint64_t lsn);
 
 static uint64_t
@@ -1230,6 +1251,8 @@ fixture_seed(void)
 	walidx_pin_reader(FIXTURE_WAL_REDO);
 	write_control(0, FIXTURE_WAL_END, FIXTURE_WAL_REDO);
 	write_control(1, FIXTURE_WAL_END, FIXTURE_WAL_REDO);
+	/* the backend's other object payloads, one of each */
+	fixture_backend_objects_seed();
 	walidx_batch_and_commit(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
 	/* a live branch with its own page version, and a deleted branch */
 	incarnation = fixture_create_branch(FIXTURE_BRANCH);
@@ -1445,6 +1468,27 @@ fixture_verify(void)
 		die("fixture WAL retain floor changed");
 	fixture_wal_check(0);
 	fixture_wal_check(RECLAIM_SEGMENT);
+	/* A fixture seeded before the backend objects were part of it carries
+	 * a legacy redo note and none of the others; one seeded since carries
+	 * all of them, and the store must hand every one back intact.  Only a
+	 * fixture the harness declares legacy may lack them: a current one
+	 * whose note has no identity is a capture that went wrong, not a
+	 * legacy store. */
+	{
+		unsigned char *note = malloc(page_size);
+		PsKey		ckey;
+		PsArtifactTrailer trailer;
+
+		if (note == NULL)
+			die("out of memory");
+		control_key(&ckey);
+		if (read_object_block(&ckey, PS_REDO_NOTE_BLOCK, UINT64_MAX, note, NULL) != 1)
+			die("fixture redo note is not readable");
+		memcpy(&trailer, note + PS_ARTIFACT_TRAILER_OFFSET, sizeof(trailer));
+		free(note);
+		if (trailer.magic != 0 || !fixture_role_legacy())
+			fixture_backend_objects_check();
+	}
 	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
 		incarnation == 0)
 		die("fixture branch is not live");
@@ -1584,9 +1628,541 @@ write_control(uint32_t block, uint64_t version, uint64_t redo)
 	ch->req_lsn = version;
 	memset(ch->data, block == 0 ? 0xC3 : 0, page_size);
 	if (block == 1)
+	{
+		/* the redo note: value at 0, identity trailer after it, as the
+		 * backend's control mirror writes it */
 		memcpy(ch->data, &redo, sizeof(redo));
+		ps_artifact_trailer_set(ch->data, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION);
+	}
 	if (execute()->status != PS_STATUS_OK)
 		die("control block write failed");
+}
+
+/*
+ * The backend's own object payloads (pagestore_artifact_format.h), seeded so
+ * the fixture carries one of each and the reopen oracle can check that the
+ * store hands them back intact: the headed control blocks, the SLRU mirror's
+ * watermark and a tombstone, and the five reader snapshot objects.  Their
+ * values are arbitrary but internally consistent (complements, CRC-32C).
+ */
+#define FIXTURE_BACKEND_VERSION FIXTURE_WAL_END
+#define FIXTURE_BACKEND_TIMELINE 0u	/* every headed object names the timeline */
+#define FIXTURE_FIRST_NORMAL_XID 3u	/* FirstNormalTransactionId */
+#define FIXTURE_TOMBSTONE_SLRU "pg_xact"	/* the tombstone's object: its id */
+#define FIXTURE_READER_GLOBAL 0u	/* InvalidOid */
+#define FIXTURE_READER_DB 1u
+#define FIXTURE_READER_TS 1663u		/* pg_default */
+#define FIXTURE_READER_GLOBAL_TS 1664u	/* pg_global */
+#define FIXTURE_READER_RELMAP_BYTES 512u
+
+static void
+write_object_block(const PsKey *key, uint32_t block, uint64_t version,
+				   const unsigned char *image, uint32_t len)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint32_t	nblocks;
+
+	set_relation(ch);
+	ch->key = *key;
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("backend object create failed");
+	set_relation(ch);
+	ch->key = *key;
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK)
+		die("backend object size read failed");
+	nblocks = ch->result;
+	/* blocks are appended in order; extend through the one requested */
+	for (uint32_t b = nblocks; b <= block; b++)
+	{
+		set_relation(ch);
+		ch->key = *key;
+		ch->opcode = b < nblocks ? PS_OP_WRITEV : PS_OP_EXTEND;
+		ch->blocknum = b;
+		ch->nblocks = 1;
+		ch->req_lsn = version;
+		memset(ch->data, 0, page_size);
+		if (b == block)
+			memcpy(ch->data, image, len);
+		if (execute()->status != PS_STATUS_OK)
+			die("backend object block write failed");
+	}
+	if (block < nblocks)
+	{
+		set_relation(ch);
+		ch->key = *key;
+		ch->opcode = PS_OP_WRITEV;
+		ch->blocknum = block;
+		ch->nblocks = 1;
+		ch->req_lsn = version;
+		memset(ch->data, 0, page_size);
+		memcpy(ch->data, image, len);
+		if (execute()->status != PS_STATUS_OK)
+			die("backend object block write failed");
+	}
+}
+
+/* Read a block as of 'version' (UINT64_MAX: the newest); 1 when found, with
+ * the version the store resolved it at in *resolved. */
+static int
+read_object_block(const PsKey *key, uint32_t block, uint64_t version,
+				  unsigned char *page, uint64_t *resolved)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->key = *key;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = version;
+	if (execute()->status != PS_STATUS_OK)
+		return -1;
+	if (ch->result != 0)
+		memcpy(page, ch->data, page_size);
+	if (resolved != NULL)
+		*resolved = ch->req_lsn;
+	return ch->result != 0;
+}
+
+/*
+ * Read a seeded object block the way the backend's loaders do: as of the
+ * version it was published at, requiring the store to resolve it at exactly
+ * that version.  A store that reopened or migrated it to another version
+ * would pass a newest-wins read while every loader that names the version
+ * -- the reader snapshot, ready record, manifest and barrier -- refused it.
+ */
+static void
+read_seeded_block(const PsKey *key, uint32_t block, unsigned char *page,
+				  const char *what)
+{
+	uint64_t	resolved = 0;
+	char		message[160];
+
+	if (read_object_block(key, block, FIXTURE_BACKEND_VERSION, page, &resolved) != 1)
+	{
+		snprintf(message, sizeof(message), "fixture %s is not readable", what);
+		die(message);
+	}
+	if (resolved != FIXTURE_BACKEND_VERSION)
+	{
+		snprintf(message, sizeof(message), "fixture %s is not at its published version", what);
+		die(message);
+	}
+}
+
+static void
+control_key(PsKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	key->klass = PS_KLASS_CONTROL;
+}
+
+static void
+slru_mirror_key(PsKey *key, uint32_t klass, uint32_t obj)
+{
+	memset(key, 0, sizeof(*key));
+	key->klass = klass;
+	key->spcOid = 0;			/* the timeline; ps_slru_obj_key() brands it */
+	key->relNumber = obj;
+}
+
+/* The backend keys the snapshot data, ready record and database barrier
+ * globally (InvalidOid) and the manifest and relation map once globally and
+ * once per database; the fixture seeds each where its loader looks. */
+static void
+reader_key(PsKey *key, uint32_t object, uint32_t db)
+{
+	memset(key, 0, sizeof(*key));
+	key->klass = PS_KLASS_READER_SNAPSHOT;
+	key->dbOid = db;
+	key->relNumber = object;
+}
+
+static uint32_t
+crc32c_of(const void *data, size_t len)
+{
+	return PS_CRC32C_FIN(ps_crc32c_update(PS_CRC32C_INIT, data, len));
+}
+
+static void
+fixture_backend_objects_seed(void)
+{
+	unsigned char image[4096];
+	PsKey		key;
+	uint64_t	v = FIXTURE_BACKEND_VERSION;
+
+	/* control block 2: the admission fence, paired with the image and note
+	 * (pagestore_ipc.h); seeded before the higher blocks so extending to
+	 * them never leaves a zero filler where the fence belongs */
+	{
+		PsAdmissionFence fence = {0};
+
+		fence.magic = PS_ADMISSION_FENCE_MAGIC;
+		fence.version = PS_ADMISSION_FENCE_VERSION;
+		fence.redo_lsn = FIXTURE_WAL_REDO;
+		fence.admission_seq = 1;
+		control_key(&key);
+		write_object_block(&key, PS_ADMISSION_FENCE_BLOCK, v, (const unsigned char *) &fence, sizeof(fence));
+	}
+	/* control block 3: materializer marker */
+	{
+		PsMaterializerMarkerFormat m = {0};
+
+		m.magic = PS_MATERIALIZER_MARKER_MAGIC;
+		m.version = PS_MATERIALIZER_MARKER_VERSION;
+		m.timeline = FIXTURE_BACKEND_TIMELINE;
+		m.materialized_lsn = FIXTURE_WAL_REDO;
+		m.materialized_lsn_complement = ~m.materialized_lsn;
+		control_key(&key);
+		write_object_block(&key, PS_MATERIALIZER_MARKER_BLOCK, v,
+						   (const unsigned char *) &m, sizeof(m));
+	}
+	/* control block 4: materializer release */
+	{
+		PsMaterializerReleaseFormat r = {0};
+
+		r.magic = PS_MATERIALIZER_RELEASE_MAGIC;
+		r.version = PS_MATERIALIZER_RELEASE_VERSION;
+		r.timeline = FIXTURE_BACKEND_TIMELINE;
+		r.materialized_lsn = FIXTURE_WAL_REDO;
+		r.materialized_lsn_complement = ~r.materialized_lsn;
+		/* a release names a checkpoint completed after the materialized
+		 * point; the backend's reader rejects one that does not */
+		r.checkpoint_lsn = FIXTURE_WAL_END;
+		r.checkpoint_lsn_complement = ~r.checkpoint_lsn;
+		control_key(&key);
+		write_object_block(&key, PS_MATERIALIZER_RELEASE_BLOCK, v,
+						   (const unsigned char *) &r, sizeof(r));
+	}
+	/* control block 5: writer checkpoint */
+	{
+		PsWriterCheckpointFormat c = {0};
+
+		c.magic = PS_WRITER_CHECKPOINT_MAGIC;
+		c.version = PS_WRITER_CHECKPOINT_VERSION;
+		c.timeline = FIXTURE_BACKEND_TIMELINE;
+		c.checkpoint_lsn = FIXTURE_WAL_REDO;
+		c.checkpoint_lsn_complement = ~c.checkpoint_lsn;
+		control_key(&key);
+		write_object_block(&key, PS_WRITER_CHECKPOINT_BLOCK, v,
+						   (const unsigned char *) &c, sizeof(c));
+	}
+	/* SLRU mirror watermark and one truncation tombstone: raw values with
+	 * the identity trailer */
+	{
+		uint64_t	w = FIXTURE_WAL_END;
+		int64_t		cutoff = 0;
+
+		memset(image, 0, sizeof(image));
+		memcpy(image, &w, sizeof(w));
+		ps_artifact_trailer_set(image, PS_SLRU_WATERMARK_MAGIC, PS_SLRU_WATERMARK_VERSION);
+		slru_mirror_key(&key, PS_KLASS_SLRU_WM, 0);
+		write_object_block(&key, 0, v, image, 16);
+
+		memset(image, 0, sizeof(image));
+		memcpy(image, &cutoff, sizeof(cutoff));
+		ps_artifact_trailer_set(image, PS_SLRU_TOMBSTONE_MAGIC, PS_SLRU_TOMBSTONE_VERSION);
+		slru_mirror_key(&key, PS_KLASS_SLRU_TOMB, ps_slru_object_id(FIXTURE_TOMBSTONE_SLRU));
+		write_object_block(&key, 0, v, image, 16);
+	}
+	/* reader snapshot objects 0..4 */
+	{
+		PsReaderSnapshotManifestFormat manifest = {0};
+		PsReaderSnapshotHeaderFormat header = {0};
+		PsReaderSnapshotReadyFormat ready = {0};
+		PsReaderRelmapFormat relmap = {0};
+		PsReaderDatabaseBarrierFormat barrier = {0};
+		PsReaderDatabaseEntryFormat entry = {0};
+		uint32_t	xids[2] = {700, 703};
+		uint32_t	global_relmap_crc = 0;
+		uint32_t	c;
+
+		header.read_lsn = FIXTURE_WAL_END;
+		header.magic = PS_READER_SNAPSHOT_MAGIC;
+		header.format = PS_READER_SNAPSHOT_FORMAT;
+		header.timeline = FIXTURE_BACKEND_TIMELINE;
+		header.count = 2;
+		header.xmin = 700;
+		header.xmax = 704;
+		c = ps_crc32c_update(PS_CRC32C_INIT, &header, offsetof(PsReaderSnapshotHeaderFormat, crc));
+		c = ps_crc32c_update(c, xids, sizeof(xids));
+		header.crc = PS_CRC32C_FIN(c);
+		memset(image, 0, sizeof(image));
+		memcpy(image, &header, sizeof(header));
+		memcpy(image + sizeof(header), xids, sizeof(xids));
+		reader_key(&key, PS_READER_SNAPSHOT_DATA_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, image, sizeof(header) + sizeof(xids));
+
+		ready.header = header;
+		ready.block_count = 1;
+		ready.crc = crc32c_of(&ready, offsetof(PsReaderSnapshotReadyFormat, crc));
+		reader_key(&key, PS_READER_SNAPSHOT_READY_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, (const unsigned char *) &ready, sizeof(ready));
+
+		/* the relation map: the global one (pg_global) and the database's */
+		for (int global = 1; global >= 0; global--)
+		{
+			relmap.magic = PS_READER_RELMAP_MAGIC;
+			relmap.format = PS_READER_RELMAP_FORMAT;
+			relmap.dbid = global ? FIXTURE_READER_GLOBAL : FIXTURE_READER_DB;
+			relmap.tsid = global ? FIXTURE_READER_GLOBAL_TS : FIXTURE_READER_TS;
+			relmap.size = FIXTURE_READER_RELMAP_BYTES;
+			memset(image, 0, sizeof(image));
+			for (uint32_t i = 0; i < FIXTURE_READER_RELMAP_BYTES; i++)
+				image[sizeof(relmap) + i] = (unsigned char) (i * 7 + global);
+			relmap.data_crc = crc32c_of(image + sizeof(relmap), FIXTURE_READER_RELMAP_BYTES);
+			relmap.crc = crc32c_of(&relmap, offsetof(PsReaderRelmapFormat, crc));
+			memcpy(image, &relmap, sizeof(relmap));
+			reader_key(&key, PS_READER_RELMAP_OBJECT, relmap.dbid);
+			write_object_block(&key, 0, v, image, sizeof(relmap) + FIXTURE_READER_RELMAP_BYTES);
+			if (global)
+				global_relmap_crc = relmap.data_crc;
+		}
+
+		/* the barrier lists the databases the snapshot covers; its CRC spans
+		 * the entries too, and the loader rejects an empty list */
+		barrier.read_lsn = FIXTURE_WAL_END;
+		barrier.magic = PS_READER_DATABASE_BARRIER_MAGIC;
+		barrier.format = PS_READER_DATABASE_BARRIER_FORMAT;
+		barrier.timeline = FIXTURE_BACKEND_TIMELINE;
+		barrier.database_count = 1;
+		barrier.block_count = 1;
+		entry.database_oid = FIXTURE_READER_DB;
+		entry.tablespace_oid = FIXTURE_READER_TS;
+		c = ps_crc32c_update(PS_CRC32C_INIT, &barrier, offsetof(PsReaderDatabaseBarrierFormat, crc));
+		c = ps_crc32c_update(c, &entry, sizeof(entry));
+		barrier.crc = PS_CRC32C_FIN(c);
+		memset(image, 0, sizeof(image));
+		memcpy(image, &barrier, sizeof(barrier));
+		memcpy(image + sizeof(barrier), &entry, sizeof(entry));
+		reader_key(&key, PS_READER_DATABASE_BARRIER_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, image, sizeof(barrier) + sizeof(entry));
+
+		manifest.read_lsn = FIXTURE_WAL_END;
+		manifest.artifact_size = sizeof(header) + sizeof(xids);
+		manifest.magic = PS_READER_SNAPSHOT_MANIFEST_MAGIC;
+		manifest.format = PS_READER_SNAPSHOT_MANIFEST_FORMAT;
+		manifest.timeline = FIXTURE_BACKEND_TIMELINE;
+		manifest.block_count = 1;
+		manifest.artifact_crc = header.crc;
+		manifest.global_relmap_crc = global_relmap_crc;
+		manifest.local_relmap_crc = relmap.data_crc;
+		manifest.crc = crc32c_of(&manifest, offsetof(PsReaderSnapshotManifestFormat, crc));
+		/* once globally, once for the database, as the backend publishes it */
+		reader_key(&key, PS_READER_SNAPSHOT_MANIFEST_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, (const unsigned char *) &manifest, sizeof(manifest));
+		reader_key(&key, PS_READER_SNAPSHOT_MANIFEST_OBJECT, FIXTURE_READER_DB);
+		write_object_block(&key, 0, v, (const unsigned char *) &manifest, sizeof(manifest));
+	}
+}
+
+static void
+fixture_backend_objects_check(void)
+{
+	unsigned char *page = malloc(page_size);
+	PsKey		key;
+
+	if (page == NULL)
+		die("out of memory");
+	/* the raw-value objects must carry exactly this build's identity: a
+	 * capture that left one unstamped is not a current fixture */
+	control_key(&key);
+	read_seeded_block(&key, PS_REDO_NOTE_BLOCK, page, "redo note");
+	if (!ps_artifact_trailer_is(page, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION))
+		die("fixture redo note lost its identity");
+	{
+		PsAdmissionFence fence;
+
+		read_seeded_block(&key, PS_ADMISSION_FENCE_BLOCK, page, "admission fence");
+		memcpy(&fence, page, sizeof(fence));
+		if (fence.magic != PS_ADMISSION_FENCE_MAGIC || fence.version != PS_ADMISSION_FENCE_VERSION ||
+			fence.redo_lsn != FIXTURE_WAL_REDO || fence.admission_seq == 0)
+			die("fixture admission fence is not intact");
+	}
+	{
+		PsMaterializerMarkerFormat m;
+
+		read_seeded_block(&key, PS_MATERIALIZER_MARKER_BLOCK, page, "materializer marker");
+		memcpy(&m, page, sizeof(m));
+		if (m.magic != PS_MATERIALIZER_MARKER_MAGIC || m.version != PS_MATERIALIZER_MARKER_VERSION ||
+			m.timeline != FIXTURE_BACKEND_TIMELINE ||
+			m.materialized_lsn != FIXTURE_WAL_REDO ||
+			m.materialized_lsn_complement != ~m.materialized_lsn)
+			die("fixture materializer marker is not intact");
+	}
+	{
+		PsMaterializerReleaseFormat r;
+
+		read_seeded_block(&key, PS_MATERIALIZER_RELEASE_BLOCK, page, "materializer release");
+		memcpy(&r, page, sizeof(r));
+		if (r.magic != PS_MATERIALIZER_RELEASE_MAGIC || r.version != PS_MATERIALIZER_RELEASE_VERSION ||
+			r.timeline != FIXTURE_BACKEND_TIMELINE ||
+			r.materialized_lsn != FIXTURE_WAL_REDO ||
+			r.materialized_lsn_complement != ~r.materialized_lsn ||
+			r.checkpoint_lsn_complement != ~r.checkpoint_lsn ||
+			r.checkpoint_lsn <= r.materialized_lsn)
+			die("fixture materializer release is not intact");
+	}
+	{
+		PsWriterCheckpointFormat c;
+
+		read_seeded_block(&key, PS_WRITER_CHECKPOINT_BLOCK, page, "writer checkpoint");
+		memcpy(&c, page, sizeof(c));
+		if (c.magic != PS_WRITER_CHECKPOINT_MAGIC || c.version != PS_WRITER_CHECKPOINT_VERSION ||
+			c.timeline != FIXTURE_BACKEND_TIMELINE ||
+			c.checkpoint_lsn != FIXTURE_WAL_REDO ||
+			c.checkpoint_lsn_complement != ~c.checkpoint_lsn)
+			die("fixture writer checkpoint is not intact");
+	}
+	{
+		uint64_t	w;
+
+		int64_t		cutoff;
+
+		slru_mirror_key(&key, PS_KLASS_SLRU_WM, 0);
+		read_seeded_block(&key, 0, page, "SLRU watermark");
+		if (!ps_artifact_trailer_is(page, PS_SLRU_WATERMARK_MAGIC, PS_SLRU_WATERMARK_VERSION))
+			die("fixture SLRU watermark lost its identity");
+		memcpy(&w, page, sizeof(w));
+		if (w != FIXTURE_WAL_END)
+			die("fixture SLRU watermark is not intact");
+		/* at the object a reader of that SLRU asks for */
+		slru_mirror_key(&key, PS_KLASS_SLRU_TOMB, ps_slru_object_id(FIXTURE_TOMBSTONE_SLRU));
+		read_seeded_block(&key, 0, page, "SLRU tombstone");
+		if (!ps_artifact_trailer_is(page, PS_SLRU_TOMBSTONE_MAGIC, PS_SLRU_TOMBSTONE_VERSION))
+			die("fixture SLRU tombstone lost its identity");
+		memcpy(&cutoff, page, sizeof(cutoff));
+		if (cutoff != 0)
+			die("fixture SLRU tombstone is not intact");
+	}
+	{
+		PsReaderSnapshotManifestFormat manifest[2];	/* [1] global, [0] the database's */
+		PsReaderSnapshotHeaderFormat header;
+		PsReaderSnapshotReadyFormat ready;
+		PsReaderRelmapFormat relmap;
+		PsReaderDatabaseBarrierFormat barrier;
+		PsReaderDatabaseEntryFormat entry;
+		uint32_t	c;
+
+		/* both manifests -- startup selects the global one, a database's
+		 * reader its own -- and each must describe the data and relation
+		 * maps below, as pagestore_load_published_reader_snapshot() demands */
+		for (int global = 1; global >= 0; global--)
+		{
+			PsReaderSnapshotManifestFormat *m = &manifest[global];
+
+			reader_key(&key, PS_READER_SNAPSHOT_MANIFEST_OBJECT,
+					   global ? FIXTURE_READER_GLOBAL : FIXTURE_READER_DB);
+			read_seeded_block(&key, 0, page, "reader manifest");
+			memcpy(m, page, sizeof(*m));
+			if (m->magic != PS_READER_SNAPSHOT_MANIFEST_MAGIC ||
+				m->format != PS_READER_SNAPSHOT_MANIFEST_FORMAT ||
+				m->timeline != FIXTURE_BACKEND_TIMELINE ||
+				m->read_lsn != FIXTURE_WAL_END ||
+				m->artifact_size < sizeof(PsReaderSnapshotHeaderFormat) ||
+				m->block_count != (m->artifact_size + page_size - 1) / page_size ||
+				m->crc != crc32c_of(m, offsetof(PsReaderSnapshotManifestFormat, crc)))
+				die("fixture reader manifest is not intact");
+		}
+
+		reader_key(&key, PS_READER_SNAPSHOT_DATA_OBJECT, FIXTURE_READER_GLOBAL);
+		read_seeded_block(&key, 0, page, "reader snapshot");
+		memcpy(&header, page, sizeof(header));
+		/* the count sizes the checksummed span: judge it before trusting it
+		 * as a length, or a mutated header reads past the page */
+		if (header.magic != PS_READER_SNAPSHOT_MAGIC || header.format != PS_READER_SNAPSHOT_FORMAT ||
+			header.timeline != FIXTURE_BACKEND_TIMELINE ||
+			header.read_lsn != FIXTURE_WAL_END || header.reserved != 0 ||
+			header.count != 2)
+			die("fixture reader snapshot is not intact");
+		c = ps_crc32c_update(PS_CRC32C_INIT, &header, offsetof(PsReaderSnapshotHeaderFormat, crc));
+		c = ps_crc32c_update(c, page + sizeof(header), header.count * sizeof(uint32_t));
+		if (header.crc != PS_CRC32C_FIN(c))
+			die("fixture reader snapshot is not intact");
+		/* what pagestore_validate_reader_snapshot() demands of the xids:
+		 * normal, within [xmin, xmax), ascending -- plain comparisons
+		 * suffice for the fixture's small, unwrapped ids */
+		if (header.xmin < FIXTURE_FIRST_NORMAL_XID || header.xmax < header.xmin)
+			die("fixture reader snapshot has an invalid xid range");
+		for (uint32_t i = 0; i < header.count; i++)
+		{
+			uint32_t	xid;
+
+			memcpy(&xid, page + sizeof(header) + i * sizeof(xid), sizeof(xid));
+			if (xid < FIXTURE_FIRST_NORMAL_XID || xid < header.xmin || xid >= header.xmax)
+				die("fixture reader snapshot has an invalid xid");
+			if (i > 0)
+			{
+				uint32_t	prev;
+
+				memcpy(&prev, page + sizeof(header) + (i - 1) * sizeof(prev), sizeof(prev));
+				if (prev >= xid)
+					die("fixture reader snapshot xids are not ascending");
+			}
+		}
+		for (int global = 1; global >= 0; global--)
+			if (manifest[global].artifact_crc != header.crc ||
+				manifest[global].artifact_size !=
+				sizeof(header) + header.count * sizeof(uint32_t))
+				die("fixture reader manifest does not describe the snapshot");
+
+		reader_key(&key, PS_READER_SNAPSHOT_READY_OBJECT, FIXTURE_READER_GLOBAL);
+		read_seeded_block(&key, 0, page, "reader ready record");
+		memcpy(&ready, page, sizeof(ready));
+		if (ready.header.magic != PS_READER_SNAPSHOT_MAGIC ||
+			ready.header.format != PS_READER_SNAPSHOT_FORMAT ||
+			ready.header.timeline != FIXTURE_BACKEND_TIMELINE ||
+			ready.header.read_lsn != FIXTURE_WAL_END ||
+			ready.header.count != header.count ||
+			ready.block_count != (sizeof(ready.header) + ready.header.count * sizeof(uint32_t) +
+								  page_size - 1) / page_size ||
+			ready.reserved != 0 ||
+			ready.crc != crc32c_of(&ready, offsetof(PsReaderSnapshotReadyFormat, crc)))
+			die("fixture reader ready record is not intact");
+
+		for (int global = 1; global >= 0; global--)
+		{
+			uint32_t	db = global ? FIXTURE_READER_GLOBAL : FIXTURE_READER_DB;
+
+			reader_key(&key, PS_READER_RELMAP_OBJECT, db);
+			read_seeded_block(&key, 0, page, "reader relation map");
+			memcpy(&relmap, page, sizeof(relmap));
+			if (relmap.magic != PS_READER_RELMAP_MAGIC || relmap.format != PS_READER_RELMAP_FORMAT ||
+				relmap.dbid != db ||
+				relmap.tsid != (global ? FIXTURE_READER_GLOBAL_TS : FIXTURE_READER_TS) ||
+				relmap.size != FIXTURE_READER_RELMAP_BYTES ||
+				relmap.size > page_size - sizeof(relmap) ||
+				relmap.crc != crc32c_of(&relmap, offsetof(PsReaderRelmapFormat, crc)) ||
+				relmap.data_crc != crc32c_of(page + sizeof(relmap), relmap.size))
+				die("fixture reader relation map is not intact");
+			/* every manifest names the global map; each names the local one */
+			for (int m = 1; m >= 0; m--)
+				if (relmap.data_crc != (global ? manifest[m].global_relmap_crc
+									   : manifest[m].local_relmap_crc))
+					die("fixture reader manifest does not describe the relation map");
+		}
+
+		reader_key(&key, PS_READER_DATABASE_BARRIER_OBJECT, FIXTURE_READER_GLOBAL);
+		read_seeded_block(&key, 0, page, "reader database barrier");
+		memcpy(&barrier, page, sizeof(barrier));
+		/* the same conditions the backend's loader applies, then the CRC
+		 * over the header and the entries it announces */
+		if (barrier.magic != PS_READER_DATABASE_BARRIER_MAGIC ||
+			barrier.format != PS_READER_DATABASE_BARRIER_FORMAT ||
+			barrier.timeline != FIXTURE_BACKEND_TIMELINE ||
+			barrier.read_lsn != FIXTURE_WAL_END || barrier.reserved != 0 ||
+			barrier.database_count != 1 || barrier.block_count != 1)
+			die("fixture reader database barrier is not intact");
+		memcpy(&entry, page + sizeof(barrier), sizeof(entry));
+		c = ps_crc32c_update(PS_CRC32C_INIT, &barrier, offsetof(PsReaderDatabaseBarrierFormat, crc));
+		c = ps_crc32c_update(c, &entry, sizeof(entry));
+		if (barrier.crc != PS_CRC32C_FIN(c) || entry.database_oid != FIXTURE_READER_DB ||
+			entry.tablespace_oid != FIXTURE_READER_TS)
+			die("fixture reader database barrier is not intact");
+	}
+	free(page);
 }
 
 static void

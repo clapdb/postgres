@@ -70,6 +70,7 @@
 #include "pagestore_backend.h"
 #include "pagestore_fault.h"
 #include "pagestore_ipc.h"
+#include "pagestore_artifact_format.h"
 #include "pagestore_materializer_marker.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
@@ -145,12 +146,9 @@ static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL
 static bool pagestore_portable_install_faults = false;
 static bool pagestore_portable_install_faults_owned = false;
 
-#define PS_MATERIALIZER_MARKER_MAGIC		0x50534d57
-#define PS_MATERIALIZER_MARKER_VERSION	2
-#define PS_MATERIALIZER_MARKER_BLOCK		3
-#define PS_MATERIALIZER_RELEASE_MAGIC		0x50534d52
-#define PS_MATERIALIZER_RELEASE_VERSION	2
-#define PS_MATERIALIZER_RELEASE_BLOCK		4
+/* The marker and release blocks' identities and layouts are the shared
+ * pagestore_artifact_format.h's (PS_MATERIALIZER_*); the structs below must
+ * stay byte-identical to the format structs there. */
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS \
 	PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS
 #define PS_MATERIALIZER_RETENTION_RESOURCES \
@@ -179,6 +177,21 @@ typedef struct PsMaterializerRelease
 	uint64		checkpoint_lsn;
 	uint64		checkpoint_lsn_complement;
 } PsMaterializerRelease;
+
+PS_ARTIFACT_LAYOUT_SIZE(PsMaterializerMarker, PsMaterializerMarkerFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerMarker, PsMaterializerMarkerFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerMarker, PsMaterializerMarkerFormat, version);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerMarker, PsMaterializerMarkerFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerMarker, PsMaterializerMarkerFormat, materialized_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerMarker, PsMaterializerMarkerFormat, materialized_lsn_complement);
+PS_ARTIFACT_LAYOUT_SIZE(PsMaterializerRelease, PsMaterializerReleaseFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerRelease, PsMaterializerReleaseFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerRelease, PsMaterializerReleaseFormat, version);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerRelease, PsMaterializerReleaseFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerRelease, PsMaterializerReleaseFormat, materialized_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerRelease, PsMaterializerReleaseFormat, materialized_lsn_complement);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerRelease, PsMaterializerReleaseFormat, checkpoint_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PsMaterializerRelease, PsMaterializerReleaseFormat, checkpoint_lsn_complement);
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static CmdType pagestore_current_command_type = CMD_UNKNOWN;
 static bool pagestore_current_has_modifying_cte = false;
@@ -3789,7 +3802,8 @@ ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
 
 	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
 		return false;
-	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key, 0,
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key,
+												PS_CONTROL_IMAGE_BLOCK,
 												(uint64) lsn, page, &resolved,
 												timeout_ms))
 		return false;
@@ -7063,8 +7077,8 @@ pagestore_publish_artifact(const char *target_dir, const char *filename,
 	}
 }
 
-#define PAGESTORE_READER_SNAPSHOT_MAGIC UINT32_C(0x50535253)
-#define PAGESTORE_READER_SNAPSHOT_FORMAT 1
+#define PAGESTORE_READER_SNAPSHOT_MAGIC PS_READER_SNAPSHOT_MAGIC
+#define PAGESTORE_READER_SNAPSHOT_FORMAT PS_READER_SNAPSHOT_FORMAT
 #define PAGESTORE_READER_SNAPSHOT_FILE "pagestore_reader.snapshot"
 #define PAGESTORE_READER_MAP_PENDING_FILE ".pagestore-reader-map-pending"
 #define PAGESTORE_READER_CATALOG_MAGIC UINT32_C(0x50534350)
@@ -7101,17 +7115,18 @@ typedef struct PagestoreReaderSnapshot
 	TransactionId *xids;
 } PagestoreReaderSnapshot;
 
-#define PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC UINT32_C(0x5053524D)
-#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 2
-#define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
-#define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
-#define PAGESTORE_READER_SNAPSHOT_READY_OBJECT 2
-#define PAGESTORE_READER_RELMAP_OBJECT 3
-#define PAGESTORE_READER_DATABASE_BARRIER_OBJECT 4
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC PS_READER_SNAPSHOT_MANIFEST_MAGIC
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT PS_READER_SNAPSHOT_MANIFEST_FORMAT
+/* the object numbers are persisted keys: the shared header's */
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT PS_READER_SNAPSHOT_MANIFEST_OBJECT
+#define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT PS_READER_SNAPSHOT_DATA_OBJECT
+#define PAGESTORE_READER_SNAPSHOT_READY_OBJECT PS_READER_SNAPSHOT_READY_OBJECT
+#define PAGESTORE_READER_RELMAP_OBJECT PS_READER_RELMAP_OBJECT
+#define PAGESTORE_READER_DATABASE_BARRIER_OBJECT PS_READER_DATABASE_BARRIER_OBJECT
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
 
-#define PAGESTORE_READER_RELMAP_MAGIC UINT32_C(0x5053524C)
-#define PAGESTORE_READER_RELMAP_FORMAT 1
+#define PAGESTORE_READER_RELMAP_MAGIC PS_READER_RELMAP_MAGIC
+#define PAGESTORE_READER_RELMAP_FORMAT PS_READER_RELMAP_FORMAT
 #define PAGESTORE_READER_RELMAP_MAX_SIZE \
 	(BLCKSZ - MAXALIGN(sizeof(PagestoreReaderRelmap)))
 
@@ -7164,8 +7179,8 @@ typedef struct PagestoreReaderSnapshotManifest
 	pg_crc32c	crc;
 } PagestoreReaderSnapshotManifest;
 
-#define PAGESTORE_READER_DATABASE_BARRIER_MAGIC UINT32_C(0x50535242)
-#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT 3
+#define PAGESTORE_READER_DATABASE_BARRIER_MAGIC PS_READER_DATABASE_BARRIER_MAGIC
+#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT PS_READER_DATABASE_BARRIER_FORMAT
 typedef struct PagestoreReaderDatabaseEntry
 {
 	Oid			database_oid;
@@ -7183,6 +7198,62 @@ typedef struct PagestoreReaderDatabaseBarrier
 	pg_crc32c	crc;
 	uint32		reserved;
 } PagestoreReaderDatabaseBarrier;
+
+/* the reader objects' layouts are restated in pagestore_artifact_format.h
+ * for the fixture workload and pagestore_format_versions: pin every field */
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, read_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, format);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, count);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, xmin);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, xmax);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotHeader, PsReaderSnapshotHeaderFormat, reserved);
+
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreReaderSnapshotReady, PsReaderSnapshotReadyFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotReady, PsReaderSnapshotReadyFormat, header);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotReady, PsReaderSnapshotReadyFormat, block_count);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotReady, PsReaderSnapshotReadyFormat, reserved);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotReady, PsReaderSnapshotReadyFormat, crc);
+
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, read_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, artifact_size);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, format);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, block_count);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, artifact_crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, global_relmap_crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, local_relmap_crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderSnapshotManifest, PsReaderSnapshotManifestFormat, crc);
+
+/* the relmap's data follows its header; the header is what is shared */
+_Static_assert(offsetof(PagestoreReaderRelmap, data) == sizeof(PsReaderRelmapFormat),
+			   "PagestoreReaderRelmap must match pagestore_artifact_format.h");
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderRelmap, PsReaderRelmapFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderRelmap, PsReaderRelmapFormat, format);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderRelmap, PsReaderRelmapFormat, dbid);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderRelmap, PsReaderRelmapFormat, tsid);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderRelmap, PsReaderRelmapFormat, size);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderRelmap, PsReaderRelmapFormat, data_crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderRelmap, PsReaderRelmapFormat, crc);
+
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreReaderDatabaseEntry, PsReaderDatabaseEntryFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseEntry, PsReaderDatabaseEntryFormat, database_oid);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseEntry, PsReaderDatabaseEntryFormat, tablespace_oid);
+
+PS_ARTIFACT_LAYOUT_SIZE(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, read_lsn);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, magic);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, format);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, timeline);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, database_count);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, block_count);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, crc);
+PS_ARTIFACT_LAYOUT_FIELD(PagestoreReaderDatabaseBarrier, PsReaderDatabaseBarrierFormat, reserved);
 
 typedef struct PagestoreReaderCatalogProvenance
 {

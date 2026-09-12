@@ -727,9 +727,7 @@ but is not complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
 2. Finish H2 under the decided D5 policy: add the backend-side
-   persisted-format fixtures (the materializer and
-   writer control blocks, the reader snapshot objects, and the raw
-   redo-note, SLRU watermark, and tombstone values in the store; the reader
+   persisted-format fixtures for the PGDATA artifacts (the reader
    and branch manifests, branch bootstrap, reader snapshot/catalog files,
    the reader-map intent marker, the branch controller's configuration,
    journal, and authority files, the materializer supervisor's

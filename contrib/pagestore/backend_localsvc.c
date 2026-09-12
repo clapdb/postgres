@@ -25,6 +25,8 @@
  */
 #include "postgres.h"
 
+#include "pagestore_artifact_format.h"
+
 #include "storage/bufpage.h"
 
 #include <fcntl.h>
@@ -546,7 +548,7 @@ pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->timeline = timeline;
 	ch->opcode = PS_OP_READ_AT;
-	ch->blocknum = 2;
+	ch->blocknum = PS_ADMISSION_FENCE_BLOCK;
 	ch->req_lsn = read_lsn;
 	ch->incarnation = ls_expected_incarnation(timeline);
 	ls_exec_timeout(ch, timeout_ms);

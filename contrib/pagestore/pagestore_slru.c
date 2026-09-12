@@ -74,6 +74,7 @@
 #include "access/multixact_internal.h"
 #include "access/slru.h"
 #include "catalog/pg_control.h"
+#include "pagestore_artifact_format.h"
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "access/xact.h"
@@ -421,6 +422,12 @@ typedef struct PsSlruWatermarkShm
 										 * but must not let cached pages
 										 * revalidate against stale
 										 * tombstones forever */
+	pg_atomic_uint32 reader_foreign;	/* generation: bumped whenever a
+										 * reader meets an object whose
+										 * identity this build does not know */
+	pg_atomic_uint32 reader_known;	/* the newest foreign generation a
+									 * completed fetch has since cleared;
+									 * reads fail while it lags behind */
 	pg_atomic_uint64 read_served;	/* live reads served from the mirror --
 									 * shared, so stats read from any backend
 									 * see the whole cluster's counts */
@@ -578,19 +585,13 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 	return false;
 }
 
-/* Stable per-SLRU object id from its directory name (FNV-1a; libc-only). */
+/* Stable per-SLRU object id from its directory name (FNV-1a; libc-only).
+ * The derivation is part of the persisted format: pagestore_artifact_format.h
+ * holds it so a fixture can seed at the ids a reader asks for. */
 uint32
 pagestore_slru_klass_id(const char *name)
 {
-	uint32		h = 2166136261u;
-	const unsigned char *p;
-
-	for (p = (const unsigned char *) name; *p != '\0'; p++)
-	{
-		h ^= *p;
-		h *= 16777619u;
-	}
-	return h;
+	return ps_slru_object_id(name);
 }
 
 /* Index of an SLRU dir in the scope table; -1 = out of scope. */
@@ -913,6 +914,8 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_at, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_ok_at, 0);
+		pg_atomic_init_u32(&ps_slru_wm->reader_foreign, 0);
+		pg_atomic_init_u32(&ps_slru_wm->reader_known, 0);
 		pg_atomic_init_u64(&ps_slru_wm->read_served, 0);
 		pg_atomic_init_u64(&ps_slru_wm->read_fallback, 0);
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
@@ -1730,6 +1733,8 @@ ps_slru_wm_publish(void)
 
 		memset(page, 0, sizeof(page));
 		memcpy(page, &w, sizeof(uint64));
+		ps_artifact_trailer_set((unsigned char *) page, PS_SLRU_WATERMARK_MAGIC,
+								PS_SLRU_WATERMARK_VERSION);
 		ps_slru_obj_key(&key, 0);
 		pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_WM, &key, 0, page,
 											 w, PS_SLRU_SHIP_TIMEOUT_MS);
@@ -1838,6 +1843,36 @@ ps_slru_rearm_interrupt(void)
 }
 
 /*
+ * A reader found a watermark or tombstone object whose identity trailer
+ * names a format this build does not know.  Unlike a store outage, that is
+ * not transient: the writer now publishes visibility metadata this reader
+ * cannot interpret, so the watermark and tombstones it fetched earlier no
+ * longer bound what the writer has done since.  Before raising, forget the
+ * last successful fetch -- so cache-hit revalidation and the freshness gate
+ * fail closed at once instead of trusting the old pair for the staleness
+ * window -- and advance the foreign generation, so the fetch's backoff fast
+ * path keeps failing every read instead of handing out the cached watermark
+ * for a TTL between probes (ps_slru_reader_require_known, which the read
+ * hooks apply after every fetch; the fetch itself stays silent, since the
+ * transaction-boundary refresh may not raise).  A generation rather than a
+ * flag: a fetch clears only the generation it observed when it began, so
+ * one that read compatible objects while another backend met the foreign
+ * one cannot erase that sighting and resurrect the pair it fetched.
+ */
+pg_noreturn static void
+ps_slru_reader_foreign_identity(const char *what)
+{
+	if (ps_slru_wm != NULL)
+	{
+		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, 0);
+		pg_atomic_fetch_add_u32(&ps_slru_wm->reader_foreign, 1);
+	}
+	ereport(ERROR,
+			(errmsg("pagestore: %s carries an identity this build does not know",
+					what)));
+}
+
+/*
  * Fetch the newest published watermark -- and each in-scope SLRU's newest
  * tombstone, which can advance independently of it (truncations publish
  * between checkpoints) -- from the store.  TTL-bounded across all backends
@@ -1850,10 +1885,14 @@ ps_slru_reader_fetch_wm(void)
 	TimestampTz now = GetCurrentTimestamp();
 	MemoryContext cxt = CurrentMemoryContext;
 	uint64		at;
+	uint32		foreign_seen;
 
 	if (ps_slru_wm == NULL)
 		return 0;
 
+	/* the foreign generation this fetch can vouch against: what it reads
+	 * from here on postdates anything that raised it up to now */
+	foreign_seen = pg_atomic_read_u32(&ps_slru_wm->reader_foreign);
 	at = pg_atomic_read_u64(&ps_slru_wm->reader_wm_at);
 	if (at != 0 &&
 		!TimestampDifferenceExceeds((TimestampTz) at, now,
@@ -1873,7 +1912,13 @@ ps_slru_reader_fetch_wm(void)
 												   PG_UINT64_MAX, page, NULL,
 												   PS_SLRU_SHIP_TIMEOUT_MS);
 		if (have_w)
+		{
+			if (ps_artifact_trailer_check((const unsigned char *) page,
+										  PS_SLRU_WATERMARK_MAGIC,
+										  PS_SLRU_WATERMARK_VERSION) != 0)
+				ps_slru_reader_foreign_identity("the SLRU mirror watermark object");
 			memcpy(&w, page, sizeof(uint64));
+		}
 
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
 		{
@@ -1886,6 +1931,10 @@ ps_slru_reader_fetch_wm(void)
 													   &resolved,
 													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) page,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ps_slru_reader_foreign_identity("an SLRU truncation tombstone object");
 				memcpy(&cutoff, page, sizeof(int64));
 				ps_slru_tomb_note(i, cutoff, resolved);
 			}
@@ -1921,6 +1970,21 @@ ps_slru_reader_fetch_wm(void)
 		now = GetCurrentTimestamp();
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at, (uint64) now);
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, (uint64) now);
+
+		/*
+		 * Clear only the foreign generation observed when this fetch began:
+		 * a sighting since then is of an object this fetch may not have
+		 * read, and stands until a fetch that began after it completes.
+		 */
+		for (;;)
+		{
+			uint32		known = pg_atomic_read_u32(&ps_slru_wm->reader_known);
+
+			if (foreign_seen <= known ||
+				pg_atomic_compare_exchange_u32(&ps_slru_wm->reader_known,
+											   &known, foreign_seen))
+				break;
+		}
 	}
 	PG_CATCH();
 	{
@@ -1943,6 +2007,18 @@ ps_slru_reader_fetch_wm(void)
 	return pg_atomic_read_u64(&ps_slru_wm->reader_wm);
 }
 
+/* A read hook's gate after a fetch: within the backoff the fetch hands back
+ * the cached watermark without IPC, which after a foreign identity is not
+ * one this build may serve against. */
+static void
+ps_slru_reader_require_known(void)
+{
+	if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) !=
+		pg_atomic_read_u32(&ps_slru_wm->reader_known))
+		ereport(ERROR,
+				(errmsg("pagestore: the SLRU mirror's visibility metadata carries an identity this build does not know")));
+}
+
 /*
  * Was the last SUCCESSFUL watermark/tombstone fetch recent enough to trust?
  * Distinguishes "the store is reachable and simply has no watermark yet"
@@ -1955,6 +2031,11 @@ ps_slru_reader_fetch_fresh(void)
 {
 	uint64		ok_at = pg_atomic_read_u64(&ps_slru_wm->reader_wm_ok_at);
 
+	/* a foreign sighting a completed fetch has not cleared outranks the
+	 * timestamp: that fetch may have begun before the sighting */
+	if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) !=
+		pg_atomic_read_u32(&ps_slru_wm->reader_known))
+		return false;
 	return ok_at != 0 &&
 		!TimestampDifferenceExceeds((TimestampTz) ok_at,
 									GetCurrentTimestamp(),
@@ -2091,6 +2172,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * revalidation epoch.
 		 */
 		w = ps_slru_reader_fetch_wm();
+		ps_slru_reader_require_known();
 
 		/*
 		 * The fetch may have loaded a newer tombstone into the shared cache
@@ -2200,6 +2282,10 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 													   tpage, &tombv,
 													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) tpage,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ps_slru_reader_foreign_identity("an SLRU truncation tombstone object");
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
 			}
@@ -2405,6 +2491,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 
 		/* same newest-wins rule as the read hook; W is only the enable gate */
 		w = ps_slru_reader_fetch_wm();
+		ps_slru_reader_require_known();
 
 		/*
 		 * See the read hook: the fetch may have advanced the tombstone
@@ -2502,6 +2589,10 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 													   tpage, &tombv,
 													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) tpage,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ps_slru_reader_foreign_identity("an SLRU truncation tombstone object");
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
 			}
@@ -2682,6 +2773,14 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 									   GetCurrentTimestamp(),
 									   PS_SLRU_READER_WM_STALE_MS))
 			return false;
+		/*
+		 * Nor after a foreign sighting no completed fetch has cleared: the
+		 * fetch that stamped ok_at may have begun before it, so the pair it
+		 * left is not one this build may revalidate against.
+		 */
+		if (pg_atomic_read_u32(&ps_slru_wm->reader_foreign) !=
+			pg_atomic_read_u32(&ps_slru_wm->reader_known))
+			return false;
 	}
 
 	if (!ps_slru_served_epoch(obj, (uint32) pageno, &epoch))
@@ -2741,6 +2840,8 @@ ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
 
 	memset(page, 0, sizeof(page));
 	memcpy(page, &cutoff_page, sizeof(int64));
+	ps_artifact_trailer_set((unsigned char *) page, PS_SLRU_TOMBSTONE_MAGIC,
+							PS_SLRU_TOMBSTONE_VERSION);
 
 	ps_slru_obj_key(&key, obj);
 	pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_TOMB, &key, 0, page,
@@ -3537,6 +3638,11 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 													   ? 2000
 													   : PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) tpage,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ereport(ERROR,
+							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
 				memcpy(&tomb_cut[idx], tpage, sizeof(int64));
 				tomb_ver[idx] = resolved;
 				tomb_valid[idx] = true;
@@ -4098,7 +4204,12 @@ pagestore_slru_tombstone_asof(PG_FUNCTION_ARGS)
 	if (!pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
 										(uint64) lsn, page, NULL))
 		PG_RETURN_NULL();
-	memcpy(&cutoff, page, sizeof(int64));
+	if (ps_artifact_trailer_check((const unsigned char *) page,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ereport(ERROR,
+							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
+				memcpy(&cutoff, page, sizeof(int64));
 	PG_RETURN_INT64(cutoff);
 }
 

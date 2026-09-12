@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "name": "posix-wal-payload-identity",
-  "role": "legacy",
+  "name": "posix-backend-objects",
+  "role": "current",
   "workload": "fixture",
   "daemon_args": [
     "--page-size",
@@ -33,7 +33,7 @@
     "xlog_blcksz": 8192
   },
   "captured": "2026-09-12",
-  "description": "POSIX fixture whose shipped-WAL envelopes are version 2 and record the payload's PostgreSQL identity (the WAL page magic and, at a PostgreSQL segment boundary, the WAL segment size) copied from the page header the payload begins with; a legacy fixture: its redo note carries no identity trailer and it holds none of the other backend objects, which the daemon still reads.",
+  "description": "POSIX fixture that also carries the backend's own object payloads: the redo note, admission fence, SLRU watermark and pg_xact tombstone with their identity trailers, the materializer marker and release and writer checkpoint control blocks, and the reader snapshot objects at the keys the backend's loaders read them from (global and per-database); the current fixture that pins the compiled identities and takes every mutation.",
   "files": [
     ".pagestore-nshards",
     "forkmeta",
@@ -41,8 +41,8 @@
     "forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
     "forkmeta_snapshots/forkmeta_manifest_v1",
     "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001",
-    "layer_0_0000000000000006",
-    "layer_0_0000000000000007",
+    "layer_0_0000000000000008",
+    "layer_0_0000000000000009",
     "layers.manifest",
     "page-prune.frontiers",
     "retention.initialized",
@@ -53,6 +53,8 @@
     "seg_00000002",
     "seg_00000003",
     "seg_00000004",
+    "seg_00000005",
+    "seg_00000006",
     "timelines",
     "wal_0",
     "wal_1",

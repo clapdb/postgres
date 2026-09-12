@@ -627,14 +627,18 @@ class Daemon:
 
 
 def run_client(client: Path, shm: str, mode: str, log: Path,
-               payload_identity: dict[str, Any] | None = None) -> subprocess.CompletedProcess[str]:
+               payload_identity: dict[str, Any] | None = None,
+               role: str = "current") -> subprocess.CompletedProcess[str]:
     """Run the fixture workload; ``payload_identity`` (the capturing build's
     on capture, the fixture's own on check) tells it which WAL page magic
-    and block size the shipped WAL carries."""
+    and block size the shipped WAL carries, and ``role`` which objects the
+    oracle may find missing: only a legacy fixture may predate the backend's
+    own object payloads."""
     env = harness.private_environment()
     if payload_identity is not None:
         env["PAGESTORE_FIXTURE_XLOG_MAGIC"] = str(int(payload_identity["xlog_page_magic"]))
         env["PAGESTORE_FIXTURE_XLOG_BLCKSZ"] = str(int(payload_identity["xlog_blcksz"]))
+    env["PAGESTORE_FIXTURE_ROLE"] = role
     with log.open("a", encoding="utf-8") as output:
         return subprocess.run(
             [str(client), "--shm", shm, "--mode", mode, "--workload", "fixture"],
@@ -829,7 +833,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                 tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-4:]
                 raise FixtureError(f"fixture reopen {generation} refused: {status}; daemon: {tail!r}")
             result = run_client(args.client_binary, shm, "verify", root / "reopen-client.log",
-                                metadata.get("payload_identity"))
+                                metadata.get("payload_identity"), metadata["role"])
             if result.returncode != 0:
                 tail = (root / "reopen-client.log").read_text(
                     encoding="utf-8", errors="replace").splitlines()[-3:]
@@ -860,7 +864,7 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
             return OPEN_REJECTED
         client_log = root / "mutations" / f"{case['name']}.client.log"
         result = run_client(args.client_binary, shm, "verify", client_log,
-                            metadata.get("payload_identity"))
+                            metadata.get("payload_identity"), metadata["role"])
         # A mutation the store repairs (a torn append-only tail) resumes the
         # transition it interrupted asynchronously, so the oracle is retried
         # while that can still land; a rejection stays a rejection.
@@ -868,7 +872,7 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
         while result.returncode != 0 and time.monotonic() < deadline and daemon.alive():
             time.sleep(0.5)
             result = run_client(args.client_binary, shm, "verify", client_log,
-                            metadata.get("payload_identity"))
+                                metadata.get("payload_identity"), metadata["role"])
         if not daemon.alive():
             code = daemon.process.returncode if daemon.process else None
             return f"{CRASHED} (daemon exited {code} under use)"
