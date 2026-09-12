@@ -3806,6 +3806,73 @@ ps_control_asof(XLogRecPtr lsn, ControlFileData *cf)
 	return ps_control_asof_timeout(lsn, cf, 0);
 }
 
+#include "access/heaptoast.h"
+#include "catalog/catversion.h"
+#include "storage/large_object.h"
+
+/*
+ * The mirrored control image binds the PostgreSQL identity of every payload
+ * the store holds for its timeline (D5 rule 1): a control file this build
+ * cannot run on means relation pages, SLRU pages and WAL this build cannot
+ * load, whatever their own headers say.  Run the checks startup would, and
+ * name the payload identity rather than the store, before a page of that
+ * timeline is interpreted.  xlog_seg_size is per cluster, so it is compared
+ * with this cluster's rather than a build constant.
+ */
+static void
+pagestore_control_image_compatible(const ControlFileData *cf, const char *what)
+{
+	if (cf->pg_control_version != PG_CONTROL_VERSION)
+		ereport(ERROR,
+				(errmsg("%s: control image is pg_control version %u; this build is %u",
+						what, cf->pg_control_version, PG_CONTROL_VERSION),
+				 errdetail("The payload needs a PostgreSQL build with that control version.")));
+	if (cf->catalog_version_no != CATALOG_VERSION_NO)
+		ereport(ERROR,
+				(errmsg("%s: control image is catalog version %u; this build is %u",
+						what, cf->catalog_version_no, CATALOG_VERSION_NO),
+				 errdetail("The payload needs a PostgreSQL build with that catalog version.")));
+	if (cf->blcksz != BLCKSZ || cf->relseg_size != RELSEG_SIZE ||
+		cf->xlog_blcksz != XLOG_BLCKSZ ||
+		cf->slru_pages_per_segment != SLRU_PAGES_PER_SEGMENT ||
+		cf->nameDataLen != NAMEDATALEN || cf->indexMaxKeys != INDEX_MAX_KEYS ||
+		cf->toast_max_chunk_size != TOAST_MAX_CHUNK_SIZE ||
+		cf->loblksize != LOBLKSIZE || cf->maxAlign != MAXIMUM_ALIGNOF ||
+		cf->floatFormat != FLOATFORMAT_VALUE ||
+		cf->float8ByVal != FLOAT8PASSBYVAL)
+		ereport(ERROR,
+				(errmsg("%s: control image layout parameters do not match this build",
+						what),
+				 errdetail("blcksz %u/%u, relseg_size %u/%u, xlog_blcksz %u/%u, "
+						   "slru_pages_per_segment %u/%u, nameDataLen %u/%u, "
+						   "indexMaxKeys %u/%u, toast_max_chunk_size %u/%u, "
+						   "loblksize %u/%u, maxAlign %u/%u (image/build).",
+						   cf->blcksz, (unsigned) BLCKSZ,
+						   cf->relseg_size, (unsigned) RELSEG_SIZE,
+						   cf->xlog_blcksz, (unsigned) XLOG_BLCKSZ,
+						   cf->slru_pages_per_segment, (unsigned) SLRU_PAGES_PER_SEGMENT,
+						   cf->nameDataLen, (unsigned) NAMEDATALEN,
+						   cf->indexMaxKeys, (unsigned) INDEX_MAX_KEYS,
+						   cf->toast_max_chunk_size, (unsigned) TOAST_MAX_CHUNK_SIZE,
+						   cf->loblksize, (unsigned) LOBLKSIZE,
+						   cf->maxAlign, (unsigned) MAXIMUM_ALIGNOF)));
+	if (cf->xlog_seg_size != wal_segment_size)
+		ereport(ERROR,
+				(errmsg("%s: control image WAL segment size %u differs from this cluster's %d",
+						what, cf->xlog_seg_size, wal_segment_size)));
+	/*
+	 * A store populated by another initdb can carry an image whose versions
+	 * and layout match this build exactly; its pages and WAL are still
+	 * another database system's.
+	 */
+	if (cf->system_identifier != GetSystemIdentifier())
+		ereport(ERROR,
+				(errmsg("%s: control image belongs to database system %llu; this cluster is %llu",
+						what, (unsigned long long) cf->system_identifier,
+						(unsigned long long) GetSystemIdentifier())));
+}
+
+
 /*
  * Discover a newer durable checkpoint view.  This only publishes a candidate:
  * adopting it also requires the exact-R running-XID snapshot, which is a
@@ -5516,6 +5583,89 @@ ps_slru_seg_path(char *buf, size_t buflen, const char *dir, int64 segno,
 	return snprintf(buf, buflen, "%s/%04X", dir, (unsigned int) segno);
 }
 
+/*
+ * pagestore.seed_reference_slru_dir: when set, every SLRU page the branch
+ * seeders reconstruct is compared, byte for byte, with the same page in
+ * that data directory before it is written.  The branch controller points
+ * it at the materializer's PGDATA while the materializer is paused at the
+ * fork LSN after a restartpoint, so the seeders' replay of (C, L] is
+ * checked against the pages PostgreSQL's own recovery produced for the
+ * same interval -- the independent oracle D5 rule 1 asks of an applier
+ * that mirrors clog_redo, CommitTsRedo and multixact_redo instead of
+ * calling them.  A mismatch is an ERROR naming the SLRU, the page, and the
+ * first differing byte; a page the reference does not have is one too.
+ */
+static char *pagestore_seed_reference_slru_dir = NULL;
+static int64 pagestore_seed_reference_pages_compared = 0;
+/* per SLRU class, so a scenario can require that each one was compared */
+static int64 pagestore_seed_reference_compared_xact = 0;
+static int64 pagestore_seed_reference_compared_commit_ts = 0;
+static int64 pagestore_seed_reference_compared_mxoffsets = 0;
+static int64 pagestore_seed_reference_compared_mxmembers = 0;
+
+static void
+pagestore_seed_reference_check(const char *slru_dir, bool long_names,
+							   int64 pageno, const char *page,
+							   const char *label)
+{
+	char		refdir[MAXPGPATH];
+	char		segpath[MAXPGPATH];
+	char		refpage[BLCKSZ];
+	int			pathlen;
+	int			fd;
+	off_t		offset;
+	ssize_t		got;
+
+	if (pagestore_seed_reference_slru_dir == NULL ||
+		pagestore_seed_reference_slru_dir[0] == '\0')
+		return;
+	/* the multixact seeder stages its two halves under pg_multixact.tmp and
+	 * names them by their leaf; the reference is a data directory */
+	if (strcmp(slru_dir, "offsets") == 0 || strcmp(slru_dir, "members") == 0)
+		pathlen = snprintf(refdir, sizeof(refdir), "%s/pg_multixact/%s",
+						   pagestore_seed_reference_slru_dir, slru_dir);
+	else
+		pathlen = snprintf(refdir, sizeof(refdir), "%s/%s",
+						   pagestore_seed_reference_slru_dir, slru_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, refdir);
+	pathlen = ps_slru_seg_path(segpath, sizeof(segpath), refdir,
+							   pageno / SLRU_PAGES_PER_SEGMENT, long_names);
+	PS_CHECK_PATH_FORMAT(pathlen, segpath);
+	fd = OpenTransientFile(segpath, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("seeded %s page %lld has no reference segment \"%s\": %m",
+						label, (long long) pageno, segpath)));
+	offset = (off_t) (pageno % SLRU_PAGES_PER_SEGMENT) * BLCKSZ;
+	got = pg_pread(fd, refpage, BLCKSZ, offset);
+	CloseTransientFile(fd);
+	if (got != BLCKSZ)
+		ereport(ERROR,
+				(errmsg("seeded %s page %lld is beyond the reference segment \"%s\" (%zd bytes at offset %lld)",
+						label, (long long) pageno, segpath, got, (long long) offset)));
+	if (memcmp(refpage, page, BLCKSZ) != 0)
+	{
+		int			at = 0;
+
+		while (at < BLCKSZ && refpage[at] == page[at])
+			at++;
+		ereport(ERROR,
+				(errmsg("seeded %s page %lld differs from the reference \"%s\" at byte %d (seeded 0x%02x, reference 0x%02x)",
+						label, (long long) pageno, segpath, at,
+						(unsigned char) page[at], (unsigned char) refpage[at])));
+	}
+	pagestore_seed_reference_pages_compared++;
+	if (strcmp(slru_dir, "pg_xact") == 0)
+		pagestore_seed_reference_compared_xact++;
+	else if (strcmp(slru_dir, "pg_commit_ts") == 0)
+		pagestore_seed_reference_compared_commit_ts++;
+	else if (strcmp(slru_dir, "offsets") == 0)
+		pagestore_seed_reference_compared_mxoffsets++;
+	else if (strcmp(slru_dir, "members") == 0)
+		pagestore_seed_reference_compared_mxmembers++;
+}
+
 static void
 pagestore_write_zero_slru_page(const char *slru_dir, const char *label,
 							   int64 pageno, bool long_names)
@@ -5692,6 +5842,11 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 				memset(zerobuf, 0, sizeof(zerobuf));
 				src = zerobuf;
 			}
+			/* only pages the horizon asked for carry reconstructed content;
+			 * those below it were zeroed above and are not the oracle's */
+			if (present[p - page_lo] && p >= req_lo && p <= req_hi)
+				pagestore_seed_reference_check(slru_dir, long_seg_names, p, src,
+											   label);
 			for (int done = 0; done < BLCKSZ;)
 			{
 				ssize_t		written;
@@ -6048,6 +6203,8 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 						 errmsg("could not create branch segment \"%s\": %m", segpath)));
 			for (;;)
 			{
+				pagestore_seed_reference_check("pg_xact", false, physical_page,
+											   pages + p * BLCKSZ, "clog");
 				if (write(fd, pages + p * BLCKSZ, BLCKSZ) != BLCKSZ)
 				{
 					CloseTransientFile(fd);
@@ -6538,6 +6695,30 @@ rollback_seeded_slru_dir(const char *target_root, const char *backup_root,
  * bootstrap helper can derive these horizons from the fork manifest and call
  * this single function.
  */
+/*
+ * The seed pages at the base cutoff and the WAL replayed onto them are
+ * PostgreSQL payloads whose identity the timeline's control image carries;
+ * every entrypoint -- the serialized controller, the public function with
+ * caller-supplied horizons, the legacy prepare (before its idempotent
+ * fast path, so a prepared directory kept across a build change is not
+ * reused unchecked either) -- resolves that image at the cutoff and refuses
+ * to interpret a page this build cannot load.  A cutoff with no mirrored
+ * image at or below it has no identity to bind and fails closed.
+ */
+static void
+pagestore_bind_seed_identity(XLogRecPtr base)
+{
+	ControlFileData seed_control;
+
+	if (!ps_control_asof_timeout(base, &seed_control,
+								 PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+		ereport(ERROR,
+				(errmsg("no mirrored control image at or below the base cutoff %X/%08X",
+						LSN_FORMAT_ARGS(base)),
+				 errdetail("The seed pages' PostgreSQL identity cannot be bound without one.")));
+	pagestore_control_image_compatible(&seed_control, "branch SLRU seed");
+}
+
 static int64
 pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 								 XLogRecPtr target, TransactionId oldest_xid,
@@ -6600,6 +6781,13 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 		ereport(ERROR,
 				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
 						(long long) oldest_member, (long long) next_member)));
+
+	pagestore_bind_seed_identity(base);
+	pagestore_seed_reference_pages_compared = 0;
+	pagestore_seed_reference_compared_xact = 0;
+	pagestore_seed_reference_compared_commit_ts = 0;
+	pagestore_seed_reference_compared_mxoffsets = 0;
+	pagestore_seed_reference_compared_mxmembers = 0;
 
 	pathlen = snprintf(staging_root, sizeof(staging_root),
 					   "%s/.pagestore-branch-seed.%ld",
@@ -6723,6 +6911,30 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	if (pagestore_seed_reference_slru_dir != NULL &&
+		pagestore_seed_reference_slru_dir[0] != '\0')
+	{
+		/*
+		 * Every reconstructed page inside the horizon was compared and
+		 * found equal (a difference is an ERROR inside the staging scope
+		 * above, before anything is published).  The remaining seeded pages
+		 * are the zero bootstrap pages an empty or segment-aligned horizon
+		 * needs below its first live entry; those make no claim about
+		 * recovery's state and are not compared, so a horizon that is empty
+		 * throughout legitimately compares nothing -- the counts below let
+		 * a scenario require what it expects.
+		 */
+		ereport(NOTICE,
+				(errmsg("seeded SLRU pages compared with recovery's at \"%s\": %lld reconstructed pages equal (pg_xact %lld, pg_commit_ts %lld, pg_multixact/offsets %lld, pg_multixact/members %lld), %lld zero bootstrap pages not compared",
+						pagestore_seed_reference_slru_dir,
+						(long long) pagestore_seed_reference_pages_compared,
+						(long long) pagestore_seed_reference_compared_xact,
+						(long long) pagestore_seed_reference_compared_commit_ts,
+						(long long) pagestore_seed_reference_compared_mxoffsets,
+						(long long) pagestore_seed_reference_compared_mxmembers,
+						(long long) (seeded - pagestore_seed_reference_pages_compared))));
+	}
 
 	return seeded;
 }
@@ -12213,6 +12425,7 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 				(errmsg("branch checkpoint redo is not exactly mirrored"),
 				 errdetail("Requested checkpoint redo is %X/%08X.",
 							   LSN_FORMAT_ARGS(target))));
+	pagestore_control_image_compatible(&control, "branch checkpoint");
 	if (!pagestore_localsvc_read_fence_timeout(
 			(uint64) target, &read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS))
 		ereport(ERROR,
@@ -12441,7 +12654,21 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 									&oldest_commit_ts_xid,
 									&next_commit_ts_xid);
 
-	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
+	/* a matching manifest reuses seeded SLRUs; they are still this build's
+	 * to interpret only if the payload identity they were seeded under is */
+	pagestore_bind_seed_identity(base);
+
+	/*
+	 * A verified preparation never reuses seeded SLRUs: whether the manifest
+	 * matches or not, the pages are reconstructed again and each compared
+	 * with the reference before publication (seeding is idempotent -- it
+	 * stages and renames), so a retry whose earlier reply was lost, or a
+	 * directory prepared before verification was asked for, is verified
+	 * rather than accepted on the strength of its manifest.
+	 */
+	if ((pagestore_seed_reference_slru_dir == NULL ||
+		 pagestore_seed_reference_slru_dir[0] == '\0') &&
+		pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
 												   incarnation, parent_incarnation,
 													   base, target,
 												   oldest_xid, next_xid,
@@ -13198,6 +13425,17 @@ _PG_init(void)
 							   "Must be a throwaway initdb'd cluster, never the live one; "
 							   "the helper only ever mutates pages handed to it over the protocol.",
 							   &pagestore_walredo_datadir,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pagestore.seed_reference_slru_dir",
+							   "Data directory whose SLRU pages every seeded branch SLRU page must equal.",
+							   "Set by the branch controller to the materializer's PGDATA while it is "
+							   "paused at the fork LSN after a restartpoint: the seeders' own replay is "
+							   "then checked against PostgreSQL recovery's result for the same pages.",
+							   &pagestore_seed_reference_slru_dir,
 							   "",
 							   PGC_SUSET,
 							   0,

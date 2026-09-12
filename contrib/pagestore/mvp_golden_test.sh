@@ -245,6 +245,7 @@ archive_mode = on
 archive_library = 'pagestore'
 listen_addresses = '127.0.0.1'
 port = $WPORT
+track_commit_timestamp = on
 EOF
 
 "$BIN/pg_ctl" -D "$WRITER" -l "$WRITER/writer.log" -w start >/dev/null 2>&1 ||
@@ -269,6 +270,7 @@ archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $MPORT
 hot_standby = on
+track_commit_timestamp = on
 restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize $materializer_wal_segment_size %f %p'
 EOF
 touch "$MATERIALIZER/standby.signal"
@@ -326,6 +328,34 @@ echo "ok   - SLRU capture fails closed before recovery is paused"
 
 "${WP[@]}" -c "INSERT INTO mvp_golden VALUES (1, 'before_fork');" >/dev/null ||
 	fail "could not commit the fork-visible row"
+# Give every SLRU the seeders reconstruct real content before the fork, so the
+# seed-versus-recovery comparison covers pg_xact, pg_commit_ts (the writer
+# tracks commit timestamps) and both pg_multixact halves: two sessions holding
+# key-share locks on the same row at once create a multixact with two members.
+"${WP[@]}" -c "BEGIN; SELECT id FROM mvp_golden WHERE id = 1 FOR KEY SHARE; SELECT pg_sleep(30); COMMIT;" \
+	>/dev/null 2>&1 &
+golden_locker=$!
+# wait until the first session observably holds its lock and is sleeping,
+# rather than trusting elapsed time on a loaded host
+for _ in $(seq 1 100); do
+	if [ "$("${WP[@]}" -c "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE '%pg_sleep(30)%' AND wait_event = 'PgSleep';")" = "1" ]; then
+		break
+	fi
+	sleep 0.1
+done
+assert_eq "$("${WP[@]}" -c "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'transactionid' AND a.query LIKE '%pg_sleep(30)%';")" "1" \
+	"the first key-share holder is in its transaction"
+"${WP[@]}" -c "SELECT id FROM mvp_golden WHERE id = 1 FOR KEY SHARE;" >/dev/null ||
+	fail "could not take the second key-share lock"
+"${WP[@]}" -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(30)%' AND wait_event = 'PgSleep';" >/dev/null
+wait "$golden_locker" 2>/dev/null
+# the multixact exists once both lockers overlapped; cancelling the sleep
+# aborted the first transaction, which is fine -- the multixact was created
+# when the second locker joined, and it is what the SLRUs carry
+assert_eq "$("${WP[@]}" -c "SELECT count(*) FROM pg_get_multixact_members((SELECT xmax FROM mvp_golden WHERE id = 1));" 2>/dev/null)" "2" \
+	"the overlapping lockers created a two-member multixact on the row"
+assert_eq "$("${WP[@]}" -c "SELECT (SELECT count(*) FROM mvp_golden) = 1 AND pg_xact_commit_timestamp((SELECT xmin FROM mvp_golden WHERE id = 1)) IS NOT NULL;")" "t" \
+	"multixact and commit-timestamp workload committed before the fork"
 
 mkdir -m 700 "$TMPROOT/controller-authority" ||
 	fail "could not create materializer authority directory"
@@ -385,11 +415,26 @@ env \
 	PAGESTORE_TEST_FAULT_SCENARIO=mvp-golden \
 	PAGESTORE_TEST_FAULT_SEED=1 \
 	PAGESTORE_TEST_FAULT_OPERATION=branch-prepare-crash \
-	"$BRANCHPREP" --config "$BRANCH_CONFIG" \
+	"$BRANCHPREP" --config "$BRANCH_CONFIG" --verify-seed-against-materializer \
 	> "$TMPROOT/branch-crash.stdout" 2> "$TMPROOT/branch-crash.stderr"
 branch_crash_status=$?
 assert_eq "$branch_crash_status" "88" \
 	"installed branch controller aborts with the canonical crash status"
+# The seeders' replay of (C, L] onto the base snapshot is compared, page by
+# page, with the SLRUs PostgreSQL recovery itself produced through L in the
+# paused materializer -- the independent oracle for appliers that mirror
+# clog_redo, CommitTsRedo and multixact_redo rather than calling them.
+seed_compare=$(grep -o "seeded SLRU pages compared with recovery's at .*" "$TMPROOT/branch-crash.stderr" | tail -1)
+[ -n "$seed_compare" ] || fail "branch preparation did not compare its seeded SLRUs with recovery's"
+seed_compared=$(printf '%s\n' "$seed_compare" | sed -n 's/.*: \([0-9]*\) reconstructed pages equal.*/\1/p')
+[ "${seed_compared:-0}" -gt 0 ] ||
+	fail "no reconstructed SLRU page was compared with recovery's: $seed_compare"
+# every class the seeders reconstruct must have been compared, not just one
+for slru in pg_xact pg_commit_ts pg_multixact/offsets pg_multixact/members; do
+	n=$(printf '%s\n' "$seed_compare" | sed -n "s|.*$slru \([0-9]*\).*|\1|p")
+	[ "${n:-0}" -gt 0 ] || fail "no reconstructed $slru page was compared with recovery's: $seed_compare"
+done
+echo "ok   - every reconstructed SLRU page equals the page PostgreSQL recovery produced ($seed_compared pages across pg_xact, pg_commit_ts and both pg_multixact halves)"
 python3 - "$BRANCH_FAULT_CONTROL/report.jsonl" <<'PY' || fail "branch crash report is not authentic"
 import json
 import sys
@@ -452,7 +497,7 @@ branch_receipt=$(env \
 	-u PAGESTORE_TEST_FAULT_OPERATION \
 	-u PAGESTORE_TEST_FAULT_OPERATION_ID \
 	-u PAGESTORE_TEST_FAULT_WATCHDOG_MS \
-	"$BRANCHPREP" --config "$BRANCH_CONFIG") ||
+	"$BRANCHPREP" --config "$BRANCH_CONFIG" --verify-seed-against-materializer) ||
 	fail "installed branch controller recovery failed"
 IFS='|' read -r receipt_state base_lsn checkpoint_redo checkpoint_lsn \
 	fork_lsn seeded <<EOF
@@ -551,6 +596,7 @@ io_method = sync
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $BPORT
+track_commit_timestamp = on
 restore_command = '$WALRESTORE --shm $SHM --timeline 1 --incarnation 1 --segsize $branch_wal_segment_size %f %p'
 recovery_target_lsn = '$checkpoint_lsn'
 recovery_target_inclusive = on

@@ -1026,10 +1026,10 @@ including legacy fixtures exercised by each format change; rule 3's
 container obligations met for the POSIX and SPDK container identities and
 a fail-closed, durably published SPDK superblock; rule 1's payload-identity
 binding done for the paths that hand bytes to PostgreSQL (the shipped-WAL
-envelope and restore command, the control image's WAL segment size, and
-the page and relation-map paths PostgreSQL's own loaders already verify);
-backend-side artifact fixtures (D5 rule 4) and the SLRU seeding
-obligations remain**.
+envelope and restore command, the control image's WAL segment size, the
+page and relation-map paths PostgreSQL's own loaders already verify, and
+the SLRU seed pages on every seeding path) with the seeders' replay proven
+against recovery's; backend-side artifact fixtures (D5 rule 4) remain**.
 
 Payload identity, per path.  The shipped-WAL envelope (`walv1_*` header
 version 2) records the payload's own identity from the WAL page header it
@@ -1262,24 +1262,34 @@ inside them), because only the former can have a page-store support window.
      versioned with the envelope, bound to the PostgreSQL version whose
      redo it mirrors, and it must be proven equivalent to actual recovery
      by an independent result, not by a fixture that would only compare
-     the mirror with itself.  That proof does not exist yet: the golden
-     scenario takes its seed base `C` from the materializer's recovery,
-     but it installs the seeded SLRUs before the branch starts, so
-     recovery never reconstructs `(C, R]` on its own for comparison, and
-     afterwards it checks a single `pg_xact` status and no commit-ts or
-     multixact content.  H2 therefore requires a comparison of the seeded
-     `pg_xact`, `pg_commit_ts`, and `pg_multixact` segments over the fork
-     horizon against the same segments produced by normal recovery of the
-     same WAL through `R` (the materializer's own files at that
-     restartpoint are such a result) before this obligation is treated as
-     covered.  Refactoring the appliers onto PostgreSQL's redo routines
-     would retire the obligation.  The
-     transformation is version checked only where its inputs are resolved
-     from a control image: the serialized branch controller path does so;
-     the public `pagestore_seed_branch_slrus()` and legacy
-     `pagestore_prepare_branch_impl()` entrypoints take caller-supplied
-     cutoffs and horizons and check nothing, so H2 requires them to resolve
-     and validate the control tuple before interpreting a seed page.
+     the mirror with itself.  That proof is the branch controller's
+     `--verify-seed-against-materializer`: while the materializer is paused
+     at the fork LSN `L` right after a restartpoint flushed its SLRUs --
+     PostgreSQL recovery's own result for the same WAL through `L` -- the
+     controller sets `pagestore.seed_reference_slru_dir` to the
+     materializer's data directory, and every page the seeders reconstruct
+     (base snapshot at `C` plus their replay of `(C, L]`) is compared byte
+     for byte with the same page there before it is written; a difference,
+     or a page the reference does not have, fails the preparation naming
+     the SLRU, the page and the byte, and a preparation that seeded pages
+     but compared none fails too.  Zero bootstrap pages an empty or
+     segment-aligned horizon writes below its first live entry make no
+     claim about recovery's state and are not compared.  The golden
+     scenario runs with the flag, gives every SLRU real content before the
+     fork (commit timestamps on, a two-member multixact), and requires
+     reconstructed pages of `pg_xact`, `pg_commit_ts` and both
+     `pg_multixact` halves to have been compared; the integration test
+     drives the mismatch and missing-segment refusals with a forged
+     reference.  Refactoring the appliers onto PostgreSQL's redo routines
+     would retire the obligation.  The transformation is version checked
+     on every path: `pagestore_seed_branch_slrus_impl()`, which the
+     serialized controller, the public `pagestore_seed_branch_slrus()` and
+     the legacy `pagestore_prepare_branch_impl()` all reach, resolves the
+     mirrored control image at the base cutoff and refuses a cutoff with
+     no image to bind to; the image's compatibility tuple is checked by
+     `pagestore_control_image_compatible()` (the checks startup makes,
+     plus `xlog_seg_size` against this cluster's) there and where the
+     controller derives its horizons from the checkpoint image.
    A payload's version is therefore
    PostgreSQL's, and whether a payload can be loaded by a different
    PostgreSQL build is PostgreSQL's question, not a page-store migration.
@@ -1433,10 +1443,8 @@ The default sequence was:
 8. R6 bounded-space acceptance and final MVP status update -- soak and nightly lane done; the
    final status update follows the first scheduled nightly runs.
 
-What remains, in order: the H2 slices under the D5 decision -- first
-control-tuple validation in the public and legacy SLRU
-seeding entrypoints, and the independent-recovery comparison for the SLRU
-appliers; then the store-object backend families, the page-store-defined
+What remains, in order: the H2 slices under the D5 decision -- the
+store-object backend families, the page-store-defined
 raw payloads (control block 1's redo note, the SLRU watermark and
 tombstone values) included; then the PGDATA artifacts -- the reader and
 branch manifests, branch bootstrap, reader snapshot and catalog files,
@@ -1486,6 +1494,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-12 | Decided D5: PostgreSQL-native payloads are wrapped and never rewritten, with their PostgreSQL version identity recorded in the envelope and checked by the loader; daemon envelopes keep a fixture per shipped version with explicit migration or fail-closed; container formats are registered per provider (SPDK `spdk_super` and extent layout included, its fixture after the MVP); backend artifacts follow the same envelope/payload split | `MVP_COMPLETION_PLAN.md` D5; the H2 backend slices are sequenced against these rules |
 | 2026-09-12 | Registered the POSIX and SPDK container identities and made the SPDK superblock fail closed and durable: `pagestore_spdk_super.c` (no SPDK dependency) decodes the checksummed v2 and both legacy struct images, refuses truncated, overlong, foreign, newer, corrupt, differently sized or differently sharded superblocks instead of zeroing the segment counts, publishes v2 through NVMe flush, temp/fsync/rename/dir-fsync with failures returned to `spdk_sync()`; `posix_container` and `spdk_container` join `pagestore_format_versions` and the current fixture's identity table | `pagestore_spdk_super_test` (69 checks) in meson and the standalone lane; the fixture check passes against both fixtures; the SPDK daemon links with the module |
 | 2026-09-12 | Bound the PostgreSQL payload identity on the paths that hand bytes to PostgreSQL: shipped-WAL envelope version 2 records `xlp_magic`, `xlp_info` and the WAL segment size from the payload's page header (read in host byte order, as PostgreSQL wrote it) in the bytes version 1 reserved, the store re-derives them from the first chunk once per open before serving any range, `pagestore_walrestore` (now built with the PostgreSQL headers) refuses a WAL page magic or segment size the payload was not written for, and a read the store refuses, with an exit status recovery treats as fatal, `pagestore_control_restore --payload-identity` prints the build's tuple and the control install refuses an image whose WAL segment size differs from the target cluster's; `posix-wal-payload-identity` is the current fixture, its predecessor legacy | `pagestore_wal_segment_test` (25 checks), fixture check across three fixtures with the new use-rejected mutation, meson fixture check against the build's identity, integration test with accept/refuse assertions for the restore command, golden scenario and managed materializer smoke with bound restore commands |
+| 2026-09-12 | Bound the SLRU seed pages' PostgreSQL identity on every seeding path (`pagestore_seed_branch_slrus_impl` resolves the control image at the base cutoff, refuses a cutoff with none, and checks its compatibility tuple; the controller's horizon derivation checks it too) and proved the seeders' replay against recovery: `pagestore.seed_reference_slru_dir` compares every reconstructed page with the paused materializer's before writing it, the branch controller sets it with `--verify-seed-against-materializer`, and the golden scenario requires pages of all four SLRUs to have been compared equal | Golden scenario (4 reconstructed pages equal), integration test (fail-closed base cutoff, forged-reference mismatch and missing-segment refusals, nothing published), branch boot test |
 | 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
 | 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |

@@ -726,10 +726,7 @@ gate 5 has its crash coverage composed and its daemon-side format fixtures,
 but is not complete.  What remains before the MVP is declared complete is:
 
 1. Keep the nightly bounded-space soak green across its first scheduled runs.
-2. Finish H2 under the decided D5 policy: validate the control
-   tuple in the public and
-   legacy SLRU seeding entrypoints and compare their output with
-   independently recovered SLRUs, then add the backend-side
+2. Finish H2 under the decided D5 policy: add the backend-side
    persisted-format fixtures (the materializer and
    writer control blocks, the reader snapshot objects, and the raw
    redo-note, SLRU watermark, and tombstone values in the store; the reader

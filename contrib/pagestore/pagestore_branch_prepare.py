@@ -431,8 +431,15 @@ class OwnerLock:
 
 
 class BranchPreparer:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, verify_seed_against_materializer: bool = False) -> None:
         self.config = config
+        # Compare every SLRU page the seeders reconstruct with the same page in
+        # the materializer's PGDATA, which is paused at the fork LSN right
+        # after a restartpoint flushed its SLRUs: PostgreSQL recovery's own
+        # result for the same interval, and so an oracle independent of the
+        # seeders' replay.  A mismatch fails the preparation.
+        self.verify_seed_against_materializer = verify_seed_against_materializer
+        self.seed_reference_report: str | None = None
         self.pause_owned = False
         self.writer_owned = False
         self.restricted_writer_running = False
@@ -666,6 +673,16 @@ class BranchPreparer:
         if errors:
             raise BranchPrepareError("; ".join(errors))
 
+    def command_with_notices(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run psql and keep the seed-comparison NOTICE, the one server
+        message the receipt's reader may want to see."""
+        result = self.command(command)
+        for line in (result.stderr or "").splitlines():
+            if "seeded SLRU pages compared with recovery's" in line:
+                self.seed_reference_report = line.split("NOTICE:", 1)[-1].strip()
+                print(self.seed_reference_report, file=sys.stderr)
+        return result
+
     def command(self, command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
             result = subprocess.run(
@@ -693,7 +710,7 @@ class BranchPreparer:
         )
 
     def psql(self, host: str, port: int, sql: str) -> str:
-        result = self.command(
+        result = self.command_with_notices(
             [
                 str(self.config.psql),
                 "-X",
@@ -1271,9 +1288,21 @@ class BranchPreparer:
         )
 
     def prepare_branch(self, base: str, redo: str, fork: str) -> int:
+        reference = ""
+        if self.verify_seed_against_materializer:
+            # the comparison report is a NOTICE; a role or database that
+            # raised client_min_messages would otherwise hide a completed
+            # comparison and make it look like an unverified fast-path reuse
+            reference = (
+                "SET client_min_messages = notice; "
+                "SET pagestore.seed_reference_slru_dir = "
+                + sql_literal(str(self.config.materializer_data_dir))
+                + "; "
+            )
         output = last_output_line(
             self.writer_sql(
-                "SET pagestore.redo_wal_from_store = on; "
+                reference
+                + "SET pagestore.redo_wal_from_store = on; "
                 "SELECT "
                 + self.extension_function(
                     self.writer_extension_schema,
@@ -1298,6 +1327,15 @@ class BranchPreparer:
             raise BranchPrepareError(f"unexpected branch prepare result: {output}") from error
         if seeded < 0:
             raise BranchPrepareError("branch prepare returned a negative page count")
+        if self.verify_seed_against_materializer and self.seed_reference_report is None:
+            # Under verification the server reseeds even a directory whose
+            # manifest already matches, so a missing report means the
+            # comparison did not run at all; say so rather than report a
+            # verified preparation.
+            raise BranchPrepareError(
+                "branch prepare returned no SLRU comparison report although verification "
+                "against the materializer was requested"
+            )
         return seeded
 
     def writer_is_normal(self) -> bool:
@@ -1405,6 +1443,7 @@ class BranchPreparer:
             raise BranchPrepareError(
                 f"branch journal state {state!r} has no safe idempotent recovery path"
             )
+        entered_state = state
         if state == "fork_captured":
             if self.journal.get("intent") not in (None, "prepare_branch"):
                 raise BranchPrepareError("branch journal has a contradictory prepare intent")
@@ -1453,6 +1492,27 @@ class BranchPreparer:
                 archived_through_lsn=self.journal["switch_lsn"],
             )
             state = "branch_prepared"
+        if (entered_state in ("branch_prepared", "prepared")
+                and self.verify_seed_against_materializer):
+            # Prepared before verification was requested (or by a run whose
+            # verification we cannot see): the materializer is still paused
+            # at the fork LSN in these states, so re-seed under verification
+            # now -- the server reconstructs and compares every page again
+            # instead of reusing the manifest -- before carrying on.  A
+            # journal that entered at fork_captured was just seeded and
+            # verified above; seeding it again would only unlink and rebuild
+            # a manifest that already stands.
+            seeded = self.prepare_branch(
+                self.journal["base_lsn"],
+                self.journal["checkpoint_redo_lsn"],
+                self.journal["fork_lsn"],
+            )
+            self.journal_update(state, None, seeded_slru_pages=seeded)
+        if state in ("materializer_resumed", "writer_restored") and self.verify_seed_against_materializer:
+            raise BranchPrepareError(
+                f"branch journal state {state!r} has resumed the materializer past the fork "
+                "LSN; the seeded SLRUs cannot be verified against it now"
+            )
         if state == "branch_prepared":
             if self.journal.get("intent") not in (None, "publish_prepared_receipt"):
                 raise BranchPrepareError("branch journal has a contradictory prepared intent")
@@ -1484,6 +1544,13 @@ class BranchPreparer:
         existing = self.read_journal()
         if existing is not None:
             if existing.get("state") == "complete":
+                if self.verify_seed_against_materializer:
+                    # nothing left to verify against: the materializer was
+                    # resumed past the fork LSN when this journal completed
+                    raise BranchPrepareError(
+                        "the prepared branch is already complete and its materializer "
+                        "resumed; its SLRUs cannot be verified against the materializer now"
+                    )
                 return existing
             self.journal = existing
             self.restore_ownership_from_journal()
@@ -1613,6 +1680,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument(
+        "--verify-seed-against-materializer", action="store_true",
+        help="compare every seeded SLRU page with the materializer's, which recovery "
+             "produced for the same interval; a mismatch fails the preparation",
+    )
     return parser.parse_args(argv)
 
 
@@ -1631,7 +1703,9 @@ def main(argv: list[str] | None = None) -> int:
                             config.materializer_lock_file,
                             "materializer supervisor or branch prepare",
                         ):
-                            preparer = BranchPreparer(config)
+                            preparer = BranchPreparer(
+                                config, args.verify_seed_against_materializer
+                            )
 
                             def cancel(signum: int, _frame: object) -> None:
                                 raise CancelledError(f"received signal {signum}")
