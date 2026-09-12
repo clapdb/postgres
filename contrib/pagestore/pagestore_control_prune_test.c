@@ -21,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "pagestore_artifact_format.h"
 #include "pagestore_core.h"
 
 static int checks;
@@ -80,6 +81,7 @@ write_control(uint32_t timeline, uint64_t version, uint64_t redo)
 	ps_lock_shard_wr(ps_shard_of(&key));
 	memset(page, 0, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
+	ps_artifact_trailer_set(page, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION);
 	if (append_page(timeline, &key, 1, page, version, NULL) != 0)
 	{
 		ps_unlock_shard(ps_shard_of(&key));
@@ -96,7 +98,9 @@ write_control(uint32_t timeline, uint64_t version, uint64_t redo)
 	return ps_storage->sync() == 0;
 }
 
-/* The redo-floor note alone: a mirror that timed out before its image. */
+/* The redo-floor note alone: a mirror that timed out before its image.
+ * Written without the identity trailer, as every note was before one
+ * existed, so the tests keep covering the legacy note. */
 static int
 write_note(uint32_t timeline, uint64_t version, uint64_t redo)
 {
@@ -107,6 +111,23 @@ write_note(uint32_t timeline, uint64_t version, uint64_t redo)
 	ps_lock_shard_wr(ps_shard_of(&key));
 	memset(page, 0, sizeof(page));
 	memcpy(page, &redo, sizeof(redo));
+	rc = append_page(timeline, &key, 1, page, version, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
+/* A note whose trailer names another format: the floor cannot be derived. */
+static int
+write_foreign_note(uint32_t timeline, uint64_t version, uint64_t redo)
+{
+	PsKey key = control_key();
+	unsigned char page[8192];
+	int rc;
+
+	ps_lock_shard_wr(ps_shard_of(&key));
+	memset(page, 0, sizeof(page));
+	memcpy(page, &redo, sizeof(redo));
+	ps_artifact_trailer_set(page, 0x41424344u, 7u);
 	rc = append_page(timeline, &key, 1, page, version, NULL);
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc == 0 && ps_storage->sync() == 0;
@@ -332,6 +353,39 @@ test_floor_retires_older_checkpoints(void)
 	configure_core(1);
 	check(ps_core_open(store) == 0, "reopen store after pruning");
 	check(wal_floor(0) == 2800, "WAL floor survives restart after pruning");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * The redo note carries the backend's identity trailer after its value; a
+ * legacy note has none and still counts, a note naming another format or
+ * version makes the floor unknown -- fail closed -- whatever its first eight
+ * bytes say.
+ */
+static void
+test_note_identity_trailer(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-trailer-XXXXXX";
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the note trailer test");
+	check(write_relation(0, 0, 900) && write_note(0, 1000, 800),
+		  "a legacy note without a trailer");
+	check(wal_floor(0) == 800, "a legacy note is a floor source");
+	check(write_relation(0, 0, 1900) && write_control(0, 2000, 1800),
+		  "a checkpoint pair with a stamped note");
+	check(wal_floor(0) == 800, "the stamped note joins the legacy one; the floor is the oldest");
+	close_store();
+
+	configure_core(1);
+	check(ps_core_open(store) == 0, "reopen store");
+	check(wal_floor(0) == 800, "both notes survive a restart");
+	check(write_relation(0, 0, 2900) && write_foreign_note(0, 3000, 100),
+		  "a note whose trailer names another format, at a lower redo");
+	check(wal_floor(0) == UINT64_MAX,
+		  "a note naming another format makes the floor unknown, so nothing is reclaimed on its word");
 	close_store();
 	remove_tree(store);
 }
@@ -1070,6 +1124,7 @@ int
 main(void)
 {
 	test_floor_retires_older_checkpoints();
+	test_note_identity_trailer();
 	test_reader_pin_retains_its_checkpoint();
 	test_branch_cap_retains_its_checkpoint();
 	test_split_pair_is_never_unnoted();

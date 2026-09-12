@@ -74,6 +74,7 @@
 #include "access/multixact_internal.h"
 #include "access/slru.h"
 #include "catalog/pg_control.h"
+#include "pagestore_artifact_format.h"
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "access/xact.h"
@@ -1730,6 +1731,8 @@ ps_slru_wm_publish(void)
 
 		memset(page, 0, sizeof(page));
 		memcpy(page, &w, sizeof(uint64));
+		ps_artifact_trailer_set((unsigned char *) page, PS_SLRU_WATERMARK_MAGIC,
+								PS_SLRU_WATERMARK_VERSION);
 		ps_slru_obj_key(&key, 0);
 		pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_WM, &key, 0, page,
 											 w, PS_SLRU_SHIP_TIMEOUT_MS);
@@ -1873,7 +1876,14 @@ ps_slru_reader_fetch_wm(void)
 												   PG_UINT64_MAX, page, NULL,
 												   PS_SLRU_SHIP_TIMEOUT_MS);
 		if (have_w)
+		{
+			if (ps_artifact_trailer_check((const unsigned char *) page,
+										  PS_SLRU_WATERMARK_MAGIC,
+										  PS_SLRU_WATERMARK_VERSION) != 0)
+				ereport(ERROR,
+						(errmsg("pagestore: the SLRU mirror watermark object carries an identity this build does not know")));
 			memcpy(&w, page, sizeof(uint64));
+		}
 
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
 		{
@@ -1886,6 +1896,11 @@ ps_slru_reader_fetch_wm(void)
 													   &resolved,
 													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) page,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ereport(ERROR,
+							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
 				memcpy(&cutoff, page, sizeof(int64));
 				ps_slru_tomb_note(i, cutoff, resolved);
 			}
@@ -2200,6 +2215,11 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 													   tpage, &tombv,
 													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) tpage,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ereport(ERROR,
+							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
 			}
@@ -2502,6 +2522,11 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 													   tpage, &tombv,
 													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) tpage,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ereport(ERROR,
+							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
 			}
@@ -2741,6 +2766,8 @@ ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
 
 	memset(page, 0, sizeof(page));
 	memcpy(page, &cutoff_page, sizeof(int64));
+	ps_artifact_trailer_set((unsigned char *) page, PS_SLRU_TOMBSTONE_MAGIC,
+							PS_SLRU_TOMBSTONE_VERSION);
 
 	ps_slru_obj_key(&key, obj);
 	pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_TOMB, &key, 0, page,
@@ -3537,6 +3564,11 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 													   ? 2000
 													   : PS_SLRU_SHIP_TIMEOUT_MS))
 			{
+				if (ps_artifact_trailer_check((const unsigned char *) tpage,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ereport(ERROR,
+							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
 				memcpy(&tomb_cut[idx], tpage, sizeof(int64));
 				tomb_ver[idx] = resolved;
 				tomb_valid[idx] = true;
@@ -4098,7 +4130,12 @@ pagestore_slru_tombstone_asof(PG_FUNCTION_ARGS)
 	if (!pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
 										(uint64) lsn, page, NULL))
 		PG_RETURN_NULL();
-	memcpy(&cutoff, page, sizeof(int64));
+	if (ps_artifact_trailer_check((const unsigned char *) page,
+											  PS_SLRU_TOMBSTONE_MAGIC,
+											  PS_SLRU_TOMBSTONE_VERSION) != 0)
+					ereport(ERROR,
+							(errmsg("pagestore: an SLRU truncation tombstone object carries an identity this build does not know")));
+				memcpy(&cutoff, page, sizeof(int64));
 	PG_RETURN_INT64(cutoff);
 }
 

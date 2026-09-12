@@ -1,0 +1,245 @@
+/*-------------------------------------------------------------------------
+ *
+ * pagestore_artifact_format.h
+ *	  The page-store-defined payloads a PostgreSQL compute stores as objects
+ *	  in the daemon: their layouts and identities, in one freestanding header
+ *	  shared by the backend that writes and loads them, the daemon that
+ *	  reads the few it interprets, the fixture workload that seeds them, and
+ *	  pagestore_format_versions, which reports their identities.
+ *
+ * D5 rule 4: these are page-store envelopes -- the store wraps them like any
+ * page, but their bytes are ours, not PostgreSQL's -- so each carries an
+ * identity a fixture can pin.  Three of them were bare values (a
+ * checkpoint-redo LSN, a watermark, a truncation cutoff) that consumers
+ * memcpy out of byte 0 of the object; they keep that value at byte 0, where
+ * every existing reader finds it, and gain an identity trailer at byte 8 --
+ * magic and version -- which a legacy object leaves zero.  The others already
+ * carried a magic and version; their layouts are restated here so a
+ * freestanding client can write and check them.
+ *
+ * Every field is stored in the writing host's byte order, as the backend's
+ * structs are; the store does not move objects between byte orders.
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef PAGESTORE_ARTIFACT_FORMAT_H
+#define PAGESTORE_ARTIFACT_FORMAT_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+/* ---- control object (PS_KLASS_CONTROL, object 0) -------------------- */
+
+/* block 0: the ControlFileData image (PostgreSQL's; not versioned here) */
+
+/*
+ * block 1: the retention "floor note" -- the checkpoint redo of the image
+ * shipped at the same version.  Value at 0; identity trailer at 8.
+ */
+#define PS_REDO_NOTE_BLOCK			1u
+#define PS_REDO_NOTE_MAGIC			0x4e525350u	/* "PSRN" */
+#define PS_REDO_NOTE_VERSION		1u
+
+/* block 2: the admission fence (PS_ADMISSION_FENCE_* in pagestore_ipc.h) */
+
+/* block 3: the materializer's durable materialized-through marker */
+#define PS_MATERIALIZER_MARKER_BLOCK	3u
+#define PS_MATERIALIZER_MARKER_MAGIC	0x50534d57u	/* "PSMW" */
+#define PS_MATERIALIZER_MARKER_VERSION	2u
+
+typedef struct PsMaterializerMarkerFormat
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	timeline;
+	uint32_t	pad;
+	uint64_t	materialized_lsn;
+	uint64_t	materialized_lsn_complement;
+} PsMaterializerMarkerFormat;
+
+/* block 4: the materializer's release of a materialized checkpoint */
+#define PS_MATERIALIZER_RELEASE_BLOCK	4u
+#define PS_MATERIALIZER_RELEASE_MAGIC	0x50534d52u	/* "PSMR" */
+#define PS_MATERIALIZER_RELEASE_VERSION	2u
+
+typedef struct PsMaterializerReleaseFormat
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	timeline;
+	uint32_t	pad;
+	uint64_t	materialized_lsn;
+	uint64_t	materialized_lsn_complement;
+	uint64_t	checkpoint_lsn;
+	uint64_t	checkpoint_lsn_complement;
+} PsMaterializerReleaseFormat;
+
+/* block 5: the writer's declared checkpoint for branch preparation */
+#define PS_WRITER_CHECKPOINT_BLOCK		5u
+#define PS_WRITER_CHECKPOINT_MAGIC		0x50535743u	/* "PSWC" */
+#define PS_WRITER_CHECKPOINT_VERSION	1u
+
+typedef struct PsWriterCheckpointFormat
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	timeline;
+	uint32_t	pad;
+	uint64_t	checkpoint_lsn;
+	uint64_t	checkpoint_lsn_complement;
+} PsWriterCheckpointFormat;
+
+/* ---- SLRU mirror objects ---------------------------------------------- */
+
+/* PS_KLASS_SLRU_WM, object 0, block 0: the mirror's visibility watermark
+ * (a uint64 LSN at 0); PS_KLASS_SLRU_TOMB, per SLRU object, block 0: the
+ * truncation cutoff page (an int64 at 0).  Identity trailer at 8. */
+#define PS_SLRU_WATERMARK_MAGIC		0x4d575350u	/* "PSWM" */
+#define PS_SLRU_WATERMARK_VERSION	1u
+#define PS_SLRU_TOMBSTONE_MAGIC		0x42545350u	/* "PSTB" */
+#define PS_SLRU_TOMBSTONE_VERSION	1u
+
+/* ---- reader snapshot objects (PS_KLASS_READER_SNAPSHOT) ---------------- */
+
+#define PS_READER_SNAPSHOT_MANIFEST_OBJECT	0u
+#define PS_READER_SNAPSHOT_DATA_OBJECT		1u
+#define PS_READER_SNAPSHOT_READY_OBJECT		2u
+#define PS_READER_RELMAP_OBJECT				3u
+#define PS_READER_DATABASE_BARRIER_OBJECT	4u
+
+#define PS_READER_SNAPSHOT_MAGIC			0x50535253u	/* "PSRS" */
+#define PS_READER_SNAPSHOT_FORMAT			1u
+#define PS_READER_SNAPSHOT_MANIFEST_MAGIC	0x5053524du	/* "PSRM" */
+#define PS_READER_SNAPSHOT_MANIFEST_FORMAT	2u
+#define PS_READER_RELMAP_MAGIC				0x5053524cu	/* "PSRL" */
+#define PS_READER_RELMAP_FORMAT				1u
+#define PS_READER_DATABASE_BARRIER_MAGIC	0x50535242u	/* "PSRB" */
+#define PS_READER_DATABASE_BARRIER_FORMAT	3u
+
+/* the snapshot header (object 1, and the ready record of object 2); the
+ * data object continues with count TransactionIds (uint32) */
+typedef struct PsReaderSnapshotHeaderFormat
+{
+	uint64_t	read_lsn;
+	uint32_t	magic;
+	uint32_t	format;
+	uint32_t	timeline;
+	uint32_t	count;
+	uint32_t	xmin;
+	uint32_t	xmax;
+	uint32_t	crc;			/* CRC-32C of the header with crc zero, then the xids */
+	uint32_t	reserved;
+} PsReaderSnapshotHeaderFormat;
+
+typedef struct PsReaderSnapshotReadyFormat
+{
+	PsReaderSnapshotHeaderFormat header;
+	uint32_t	block_count;
+	uint32_t	reserved;
+	uint32_t	crc;			/* CRC-32C of the bytes before it */
+} PsReaderSnapshotReadyFormat;
+
+typedef struct PsReaderSnapshotManifestFormat
+{
+	uint64_t	read_lsn;
+	uint64_t	artifact_size;
+	uint32_t	magic;
+	uint32_t	format;
+	uint32_t	timeline;
+	uint32_t	block_count;
+	uint32_t	artifact_crc;
+	uint32_t	global_relmap_crc;
+	uint32_t	local_relmap_crc;
+	uint32_t	crc;			/* CRC-32C of the bytes before it */
+} PsReaderSnapshotManifestFormat;
+
+typedef struct PsReaderRelmapFormat
+{
+	uint32_t	magic;
+	uint32_t	format;
+	uint32_t	dbid;
+	uint32_t	tsid;
+	uint32_t	size;
+	uint32_t	data_crc;		/* CRC-32C of the size bytes of data */
+	uint32_t	crc;			/* CRC-32C of the bytes before it */
+	/* followed by size bytes: a pg_filenode.map, PostgreSQL's */
+} PsReaderRelmapFormat;
+
+typedef struct PsReaderDatabaseBarrierFormat
+{
+	uint64_t	read_lsn;
+	uint32_t	magic;
+	uint32_t	format;
+	uint32_t	timeline;
+	uint32_t	database_count;
+	uint32_t	block_count;
+	uint32_t	crc;			/* CRC-32C of the bytes before it */
+	uint32_t	reserved;
+} PsReaderDatabaseBarrierFormat;
+
+/* ---- the raw-value trailer ---------------------------------------------- */
+
+#define PS_ARTIFACT_TRAILER_OFFSET 8u
+
+typedef struct PsArtifactTrailer
+{
+	uint32_t	magic;
+	uint32_t	version;
+} PsArtifactTrailer;
+
+/* Stamp a raw-value object's identity after its value. */
+static inline void
+ps_artifact_trailer_set(unsigned char *page, uint32_t magic, uint32_t version)
+{
+	PsArtifactTrailer trailer;
+
+	trailer.magic = magic;
+	trailer.version = version;
+	memcpy(page + PS_ARTIFACT_TRAILER_OFFSET, &trailer, sizeof(trailer));
+}
+
+/*
+ * Check a raw-value object's identity.  A zero trailer is a legacy object
+ * that recorded none and is accepted; a trailer naming another format, or a
+ * version this build does not know, is not.  Returns 0 when acceptable.
+ */
+static inline int
+ps_artifact_trailer_check(const unsigned char *page, uint32_t magic,
+						  uint32_t version)
+{
+	PsArtifactTrailer trailer;
+
+	memcpy(&trailer, page + PS_ARTIFACT_TRAILER_OFFSET, sizeof(trailer));
+	if (trailer.magic == 0 && trailer.version == 0)
+		return 0;
+	return trailer.magic == magic && trailer.version == version ? 0 : -1;
+}
+
+/* ---- CRC-32C, as PostgreSQL's pg_crc32c computes it -------------------- */
+
+/*
+ * The reader objects are checksummed with PostgreSQL's CRC-32C (Castagnoli
+ * polynomial, initial value and final inversion of 0xFFFFFFFF).  A
+ * freestanding client that seeds them needs the same function; this is the
+ * bytewise form of the algorithm, checked against pg_crc32c by the backend
+ * test that links both.
+ */
+static inline uint32_t
+ps_crc32c_update(uint32_t crc, const void *data, size_t len)
+{
+	const unsigned char *p = (const unsigned char *) data;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		crc ^= p[i];
+		for (int bit = 0; bit < 8; bit++)
+			crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
+	}
+	return crc;
+}
+
+#define PS_CRC32C_INIT 0xffffffffu
+#define PS_CRC32C_FIN(crc) ((crc) ^ 0xffffffffu)
+
+#endif							/* PAGESTORE_ARTIFACT_FORMAT_H */

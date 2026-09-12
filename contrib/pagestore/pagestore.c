@@ -70,6 +70,7 @@
 #include "pagestore_backend.h"
 #include "pagestore_fault.h"
 #include "pagestore_ipc.h"
+#include "pagestore_artifact_format.h"
 #include "pagestore_materializer_marker.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
@@ -145,12 +146,9 @@ static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL
 static bool pagestore_portable_install_faults = false;
 static bool pagestore_portable_install_faults_owned = false;
 
-#define PS_MATERIALIZER_MARKER_MAGIC		0x50534d57
-#define PS_MATERIALIZER_MARKER_VERSION	2
-#define PS_MATERIALIZER_MARKER_BLOCK		3
-#define PS_MATERIALIZER_RELEASE_MAGIC		0x50534d52
-#define PS_MATERIALIZER_RELEASE_VERSION	2
-#define PS_MATERIALIZER_RELEASE_BLOCK		4
+/* The marker and release blocks' identities and layouts are the shared
+ * pagestore_artifact_format.h's (PS_MATERIALIZER_*); the structs below must
+ * stay byte-identical to the format structs there. */
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS \
 	PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS
 #define PS_MATERIALIZER_RETENTION_RESOURCES \
@@ -179,6 +177,11 @@ typedef struct PsMaterializerRelease
 	uint64		checkpoint_lsn;
 	uint64		checkpoint_lsn_complement;
 } PsMaterializerRelease;
+
+StaticAssertDecl(sizeof(PsMaterializerMarker) == sizeof(PsMaterializerMarkerFormat),
+				 "materializer marker layout must match pagestore_artifact_format.h");
+StaticAssertDecl(sizeof(PsMaterializerRelease) == sizeof(PsMaterializerReleaseFormat),
+				 "materializer release layout must match pagestore_artifact_format.h");
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static CmdType pagestore_current_command_type = CMD_UNKNOWN;
 static bool pagestore_current_has_modifying_cte = false;
@@ -7063,8 +7066,8 @@ pagestore_publish_artifact(const char *target_dir, const char *filename,
 	}
 }
 
-#define PAGESTORE_READER_SNAPSHOT_MAGIC UINT32_C(0x50535253)
-#define PAGESTORE_READER_SNAPSHOT_FORMAT 1
+#define PAGESTORE_READER_SNAPSHOT_MAGIC PS_READER_SNAPSHOT_MAGIC
+#define PAGESTORE_READER_SNAPSHOT_FORMAT PS_READER_SNAPSHOT_FORMAT
 #define PAGESTORE_READER_SNAPSHOT_FILE "pagestore_reader.snapshot"
 #define PAGESTORE_READER_MAP_PENDING_FILE ".pagestore-reader-map-pending"
 #define PAGESTORE_READER_CATALOG_MAGIC UINT32_C(0x50534350)
@@ -7101,8 +7104,8 @@ typedef struct PagestoreReaderSnapshot
 	TransactionId *xids;
 } PagestoreReaderSnapshot;
 
-#define PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC UINT32_C(0x5053524D)
-#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 2
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC PS_READER_SNAPSHOT_MANIFEST_MAGIC
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT PS_READER_SNAPSHOT_MANIFEST_FORMAT
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
 #define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
 #define PAGESTORE_READER_SNAPSHOT_READY_OBJECT 2
@@ -7110,8 +7113,8 @@ typedef struct PagestoreReaderSnapshot
 #define PAGESTORE_READER_DATABASE_BARRIER_OBJECT 4
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
 
-#define PAGESTORE_READER_RELMAP_MAGIC UINT32_C(0x5053524C)
-#define PAGESTORE_READER_RELMAP_FORMAT 1
+#define PAGESTORE_READER_RELMAP_MAGIC PS_READER_RELMAP_MAGIC
+#define PAGESTORE_READER_RELMAP_FORMAT PS_READER_RELMAP_FORMAT
 #define PAGESTORE_READER_RELMAP_MAX_SIZE \
 	(BLCKSZ - MAXALIGN(sizeof(PagestoreReaderRelmap)))
 
@@ -7164,8 +7167,8 @@ typedef struct PagestoreReaderSnapshotManifest
 	pg_crc32c	crc;
 } PagestoreReaderSnapshotManifest;
 
-#define PAGESTORE_READER_DATABASE_BARRIER_MAGIC UINT32_C(0x50535242)
-#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT 3
+#define PAGESTORE_READER_DATABASE_BARRIER_MAGIC PS_READER_DATABASE_BARRIER_MAGIC
+#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT PS_READER_DATABASE_BARRIER_FORMAT
 typedef struct PagestoreReaderDatabaseEntry
 {
 	Oid			database_oid;

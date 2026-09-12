@@ -63,6 +63,7 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "utils/memutils.h"
+#include "pagestore_artifact_format.h"
 #include "pagestore_backend.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
@@ -95,10 +96,7 @@
  */
 #define PS_CONTROL_DRAIN_BUDGET_MS	30000
 
-#define PS_WRITER_CHECKPOINT_MAGIC	0x50535743
-#define PS_WRITER_CHECKPOINT_VERSION	1
-#define PS_WRITER_CHECKPOINT_BLOCK	5
-
+/* identity and layout from the shared pagestore_artifact_format.h */
 typedef struct PsWriterCheckpoint
 {
 	uint32		magic;
@@ -108,6 +106,9 @@ typedef struct PsWriterCheckpoint
 	uint64		checkpoint_lsn;
 	uint64		checkpoint_lsn_complement;
 } PsWriterCheckpoint;
+
+StaticAssertDecl(sizeof(PsWriterCheckpoint) == sizeof(PsWriterCheckpointFormat),
+				 "writer checkpoint layout must match pagestore_artifact_format.h");
 
 typedef struct PsControlPending
 {
@@ -266,6 +267,9 @@ ps_control_drain(void)
 			 */
 			memset(page, 0, sizeof(page));
 			memcpy(page, &p->image.checkPointCopy.redo, sizeof(XLogRecPtr));
+			/* the value stays at 0 for every reader; the identity follows it */
+			ps_artifact_trailer_set((unsigned char *) page, PS_REDO_NOTE_MAGIC,
+									PS_REDO_NOTE_VERSION);
 			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
 													  1, page,
 													  (uint64) p->update_lsn,
