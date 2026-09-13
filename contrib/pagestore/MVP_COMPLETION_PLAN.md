@@ -747,13 +747,12 @@ Expected scope: one or two PRs.
 Status: **soak in CI and scheduled nightly; every persisted category the
 soak's owner mix exercises is proven bounded on CI-sized and 6000/8000-round
 runs, the operational cutoff no longer needs a page-history owner, and
-SLRU-class and reader-artifact versions follow the relation plan.  One
-documented limitation stays open: the newest artifact generation at or below
-the floor is retained even after the object it describes is dropped, because
-the publication protocol emits no durable drop event, so churn of artifact
-keys (a reader snapshot per dropped database, say) accumulates one surviving
-generation per removed object, which the soak's fixed/advancing readers do
-not exercise**.
+SLRU-class and reader-artifact versions follow the relation plan. The artifact
+lifecycle follow-up adds completion intervals and durable drop
+events, so dropped objects' last data generations can be reclaimed after their
+retained dependencies disappear. Small lifecycle metadata tombstones remain;
+the fixed-key soak is not a proof of bounded metadata for unbounded distinct
+keys. See `ARTIFACT_LIFECYCLE.md` for the protocol and deterministic validation**.
 
 `pagestore_soak_test` is the acceptance harness.  It plays every retention
 role over the daemon protocol: a WAL-shipping writer with a bounded live set

@@ -372,6 +372,13 @@ handle_request(PsChannel *ch)
 
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
+	if (ch->key.klass == PS_KLASS_ARTIFACT ||
+		((ch->key.klass == PS_KLASS_SLRU || ch->key.klass == PS_KLASS_READER_SNAPSHOT) &&
+		 ch->opcode == PS_OP_WRITEV && ch->nblocks != 1))
+	{
+		ch->status = PS_STATUS_ERROR;
+		return;
+	}
 	if ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV ||
 		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READ_AT) &&
 		!ps_timeline_request_allowed(tl, ch->incarnation))
@@ -385,19 +392,31 @@ handle_request(PsChannel *ch)
 
 	switch ((PsOpcode) ch->opcode)
 	{
+		case PS_OP_ARTIFACT_BEGIN:
+			if (ps_artifact_begin(tl, &ch->key, ch->req_lsn, &ch->req_seq) != 0)
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_ARTIFACT_COMMIT:
+			if (ps_artifact_commit(tl, &ch->key, ch->req_lsn, ch->req_seq, ch->nblocks) != 0)
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_ARTIFACT_DROP:
+			if (ps_artifact_drop(tl, &ch->key, ch->req_lsn) != 0)
+				ch->status = PS_STATUS_ERROR;
+			break;
 		case PS_OP_EXTEND:
 			/* append_page grows the fork with the page's exact LSN */
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data,
-							ch->req_lsn, &ch->req_seq) != 0)
+			if (ps_artifact_write(tl, &ch->key, ch->blocknum, ch->data,
+							ch->req_lsn, ch->req_seq, &ch->req_seq) != 0)
 				ch->status = PS_STATUS_ERROR;
 			break;
 
 		case PS_OP_WRITEV:
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
-				if (append_page(tl, &ch->key, ch->blocknum + i,
+				if (ps_artifact_write(tl, &ch->key, ch->blocknum + i,
 								ch->data + (size_t) i * page_size,
-								 ch->req_lsn, &ch->req_seq) != 0)
+								 ch->req_lsn, ch->req_seq, &ch->req_seq) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
@@ -513,6 +532,9 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_CREATE_BRANCH:
 		case PS_OP_BEGIN_DELETE:
 		case PS_OP_EXTEND:
+		case PS_OP_ARTIFACT_BEGIN:
+		case PS_OP_ARTIFACT_COMMIT:
+		case PS_OP_ARTIFACT_DROP:
 		case PS_OP_WRITEV:
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_INDEX_ADD:
@@ -561,6 +583,9 @@ request_is_mutation(const PsChannel *ch)
 		case PS_OP_CREATE_BRANCH:
 		case PS_OP_BEGIN_DELETE:
 		case PS_OP_EXTEND:
+		case PS_OP_ARTIFACT_BEGIN:
+		case PS_OP_ARTIFACT_COMMIT:
+		case PS_OP_ARTIFACT_DROP:
 		case PS_OP_WRITEV:
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_INDEX_ADD:
@@ -586,6 +611,12 @@ request_backpressure_mask(const PsChannel *ch)
 {
 	uint32_t mask;
 
+	/* Publication and retirement close the intervals that can hold history.
+	 * Throttling these control records behind that debt can prevent catch-up. */
+	if (ch->opcode == PS_OP_ARTIFACT_BEGIN || ch->opcode == PS_OP_ARTIFACT_COMMIT ||
+		ch->opcode == PS_OP_ARTIFACT_DROP)
+		return 0;
+
 	if (!request_is_mutation(ch))
 		return 0;
 	mask = PS_BACKPRESSURE_PAGE | PS_BACKPRESSURE_WAL |
@@ -597,6 +628,9 @@ request_backpressure_mask(const PsChannel *ch)
 		case PS_OP_TRUNCATE:
 		case PS_OP_ZEROEXTEND:
 		case PS_OP_EXTEND:
+		case PS_OP_ARTIFACT_BEGIN:
+		case PS_OP_ARTIFACT_COMMIT:
+		case PS_OP_ARTIFACT_DROP:
 		case PS_OP_WRITEV:
 			mask |= PS_BACKPRESSURE_FORKMETA;
 			break;

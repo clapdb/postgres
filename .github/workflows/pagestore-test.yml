@@ -98,6 +98,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_snapshot_test pagestore_forkmeta_snapshot_test.c pagestore_forkmeta_snapshot.c -lrt
           cc -O2 -Wall -Wextra -Werror -o storage_posix_wal_test storage_posix_wal_test.c storage_posix.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_control_prune_test pagestore_control_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_artifact_lifecycle_test pagestore_artifact_lifecycle_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_lifecycle_prune_test pagestore_lifecycle_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_wal_reclaim_core_test pagestore_wal_reclaim_core_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
@@ -188,6 +189,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
+                    fixtures/posix-artifact-lifecycle \
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \
@@ -259,6 +261,12 @@ jobs:
       - name: Run flat-WAL prefix rewrite unit test
         working-directory: contrib/pagestore
         run: ./storage_posix_wal_test
+
+      - name: Run artifact publication and drop tests
+        working-directory: contrib/pagestore
+        run: |
+          ./pagestore_artifact_lifecycle_test
+          PAGESTORE_ARTIFACT_TEST_READER=1 ./pagestore_artifact_lifecycle_test
 
       - name: Run control-object retention unit test
         working-directory: contrib/pagestore
@@ -406,6 +414,7 @@ jobs:
                     contrib/pagestore/fixtures/posix-forkmeta-crc \
                     contrib/pagestore/fixtures/posix-wal-payload-identity \
                     contrib/pagestore/fixtures/posix-backend-objects \
+                    contrib/pagestore/fixtures/posix-artifact-lifecycle \
             --daemon-binary build/contrib/pagestore/pagestore_daemon \
             --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
             --inspect-binary build/contrib/pagestore/pagestore_inspect \

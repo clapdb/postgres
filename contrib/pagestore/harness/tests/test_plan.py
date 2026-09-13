@@ -32,7 +32,7 @@ CAPABILITIES = {
     "postgres_major": [13, 14, 15, 16, 17, 18, 19],
     "runtimes": {
         "daemon_smoke": {
-            "operations": ["crash"], "protocol_version": 46,
+            "operations": ["crash"], "protocol_version": 47,
             "page_size": 8192, "io_unit": 262144,
             "constraints": {
                 "crash": {
@@ -1084,7 +1084,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 46, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 47, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -1237,7 +1237,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         root = Path(directory.name) / "failure"
         health = {
-            "protocol_version": 46, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 47, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -1499,7 +1499,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":46,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":47,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "*) exit 1 ;;\n"
@@ -2474,7 +2474,7 @@ class PlanValidationTests(unittest.TestCase):
     def test_runtime_requires_advertised_inspection_operations(self):
         path = self.write_plan([self.header()])
         health = {
-            "protocol_version": 46, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 47, "page_size": 8192, "io_unit": 262144,
             "nshards": 1,
         }
         schema = {"implemented_operations": ["health"]}
@@ -2491,7 +2491,7 @@ class PlanValidationTests(unittest.TestCase):
             "#!/bin/sh\n"
             "case \"$3\" in\n"
             "health) printf '%s\\n' '"
-            "{\"protocol_version\":46,\"page_size\":8192,\"io_unit\":262144,"
+            "{\"protocol_version\":47,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -2685,7 +2685,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":46,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":47,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -2790,7 +2790,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":46,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":47,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"

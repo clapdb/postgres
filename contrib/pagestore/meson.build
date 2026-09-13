@@ -375,6 +375,31 @@ test('pagestore_control_prune',
   timeout: 60,
 )
 
+pagestore_artifact_lifecycle_test = executable('pagestore_artifact_lifecycle_test',
+  files('pagestore_artifact_lifecycle_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_artifact_lifecycle',
+  pagestore_artifact_lifecycle_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+test('pagestore_artifact_lifecycle_reader',
+  pagestore_artifact_lifecycle_test,
+  env: ['PAGESTORE_ARTIFACT_TEST_READER=1'],
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Bounded fork-lifecycle history: invalidated page versions leave image
 # layers, and forkmeta compaction keeps only base, fence, and growth per
 # horizon plus the fences a retained version or indexed record still needs.
@@ -757,6 +782,7 @@ test('pagestore_persisted_format_fixture',
          meson.current_source_dir() / 'fixtures' / 'posix-forkmeta-crc',
          meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
          meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
+         meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
          '--daemon-binary', pagestore_daemon,
          '--client-binary', pagestore_gc_crash_client,
          '--inspect-binary', pagestore_inspect,

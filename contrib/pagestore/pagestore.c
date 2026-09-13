@@ -3051,6 +3051,7 @@ slru_scan_snapshot(const char *slru, PsSlruPageConsumer consume, void *arg)
 typedef struct PsSlruDirectContext
 {
 	XLogRecPtr	cutoff;
+	uint64 token;
 } PsSlruDirectContext;
 
 static void
@@ -3061,8 +3062,8 @@ slru_publish_page(const char *slru, BlockNumber pageno, const char *page,
 	PageStoreRelKey key;
 
 	slru_obj_key(&key, slru);
-	pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, pageno, page,
-								 (uint64) context->cutoff);
+	pagestore_localsvc_artifact_write(PS_KLASS_SLRU, &key, pageno, page,
+		(uint64) context->cutoff, context->token, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 }
 
 typedef struct PsSlruStagePage
@@ -3106,9 +3107,19 @@ slru_stage_page(const char *slru, BlockNumber pageno, const char *page,
 static void
 slru_publish_stage(File file, int64 pages, XLogRecPtr cutoff)
 {
-	PsSlruDirectContext context = {.cutoff = cutoff};
+	PsSlruDirectContext contexts[lengthof(ps_slru_dirs)];
+	uint32 counts[lengthof(ps_slru_dirs)] = {0};
 	PsSlruStagePage staged;
-	pgoff_t		offset = 0;
+	pgoff_t offset = 0;
+
+	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
+	{
+		PageStoreRelKey key;
+		slru_obj_key(&key, ps_slru_dirs[i]);
+		contexts[i].cutoff = cutoff;
+		contexts[i].token = pagestore_localsvc_artifact_begin(PS_KLASS_SLRU,
+			&key, cutoff, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	}
 
 	for (int64 i = 0; i < pages; i++)
 	{
@@ -3127,9 +3138,18 @@ slru_publish_stage(File file, int64 pages, XLogRecPtr cutoff)
 		if (staged.dir_index >= lengthof(ps_slru_dirs))
 			elog(ERROR, "invalid staged pagestore SLRU directory index");
 		slru_publish_page(ps_slru_dirs[staged.dir_index], staged.pageno,
-						  staged.page, &context);
+						  staged.page, &contexts[staged.dir_index]);
+		counts[staged.dir_index]++;
 		offset += sizeof(staged);
 	}
+	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
+	{
+		PageStoreRelKey key;
+		slru_obj_key(&key, ps_slru_dirs[i]);
+		pagestore_localsvc_artifact_commit(PS_KLASS_SLRU, &key, cutoff,
+			contexts[i].token, counts[i], PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	}
+
 }
 
 /*
@@ -3151,12 +3171,18 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 	XLogRecPtr	cutoff = PG_GETARG_LSN(1);
 	PsSlruDirectContext context = {.cutoff = cutoff};
 	int64		shipped;
+	PageStoreRelKey key;
 
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
+	slru_obj_key(&key, slru);
+	context.token = pagestore_localsvc_artifact_begin(PS_KLASS_SLRU, &key,
+		cutoff, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	shipped = slru_scan_snapshot(slru, slru_publish_page, &context);
 
+	pagestore_localsvc_artifact_commit(PS_KLASS_SLRU, &key, cutoff,
+		context.token, (uint32) shipped, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	PG_RETURN_INT64(shipped);
 }
 
@@ -7458,6 +7484,25 @@ pagestore_reader_snapshot_key(uint32 object, Oid dbid)
 	return key;
 }
 
+/* A global manifest must have identical bytes regardless of which database
+ * publishes it. It is complete on its first publication, never a placeholder. */
+static void
+pagestore_publish_global_reader_manifest(const PagestoreReaderSnapshotManifest *manifest)
+{
+	PagestoreReaderSnapshotManifest global = *manifest;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+	char page[BLCKSZ];
+
+	global.local_relmap_crc = 0;
+	pagestore_reader_snapshot_manifest_crc(&global);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &global, sizeof(global));
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, (uint64) global.read_lsn, 0,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+}
+
 static bool
 pagestore_database_reader_manifest_ready(Oid dbid, XLogRecPtr read_lsn)
 {
@@ -7810,7 +7855,42 @@ pagestore_publish_reader_database_barrier(List *databases, XLogRecPtr read_lsn)
 	char	   *artifact;
 	char		page[BLCKSZ];
 	Size		artifact_size;
-	BlockNumber nblocks;
+	uint64 token;
+
+	/* Retire keys absent from the new catalog set before replacing the old
+	 * barrier. A crash leaves the old inventory available for idempotent retry.
+	 * The launcher holds pg_database's ShareLock through this operation. */
+	{
+		uint64 old_lsn = 0;
+		PagestoreReaderDatabaseBarrier old;
+		PagestoreReaderDatabaseEntry *entries = NULL;
+		if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, PG_UINT64_MAX, page, &old_lsn,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) && old_lsn < read_lsn)
+		{
+			if (!pagestore_load_reader_database_barrier(old_lsn, &old, &entries))
+				ereport(ERROR, (errmsg("could not read previous artifact database inventory")));
+			for (uint32 i = 0; i < old.database_count; i++)
+			{
+				bool found = false;
+				ListCell *lc;
+				foreach(lc, databases)
+					if (((PagestoreReaderDatabaseEntry *) lfirst(lc))->database_oid == entries[i].database_oid)
+						found = true;
+				if (!found)
+				{
+					PageStoreRelKey removed = pagestore_reader_snapshot_key(
+						PAGESTORE_READER_RELMAP_OBJECT, entries[i].database_oid);
+					pagestore_localsvc_artifact_drop(PS_KLASS_READER_SNAPSHOT,
+						&removed, read_lsn, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+					removed.relNumber = PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT;
+					pagestore_localsvc_artifact_drop(PS_KLASS_READER_SNAPSHOT,
+						&removed, read_lsn, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+				}
+			}
+			pfree(entries);
+		}
+	}
 
 	memset(&barrier, 0, sizeof(barrier));
 	if (list_length(databases) >
@@ -7842,9 +7922,8 @@ pagestore_publish_reader_database_barrier(List *databases, XLogRecPtr read_lsn)
 			  artifact_size - sizeof(barrier));
 	FIN_CRC32C(barrier.crc);
 	memcpy(artifact, &barrier, sizeof(barrier));
-	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-		PS_KLASS_READER_SNAPSHOT, &key,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	token = pagestore_localsvc_artifact_begin(PS_KLASS_READER_SNAPSHOT,
+		&key, (uint64) read_lsn, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 	for (BlockNumber block = 0; block < barrier.block_count; block++)
 	{
 		Size offset = (Size) block * BLCKSZ;
@@ -7852,14 +7931,12 @@ pagestore_publish_reader_database_barrier(List *databases, XLogRecPtr read_lsn)
 
 		memset(page, 0, sizeof(page));
 		memcpy(page, artifact + offset, chunk);
-		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-			&key, block, page, (uint64) read_lsn, nblocks,
+		pagestore_localsvc_artifact_write(PS_KLASS_READER_SNAPSHOT,
+			&key, block, page, (uint64) read_lsn, token,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-		if (block >= nblocks)
-			nblocks = block + 1;
 	}
-	pagestore_localsvc_store_sync_timeout(
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_artifact_commit(PS_KLASS_READER_SNAPSHOT,
+		&key, (uint64) read_lsn, token, barrier.block_count, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 	pfree(artifact);
 }
 
@@ -8426,7 +8503,7 @@ pagestore_publish_reader_snapshot_data(PagestoreReaderSnapshot *snapshot)
 	Size		xids_size;
 	Size		artifact_size;
 	BlockNumber block_count;
-	BlockNumber nblocks;
+	uint64 token;
 
 	xids_size = snapshot->header.count * sizeof(TransactionId);
 	artifact_size = sizeof(snapshot->header) + xids_size;
@@ -8438,9 +8515,8 @@ pagestore_publish_reader_snapshot_data(PagestoreReaderSnapshot *snapshot)
 
 	data_key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_DATA_OBJECT, InvalidOid);
-	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-		PS_KLASS_READER_SNAPSHOT, &data_key,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	token = pagestore_localsvc_artifact_begin(PS_KLASS_READER_SNAPSHOT,
+		&data_key, (uint64) snapshot->header.read_lsn, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 	for (BlockNumber block = 0; block < block_count; block++)
 	{
 		Size		offset = (Size) block * BLCKSZ;
@@ -8448,15 +8524,13 @@ pagestore_publish_reader_snapshot_data(PagestoreReaderSnapshot *snapshot)
 
 		memset(page, 0, sizeof(page));
 		memcpy(page, artifact + offset, chunk);
-		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		pagestore_localsvc_artifact_write(PS_KLASS_READER_SNAPSHOT,
 			&data_key, block, page,
-			(uint64) snapshot->header.read_lsn, nblocks,
+			(uint64) snapshot->header.read_lsn, token,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-		if (block >= nblocks)
-			nblocks = block + 1;
 	}
-	pagestore_localsvc_store_sync_timeout(
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_artifact_commit(PS_KLASS_READER_SNAPSHOT,
+		&data_key, (uint64) snapshot->header.read_lsn, token, block_count, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 	pfree(artifact);
 	return block_count;
 }
@@ -8569,7 +8643,6 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 	{
 		PagestoreReaderSnapshot snapshot;
 		PagestoreReaderSnapshotReady ready;
-		PagestoreReaderSnapshotManifest manifest;
 		PageStoreRelKey key;
 		char		page[BLCKSZ];
 		TransactionId *xids;
@@ -8661,39 +8734,9 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		pagestore_reader_snapshot_crc(&snapshot.header, xids);
 		blocks = pagestore_publish_reader_snapshot_data(&snapshot);
 
-		/*
-		 * Publish a database-independent manifest before READY.  A backend can
-		 * be forked after the reader pin advances but before DatabasePath is
-		 * available; this exact-R global artifact lets it adopt safely during
-		 * catalog startup.  The database worker later adds the local relmap CRC.
-		 */
-		memset(&manifest, 0, sizeof(manifest));
-		manifest.read_lsn = read_lsn;
-		manifest.artifact_size = sizeof(snapshot.header) +
-			(Size) snapshot.header.count * sizeof(TransactionId);
-		manifest.magic = PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC;
-		manifest.format = PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT;
-		manifest.timeline = pagestore_localsvc_timeline();
-		manifest.block_count = blocks;
-		manifest.artifact_crc = snapshot.header.crc;
-		/* READY is database-independent staging.  The database workers prime
-		 * and validate the exact-R global map together with each local map before
-		 * publishing adoption manifests and the all-database barrier. */
-		manifest.global_relmap_crc = 0;
-		pagestore_reader_snapshot_manifest_crc(&manifest);
-		memset(page, 0, sizeof(page));
-		memcpy(page, &manifest, sizeof(manifest));
-		key = pagestore_reader_snapshot_key(
-			PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
-		nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-			PS_KLASS_READER_SNAPSHOT, &key,
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-			&key, 0, page, (uint64) read_lsn, nblocks,
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-		pagestore_localsvc_store_sync_timeout(
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-
+		/* READY stages the database-independent snapshot. Database workers
+		 * publish the final global manifest after validating the exact-R map,
+		 * before the all-database barrier permits reader adoption. */
 		memset(&ready, 0, sizeof(ready));
 		ready.header = snapshot.header;
 		ready.block_count = blocks;
@@ -8935,17 +8978,7 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
-	/* READY deliberately carries no relmap checksum.  Once a database worker
-	 * has primed the exact-R global map, replace the global manifest first so
-	 * backends can validate the database-independent snapshot header. */
-	key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
-	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-		PS_KLASS_READER_SNAPSHOT, &key,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-		&key, 0, page, resolved, nblocks,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_publish_global_reader_manifest(&manifest);
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	{
@@ -9011,14 +9044,7 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
-	manifest_key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
-	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-		PS_KLASS_READER_SNAPSHOT, &manifest_key,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-		&manifest_key, 0, page, (uint64) read_lsn, nblocks,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_publish_global_reader_manifest(&manifest);
 	manifest_key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	nblocks = pagestore_localsvc_obj_write_prepare_timeout(

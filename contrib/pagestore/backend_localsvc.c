@@ -1879,16 +1879,17 @@ pagestore_localsvc_obj_write_timeout(uint32 klass, const PageStoreRelKey *key,
  * between the two phases.  Returns the object's current block count, to be
  * passed to _post.
  */
-BlockNumber
-pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
+static BlockNumber
+ls_obj_write_prepare_legacy(uint32 klass,
 											 const PageStoreRelKey *key,
 											 int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
-													(uint32) localsvc_timeline);
+	PsChannel *ch;
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("object write");
+
+	ch = ls_chan_for_key_klass_stamped(key, klass, (uint32) localsvc_timeline);
 
 	/* ensure the object's fork exists (tolerate an existing one) */
 	ch->key.klass = klass;
@@ -1903,6 +1904,79 @@ pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 	return (BlockNumber) ch->result;
 }
 
+BlockNumber
+pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
+											 const PageStoreRelKey *key,
+											 int timeout_ms)
+{
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("object write");
+	/* BEGIN owns creation. Defer legacy diagnostics until post supplies
+	 * version zero, so a failed first publication cannot expose an empty fork. */
+	if (klass == PS_KLASS_SLRU || klass == PS_KLASS_READER_SNAPSHOT)
+		return 0;
+	return ls_obj_write_prepare_legacy(klass, key, timeout_ms);
+}
+
+static PsChannel *
+ls_artifact_channel(uint32 klass, const PageStoreRelKey *key, uint64 version)
+{
+	PsChannel *ch;
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("artifact mutation");
+	ch = ls_chan_for_key_klass_stamped(key, klass, (uint32) localsvc_timeline);
+	ch->key.klass = klass;
+	ch->req_lsn = version;
+	ch->req_seq = 0;
+	return ch;
+}
+
+uint64
+pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, int timeout_ms)
+{
+	PsChannel *ch = ls_artifact_channel(klass, key, version);
+	ch->opcode = PS_OP_ARTIFACT_BEGIN;
+	ls_exec_timeout(ch, timeout_ms);
+	return ch->req_seq;
+}
+
+void
+pagestore_localsvc_artifact_commit(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, uint64 token, uint32 count, int timeout_ms)
+{
+	PsChannel *ch = ls_artifact_channel(klass, key, version);
+	ch->opcode = PS_OP_ARTIFACT_COMMIT;
+	ch->req_seq = token;
+	ch->nblocks = count;
+	ls_exec_timeout(ch, timeout_ms);
+}
+
+void
+pagestore_localsvc_artifact_drop(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, int timeout_ms)
+{
+	PsChannel *ch = ls_artifact_channel(klass, key, version);
+	ch->opcode = PS_OP_ARTIFACT_DROP;
+	ls_exec_timeout(ch, timeout_ms);
+}
+
+uint64
+pagestore_localsvc_artifact_write(uint32 klass, const PageStoreRelKey *key,
+	BlockNumber block, const void *page, uint64 version, uint64 token, int timeout_ms)
+{
+	PsChannel *ch = ls_artifact_channel(klass, key, version);
+	ch->opcode = PS_OP_EXTEND;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->skip_fsync = 0;
+	ch->req_seq = token;
+	memcpy(ch->data, page, BLCKSZ);
+	ls_exec_timeout(ch, timeout_ms);
+	return ch->req_seq;
+}
+
 uint64
 pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 										  const PageStoreRelKey *key,
@@ -1910,7 +1984,22 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 										  uint64 version, BlockNumber nb,
 										  int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
+	PsChannel *ch;
+
+	/* Single-page artifacts publish atomically. Multi-page producers use the
+	 * explicit begin/write/commit API around the whole object. */
+	if (version != 0 && (klass == PS_KLASS_SLRU || klass == PS_KLASS_READER_SNAPSHOT))
+	{
+		uint64 token = pagestore_localsvc_artifact_begin(klass, key, version, timeout_ms);
+		uint64 seq = pagestore_localsvc_artifact_write(klass, key, block, page,
+			version, token, timeout_ms);
+		pagestore_localsvc_artifact_commit(klass, key, version, token, 1, timeout_ms);
+		return seq;
+	}
+	/* Only unversioned diagnostic writes retain the legacy fork protocol. */
+	if (klass == PS_KLASS_SLRU || klass == PS_KLASS_READER_SNAPSHOT)
+		nb = ls_obj_write_prepare_legacy(klass, key, timeout_ms);
+	ch = ls_chan_for_key_klass_stamped(key, klass,
 													(uint32) localsvc_timeline);
 
 	if (localsvc_read_lsn != 0)
@@ -1928,6 +2017,7 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 	 * as-of an LSN >= that version; ignored for relations (pd_lsn).
 	 */
 	ch->req_lsn = version;
+	ch->req_seq = 0;
 	memcpy(ch->data, page, BLCKSZ);
 	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_seq;

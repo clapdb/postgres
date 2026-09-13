@@ -97,6 +97,8 @@ static int tier_one_layer(void);
 static int finish_upload(const PsLayerDesc *candidate);
 static int map_locks_ready;
 static int core_opened;
+static int artifact_io_failed;
+static uint64_t artifact_recovery_seq;
 static pid_t core_pid;
 
 /* A fork inherits mutexes and buffered mutations, not a usable core instance.
@@ -105,6 +107,7 @@ static int
 core_process_valid(void)
 {
 	pid_t pid = __atomic_load_n(&core_pid, __ATOMIC_ACQUIRE);
+
 
 	if (pid != 0 && pid != getpid())
 	{
@@ -403,6 +406,14 @@ static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS]
 static int page_frontier_load(const char *store_dir);
 static void page_prune_mark_all_due_locked(void);
 static int key_eq(const PsKey *a, const PsKey *b);
+static int append_page_raw(uint32_t timeline, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq);
+typedef struct ArtifactPruneCache ArtifactPruneCache;
+static void artifact_prune_cache_free(ArtifactPruneCache *cache);
+static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
+	uint32_t block, const PsPruneVersion *versions, uint32_t nversions,
+	uint64_t floor, const PsPruneFence *fences, uint32_t nfences,
+	unsigned char *keep, ArtifactPruneCache **cache);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
 static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -1770,10 +1781,10 @@ layer_matches_read_shard(const PsLayerDesc *layer, uint32_t shard)
 		(layer->legacy_shard_zero && layer_shard == 0 && shard != 0);
 }
 
-/* The shard count is persisted as a decimal number with no header, so its
- * schema number is what a fixture pins: a different representation must bump
- * it and ship a fixture that carries the new one. */
-#define PS_STORE_SHARD_COUNT_SCHEMA 1
+/* PSS2 is also the minimum-reader fence for artifact lifecycle semantics.
+ * Old daemons only accept a decimal count and therefore refuse these stores.
+ * Publish the upgraded identity before serving any new artifact operations. */
+#define PS_STORE_SHARD_COUNT_SCHEMA 2
 
 static int
 store_shard_count_path(const char *store_dir, char *path, size_t path_len)
@@ -1816,7 +1827,8 @@ publish_store_shard_count(const char *store_dir)
 	f = fopen(tmp, "w");
 	if (f == NULL)
 		return -1;
-	if (fprintf(f, "%u\n", current) < 0 || fflush(f) != 0 ||
+	if (fprintf(f, "PSS2 %u %08x\n", current,
+		~ps_crc32c_update(UINT32_MAX, &current, sizeof(current))) < 0 || fflush(f) != 0 ||
 		fsync(fileno(f)) != 0)
 	{
 		fclose(f);
@@ -1912,9 +1924,23 @@ validate_store_shard_count(const char *store_dir, int *publish_needed)
 	f = fopen(path, "r");
 	if (f != NULL)
 	{
-		if (fscanf(f, "%u", &persisted) == 1 && persisted > 0 &&
-			persisted <= PS_MAX_CHANNELS)
-			have_persisted = 1;
+		char line[80];
+		char extra;
+		unsigned int checksum;
+		int legacy = 0;
+
+		if (fgets(line, sizeof(line), f) != NULL && fgetc(f) == EOF)
+		{
+			if (sscanf(line, "PSS2 %u %x %c", &persisted, &checksum, &extra) == 2)
+				have_persisted = checksum ==
+					~ps_crc32c_update(UINT32_MAX, &persisted, sizeof(persisted));
+			else if (sscanf(line, "%u %c", &persisted, &extra) == 1)
+				legacy = have_persisted = 1;
+		}
+		if (persisted == 0 || persisted > PS_MAX_CHANNELS)
+			have_persisted = 0;
+		if (legacy)
+			*publish_needed = 1;
 		fclose(f);
 		if (!have_persisted)
 			return -1;
@@ -2730,6 +2756,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint64_t   *obj_required = NULL;
 	uint32_t	obj_nrequired = 0;
 	uint32_t	obj_hi = 0;
+	ArtifactPruneCache *artifact_cache = NULL;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
@@ -2759,6 +2786,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		free(obj_required);
 		free(fences);
 		free(control_fences);
+		artifact_prune_cache_free(artifact_cache);
 		return -1;
 	}
 	for (uint32_t i = 0; i < *nrec; i++)
@@ -2773,6 +2801,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	for (uint32_t first = 0; first < *nrec;)
 	{
 		uint32_t end = first + 1;
+		int artifact_plan;
 
 		while (end < *nrec && compact_same_page(&order[first], &order[end]))
 			end++;
@@ -2786,6 +2815,19 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		 * an older SLRU base even when its ordinary relation pages have
 		 * advanced.  Keep all SLRU and reader-snapshot versions until their
 		 * dedicated retention protocols prove them reclaimable. */
+		for (uint32_t i = first; i < end; i++)
+			versions[i - first] = order[i].version;
+		artifact_plan = artifact_prune_versions(timeline, &order[first].key,
+			order[first].block, versions, end - first, floor, fences, nfences, keep, &artifact_cache);
+		if (artifact_plan < 0)
+			memset(keep, 1, end - first); /* Unavailable proof never authorizes GC. */
+		if (artifact_plan != 0)
+		{
+			out = compact_emit_grouped(order, first, end, keep, recs,
+				selected, out, dropped, &ndropped);
+			first = end;
+			continue;
+		}
 		if (order[first].key.klass != PS_KLASS_RELATION &&
 			order[first].key.klass != PS_KLASS_CONTROL)
 		{
@@ -2926,6 +2968,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(obj_required);
 				free(fences);
 				free(control_fences);
+				artifact_prune_cache_free(artifact_cache);
 				return -1;
 			}
 			{
@@ -2953,6 +2996,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			free(dropped);
 			free(fences);
 			free(control_fences);
+			artifact_prune_cache_free(artifact_cache);
 			return -1;
 		}
 		else
@@ -2978,6 +3022,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	free(selected);
 	free(fences);
 	free(control_fences);
+	artifact_prune_cache_free(artifact_cache);
 	*nrec = out;
 	*dropped_out = dropped;
 	*ndropped_out = ndropped;
@@ -3482,6 +3527,7 @@ typedef struct PageEnt
 	PageVer    *vers;			/* dynamic array, length nver, capacity cap */
 	int			nver;
 	int			cap;
+	uint64_t artifact_attempt_seq; /* last live attempt to count this block */
 } PageEnt;
 
 /* Hash entry: the block count of one fork on one timeline. */
@@ -3536,6 +3582,9 @@ typedef struct ForkEnt
 	uint64_t	last_page_lsn;	/* newest durable local page tuple */
 	uint64_t	last_page_seq;
 	int			has_wal_less;	/* at least one page version has lsn 0 */
+	uint64_t artifact_attempt_seq;
+	uint64_t artifact_page_count;
+	uint32_t artifact_nblocks;
 } ForkEnt;
 
 static void artifact_fence_reset(void);
@@ -6008,6 +6057,8 @@ branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
 		timelines[tl].branch_lsn == branch_lsn;
 }
 
+#include "pagestore_artifact_lifecycle.inc"
+
 /*
  * Resolve a read by walking the timeline ancestry: return the newest version of
  * (key, block) visible at read_lsn on 'timeline'; if the timeline never wrote
@@ -6033,6 +6084,12 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 			FORK_HOP_NONE;
 		PageEnt    *e = page_find(w.tl, key, block);
 		PageVer    *v = e ? page_visible(e, w.lsn, seq_cap) : NULL;
+		if (artifact_data_key(key))
+		{
+			int state = artifact_visible(w.tl, key, block, w.lsn, seq_cap, &v, 1);
+			if (state < 0 || state == 2)
+				return NULL;
+		}
 
 		if (v)
 		{
@@ -7038,7 +7095,7 @@ fork_meta_ordered_marker_valid(const ForkMetaRecV2 *rec,
 
 	return (bound || unbound) && fork_meta_rec_wire_valid(rec) &&
 		rec->timeline < MAX_TIMELINES &&
-		rec->key.klass <= PS_KLASS_READER_SNAPSHOT &&
+		rec->key.klass <= PS_KLASS_ARTIFACT &&
 		rec->nblocks != 0 &&
 		((bound && rec->order_id != 0 &&
 		  (allow_zero_bound_seq || rec->admission_seq != 0)) ||
@@ -7064,7 +7121,7 @@ fork_meta_snapshot_record_valid(const ForkMetaRecV2 *records, uint64_t index,
 
 	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
-		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
+		rec->key.klass > PS_KLASS_ARTIFACT ||
 		(!ordered_marker && (rec->kind > FEV_DEAD || rec->order_id != 0)) ||
 		(ordered_marker && !fork_meta_ordered_marker_valid(rec, 1)) ||
 		(rec->kind == FEV_DEAD && rec->nblocks != 0))
@@ -7298,7 +7355,7 @@ fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
 {
 	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
-		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
+		rec->key.klass > PS_KLASS_ARTIFACT ||
 		rec->admission_seq == 0 ||
 		!fork_meta_event_future(rec->lsn, rec->admission_seq,
 								fork_meta_snapshot_cutoff_lsn,
@@ -7370,7 +7427,7 @@ fork_meta_source_conflicts_with_snapshot(void)
 			int			legacy_read = ps_storage->fork_meta_read(off, &old, sizeof(old));
 
 			if (legacy_read != (int) sizeof(old) || old.timeline >= MAX_TIMELINES ||
-				old.key.klass > PS_KLASS_READER_SNAPSHOT ||
+				old.key.klass > PS_KLASS_ARTIFACT ||
 				old.kind > FEV_SEG_COMMIT_BOUND)
 			{
 				fprintf(stderr, "pagestore: forkmeta source epoch record at %llu is "
@@ -11505,7 +11562,7 @@ fork_meta_source_record_valid(const ForkMetaRecV2 *rec)
 
 	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
-		rec->key.klass > PS_KLASS_READER_SNAPSHOT)
+		rec->key.klass > PS_KLASS_ARTIFACT)
 		return 0;
 	ordered_marker = rec->kind >= FEV_SEG_GROW &&
 		rec->kind <= FEV_SEG_COMMIT_BOUND;
@@ -11560,7 +11617,7 @@ fork_meta_source_has_timeline(uint32_t target)
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
 			if (nread != (int) sizeof(rec) || first >= MAX_TIMELINES ||
 				rec.timeline >= MAX_TIMELINES ||
-				rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
+				rec.key.klass > PS_KLASS_ARTIFACT ||
 				rec.kind > FEV_DEAD ||
 				(rec.kind == FEV_DEAD && rec.nblocks != 0) ||
 				rec.pad[0] != 0 || rec.pad[1] != 0 || rec.pad[2] != 0)
@@ -14104,6 +14161,13 @@ static int append_page_impl(uint32_t timeline, const PsKey *key,
 
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq)
+{
+	return ps_artifact_write(timeline, key, block, page, version, 0, out_admission_seq);
+}
+
+static int
+append_page_raw(uint32_t timeline, const PsKey *key, uint32_t block,
 			const unsigned char *page, uint64_t version,
 			uint64_t *out_admission_seq)
 {
@@ -14193,7 +14257,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	else if (key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_CONTROL ||
 			 key->klass == PS_KLASS_SLRU_LIVE || key->klass == PS_KLASS_SLRU_TOMB ||
 			 key->klass == PS_KLASS_SLRU_WM ||
-			 key->klass == PS_KLASS_READER_SNAPSHOT)
+			 key->klass == PS_KLASS_READER_SNAPSHOT || key->klass == PS_KLASS_ARTIFACT)
 		hdr.lsn = version;
 	else
 	{
@@ -14682,6 +14746,21 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 				FORK_HOP_NONE;
 			e = page_find(tl, key, block);
 			pv = e ? page_visible(e, rl, seq_cap) : NULL;
+			if (artifact_data_key(key))
+			{
+				int state = artifact_visible(tl, key, block, rl, seq_cap, &pv, 0);
+				if (state < 0)
+					return -1;
+				if (state == 2)
+					return 0;
+			}
+			/* Storage lookup must select the same committed tuple even if a
+			 * newer attempt at the same LSN has staged bytes. */
+			if (pv && artifact_data_key(key))
+			{
+				rl = pv->lsn;
+				seq_cap = pv->admission_seq;
+			}
 
 		if (pv)
 		{
@@ -17053,6 +17132,18 @@ ps_handle_meta(PsChannel *ch)
 		return 1;
 	}
 
+	/* A managed artifact can only be replaced through a completed interval,
+	 * and only DROP supplies its logical death. Legacy fork mutations must
+	 * not invalidate committed bytes behind the publication protocol. */
+	if (artifact_data_key(&ch->key) &&
+		(ch->opcode == PS_OP_UNLINK || ch->opcode == PS_OP_TRUNCATE ||
+		 ch->opcode == PS_OP_ZEROEXTEND || (ch->opcode == PS_OP_CREATE && !ch->is_redo)) &&
+		artifact_has_protocol(tl, &ch->key))
+	{
+		ch->status = PS_STATUS_ERROR;
+		return 1;
+	}
+
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_CREATE:
@@ -17137,6 +17228,19 @@ ps_handle_meta(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 				break;
 			}
+			if (artifact_data_key(&ch->key))
+			{
+				int exists;
+				uint32_t nblocks;
+
+				if (artifact_metadata(tl, &ch->key,
+					ch->req_lsn ? ch->req_lsn : UINT64_MAX, ch->req_seq,
+					&exists, &nblocks) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = ch->opcode == PS_OP_EXISTS ? (uint32_t) exists : nblocks;
+				break;
+			}
 			ch->result = fork_exists_through(tl, &ch->key,
 										 ch->req_lsn ? ch->req_lsn : UINT64_MAX,
 										 ch->req_seq) ? 1 : 0;
@@ -17204,6 +17308,19 @@ ps_handle_meta(PsChannel *ch)
 				fork_has_wal_less_page(tl, &ch->key))
 			{
 				ch->status = PS_STATUS_ERROR;
+				break;
+			}
+			if (artifact_data_key(&ch->key))
+			{
+				int exists;
+				uint32_t nblocks;
+
+				if (artifact_metadata(tl, &ch->key,
+					ch->req_lsn ? ch->req_lsn : UINT64_MAX, ch->req_seq,
+					&exists, &nblocks) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = ch->opcode == PS_OP_EXISTS ? (uint32_t) exists : nblocks;
 				break;
 			}
 			ch->result = ch->is_redo ?
@@ -18956,11 +19073,21 @@ ps_core_open(const char *store_dir)
 	int save_errno;
 	int storage_opened = 0;
 
+	/* Lifecycle recovery and publication both copy a complete fixed record.
+	 * Validate before opening storage, including for callers without a CLI. */
+	if (page_size < sizeof(PsArtifactLifecycle))
+	{
+		errno = EINVAL;
+		return -1;
+	}
 	if (!core_process_valid())
 		return -1;
 	pthread_mutex_lock(&core_state_lock);
 	__atomic_store_n(&core_pid, getpid(), __ATOMIC_RELEASE);
+	__atomic_store_n(&artifact_io_failed, 0, __ATOMIC_RELEASE);
 	rc = ps_core_open_impl(store_dir, &storage_opened);
+	if (rc == 0)
+		artifact_recovery_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
 	if (rc != 0)
 	{
 		/* Provider opens own the store lease.  Unwind all lifecycle refs on every
@@ -19385,6 +19512,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		if (recover(sh) != 0)
 			return -1;
 	}
+	if (artifact_validate_recovery() != 0)
+		return -1;
 	/* Retention mutations may have committed immediately before shutdown.
 	 * Conservatively revisit every nonempty layer set after recovery. */
 	page_prune_mark_all_due();
@@ -19494,7 +19623,7 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		 WALIDX_PROGRESS_MAGIC, 0},
 		/* Headerless persisted configuration: the schema number stands in
 		 * for a magic, which is why it reports zero. */
-		{"store_config", ".pagestore-nshards decimal shard count", 0,
+		{"store_config", ".pagestore-nshards PSS2 checked shard count (legacy decimal accepted)", 0,
 		 PS_STORE_SHARD_COUNT_SCHEMA},
 	};
 

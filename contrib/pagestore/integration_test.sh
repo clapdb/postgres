@@ -2238,6 +2238,30 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_rel_nblocks_asof('unlogged_t', 0, pg_current_wal_lsn()) > 0;")" "t" \
 	"an unlogged table's WAL-less growth raises the store's newest size"
 
+# A removed database emits durable artifact drops, while an old reader's
+# horizon still resolves byte-identical manifest and relmap generations.
+artifact_db_oid=$($P -c "SELECT oid FROM pg_database WHERE datname='reader_aux';")
+artifact_old_lsn=$($P -c "SELECT pagestore_retention_owner_lsn(0,1,8001,1);")
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8801,1,7,'$artifact_old_lsn');")" "0" \
+	"pin the database artifacts before deletion"
+artifact_probe="$BUILD/contrib/pagestore/pagestore_gc_crash_client"
+artifact_before=$("$artifact_probe" --reader-artifacts "$SHM" "$artifact_db_oid" "$artifact_old_lsn" present)
+assert "$?" "0" "database artifacts exist before DROP DATABASE"
+$P -v ON_ERROR_STOP=1 -c "DROP DATABASE reader_aux;" >/dev/null
+$P -v ON_ERROR_STOP=1 -c "CHECKPOINT;" >/dev/null
+artifact_dropped=0
+for _ in $(seq 1 60); do
+	if "$artifact_probe" --reader-artifacts "$SHM" "$artifact_db_oid" latest absent >/dev/null; then
+		artifact_dropped=1
+		break
+	fi
+	sleep 1
+done
+assert "$artifact_dropped" "1" "database removal retires its manifest and relmap"
+artifact_after=$("$artifact_probe" --reader-artifacts "$SHM" "$artifact_db_oid" "$artifact_old_lsn" present)
+assert "$?" "0" "old reader still resolves dropped database artifacts"
+assert "$artifact_after" "$artifact_before" "retained database artifacts stay byte-identical after drop"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

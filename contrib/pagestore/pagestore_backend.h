@@ -310,6 +310,14 @@ extern void pagestore_localsvc_admission_fence_end(uint64 token);
 extern BlockNumber pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 																 const PageStoreRelKey *key,
 																 int timeout_ms);
+extern uint64 pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, int timeout_ms);
+extern void pagestore_localsvc_artifact_commit(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, uint64 token, uint32 count, int timeout_ms);
+extern void pagestore_localsvc_artifact_drop(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, int timeout_ms);
+extern uint64 pagestore_localsvc_artifact_write(uint32 klass, const PageStoreRelKey *key,
+	BlockNumber block, const void *page, uint64 version, uint64 token, int timeout_ms);
 extern uint64 pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 												  const PageStoreRelKey *key,
 													   BlockNumber block,
