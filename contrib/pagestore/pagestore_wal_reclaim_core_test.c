@@ -58,8 +58,12 @@ remove_tree(const char *path)
 {
 	char command[512];
 
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0)
-		(void) system(command);
+	/* best effort: a store left behind in /tmp is a nuisance, not a failure
+	 * (and the compiler's warn_unused_result on system() is not silenced by
+	 * a void cast) */
+	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0 &&
+		system(command) != 0)
+		fprintf(stderr, "note: could not remove %s\n", path);
 }
 
 static void
@@ -719,7 +723,14 @@ test_dependency_cutoffs(void)
 	/* A materializer pins only WAL resources, but its pin LSN (the redo of its
 	 * last durable restartpoint) is the operational page-history cutoff, so
 	 * the stored base at its own horizon is retained by that same pin and
-	 * authorizes the replacement. */
+	 * may authorize the replacement -- except where the pin coincides with a
+	 * standing horizon: the shipper's progress admits a new WAL-index-only
+	 * owner at exactly its LSN, which would arrive after the materializer
+	 * advanced and the base was retired, so a materializer pinned there
+	 * keeps its FPI-led chain.  (This harness indexes through the whole
+	 * shipped WAL, so the only materializer pin that could free every
+	 * segment is one at the progress; the exception's positive effect is
+	 * not representable here.) */
 	configure_core();
 	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
@@ -728,8 +739,9 @@ test_dependency_cutoffs(void)
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
 					  PS_RETENTION_RESOURCE_WAL |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL) &&
-		  maintenance_until_count(store, 0, 0),
-		  "a materializer's WAL/WAL-index pin authorizes the stored base at its own horizon");
+		  !maintenance_until_count(store, 0, 0) &&
+		  segment_count(store, 0) == 2,
+		  "a materializer pinned at the shipper's progress keeps its FPI-led chain");
 	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
 		  "clear the WAL-index snapshot trigger override after the WAL-only pin");
 	close_store();
