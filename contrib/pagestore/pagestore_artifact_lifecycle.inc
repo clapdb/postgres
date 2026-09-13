@@ -665,8 +665,8 @@ ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn)
 
 		if (artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK, last, &prior, 0) != 0)
 			return -1;
-		if (prior.state == PS_ARTIFACT_DROPPED)
-			return 0;
+		/* A same-LSN DROP cannot replace completed bytes seen by a branch. */
+		return prior.state == PS_ARTIFACT_DROPPED ? 0 : -1;
 	}
 	return artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL);
 }

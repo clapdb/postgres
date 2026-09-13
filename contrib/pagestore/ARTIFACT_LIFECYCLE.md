@@ -69,6 +69,9 @@ READY stages the snapshot; the global manifest is published only after its
 exact-generation relmap checksum is known, before the all-database adoption
 barrier. It omits the database-local relmap checksum, so different database
 workers publish identical global bytes rather than overwrite a placeholder.
+Single-page artifact preparation bypasses legacy CREATE/NBLOCKS: the first
+BEGIN is the creation boundary, so a failed initial publication cannot expose
+a legacy empty fork.
 Empty SLRU snapshots publish complete zero-page generations and can be retried
 at the same cutoff. The four SLRU banks are separate objects; the capture API
 returns its cutoff only after every bank is complete, retaining the existing
@@ -76,7 +79,8 @@ paused-materializer/control identity checks.
 
 ## Drop and reuse
 
-DROP durably records absence at a supplied LSN. Repeating that drop is
+DROP durably records absence at a supplied LSN strictly later than the latest
+completed generation. Repeating that drop is
 idempotent. It hides the object at and above the drop horizon while readers and
 branches below that boundary keep their complete generations. An older writer
 cannot resurrect it. A new generation strictly after the drop can reuse the
@@ -162,7 +166,7 @@ release-qualification work remains in `RELEASE_VALIDATION.md`.
 ### Validation for this change (2026-09-13)
 
 The cassert-enabled Meson build passed. Both lifecycle variants passed all
-60 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
+61 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
 control-prune, lifecycle-prune, retention, GC, forkmeta-snapshot, WAL-reclaim
 and harness-plan tests passed. PostgreSQL integration (including database
 retirement), MVP golden and independent branch boot passed. All five persisted

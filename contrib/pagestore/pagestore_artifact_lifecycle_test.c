@@ -274,6 +274,8 @@ main(int argc, char **argv)
 	check(write_page(300, token, 0, 0x34) != 0 &&
 		  write_page(300, token, 0, 0x33) == 0 && commit(300, token, 1) == 0 &&
 		  read_value(1, UINT64_MAX, 0, 0x33), "same-LSN retry cannot change branch bytes after restart");
+	check(drop(300) != 0 && read_value(0, 300, 0, 0x33) &&
+		read_value(1, UINT64_MAX, 0, 0x33), "same-LSN DROP cannot change a frozen view");
 	check(drop(400) == 0 && drop(400) == 0, "durable drop is idempotent");
 	check(metadata_matches(0, 0, 0, 0, 0) && metadata_matches(0, 300, 0, 1, 1) &&
 		  metadata_matches(1, 0, 0, 1, 1), "drop metadata respects history and ancestry");

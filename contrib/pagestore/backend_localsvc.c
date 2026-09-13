@@ -1879,16 +1879,17 @@ pagestore_localsvc_obj_write_timeout(uint32 klass, const PageStoreRelKey *key,
  * between the two phases.  Returns the object's current block count, to be
  * passed to _post.
  */
-BlockNumber
-pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
+static BlockNumber
+ls_obj_write_prepare_legacy(uint32 klass,
 											 const PageStoreRelKey *key,
 											 int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
-													(uint32) localsvc_timeline);
+	PsChannel *ch;
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("object write");
+
+	ch = ls_chan_for_key_klass_stamped(key, klass, (uint32) localsvc_timeline);
 
 	/* ensure the object's fork exists (tolerate an existing one) */
 	ch->key.klass = klass;
@@ -1901,6 +1902,20 @@ pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 	ch->opcode = PS_OP_NBLOCKS;
 	ls_exec_timeout(ch, timeout_ms);
 	return (BlockNumber) ch->result;
+}
+
+BlockNumber
+pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
+											 const PageStoreRelKey *key,
+											 int timeout_ms)
+{
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("object write");
+	/* BEGIN owns creation. Defer legacy diagnostics until post supplies
+	 * version zero, so a failed first publication cannot expose an empty fork. */
+	if (klass == PS_KLASS_SLRU || klass == PS_KLASS_READER_SNAPSHOT)
+		return 0;
+	return ls_obj_write_prepare_legacy(klass, key, timeout_ms);
 }
 
 static PsChannel *
@@ -1981,6 +1996,9 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 		pagestore_localsvc_artifact_commit(klass, key, version, token, 1, timeout_ms);
 		return seq;
 	}
+	/* Only unversioned diagnostic writes retain the legacy fork protocol. */
+	if (klass == PS_KLASS_SLRU || klass == PS_KLASS_READER_SNAPSHOT)
+		nb = ls_obj_write_prepare_legacy(klass, key, timeout_ms);
 	ch = ls_chan_for_key_klass_stamped(key, klass,
 													(uint32) localsvc_timeline);
 
