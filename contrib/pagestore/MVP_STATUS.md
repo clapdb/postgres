@@ -368,7 +368,7 @@ watermark still cannot substitute for the proven capture API: its newest-image
 contract deliberately permits bytes newer than its completeness floor and is
 therefore unsafe as an exact branch seed.
 
-### 4. Retention-driven space reclamation -- implemented for local POSIX; dropped artifacts keep one generation
+### 4. Retention-driven space reclamation -- implemented for local POSIX; artifact publication and drop are durable
 
 Segment GC removes page-log segments covered by image layers, and image
 compaction now bounds retained page-version history.  `retention.meta` is the
@@ -581,20 +581,17 @@ control era once its reader is gone.  The live mirror, tombstones, and watermark
 horizon by their consumer and at the fork point by a branch, so they keep
 only the newest version and the newest at or below each fence.  Retried
 copies collapse to one, and a retired artifact releases the control era it
-fenced (`pagestore_control_prune_test`).  One limitation is deliberate and
-documented: a generation is defined by the pages that carry its LSN, and
-nothing marks a publication complete, so a publication that appends some
-pages and then fails is indistinguishable from an object that shrank.  Such a
-partial generation supersedes the complete one below it, and a consumer at
-that cutoff then fails to reconstruct rather than silently reading a stale
-page from the older generation.  Making the newer generation wait for a
-durable completion marker is part of the artifact-publication protocol, not
-of retention.  The same missing lifecycle shows at object granularity: the
-newest generation at or below the floor is the replay base for every horizon
-above it, so it is kept even when the object it describes is gone (a reader
-snapshot of a dropped database publishes no newer generation of that key).
-Retiring it needs a durable drop event for the artifact, which the
-publication protocol does not emit yet.
+fenced (`pagestore_control_prune_test`).  Exact-generation artifacts now have a durable publication and retirement
+protocol: BEGIN fences a write attempt, COMMIT selects only its fully synced
+pages, and DROP records absence without crossing reader or branch retention
+fences. Incomplete generations no longer supersede complete ones, and removed
+databases' manifest/relmap data can be reclaimed after their last dependency
+is released. The launcher retires removed keys before replacing its durable
+database inventory, making interrupted cleanup retryable. Small lifecycle
+metadata tombstones remain to prevent resurrection; this does not promise
+bounded metadata for infinitely many distinct keys. See
+[`ARTIFACT_LIFECYCLE.md`](ARTIFACT_LIFECYCLE.md) for retry, recovery, legacy
+migration and the minimum-reader store format.
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):
@@ -739,7 +736,7 @@ it; the integration test models exactly that.
 
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  Gates 1-4 are implemented for the local POSIX
-deployment, with the dropped-artifact limitation gate 4 documents above;
+deployment, with the artifact lifecycle described in gate 4;
 gate 5 has its crash coverage composed, its concurrency clause closed (the
 crash matrix's concurrent appender at every publication boundary, and the
 composed forkmeta workload's acknowledged-append ledger), and its format

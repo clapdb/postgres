@@ -30,6 +30,34 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Lifecycle records share the data object's shard and ordinary durable page
+ * storage. Block 0 is BEGIN; block 1 is COMMIT or DROP. The enclosing page
+ * version supplies the generation LSN and admission sequence. */
+#define PS_ARTIFACT_LIFECYCLE_MAGIC 0x414c5031u
+#define PS_ARTIFACT_LIFECYCLE_VERSION 1u
+#define PS_ARTIFACT_BEGIN_BLOCK 0u
+#define PS_ARTIFACT_COMMIT_BLOCK 1u
+#define PS_ARTIFACT_COMMITTED 1u
+#define PS_ARTIFACT_DROPPED 2u
+
+typedef struct PsArtifactLifecycle
+{
+	uint32_t magic;
+	uint32_t version;
+	uint64_t begin_seq;
+	uint64_t page_count;
+	uint64_t generation;
+	uint64_t incarnation;
+	uint32_t timeline;
+	uint32_t klass;
+	uint32_t spcOid;
+	uint32_t dbOid;
+	uint32_t relNumber;
+	uint32_t reserved;
+	uint32_t state;
+	uint32_t crc;
+} PsArtifactLifecycle;
+
 /* ---- control object (PS_KLASS_CONTROL, object 0) -------------------- */
 
 /* block 0: the ControlFileData image (PostgreSQL's; not versioned here) */

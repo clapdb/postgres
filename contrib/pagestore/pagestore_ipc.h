@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		46	/* 46: block death as-of query (PS_OP_BLOCK_DEATH);
+#define PS_SHM_VERSION		47	/* 47: artifact publication and drop operations;
+								 * 46: block death as-of query (PS_OP_BLOCK_DEATH);
 								 * 45: relation inspection incarnation fence;
 								 * 44: isolated relation inspection request;
 							 * relation inspection uses an fd lock and
@@ -151,6 +152,9 @@ typedef enum PsOpcode
 	PS_OP_BEGIN_DELETE,			/* durable LIVE -> DELETING transition */
 	PS_OP_TIMELINE_STATE,		/* return lifecycle state/incarnation */
 	PS_OP_BLOCK_DEATH,			/* newest death of (key, blocknum) at/below req_lsn -> req_lsn */
+	PS_OP_ARTIFACT_BEGIN,
+	PS_OP_ARTIFACT_COMMIT,
+	PS_OP_ARTIFACT_DROP,
 } PsOpcode;
 
 typedef enum PsTimelineState
@@ -193,6 +197,7 @@ typedef enum PsObjClass
 								 * other computes trust the live mirror up
 								 * to the newest one and no further */
 	PS_KLASS_READER_SNAPSHOT = 6, /* exact-R running-XID snapshot artifacts */
+	PS_KLASS_ARTIFACT = 7, /* lifecycle records; forkNum names the data class */
 } PsObjClass;
 
 /* Version-neutral object identity (relation forks: mirrors PageStoreRelKey). */
@@ -362,6 +367,14 @@ ps_key_shard(const PsKey *key, uint32_t nshards)
 {
 	if (nshards <= 1)
 		return 0;
+	if (key->klass == PS_KLASS_ARTIFACT)
+	{
+		PsKey data = *key;
+
+		data.klass = (uint32_t) key->forkNum;
+		data.forkNum = 0;
+		return ps_fnv1a32(&data, sizeof(data)) % nshards;
+	}
 	return ps_fnv1a32(key, sizeof(*key)) % nshards;
 }
 

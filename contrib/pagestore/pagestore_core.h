@@ -64,6 +64,14 @@ extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
  * fresh process instead of reopening or flushing inherited mutex/buffer state.
  * On success non-POSIX storage retains caller-owned close.  On failure core
  * closes only providers whose open completed; failed opens clean themselves. */
+/* Artifact operations require the data shard write lock and ordinary admission. */
+extern int ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token);
+extern int ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq);
+extern int ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
+	uint64_t token, uint64_t count);
+extern int ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn);
+
 extern int	ps_core_open(const char *store_dir);
 
 /* Clean-shutdown: flush the memtable into a layer and close the manifest. */

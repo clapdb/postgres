@@ -75,14 +75,15 @@ revision; its result must not be attributed to the final release candidate.
    `pagestore`, but permits a missing build match on release branches; a release
    acceptance run must require that match rather than accept the warning.
 
-Two known implementation limitations also constrain validation claims (see
-MVP status gate 4): artifact generations have no durable publication-complete
-marker, so a partial generation can supersede a complete one and fail
-reconstruction at that cutoff; and artifacts have no durable drop event, so
-the last generation can remain after its described object is gone. Do not
-generalize the present soak result to arbitrary database/artifact churn.
-Production qualification must resolve these limitations or explicitly scope
-and test the supported behavior.
+The two artifact lifecycle gaps identified in the reviewed baseline are
+addressed by the follow-up described in [`ARTIFACT_LIFECYCLE.md`](ARTIFACT_LIFECYCLE.md):
+completion records prevent partial generations from superseding complete ones,
+and durable drops allow removed objects' data to be reclaimed after retained
+dependencies disappear. The follow-up adds deterministic validation; it does
+not replace the proposed endurance work below. Small lifecycle metadata
+remains per object identity, so arbitrary distinct-key churn still needs its
+own resource assessment. The CI links above describe the original reviewed
+revision, not qualification of the follow-up release candidate.
 
 ## Proposed acceptance work
 

@@ -1379,6 +1379,46 @@ fixture_create_branch(uint32_t timeline)
 	return ch->incarnation;
 }
 
+
+/* The fixture includes a complete sparse generation, an interrupted newer
+ * attempt and a dropped object. Reads must use the completion interval. */
+static void
+fixture_artifact_request(PsKey key, uint32_t op, uint64_t lsn, uint64_t token,
+	uint32_t block, uint32_t count, int value, uint64_t *out)
+{
+	PsChannel *ch = ps_channel(shm_base, channel);
+	set_relation(ch);
+	ch->key = key;
+	ch->opcode = op;
+	ch->req_lsn = lsn;
+	ch->req_seq = token;
+	ch->blocknum = block;
+	ch->nblocks = count;
+	memset(ch->data, value, page_size);
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture artifact lifecycle operation failed");
+	if (out) *out = ch->req_seq;
+}
+
+static void
+fixture_artifacts_seed(void)
+{
+	PsKey key = {.klass = PS_KLASS_SLRU, .relNumber = 900};
+	uint64_t token;
+	uint64_t lsn = FIXTURE_WAL_END + 100;
+	fixture_artifact_request(key, PS_OP_ARTIFACT_BEGIN, lsn, 0, 0, 0, 0, &token);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn, token, 0, 1, 0xA1, NULL);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn, token, 2, 1, 0xA2, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_COMMIT, lsn, token, 0, 2, 0, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_BEGIN, lsn + 10, 0, 0, 0, 0, &token);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn + 10, token, 0, 1, 0xB1, NULL);
+	key.relNumber = 901;
+	fixture_artifact_request(key, PS_OP_ARTIFACT_BEGIN, lsn, 0, 0, 0, 0, &token);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn, token, 0, 1, 0xA1, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_COMMIT, lsn, token, 0, 1, 0, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_DROP, lsn + 20, 0, 0, 0, 0, NULL);
+}
+
 static void
 fixture_seed(void)
 {
@@ -1438,6 +1478,7 @@ fixture_seed(void)
 	write_control(1, FIXTURE_WAL_END, FIXTURE_WAL_REDO);
 	/* the backend's other object payloads, one of each */
 	fixture_backend_objects_seed();
+	fixture_artifacts_seed();
 	walidx_batch_and_commit(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
 	/* a live branch with its own page version, and a deleted branch */
 	incarnation = fixture_create_branch(FIXTURE_BRANCH);
@@ -1651,6 +1692,23 @@ fixture_verify(void)
 	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
 	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_REDO)
 		die("fixture WAL retain floor changed");
+	if (!fixture_role_legacy())
+	{
+		PsKey key = {.klass = PS_KLASS_SLRU, .relNumber = 900};
+		set_relation(ch); ch->key = key; ch->opcode = PS_OP_READ_AT;
+		ch->blocknum = 0; ch->req_lsn = UINT64_MAX;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1 ||
+			ch->req_lsn != FIXTURE_WAL_END + 100 || ch->data[0] != 0xA1)
+			die("fixture exposed incomplete artifact generation");
+		set_relation(ch); ch->key = key; ch->opcode = PS_OP_READ_AT;
+		ch->blocknum = 2; ch->req_lsn = UINT64_MAX;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1 || ch->data[0] != 0xA2)
+			die("fixture lost sparse committed artifact page");
+		set_relation(ch); key.relNumber = 901; ch->key = key;
+		ch->opcode = PS_OP_READ_AT; ch->req_lsn = UINT64_MAX; ch->blocknum = 0;
+		if (execute()->status != PS_STATUS_OK || ch->result != 0)
+			die("fixture resurrected dropped artifact");
+	}
 	fixture_wal_check(0);
 	fixture_wal_check(RECLAIM_SEGMENT);
 	/* A fixture seeded before the backend objects were part of it carries
@@ -2646,11 +2704,55 @@ verify(void)
 	free(page);
 }
 
+/* Small read-only oracle used by the real-PG DROP DATABASE integration test. */
+static int
+reader_artifact_probe(const char *name, const char *database, const char *horizon,
+	const char *expected)
+{
+	uint64_t lsn = UINT64_MAX;
+	unsigned int hi, lo;
+	uint32_t objects[] = {PS_READER_SNAPSHOT_MANIFEST_OBJECT, PS_READER_RELMAP_OBJECT};
+	int result = 0;
+	if (strcmp(horizon, "latest") != 0)
+	{
+		if (sscanf(horizon, "%x/%x", &hi, &lo) != 2)
+			return 2;
+		lsn = ((uint64_t) hi << 32) | lo;
+	}
+	attach(name);
+	for (unsigned int i = 0; i < 2; i++)
+	{
+		PsChannel *ch = ps_channel(shm_base, channel);
+		set_relation(ch);
+		memset(&ch->key, 0, sizeof(ch->key));
+		ch->key.klass = PS_KLASS_READER_SNAPSHOT;
+		ch->key.dbOid = (uint32_t) strtoul(database, NULL, 10);
+		ch->key.relNumber = objects[i];
+		ch->opcode = PS_OP_READ_AT;
+		ch->req_lsn = lsn;
+		if (execute()->status != PS_STATUS_OK)
+		{
+			result = 2;
+			break;
+		}
+		if ((ch->result != 0) != (strcmp(expected, "present") == 0))
+			result = 1;
+		if (ch->result != 0)
+			printf("%u %llu %08x\n", objects[i], (unsigned long long) ch->req_lsn,
+				~ps_crc32c_update(UINT32_MAX, ch->data, page_size));
+	}
+	detach();
+	return result;
+}
+
 int
 main(int argc, char **argv)
 {
 	const char *shm = NULL;
 	const char *mode = NULL;
+
+	if (argc == 6 && strcmp(argv[1], "--reader-artifacts") == 0)
+		return reader_artifact_probe(argv[2], argv[3], argv[4], argv[5]);
 
 	for (int i = 1; i < argc; i++)
 	{
