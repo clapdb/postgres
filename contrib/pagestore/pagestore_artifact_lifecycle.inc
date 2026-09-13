@@ -133,36 +133,38 @@ artifact_visible(uint32_t tl, const PsKey *key, uint32_t block,
 	return commit ? (best ? 1 : 2) : 0;
 }
 
-/* Match page visibility for size/existence, including legacy and ancestry.
- * A zero-page COMMIT is an existing empty object; DROP is nonexistence. */
+/*
+ * Match page visibility for size/existence, including legacy and ancestry.
+ * A zero-page COMMIT is an existing empty object; DROP is nonexistence.
+ */
 static int
 artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 				  uint64_t seq_cap, int *exists, uint32_t *nblocks)
 {
-	PsKey meta = artifact_meta_key(key);
-	TlWalk walk = tl_walk_first(tl, horizon);
-	int rc = 0;
+	PsKey		meta = artifact_meta_key(key);
+	TlWalk		walk = tl_walk_first(tl, horizon);
+	int			rc = 0;
 
 	*exists = 0;
 	*nblocks = 0;
 	ps_lock_map_rd();
 	do
 	{
-		PageEnt *commits = page_find(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
-		PageEnt *begins = page_find(walk.tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
-		uint64_t cap = walk.lsn == horizon ? seq_cap : 0;
-		uint64_t lsn = walk.lsn;
-		PageVer *commit = commits ? page_visible(commits, lsn, cap) : NULL;
-		ForkEnt *fork = fork_find(walk.tl, key);
-		uint32_t nb = 0;
-		int state;
+		PageEnt    *commits = page_find(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
+		PageEnt    *begins = page_find(walk.tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
+		uint64_t	cap = walk.lsn == horizon ? seq_cap : 0;
+		uint64_t	lsn = walk.lsn;
+		PageVer    *commit = commits ? page_visible(commits, lsn, cap) : NULL;
+		ForkEnt    *fork = fork_find(walk.tl, key);
+		uint32_t	nb = 0;
+		int			state;
 
 		if (commit)
 		{
 			PsArtifactLifecycle record;
 
 			if (artifact_record(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK,
-				commit, &record, 1) != 0)
+								commit, &record, 1) != 0)
 				rc = -1;
 			else if (record.state == PS_ARTIFACT_COMMITTED)
 			{
@@ -172,11 +174,14 @@ artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 			}
 			break;
 		}
-		/* BEGIN is monotone in LSN. Exclude all subsequent staged growth
-		 * while resolving the legacy fork, including at the same LSN. */
+
+		/*
+		 * BEGIN is monotone in LSN. Exclude all subsequent staged growth
+		 * while resolving the legacy fork, including at the same LSN.
+		 */
 		if (begins)
 		{
-			uint64_t first = artifact_legacy_seq(begins);
+			uint64_t	first = artifact_legacy_seq(begins);
 
 			for (int i = 0; i < begins->nver; i++)
 				if (begins->vers[i].admission_seq == first)
@@ -184,8 +189,12 @@ artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 					if (lsn >= begins->vers[i].lsn)
 					{
 						if (lsn > begins->vers[i].lsn || cap == 0 || cap >= first)
-							/* BEGIN itself has no data-fork event; using its
-							 * nonzero sequence also handles the first store mutation. */
+
+							/*
+							 * BEGIN itself has no data-fork event; using its
+							 * nonzero sequence also handles the first store
+							 * mutation.
+							 */
 							cap = first;
 						lsn = begins->vers[i].lsn;
 					}
@@ -208,23 +217,132 @@ artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 	return rc;
 }
 
+/* One object's decoded intervals, reused by all its page groups in a pass. */
+struct ArtifactPruneCache
+{
+	PsKey		key;
+	int			status;
+	uint64_t	first;
+	PageVer    *begin;
+	int			pending;
+	struct ArtifactPruneInterval
+	{
+		PsPruneVersion version;
+		PsArtifactLifecycle record;
+	}		   *intervals;
+	uint32_t	nintervals;
+	PsPruneFence *legacy;
+	uint32_t	nlegacy;
+};
+
+static void
+artifact_prune_cache_free(ArtifactPruneCache *cache)
+{
+	if (cache)
+	{
+		free(cache->intervals);
+		free(cache->legacy);
+		free(cache);
+	}
+}
+
+static int
+artifact_prune_cache_build(uint32_t tl, const PsKey *data, uint64_t floor,
+						   const PsPruneFence *fences, uint32_t nfences, ArtifactPruneCache **out)
+{
+	PsKey		meta = artifact_meta_key(data);
+	PageEnt    *begins = page_find(tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
+	PageEnt    *commits = page_find(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
+	PageVer    *last = commits ? page_visible(commits, UINT64_MAX, 0) : NULL;
+	uint32_t	n = commits ? (uint32_t) commits->nver : 0;
+	unsigned char *selected;
+	ArtifactPruneCache *cache;
+
+	artifact_prune_cache_free(*out);
+	*out = cache = calloc(1, sizeof(*cache));
+	if (!cache)
+		return -1;
+	cache->key = *data;
+	if (!begins && !commits)
+		return 0;
+	cache->status = -1;
+	cache->first = artifact_legacy_seq(begins);
+	cache->begin = begins ? page_visible(begins, UINT64_MAX, 0) : NULL;
+	cache->pending = cache->begin && cache->begin->admission_seq >= artifact_recovery_seq &&
+		(!last || last->admission_seq < cache->begin->admission_seq);
+	cache->intervals = calloc(n ? n : 1, sizeof(*cache->intervals));
+	cache->legacy = calloc((size_t) nfences + 1, sizeof(*cache->legacy));
+	selected = calloc(n ? n : 1, 1);
+	if (!cache->intervals || !cache->legacy || !selected)
+	{
+		free(selected);
+		return -1;
+	}
+	for (uint32_t i = 0; i < n; i++)
+		selected[i] = commits->vers[i].lsn > floor;
+	for (uint32_t h = 0; h <= nfences; h++)
+	{
+		PsPruneFence horizon = h == 0 ? (PsPruneFence) {floor, 0} : fences[h - 1];
+		PageVer    *commit = commits ? page_visible(commits, horizon.lsn, horizon.admission_seq) : NULL;
+
+		if (commit)
+			selected[commit - commits->vers] = 1;
+		else
+			cache->legacy[cache->nlegacy++] = horizon;
+	}
+	for (uint32_t i = 0; i < n; i++)
+		if (selected[i])
+		{
+			struct ArtifactPruneInterval *interval = &cache->intervals[cache->nintervals++];
+
+			interval->version = (PsPruneVersion)
+			{
+				commits->vers[i].lsn, commits->vers[i].admission_seq
+			};
+			if (artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK,
+								&commits->vers[i], &interval->record, 1) != 0)
+			{
+				free(selected);
+				return -1;
+			}
+		}
+	free(selected);
+	return cache->status = 1;
+}
+
+/* Last input tuple at/below an exact boundary; inputs are already sorted. */
+static int
+artifact_prune_at(const PsPruneVersion *versions, uint32_t n,
+				  uint64_t lsn, uint64_t seq)
+{
+	uint32_t	lo = 0,
+				hi = n;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (versions[mid].lsn < lsn ||
+			(versions[mid].lsn == lsn && (seq == 0 || versions[mid].admission_seq <= seq)))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo == 0 ? -1 : (int) (lo - 1);
+}
+
 /*
- * Called with map-wr during compaction. Keep every selected complete interval
- * above the floor, the floor base and pinned views. Also keep the current
- * process's newest unfinished attempt; recovery makes old attempts abandoned.
+ * Called under map-wr. Decode each retained interval once per object, then
+ * find its page tuple by binary search instead of nested history scans.
  */
 static int
 artifact_prune_versions(uint32_t tl, const PsKey *key, uint32_t block,
 						const PsPruneVersion *versions, uint32_t nversions, uint64_t floor,
-						const PsPruneFence *fences, uint32_t nfences, unsigned char *keep)
+						const PsPruneFence *fences, uint32_t nfences, unsigned char *keep,
+						ArtifactPruneCache **cachep)
 {
 	PsKey		data = *key;
-	PsKey		meta;
-	PageEnt    *begins,
-			   *commits;
-	PageVer    *begin;
-	uint64_t	first;
-	uint32_t nh;
+	ArtifactPruneCache *cache;
 
 	if (key->klass == PS_KLASS_ARTIFACT)
 	{
@@ -233,73 +351,60 @@ artifact_prune_versions(uint32_t tl, const PsKey *key, uint32_t block,
 	}
 	if (!artifact_data_key(&data) || floor == 0)
 		return 0;
-	meta = artifact_meta_key(&data);
-	begins = page_find(tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
-	commits = page_find(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
-	if (!begins && !commits)
-		return 0;
-	first = artifact_legacy_seq(begins);
-	begin = begins ? page_visible(begins, UINT64_MAX, 0) : NULL;
-	nh = 1 + nfences + (commits ? (uint32_t) commits->nver : 0);
+	if (!*cachep || !key_eq(&(*cachep)->key, &data))
+		if (artifact_prune_cache_build(tl, &data, floor, fences, nfences, cachep) < 0)
+			return -1;
+	cache = *cachep;
+	if (cache->status != 1)
+		return cache->status;
 	memset(keep, 0, nversions);
 	for (uint32_t i = 0; i < nversions; i++)
 	{
 		const PsPruneVersion *v = &versions[i];
 
 		if (key->klass == PS_KLASS_ARTIFACT && block == PS_ARTIFACT_BEGIN_BLOCK)
-		{
-			keep[i] = v->admission_seq == first ||
-				(begin && v->admission_seq == begin->admission_seq);
-			continue;
-		}
-		/* Keep a pending attempt until superseded or the daemon restarts. */
-		if (key->klass != PS_KLASS_ARTIFACT && begin &&
-			begin->admission_seq >= artifact_recovery_seq &&
-			v->lsn == begin->lsn && v->admission_seq > begin->admission_seq)
-		{
-			PageVer    *last = commits ? page_visible(commits, UINT64_MAX, 0) : NULL;
+			keep[i] = v->admission_seq == cache->first ||
+				(cache->begin && v->admission_seq == cache->begin->admission_seq);
+		else if (key->klass != PS_KLASS_ARTIFACT)
+			keep[i] = (cache->pending && v->lsn == cache->begin->lsn &&
+					   v->admission_seq > cache->begin->admission_seq) ||
+				(v->admission_seq < cache->first && v->lsn > floor);
+	}
+	if (key->klass == PS_KLASS_ARTIFACT && block == PS_ARTIFACT_BEGIN_BLOCK)
+		return 1;
+	for (uint32_t h = 0; h < cache->nintervals; h++)
+	{
+		const struct ArtifactPruneInterval *interval = &cache->intervals[h];
+		int			i;
 
-			if (!last || last->admission_seq < begin->admission_seq)
+		if (key->klass == PS_KLASS_ARTIFACT)
+		{
+			i = artifact_prune_at(versions, nversions, interval->version.lsn,
+								  interval->version.admission_seq);
+			if (i >= 0 && versions[i].lsn == interval->version.lsn &&
+				versions[i].admission_seq == interval->version.admission_seq)
 				keep[i] = 1;
 		}
-
-		/*
-		 * Every committed generation above the floor is an admissible view;
-		 * below it only the floor and explicit retention fences are needed.
-		 */
-		for (uint32_t h = 0; h < nh && !keep[i]; h++)
+		else if (interval->record.state == PS_ARTIFACT_COMMITTED)
 		{
-			uint64_t	horizon = h == 0 ? floor : h <= nfences ?
-				fences[h - 1].lsn : commits->vers[h - nfences - 1].lsn;
-			uint64_t	cap = h > 0 && h <= nfences ? fences[h - 1].admission_seq : 0;
-
-			if (h > nfences && horizon <= floor)
-				continue;
-			if (key->klass == PS_KLASS_ARTIFACT)
-			{
-				PageVer    *c = commits ? page_visible(commits, horizon, cap) : NULL;
-
-				if (c && c->lsn == v->lsn && c->admission_seq == v->admission_seq)
-					keep[i] = 1;
-			}
-			else
-			{
-				PageVer    *selected = NULL;
-				int			state = artifact_visible(tl, &data, block, horizon, cap,
-													 &selected, 1);
-
-				if (state < 0)
-					return -1;
-				if (selected && selected->lsn == v->lsn &&
-					selected->admission_seq == v->admission_seq)
-					keep[i] = 1;
-			}
+			i = artifact_prune_at(versions, nversions, interval->version.lsn,
+								  interval->version.admission_seq - 1);
+			if (i >= 0 && versions[i].lsn == interval->version.lsn &&
+				versions[i].admission_seq > interval->record.begin_seq)
+				keep[i] = 1;
 		}
-		/* Legacy history above the floor can still have unenumerated views. */
-		if (key->klass != PS_KLASS_ARTIFACT &&
-			v->admission_seq < first && v->lsn > floor)
-			keep[i] = 1;
 	}
+	if (key->klass != PS_KLASS_ARTIFACT)
+		for (uint32_t h = 0; h < cache->nlegacy; h++)
+		{
+			int			i = artifact_prune_at(versions, nversions, cache->legacy[h].lsn,
+											  cache->legacy[h].admission_seq);
+
+			while (i >= 0 && versions[i].admission_seq >= cache->first)
+				i--;
+			if (i >= 0)
+				keep[i] = 1;
+		}
 	return 1;
 }
 
@@ -369,11 +474,22 @@ ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token)
 	last = e ? page_visible(e, UINT64_MAX, 0) : NULL;
 	if (last && lsn < last->lsn)
 		return -1;
+
+	/*
+	 * Completed generations are immutable even for zero-cap readers. A
+	 * same-LSN retry only verifies already durable content; it never replaces
+	 * it.
+	 */
+	if (record.state == PS_ARTIFACT_COMMITTED && record.generation == lsn)
+	{
+		*token = record.begin_seq;
+		return 0;
+	}
 	memset(&record, 0, sizeof(record));
 	if (artifact_store_record(tl, key, PS_ARTIFACT_BEGIN_BLOCK, lsn, &record, token) != 0)
 		return -1;
 	{
-		ForkEnt *fork = fork_get_or_create(tl, key);
+		ForkEnt    *fork = fork_get_or_create(tl, key);
 
 		fork->artifact_attempt_seq = *token;
 		fork->artifact_page_count = 0;
@@ -417,12 +533,30 @@ artifact_has_protocol(uint32_t tl, const PsKey *key)
 	return found;
 }
 
+/* 1 = already complete, 0 = not this completed attempt, -1 = unavailable. */
+static int
+artifact_completed_attempt(uint32_t tl, const PsKey *key, uint64_t lsn,
+						   uint64_t token, PsArtifactLifecycle *record)
+{
+	PsKey		meta = artifact_meta_key(key);
+	PageEnt    *commits = page_find(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
+	PageVer    *last = commits ? page_visible(commits, UINT64_MAX, 0) : NULL;
+
+	if (!last || last->lsn != lsn)
+		return 0;
+	if (artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK, last, record, 0) != 0)
+		return -1;
+	return record->state == PS_ARTIFACT_COMMITTED && record->begin_seq == token;
+}
+
 int
 ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 				  const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq)
 {
-	ForkEnt *fork;
-	PageEnt *entry;
+	ForkEnt    *fork;
+	PageEnt    *entry;
+	PsArtifactLifecycle completed;
+	int			state;
 
 	if (!artifact_data_key(key))
 		return append_page_raw(tl, key, block, page, lsn, seq);
@@ -433,6 +567,28 @@ ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 		if (artifact_has_protocol(tl, key))
 			return -1;
 		return append_page_raw(tl, key, block, page, lsn, seq);
+	}
+	state = artifact_completed_attempt(tl, key, lsn, token, &completed);
+	if (state < 0)
+		return -1;
+	if (state > 0)
+	{
+		unsigned char *durable = malloc(page_size);
+		uint64_t	resolved = 0;
+		int			identical;
+
+		if (!durable)
+			return -1;
+		identical = read_resolve(tl, key, block, lsn, 0, durable, &resolved) == 1 &&
+			resolved == lsn && memcmp(durable, page, page_size) == 0;
+		if (!identical)
+			fprintf(stderr, "pagestore: immutable artifact mismatch tl=%u class=%u db=%u object=%u block=%u lsn=%llu resolved=%llu\n",
+				tl, key->klass, key->dbOid, key->relNumber, block,
+				(unsigned long long) lsn, (unsigned long long) resolved);
+		free(durable);
+		if (identical && seq)
+			*seq = token;
+		return identical ? 0 : -1;
 	}
 	if (block == UINT32_MAX || !artifact_attempt(tl, key, lsn, token))
 		return -1;
@@ -463,10 +619,16 @@ ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	ForkEnt    *fork;
 	PsArtifactLifecycle record = {.begin_seq = token, .page_count = count,
 	.state = PS_ARTIFACT_COMMITTED};
+	PsArtifactLifecycle completed;
+	int			state;
 
 	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE) ||
-		!core_process_valid() || tl >= MAX_TIMELINES || ps_storage->sync_needs_write_lock || !artifact_data_key(key) ||
-		!artifact_attempt(tl, key, lsn, token))
+		!core_process_valid() || tl >= MAX_TIMELINES || ps_storage->sync_needs_write_lock || !artifact_data_key(key))
+		return -1;
+	state = artifact_completed_attempt(tl, key, lsn, token, &completed);
+	if (state != 0)
+		return state > 0 && count == completed.page_count ? 0 : -1;
+	if (!artifact_attempt(tl, key, lsn, token))
 		return -1;
 	fork = fork_find(tl, key);
 	if (!fork || fork->artifact_attempt_seq != token ||

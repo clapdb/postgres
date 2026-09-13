@@ -7484,6 +7484,25 @@ pagestore_reader_snapshot_key(uint32 object, Oid dbid)
 	return key;
 }
 
+/* A global manifest must have identical bytes regardless of which database
+ * publishes it. It is complete on its first publication, never a placeholder. */
+static void
+pagestore_publish_global_reader_manifest(const PagestoreReaderSnapshotManifest *manifest)
+{
+	PagestoreReaderSnapshotManifest global = *manifest;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+	char page[BLCKSZ];
+
+	global.local_relmap_crc = 0;
+	pagestore_reader_snapshot_manifest_crc(&global);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &global, sizeof(global));
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, (uint64) global.read_lsn, 0,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+}
+
 static bool
 pagestore_database_reader_manifest_ready(Oid dbid, XLogRecPtr read_lsn)
 {
@@ -8624,7 +8643,6 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 	{
 		PagestoreReaderSnapshot snapshot;
 		PagestoreReaderSnapshotReady ready;
-		PagestoreReaderSnapshotManifest manifest;
 		PageStoreRelKey key;
 		char		page[BLCKSZ];
 		TransactionId *xids;
@@ -8716,39 +8734,9 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		pagestore_reader_snapshot_crc(&snapshot.header, xids);
 		blocks = pagestore_publish_reader_snapshot_data(&snapshot);
 
-		/*
-		 * Publish a database-independent manifest before READY.  A backend can
-		 * be forked after the reader pin advances but before DatabasePath is
-		 * available; this exact-R global artifact lets it adopt safely during
-		 * catalog startup.  The database worker later adds the local relmap CRC.
-		 */
-		memset(&manifest, 0, sizeof(manifest));
-		manifest.read_lsn = read_lsn;
-		manifest.artifact_size = sizeof(snapshot.header) +
-			(Size) snapshot.header.count * sizeof(TransactionId);
-		manifest.magic = PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC;
-		manifest.format = PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT;
-		manifest.timeline = pagestore_localsvc_timeline();
-		manifest.block_count = blocks;
-		manifest.artifact_crc = snapshot.header.crc;
-		/* READY is database-independent staging.  The database workers prime
-		 * and validate the exact-R global map together with each local map before
-		 * publishing adoption manifests and the all-database barrier. */
-		manifest.global_relmap_crc = 0;
-		pagestore_reader_snapshot_manifest_crc(&manifest);
-		memset(page, 0, sizeof(page));
-		memcpy(page, &manifest, sizeof(manifest));
-		key = pagestore_reader_snapshot_key(
-			PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
-		nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-			PS_KLASS_READER_SNAPSHOT, &key,
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-			&key, 0, page, (uint64) read_lsn, nblocks,
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-		pagestore_localsvc_store_sync_timeout(
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-
+		/* READY stages the database-independent snapshot. Database workers
+		 * publish the final global manifest after validating the exact-R map,
+		 * before the all-database barrier permits reader adoption. */
 		memset(&ready, 0, sizeof(ready));
 		ready.header = snapshot.header;
 		ready.block_count = blocks;
@@ -8990,17 +8978,7 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
-	/* READY deliberately carries no relmap checksum.  Once a database worker
-	 * has primed the exact-R global map, replace the global manifest first so
-	 * backends can validate the database-independent snapshot header. */
-	key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
-	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-		PS_KLASS_READER_SNAPSHOT, &key,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-		&key, 0, page, resolved, nblocks,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_publish_global_reader_manifest(&manifest);
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	{
@@ -9066,14 +9044,7 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
-	manifest_key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
-	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
-		PS_KLASS_READER_SNAPSHOT, &manifest_key,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-		&manifest_key, 0, page, (uint64) read_lsn, nblocks,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_publish_global_reader_manifest(&manifest);
 	manifest_key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	nblocks = pagestore_localsvc_obj_write_prepare_timeout(

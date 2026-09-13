@@ -408,10 +408,12 @@ static void page_prune_mark_all_due_locked(void);
 static int key_eq(const PsKey *a, const PsKey *b);
 static int append_page_raw(uint32_t timeline, const PsKey *key, uint32_t block,
 	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq);
+typedef struct ArtifactPruneCache ArtifactPruneCache;
+static void artifact_prune_cache_free(ArtifactPruneCache *cache);
 static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
 	uint32_t block, const PsPruneVersion *versions, uint32_t nversions,
 	uint64_t floor, const PsPruneFence *fences, uint32_t nfences,
-	unsigned char *keep);
+	unsigned char *keep, ArtifactPruneCache **cache);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
 static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -2754,6 +2756,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint64_t   *obj_required = NULL;
 	uint32_t	obj_nrequired = 0;
 	uint32_t	obj_hi = 0;
+	ArtifactPruneCache *artifact_cache = NULL;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
@@ -2783,6 +2786,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		free(obj_required);
 		free(fences);
 		free(control_fences);
+		artifact_prune_cache_free(artifact_cache);
 		return -1;
 	}
 	for (uint32_t i = 0; i < *nrec; i++)
@@ -2814,7 +2818,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		for (uint32_t i = first; i < end; i++)
 			versions[i - first] = order[i].version;
 		artifact_plan = artifact_prune_versions(timeline, &order[first].key,
-			order[first].block, versions, end - first, floor, fences, nfences, keep);
+			order[first].block, versions, end - first, floor, fences, nfences, keep, &artifact_cache);
 		if (artifact_plan < 0)
 			memset(keep, 1, end - first); /* Unavailable proof never authorizes GC. */
 		if (artifact_plan != 0)
@@ -2964,6 +2968,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(obj_required);
 				free(fences);
 				free(control_fences);
+				artifact_prune_cache_free(artifact_cache);
 				return -1;
 			}
 			{
@@ -2991,6 +2996,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			free(dropped);
 			free(fences);
 			free(control_fences);
+			artifact_prune_cache_free(artifact_cache);
 			return -1;
 		}
 		else
@@ -3016,6 +3022,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	free(selected);
 	free(fences);
 	free(control_fences);
+	artifact_prune_cache_free(artifact_cache);
 	*nrec = out;
 	*dropped_out = dropped;
 	*ndropped_out = ndropped;

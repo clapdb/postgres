@@ -47,12 +47,15 @@ ancestry and at historical horizons. A zero-page COMMIT is an existing empty
 object (`EXISTS=1`, `NBLOCKS=0`); DROP reports nonexistence and zero blocks.
 Pending growth cannot change either answer. Lifecycle record version 2 stores
 the completed size alongside the distinct-page count. Live attempt counters
-need no recovery because pre-restart attempts cannot commit.
+need no recovery because unfinished pre-restart attempts cannot commit.
 
-A retry at the same LSN uses a fresh token. The previous completed interval
-remains readable until the replacement completes; staged bytes from the retry
-cannot change its contents. Exact admission-sequence fences retain the
-corresponding committed interval during compaction.
+An unfinished generation can be retried at the same LSN with a fresh token.
+Once completed, a generation is immutable: BEGIN returns its original token,
+WRITE verifies identical durable bytes without appending, and COMMIT verifies
+the existing page count without publishing another interval. Different bytes
+or block sets require a newer LSN. This also holds after restart, so readers
+and branches using an LSN without an admission cap cannot switch to a replacement.
+Exact admission-sequence fences still preserve the corresponding interval.
 
 Publication errors do not imply that an operation was absent from disk. If
 completion-record append/sync has an ambiguous outcome, artifact operations
@@ -62,6 +65,10 @@ the complete new state. A process-crash test is not a power-loss guarantee.
 The PostgreSQL producers use this protocol for whole SLRU directory snapshots,
 running-XID snapshot data and multi-page database barriers. Single-page reader
 manifests, READY records and relation maps publish as one-page generations.
+READY stages the snapshot; the global manifest is published only after its
+exact-generation relmap checksum is known, before the all-database adoption
+barrier. It omits the database-local relmap checksum, so different database
+workers publish identical global bytes rather than overwrite a placeholder.
 Empty SLRU snapshots publish complete zero-page generations and can be retried
 at the same cutoff. The four SLRU banks are separate objects; the capture API
 returns its cutoff only after every bank is complete, retaining the existing
@@ -88,7 +95,10 @@ running-XID snapshot merely because one database disappeared.
 
 ## Retention and recovery
 
-Compaction retains completed intervals above the operational floor and those
+Compaction decodes selected intervals once per object and reuses them across
+page groups, locating page tuples with binary search instead of nested scans
+of each version at each horizon. It retains completed intervals above the
+operational floor and those
 selected at the floor and retained reader/branch fences. A DROP selected at a
 horizon requires no data pages there. When no surviving horizon selects the
 old generation, its pages and their control-era fences are released.
@@ -151,7 +161,7 @@ release-qualification work remains in `RELEASE_VALIDATION.md`.
 ### Validation for this change (2026-09-13)
 
 The cassert-enabled Meson build passed. Both lifecycle variants passed all
-55 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
+57 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
 control-prune, lifecycle-prune, retention, GC, forkmeta-snapshot, WAL-reclaim
 and harness-plan tests passed. PostgreSQL integration (including database
 retirement), MVP golden and independent branch boot passed. All five persisted

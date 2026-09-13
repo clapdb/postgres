@@ -180,3 +180,26 @@ The release record should distinguish:
   procedures within the advertised durability model.
 
 No production sign-off is implied by the current assessment.
+
+## Additional recovery finding during PR #262 review
+
+A cassert integration run passed with the final artifact publication producers,
+but reopening its retained store after shutdown failed in
+`recover_layer_prefix()` / `replay_page_record()`. The failing tuple was a
+relation-class FSM page (`spcOid=1664`, `dbOid=0`, `relNumber=2396`, `forkNum=1`,
+block 0), with a nonzero ordered-write identity. Its recovered fork history
+contained plain GROW events with zero order IDs, so `fork_event_activate_seg()`
+correctly refused the missing identity. The artifact lifecycle fixtures and
+focused restart tests passed; they do not cover this full integration tail.
+
+The failing recovery/activation functions are unchanged by the artifact PR.
+That is not proof the failure predates it: baseline reproduction and diagnosis
+of the lost ordering marker remain open. Treat independent reopen of the full
+integration store as a release blocker; do not generalize the script's PASS
+into a claim that this additional recovery check passed.
+
+Reproduce with `KEEPTMP=1 contrib/pagestore/integration_test.sh <build>`, then
+start `<build>/contrib/pagestore/pagestore_daemon` on the reported retained
+STORE after the script has stopped its processes. Preserve that store for
+forensic checks. Refresh `<build>/tmp_install` with the setup suite after
+rebuilding PostgreSQL producers, so the script loads the intended extension.
