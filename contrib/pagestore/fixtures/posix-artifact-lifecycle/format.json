@@ -3,7 +3,7 @@
     "family": "artifact_lifecycle",
     "artifact": "artifact BEGIN and COMMIT/DROP objects",
     "magic": "0x414c5031",
-    "version": 1
+    "version": 2
   },
   {
     "family": "control",

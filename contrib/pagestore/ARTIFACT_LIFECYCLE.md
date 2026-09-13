@@ -17,7 +17,7 @@ compacted with the data.
 `PsArtifactLifecycle` in `pagestore_artifact_format.h` binds the record to its
 object, timeline incarnation and generation LSN. Magic, version and CRC-32C
 are checked on recovery and use. The completion record carries the BEGIN
-admission sequence and expected distinct page count. Its own persisted page
+admission sequence, expected distinct page count and maximum block plus one. Its own persisted page
 identity supplies the upper admission boundary.
 
 ## Publication
@@ -28,8 +28,9 @@ identity supplies the upper admission boundary.
 2. Every staged page carries that token and the generation LSN. Pages remain
    hidden until completion. Pages can be sparse, and retries within an attempt
    may overwrite a block; the latest admitted copy is authoritative.
-3. COMMIT verifies that the attempt contains the declared number of distinct
-   blocks, syncs the data, appends the identity-bound completion record, then
+3. Writes maintain a per-attempt distinct-block counter and maximum block in
+   memory; repeated writes of a block count once. COMMIT compares that counter
+   with the declared count without scanning retained page history, syncs the data, appends the identity-bound completion record, then
    syncs again before acknowledging. A completed attempt accepts no further
    writes. BEGIN/COMMIT/DROP bypass reclamation backpressure so closing an
    interval cannot wait behind the debt it releases; ordinary data writes keep
@@ -40,6 +41,13 @@ identity supplies the upper admission boundary.
    or ancestors contain it. An unfinished newer generation leaves the prior
    complete generation available. Consumers requiring an exact cutoff still
    check the resolved LSN and fail if that cutoff was never completed.
+
+`EXISTS` and `NBLOCKS` resolve the same completed interval, including through
+ancestry and at historical horizons. A zero-page COMMIT is an existing empty
+object (`EXISTS=1`, `NBLOCKS=0`); DROP reports nonexistence and zero blocks.
+Pending growth cannot change either answer. Lifecycle record version 2 stores
+the completed size alongside the distinct-page count. Live attempt counters
+need no recovery because pre-restart attempts cannot commit.
 
 A retry at the same LSN uses a fresh token. The previous completed interval
 remains readable until the replacement completes; staged bytes from the retry
@@ -143,7 +151,7 @@ release-qualification work remains in `RELEASE_VALIDATION.md`.
 ### Validation for this change (2026-09-13)
 
 The cassert-enabled Meson build passed. Both lifecycle variants passed all
-46 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
+55 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
 control-prune, lifecycle-prune, retention, GC, forkmeta-snapshot, WAL-reclaim
 and harness-plan tests passed. PostgreSQL integration (including database
 retirement), MVP golden and independent branch boot passed. All five persisted

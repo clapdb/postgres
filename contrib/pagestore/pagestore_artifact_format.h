@@ -34,7 +34,7 @@
  * storage. Block 0 is BEGIN; block 1 is COMMIT or DROP. The enclosing page
  * version supplies the generation LSN and admission sequence. */
 #define PS_ARTIFACT_LIFECYCLE_MAGIC 0x414c5031u
-#define PS_ARTIFACT_LIFECYCLE_VERSION 1u
+#define PS_ARTIFACT_LIFECYCLE_VERSION 2u
 #define PS_ARTIFACT_BEGIN_BLOCK 0u
 #define PS_ARTIFACT_COMMIT_BLOCK 1u
 #define PS_ARTIFACT_COMMITTED 1u
@@ -53,7 +53,7 @@ typedef struct PsArtifactLifecycle
 	uint32_t spcOid;
 	uint32_t dbOid;
 	uint32_t relNumber;
-	uint32_t reserved;
+	uint32_t nblocks; /* maximum admitted block plus one; zero for empty */
 	uint32_t state;
 	uint32_t crc;
 } PsArtifactLifecycle;

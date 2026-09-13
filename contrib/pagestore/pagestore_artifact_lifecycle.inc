@@ -55,17 +55,19 @@ artifact_record(uint32_t tl, const PsKey *meta, uint32_t block,
 		record->generation != v->lsn || record->timeline != tl ||
 		record->incarnation != __atomic_load_n(&timelines[tl].incarnation, __ATOMIC_ACQUIRE) ||
 		record->klass != (uint32_t) meta->forkNum || record->spcOid != meta->spcOid ||
-		record->dbOid != meta->dbOid || record->relNumber != meta->relNumber || record->reserved != 0 ||
+		record->dbOid != meta->dbOid || record->relNumber != meta->relNumber ||
 		record->crc != ~ps_crc32c_update(UINT32_MAX, record,
 										 offsetof(PsArtifactLifecycle, crc)) ||
 		(block == PS_ARTIFACT_BEGIN_BLOCK ? record->state != 0 :
 		 (record->state != PS_ARTIFACT_COMMITTED && record->state != PS_ARTIFACT_DROPPED)))
 		return -1;
 	if (record->state != PS_ARTIFACT_COMMITTED &&
-		(record->begin_seq != 0 || record->page_count != 0))
+		(record->begin_seq != 0 || record->page_count != 0 || record->nblocks != 0))
 		return -1;
 	if (record->state == PS_ARTIFACT_COMMITTED &&
-		(record->begin_seq == 0 || record->begin_seq >= v->admission_seq))
+		(record->begin_seq == 0 || record->begin_seq >= v->admission_seq ||
+		 record->page_count > record->nblocks ||
+		 (record->page_count == 0 && record->nblocks != 0)))
 		return -1;
 	return 0;
 }
@@ -129,6 +131,81 @@ artifact_visible(uint32_t tl, const PsKey *key, uint32_t block,
 		}
 	*out = best;
 	return commit ? (best ? 1 : 2) : 0;
+}
+
+/* Match page visibility for size/existence, including legacy and ancestry.
+ * A zero-page COMMIT is an existing empty object; DROP is nonexistence. */
+static int
+artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
+				  uint64_t seq_cap, int *exists, uint32_t *nblocks)
+{
+	PsKey meta = artifact_meta_key(key);
+	TlWalk walk = tl_walk_first(tl, horizon);
+	int rc = 0;
+
+	*exists = 0;
+	*nblocks = 0;
+	ps_lock_map_rd();
+	do
+	{
+		PageEnt *commits = page_find(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
+		PageEnt *begins = page_find(walk.tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
+		uint64_t cap = walk.lsn == horizon ? seq_cap : 0;
+		uint64_t lsn = walk.lsn;
+		PageVer *commit = commits ? page_visible(commits, lsn, cap) : NULL;
+		ForkEnt *fork = fork_find(walk.tl, key);
+		uint32_t nb = 0;
+		int state;
+
+		if (commit)
+		{
+			PsArtifactLifecycle record;
+
+			if (artifact_record(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK,
+				commit, &record, 1) != 0)
+				rc = -1;
+			else if (record.state == PS_ARTIFACT_COMMITTED)
+			{
+				*exists = 1;
+				if (record.nblocks > *nblocks)
+					*nblocks = record.nblocks;
+			}
+			break;
+		}
+		/* BEGIN is monotone in LSN. Exclude all subsequent staged growth
+		 * while resolving the legacy fork, including at the same LSN. */
+		if (begins)
+		{
+			uint64_t first = artifact_legacy_seq(begins);
+
+			for (int i = 0; i < begins->nver; i++)
+				if (begins->vers[i].admission_seq == first)
+				{
+					if (lsn >= begins->vers[i].lsn)
+					{
+						if (lsn > begins->vers[i].lsn || cap == 0 || cap >= first)
+							/* BEGIN itself has no data-fork event; using its
+							 * nonzero sequence also handles the first store mutation. */
+							cap = first;
+						lsn = begins->vers[i].lsn;
+					}
+					break;
+				}
+		}
+		state = fork ? fork_asof_hop(fork, lsn, cap, &nb) : FORK_HOP_NONE;
+		if (state == FORK_HOP_DEAD)
+			break;
+		if (state != FORK_HOP_NONE)
+		{
+			*exists = 1;
+			if (nb > *nblocks)
+				*nblocks = nb;
+		}
+		if (state == FORK_HOP_DEF)
+			break;
+	} while (tl_walk_next(&walk));
+	ps_unlock_map();
+	return rc;
 }
 
 /*
@@ -293,7 +370,16 @@ ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token)
 	if (last && lsn < last->lsn)
 		return -1;
 	memset(&record, 0, sizeof(record));
-	return artifact_store_record(tl, key, PS_ARTIFACT_BEGIN_BLOCK, lsn, &record, token);
+	if (artifact_store_record(tl, key, PS_ARTIFACT_BEGIN_BLOCK, lsn, &record, token) != 0)
+		return -1;
+	{
+		ForkEnt *fork = fork_get_or_create(tl, key);
+
+		fork->artifact_attempt_seq = *token;
+		fork->artifact_page_count = 0;
+		fork->artifact_nblocks = 0;
+	}
+	return 0;
 }
 
 static int
@@ -335,6 +421,9 @@ int
 ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 				  const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq)
 {
+	ForkEnt *fork;
+	PageEnt *entry;
+
 	if (!artifact_data_key(key))
 		return append_page_raw(tl, key, block, page, lsn, seq);
 	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE))
@@ -343,10 +432,28 @@ ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 	{
 		if (artifact_has_protocol(tl, key))
 			return -1;
+		return append_page_raw(tl, key, block, page, lsn, seq);
 	}
-	else if (!artifact_attempt(tl, key, lsn, token))
+	if (block == UINT32_MAX || !artifact_attempt(tl, key, lsn, token))
 		return -1;
-	return append_page_raw(tl, key, block, page, lsn, seq);
+	fork = fork_find(tl, key);
+	if (!fork || fork->artifact_attempt_seq != token)
+		return -1;
+	if (append_page_raw(tl, key, block, page, lsn, seq) != 0)
+	{
+		/* An ambiguous append must not escape the attempt's counters. */
+		__atomic_store_n(&artifact_io_failed, 1, __ATOMIC_RELEASE);
+		return -1;
+	}
+	entry = page_find(tl, key, block);
+	if (entry->artifact_attempt_seq != token)
+	{
+		entry->artifact_attempt_seq = token;
+		fork->artifact_page_count++;
+	}
+	if (block + 1 > fork->artifact_nblocks)
+		fork->artifact_nblocks = block + 1;
+	return 0;
 }
 
 int
@@ -354,7 +461,6 @@ ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 				   uint64_t token, uint64_t count)
 {
 	ForkEnt    *fork;
-	uint64_t	found = 0;
 	PsArtifactLifecycle record = {.begin_seq = token, .page_count = count,
 	.state = PS_ARTIFACT_COMMITTED};
 
@@ -363,15 +469,10 @@ ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 		!artifact_attempt(tl, key, lsn, token))
 		return -1;
 	fork = fork_find(tl, key);
-	for (PageEnt *e = fork ? fork->pages : NULL; e; e = e->fork_next)
-		for (int i = 0; i < e->nver; i++)
-			if (e->vers[i].lsn == lsn && e->vers[i].admission_seq > token)
-			{
-				found++;
-				break;
-			}
-	if (found != count || ps_storage->sync() != 0)
+	if (!fork || fork->artifact_attempt_seq != token ||
+		fork->artifact_page_count != count || ps_storage->sync() != 0)
 		return -1;
+	record.nblocks = fork->artifact_nblocks;
 	return artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL);
 }
 

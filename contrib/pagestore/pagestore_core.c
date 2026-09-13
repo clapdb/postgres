@@ -3520,6 +3520,7 @@ typedef struct PageEnt
 	PageVer    *vers;			/* dynamic array, length nver, capacity cap */
 	int			nver;
 	int			cap;
+	uint64_t artifact_attempt_seq; /* last live attempt to count this block */
 } PageEnt;
 
 /* Hash entry: the block count of one fork on one timeline. */
@@ -3574,6 +3575,9 @@ typedef struct ForkEnt
 	uint64_t	last_page_lsn;	/* newest durable local page tuple */
 	uint64_t	last_page_seq;
 	int			has_wal_less;	/* at least one page version has lsn 0 */
+	uint64_t artifact_attempt_seq;
+	uint64_t artifact_page_count;
+	uint32_t artifact_nblocks;
 } ForkEnt;
 
 static void artifact_fence_reset(void);
@@ -17217,6 +17221,19 @@ ps_handle_meta(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 				break;
 			}
+			if (artifact_data_key(&ch->key))
+			{
+				int exists;
+				uint32_t nblocks;
+
+				if (artifact_metadata(tl, &ch->key,
+					ch->req_lsn ? ch->req_lsn : UINT64_MAX, ch->req_seq,
+					&exists, &nblocks) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = ch->opcode == PS_OP_EXISTS ? (uint32_t) exists : nblocks;
+				break;
+			}
 			ch->result = fork_exists_through(tl, &ch->key,
 										 ch->req_lsn ? ch->req_lsn : UINT64_MAX,
 										 ch->req_seq) ? 1 : 0;
@@ -17284,6 +17301,19 @@ ps_handle_meta(PsChannel *ch)
 				fork_has_wal_less_page(tl, &ch->key))
 			{
 				ch->status = PS_STATUS_ERROR;
+				break;
+			}
+			if (artifact_data_key(&ch->key))
+			{
+				int exists;
+				uint32_t nblocks;
+
+				if (artifact_metadata(tl, &ch->key,
+					ch->req_lsn ? ch->req_lsn : UINT64_MAX, ch->req_seq,
+					&exists, &nblocks) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = ch->opcode == PS_OP_EXISTS ? (uint32_t) exists : nblocks;
 				break;
 			}
 			ch->result = ch->is_redo ?

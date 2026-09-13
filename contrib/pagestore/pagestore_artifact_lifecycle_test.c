@@ -120,6 +120,24 @@ meta(PsChannel *ch)
 	ps_lifecycle_read_unlock();
 	check(ch->status == PS_STATUS_OK, "metadata operation");
 }
+static int
+metadata_matches(uint32_t tl, uint64_t lsn, uint64_t seq,
+				 int exists, uint32_t nblocks)
+{
+	PsChannel ch = {.opcode = PS_OP_EXISTS, .timeline = tl, .key = key,
+		.req_lsn = lsn, .req_seq = seq};
+	int ok;
+
+	ps_lock_shard_rd(ps_shard_of(&key));
+	(void) ps_handle_meta(&ch);
+	ok = ch.status == PS_STATUS_OK && ch.result == (uint32_t) exists;
+	ch.opcode = PS_OP_NBLOCKS;
+	(void) ps_handle_meta(&ch);
+	ok = ok && ch.status == PS_STATUS_OK && ch.result == nblocks;
+	ps_unlock_shard(ps_shard_of(&key));
+	return ok;
+}
+
 static void
 maintain(void)
 {
@@ -189,7 +207,11 @@ main(int argc, char **argv)
 	check(mkdtemp(store) != NULL && ps_core_open(store) == 0, "open three-shard store");
 	key.relNumber = 2;
 	uint64_t empty = begin(100);
-	check(commit(100, empty, 0) == 0, "publish empty generation");
+	check(write_page(100, empty, 8, 0x18) == 0 &&
+		metadata_matches(0, 0, 0, 0, 0), "first pending attempt has no visible metadata");
+	empty = begin(100);
+	check(commit(100, empty, 0) == 0 && metadata_matches(0, 0, 0, 1, 0),
+		"publish empty generation with empty metadata");
 	empty = begin(100);
 	check(commit(100, empty, 0) == 0 && read_value(0, 100, 0, -1),
 		"retry empty generation at the same cutoff");
@@ -197,17 +219,22 @@ main(int argc, char **argv)
 	check(write_page(100, 0, 0, 0x11) == 0 && write_page(100, 0, 1, 0x12) == 0, "legacy generation");
 	uint64_t	token = begin(200);
 
-	check(write_page(200, token, 0, 0x21) == 0, "stage first page");
+	check(write_page(200, token, 7, 0x21) == 0, "stage first page");
 	check(read_value(0, 200, 0, 0x11) && read_value(0, 200, 1, 0x12), "partial generation preserves complete legacy base");
+	check(metadata_matches(0, 0, 0, 1, 2), "pending high block preserves legacy size");
 	check(commit(200, token, 2) != 0, "commit refuses missing page");
 	uint64_t	retry = begin(200);
 
 	check(write_page(200, token, 1, 0x22) != 0, "superseded attempt cannot append");
 	check(write_page(200, retry, 1, 0x23) == 0 && commit(200, retry, 2) != 0, "retry cannot count previous attempt's pages");
-	check(commit(200, retry, 1) == 0, "commit sparse one-page replacement");
+	check(write_page(200, retry, 1, 0x23) == 0 && commit(200, retry, 1) == 0,
+		"overwriting a block counts once in sparse replacement");
+	check(metadata_matches(0, 0, 0, 1, 2), "sparse size uses maximum block, not page count");
 	check(read_value(0, 200, 0, -1) && read_value(0, 200, 1, 0x23), "absent blocks never inherit older pages");
 	check(write_page(200, retry, 1, 0x24) != 0 && write_page(200, 0, 1, 0x24) != 0, "committed interval immutable; legacy bypass refused");
 	token = begin(200);
+	check(metadata_matches(0, 0, 0, 1, 2) && metadata_matches(0, 200, token, 1, 2),
+		"same-LSN retry retains completed metadata");
 	check(write_page(200, token, 1, 0x25) == 0 && read_value(0, 200, 1, 0x23), "same-LSN pending retry preserves prior commit");
 	check(commit(200, token, 1) == 0 && read_value(0, 200, 1, 0x25), "same-LSN commit selects its own interval");
 	ps_core_close();
@@ -228,10 +255,16 @@ main(int argc, char **argv)
 		ps_core_close();
 	}
 	check(ps_core_open(store) == 0, "second restart");
+	check(metadata_matches(0, 0, 0, 1, 1), "recovery restores committed size");
+	key.relNumber = 2;
+	check(metadata_matches(0, 0, 0, 1, 0), "empty metadata survives restart");
+	key.relNumber = 1;
 	PsChannel	branch = {.opcode = PS_OP_CREATE_BRANCH, .timeline = 1, .req_lsn = 300};
 
 	meta(&branch);
 	check(drop(400) == 0 && drop(400) == 0, "durable drop is idempotent");
+	check(metadata_matches(0, 0, 0, 0, 0) && metadata_matches(0, 300, 0, 1, 1) &&
+		metadata_matches(1, 0, 0, 1, 1), "drop metadata respects history and ancestry");
 	check(read_value(0, 400, 0, -1) && read_value(0, 300, 0, 0x33) && read_value(1, UINT64_MAX, 0, 0x33), "drop preserves retained history and branch ancestry");
 	check(write_page(300, 0, 0, 0x44) != 0, "delayed writer cannot resurrect dropped object");
 	PsChannel	pin = {.opcode = PS_OP_RETENTION_PIN_RESERVE, .blocknum = PS_RETENTION_OWNER_MATERIALIZER,
@@ -242,6 +275,8 @@ main(int argc, char **argv)
 	check(read_value(1, UINT64_MAX, 0, 0x33), "compaction preserves descendant generation");
 	ps_core_close();
 	check(ps_core_open(store) == 0 && read_value(0, 500, 0, -1) && read_value(1, UINT64_MAX, 0, 0x33), "drop survives compacted restart");
+	check(metadata_matches(0, 0, 0, 0, 0) && metadata_matches(1, 0, 0, 1, 1),
+		"compacted restart preserves drop and branch metadata");
 	PsChannel	deleting = {.opcode = PS_OP_BEGIN_DELETE, .timeline = 1, .req_seq = 1};
 
 	meta(&deleting);
