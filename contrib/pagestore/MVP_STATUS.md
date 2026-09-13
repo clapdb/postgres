@@ -9,6 +9,10 @@ The ordered work packages, acceptance criteria, and open decisions for closing
 the remaining gates are tracked in
 [`MVP_COMPLETION_PLAN.md`](MVP_COMPLETION_PLAN.md).
 
+The evidence assessment and proposed release-qualification tests are in
+[`RELEASE_VALIDATION.md`](RELEASE_VALIDATION.md). They distinguish the accepted
+MVP gates from the additional evidence needed for a supported production release.
+
 Status below includes work through managed retention owners, page-history
 pruning, and immutable WAL segment/store primitives.
 
