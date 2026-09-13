@@ -204,7 +204,13 @@ main(int argc, char **argv)
 	}
 	char		store[] = "/tmp/pagestore-artifact-XXXXXX";
 
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0, "open three-shard store");
+	check(mkdtemp(store) != NULL, "create test directory");
+	page_size = 8;
+	check(ps_core_open(store) != 0 && errno == EINVAL, "reject eight-byte logical pages before recovery");
+	page_size = sizeof(PsArtifactLifecycle) - 1;
+	check(ps_core_open(store) != 0 && errno == EINVAL, "reject pages smaller than lifecycle records");
+	page_size = 8192;
+	check(ps_core_open(store) == 0, "open three-shard store after rejected configurations");
 	key.relNumber = 2;
 	uint64_t	empty = begin(100);
 

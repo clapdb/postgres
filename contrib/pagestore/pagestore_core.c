@@ -19073,6 +19073,13 @@ ps_core_open(const char *store_dir)
 	int save_errno;
 	int storage_opened = 0;
 
+	/* Lifecycle recovery and publication both copy a complete fixed record.
+	 * Validate before opening storage, including for callers without a CLI. */
+	if (page_size < sizeof(PsArtifactLifecycle))
+	{
+		errno = EINVAL;
+		return -1;
+	}
 	if (!core_process_valid())
 		return -1;
 	pthread_mutex_lock(&core_state_lock);

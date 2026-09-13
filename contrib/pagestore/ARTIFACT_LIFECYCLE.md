@@ -135,7 +135,8 @@ unchanged.
 `posix-backend-objects` fixture is retained as legacy. The new fixture includes a
 complete sparse generation, an unfinished newer attempt and a dropped object,
 with reopen/read/restart checks. This protocol is qualified for the local POSIX
-provider; providers requiring all-shard write locking for sync are rejected by
+provider. Startup rejects logical pages smaller than the 72-byte lifecycle
+record before opening storage. Providers requiring all-shard write locking for sync are rejected by
 the lifecycle operations.
 
 ## Deterministic validation
@@ -161,7 +162,7 @@ release-qualification work remains in `RELEASE_VALIDATION.md`.
 ### Validation for this change (2026-09-13)
 
 The cassert-enabled Meson build passed. Both lifecycle variants passed all
-57 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
+60 checks, and the standalone `-O2 -Wall -Wextra -Werror` build passed. The
 control-prune, lifecycle-prune, retention, GC, forkmeta-snapshot, WAL-reclaim
 and harness-plan tests passed. PostgreSQL integration (including database
 retirement), MVP golden and independent branch boot passed. All five persisted
