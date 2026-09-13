@@ -192,11 +192,14 @@ contained plain GROW events with zero order IDs, so `fork_event_activate_seg()`
 correctly refused the missing identity. The artifact lifecycle fixtures and
 focused restart tests passed; they do not cover this full integration tail.
 
-The failing recovery/activation functions are unchanged by the artifact PR.
-That is not proof the failure predates it: baseline reproduction and diagnosis
-of the lost ordering marker remain open. Treat independent reopen of the full
-integration store as a release blocker; do not generalize the script's PASS
-into a claim that this additional recovery check passed.
+The failure was reproduced on the unmodified `pagestore` baseline
+`2b2349887c2` in an isolated cassert build: its integration script passed, then
+its own daemon failed reopening the retained store. Debugging found the same
+FSM key and block, LSN 318767144 and order ID 2; the recovered GROW events again
+had zero order IDs. This predates the artifact changes. Diagnosis and repair
+of the lost ordering marker remain separate release work. Treat independent
+reopen of the full integration store as a release blocker; do not generalize
+the script's PASS into a claim that this additional recovery check passed.
 
 Reproduce with `KEEPTMP=1 contrib/pagestore/integration_test.sh <build>`, then
 start `<build>/contrib/pagestore/pagestore_daemon` on the reported retained
