@@ -12657,8 +12657,20 @@ timeline_delete_wal_cleanup_one(void)
 static int
 timeline_delete_page_cleanup_one(void)
 {
-	if (ps_storage->seg_rewrite == NULL)
-		return 0; /* SPDK has no safe same-id replacement primitive. */
+	/*
+	 * Tombstoning writes holes in place (page_cleanup_tombstone_segment())
+	 * with seg_read/seg_size/seg_write/sync alone; it needs no same-id
+	 * whole-segment replacement primitive.  seg_read/seg_size are already
+	 * required elsewhere in this path, so the one capability worth gating on
+	 * here is seg_write.  SPDK does implement it, but its seg_size always
+	 * reports the fixed g_segsize for every segment rather than how much of
+	 * it actually holds records, so pass 1's validation scan runs into the
+	 * unwritten tail padding and fails closed as malformed: SPDK timeline
+	 * deletion still cannot complete, for that structural reason, not a
+	 * missing capability (out of MVP scope, see D6 in MVP_STATUS.md).
+	 */
+	if (ps_storage->seg_write == NULL)
+		return 0;
 	for (uint32_t pass = 0; pass < MAX_TIMELINES; pass++)
 	{
 		uint32_t tl = 1 + (timeline_page_cleanup_cursor + pass) % (MAX_TIMELINES - 1);
@@ -12890,13 +12902,15 @@ timeline_delete_publish_ready(uint32_t timeline)
 		state != PS_TIMELINE_DELETING || timeline_meta_poisoned_load() ||
 		ps_manifest_poisoned() || fork_meta_poisoned_load())
 		return 0;
-	/* A missing capability is never interpreted as an empty consumer.  In
-	 * particular this keeps SPDK's NULL same-id rewrite fail-closed. */
+	/* A missing capability is never interpreted as an empty consumer.  Page
+	 * cleanup tombstones records in place with seg_read/seg_size/seg_write
+	 * (see timeline_delete_page_cleanup_one()); there is no separate
+	 * same-id whole-segment replacement primitive to require here. */
 	if (ps_storage->meta_append == NULL || ps_storage->fork_meta_read == NULL ||
 		ps_storage->fork_meta_rewrite == NULL ||
 		ps_storage->timeline_wal_cleanup == NULL ||
 		ps_storage->seg_read == NULL || ps_storage->seg_size == NULL ||
-		ps_storage->seg_rewrite == NULL ||
+		ps_storage->seg_write == NULL ||
 		(use_layers && (ps_layer_store == NULL ||
 			ps_layer_store->layer_exists_local == NULL ||
 			ps_layer_store->delete_local_layer == NULL ||
