@@ -788,6 +788,43 @@ test_unreplaceable_dependency_requests_once(void)
 		  ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
 		  next_generation <= 2,
 		  "no publication storm: at most one compacted publication while progress does not advance");
+	/* Durable WAL-index progress is published once per indexing batch in
+	 * production (continuously while WAL ships), so repeating the old
+	 * progress-keyed request on every advance would be a sustained
+	 * non-compacting rewrite for as long as this dependency stays
+	 * unreplaceable.  A progress advance alone also can never retire the
+	 * raw item (walidx_entry_prune_plan needs a durable base and no
+	 * retained horizon; a higher cutoff changes neither), so the
+	 * fence-keyed request must not re-fire here: fails on a branch that
+	 * still gates on progress alone (generation grows to ~7). */
+	{
+		uint64_t end = WAL_TOTAL;
+
+		for (int round = 0; round < 5; round++)
+		{
+			check(append_wal_bytes(0, end, 8192) &&
+				  wal_index_progress(0, end, end + 8192),
+				  "append and advance durable progress past the unreplaceable dependency");
+			end += 8192;
+			for (int pass = 0; pass < 8; pass++)
+				(void) ps_core_maintenance();
+		}
+		check(segment_count(store, 0) == 2,
+			  "repeated progress advances alone do not retire the unreplaceable raw dependency");
+		check(ps_test_walidx_reclaim_due(0) == 0,
+			  "no re-request while the raw floor and retention floor are both unchanged");
+		check(ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
+			  next_generation <= 2,
+			  "progress advances alone produce no further compacted publication");
+		check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+						  PS_RETENTION_RESOURCE_ALL, end) &&
+			  maintenance_until_count(store, 0, 0),
+			  "a fence change (the materializer pin, which also authorizes the"
+			  " stored page as a base) re-issues the request and retires the chain");
+		check(ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
+			  next_generation <= 3,
+			  "the fence-triggered request adds exactly one more compacted publication");
+	}
 	close_store();
 	remove_tree(store);
 }
