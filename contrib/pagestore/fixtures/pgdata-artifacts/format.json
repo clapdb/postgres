@@ -1,5 +1,11 @@
 [
   {
+    "family": "artifact_lifecycle",
+    "artifact": "artifact BEGIN and COMMIT/DROP objects",
+    "magic": "0x414c5031",
+    "version": 2
+  },
+  {
     "family": "control",
     "artifact": "control object admission fence block",
     "magic": "0x434e4641",
@@ -223,9 +229,9 @@
   },
   {
     "family": "store_config",
-    "artifact": ".pagestore-nshards decimal shard count",
+    "artifact": ".pagestore-nshards PSS2 checked shard count (legacy decimal accepted)",
     "magic": "0x00000000",
-    "version": 1
+    "version": 2
   },
   {
     "family": "timelines",
