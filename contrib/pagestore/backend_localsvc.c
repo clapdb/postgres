@@ -425,10 +425,25 @@ ls_exec_wait(PsChannel *ch, int timeout_ms)
 static void
 ls_exec_timeout(PsChannel *ch, int timeout_ms)
 {
-	if (ls_exec_wait(ch, timeout_ms) != PS_STATUS_OK)
+	uint8		status = ls_exec_wait(ch, timeout_ms);
+
+	if (status == PS_STATUS_OK)
+		return;
+	/* An artifact BEGIN/COMMIT/DROP refusal carries its reason in ch->result
+	 * (pagestore_daemon.c logs the same reason plus the key/lsn/horizon
+	 * context); every other opcode still reports only the opcode number. */
+	if (status == PS_STATUS_ERROR &&
+		(ch->opcode == PS_OP_ARTIFACT_BEGIN || ch->opcode == PS_OP_ARTIFACT_COMMIT ||
+		 ch->opcode == PS_OP_ARTIFACT_DROP))
 		ereport(ERROR,
-				(errmsg("pagestore localsvc: daemon reported error for op %u",
-						ch->opcode)));
+				(errmsg("pagestore localsvc: daemon reported error for op %u (artifact %s: %s)",
+						ch->opcode,
+						ch->opcode == PS_OP_ARTIFACT_BEGIN ? "begin" :
+						ch->opcode == PS_OP_ARTIFACT_COMMIT ? "commit" : "drop",
+						pagestore_artifact_refuse_reason_name((PsArtifactRefuseReason) ch->result))));
+	ereport(ERROR,
+			(errmsg("pagestore localsvc: daemon reported error for op %u",
+					ch->opcode)));
 }
 
 static void

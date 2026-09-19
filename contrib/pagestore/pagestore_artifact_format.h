@@ -58,6 +58,59 @@ typedef struct PsArtifactLifecycle
 	uint32_t crc;
 } PsArtifactLifecycle;
 
+/*
+ * Every reason ps_artifact_begin/commit/drop can refuse a request (they
+ * return -1 for many distinct causes).  A silent -1 -- the daemon mapping it
+ * to PS_STATUS_ERROR with no log line, the client reporting only an opcode
+ * number -- was itself a diagnostic bug: it once cost a day identifying a
+ * key-namespace collision between two artifact producers.  Every refusal now
+ * reports one of these through an out-parameter; the daemon logs it and
+ * returns it to the client in ch->result, and the client appends its name to
+ * the ERROR it raises.
+ */
+typedef enum PsArtifactRefuseReason
+{
+	PS_ARTIFACT_REFUSE_NONE = 0,
+	PS_ARTIFACT_REFUSE_POISONED,		/* an earlier failure poisoned the store */
+	PS_ARTIFACT_REFUSE_INVALID,		/* bad process/timeline/lsn/key state */
+	PS_ARTIFACT_REFUSE_WRITE_LOCK,		/* SPDK: sync needs the write lock */
+	PS_ARTIFACT_REFUSE_HORIZON,		/* branch_lsn, or a newer generation's pages already exist */
+	PS_ARTIFACT_REFUSE_OLDER_GENERATION,	/* older than the last commit */
+	PS_ARTIFACT_REFUSE_DROPPED,		/* same-LSN retry of an already-dropped generation */
+	PS_ARTIFACT_REFUSE_BEGIN_NEWER,	/* a newer BEGIN is already in flight or abandoned */
+	PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH,	/* commit/drop token or page count does not match the open attempt */
+	PS_ARTIFACT_REFUSE_STORE_RECORD,	/* admission or storage failure recording the lifecycle page */
+} PsArtifactRefuseReason;
+
+static inline const char *
+pagestore_artifact_refuse_reason_name(PsArtifactRefuseReason reason)
+{
+	switch (reason)
+	{
+		case PS_ARTIFACT_REFUSE_NONE:
+			return "none";
+		case PS_ARTIFACT_REFUSE_POISONED:
+			return "poisoned";
+		case PS_ARTIFACT_REFUSE_INVALID:
+			return "invalid request";
+		case PS_ARTIFACT_REFUSE_WRITE_LOCK:
+			return "storage write lock";
+		case PS_ARTIFACT_REFUSE_HORIZON:
+			return "newer generation exists";
+		case PS_ARTIFACT_REFUSE_OLDER_GENERATION:
+			return "older generation exists";
+		case PS_ARTIFACT_REFUSE_DROPPED:
+			return "generation already dropped";
+		case PS_ARTIFACT_REFUSE_BEGIN_NEWER:
+			return "newer begin in flight";
+		case PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH:
+			return "attempt token or page count mismatch";
+		case PS_ARTIFACT_REFUSE_STORE_RECORD:
+			return "store record failure";
+	}
+	return "unknown";
+}
+
 /* ---- control object (PS_KLASS_CONTROL, object 0) -------------------- */
 
 /* block 0: the ControlFileData image (PostgreSQL's; not versioned here) */
@@ -152,7 +205,24 @@ ps_slru_object_id(const char *dir)
 	return h;
 }
 
-/* ---- reader snapshot objects (PS_KLASS_READER_SNAPSHOT) ---------------- */
+/*
+ * ---- reader snapshot objects (PS_KLASS_READER_SNAPSHOT) ----------------
+ *
+ * The DATA and MANIFEST objects are keyed (object, dbOid); dbOid is
+ * InvalidOid (0) for the automatic checkpoint-driven snapshot the reader
+ * launcher publishes at every checkpoint redo, and the retention owner id
+ * that pinned an exact-R snapshot's read LSN for an explicit publish
+ * (pagestore_publish_reader_snapshot_artifact()).  Both go through the same
+ * artifact-lifecycle admission (single producer, monotonic generations per
+ * key), so two producers sharing a key is a real collision, not just an
+ * odd read: an automatic generation at a later checkpoint silently refused
+ * an explicit publish at an earlier, controller-chosen R (see
+ * RELEASE_VALIDATION.md).  The owner id is truncated to fit dbOid's 32
+ * bits -- readers pin with small controller-assigned ids, not the full
+ * 64-bit retention-owner space -- and must not be zero, or it aliases the
+ * automatic key.  READY has only one producer (automatic) and stays
+ * InvalidOid-only.
+ */
 
 #define PS_READER_SNAPSHOT_MANIFEST_OBJECT	0u
 #define PS_READER_SNAPSHOT_DATA_OBJECT		1u
