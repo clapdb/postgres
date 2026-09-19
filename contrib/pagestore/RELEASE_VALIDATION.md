@@ -62,16 +62,30 @@ high-water, and nothing requested a WAL-index compaction on the reclaimer's
 own behalf, so a fully proven segment waited on the WAL-index controller's own
 ~1000-round cadence; a fixed one-second no-progress backoff, uncancelled by
 the publication that unblocked it, added up to another 237 rounds on the
-hosted runner.  The fix (`wal_segment_reclaim_one` requests an on-demand
-compacted WAL-index publication for a segment blocked only by the stale raw
-floor, and the no-progress backoff is cancelled by a proof-epoch bump on
-retention/WAL-index-publish/GC/progress/timeline-delete events, not only by
-the clock) closes it: the soak's `wal` bound is restated from five declared
-terms (18 KiB tighter, 4667392) with a per-sample check tying physical WAL to
-the soak's own fences, and seed 20260909 at 8000 rounds now peaks at ~1.75 MiB
-across repeated local runs, plain and CPU-contended.  The first post-fix
-nightly dispatch is run <PAGESTORE_NIGHTLY_POSTFIX_RUN_ID> (to be filled in
-after this change merges to `pagestore` and the nightly lane runs against it).
+hosted runner.  The fix closes it: `wal_segment_reclaim_one` requests an
+on-demand, fence-keyed WAL-index compaction for a segment blocked only by
+the stale raw dependency (re-issued when the raw floor or a
+retention-registry fence changes, not on every durable progress op, which
+the backend materializer publishes once per indexing batch and which alone
+can never retire the blocking item), and the no-progress backoff is
+cancelled by a proof-epoch bump on the same events, rate limited to a 20 ms
+floor so a retention pin drop -- dispatched without the admission lock --
+cannot turn drop-heavy churn into a drain storm.  Two review rounds on the
+fix itself found and closed four more gaps before merge: a lost-wakeup
+ordering bug in the backoff's epoch read; the missing 20 ms rate limit; the
+request needing to be fence-keyed rather than progress-keyed (plus two
+spec bugs found validating that redesign: the wrong "never requested"
+sentinel, and comparing `retention_effective_floor`'s raw value instead of a
+dedicated fence epoch); and, in the second round, WAL_INDEX-only pin changes
+not bumping either epoch, and a stale `walidx_snapshot_end[tl] < progress`
+guard that wrongly assumed a publication already covering current progress
+could never drop more.  The soak's `wal` bound is restated from five
+declared terms (18 KiB tighter, 4667392) with a per-sample check tying
+physical WAL to the soak's own fences, and seed 20260909 at 8000 rounds now
+peaks at ~1.7-1.8 MiB across repeated local runs, plain and CPU-contended.
+The first post-fix nightly dispatch is run
+<PAGESTORE_NIGHTLY_POSTFIX_RUN_ID> (to be filled in after this change merges
+to `pagestore` and the nightly lane runs against it).
 
 ## Gaps in release evidence
 

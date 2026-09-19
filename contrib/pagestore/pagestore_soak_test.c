@@ -233,7 +233,16 @@ static unsigned int latest_verifications;
  * sample.wal - (g_wal_end - model_floor).  Reported so nightly drift toward
  * the allowance (WAL_SEGMENT_BYTES + WAL_HIGH_WATER +
  * RECLAIM_REACTION_WAL_BYTES + BRANCH_WAL_ALLOWANCE) is visible even while
- * the check itself still passes. */
+ * the check itself still passes.  Expected composition, so nightly readers
+ * know what a "normal" value looks like: up to WAL_SEGMENT_BYTES (1 MiB) of
+ * segment alignment below model_floor; up to one fully proven segment caught
+ * between clearing its boundary and actually reclaiming -- a WAL-index
+ * publication + GC + the 20 ms rate-limit floor + the reclaim pass itself,
+ * bounded by RECLAIM_REACTION_WAL_BYTES (another <= 1 MiB); and up to a few
+ * raw WAL-index items retained for a held reader or branch whose pin LSN sits
+ * below its own horizon (observed ~130-200 KiB).  Together that is up to
+ * roughly 2.1 MiB; a value near WAL_HIGH_WATER (2 MiB) on top of that would
+ * be the signal worth investigating, not values in this range. */
 static uint64_t wal_fence_slack_max;
 
 typedef struct RelModel
