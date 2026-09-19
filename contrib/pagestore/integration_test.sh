@@ -2381,6 +2381,14 @@ refuse_count=$(grep -c "refusing unmatched ordered record" "$DATA/daemon.log" 2>
 refuse_count=${refuse_count:-0}
 assert "$adopt_count" "0" \
 	"no orphaned ordered records were adopted on reopen (F3 detector: a nonzero count here means F3 fired and needs investigation, not a retry) (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
+# A "retiring tail" on a clean-shutdown reopen is always a defect here, never
+# an expected torn-append signature: a torn record requires a crash, and this
+# reopen follows a clean kill+wait shutdown, so nothing in this store can be
+# torn.  The only OTHER way recover() retires a proven, size-covered record is
+# a last-in-segment pruned survivor with no complete record behind it (R2-F1);
+# that needs a deletion rewrite to have dropped records behind it, which this
+# script's branch drops could produce.  If this count is ever nonzero, it is
+# the F3 signal (see RELEASE_VALIDATION.md's open finding), not noise.
 assert "$retire_count" "0" \
 	"no segment tail was retired on reopen (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
 assert "$refuse_count" "0" \
