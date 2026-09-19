@@ -771,16 +771,34 @@ marker existed only in the forkmeta source log -- the in-memory fork history
 recorded a plain GROW instead -- so a second forkmeta cutover in the same
 daemon lifetime published that plain GROW and the store could not reopen
 (`storage open: Invalid argument`).  Live writes now insert the marker-plus-
-activation representation recovery itself rebuilds, and recovery adopts an
-orphaned record -- one whose plain GROW carries the exact nonzero admission
-identity (`order_id`, `admission_seq`, `lsn`, `nblocks`) of an otherwise-
-unmatched ordered record -- logging one `adopting orphaned ordered record`
-line per repair; any mismatch stays fail-closed.  `integration_test.sh` now
-stops every cluster it started, reopens its own retained store against a
-fresh daemon, and asserts both that the reopen succeeds and that zero
-adoptions were needed, so this class of failure fails the script instead of
-requiring the separate manual check `RELEASE_VALIDATION.md` used to call out.
-One gap remains documented in the check: a
+activation representation recovery itself rebuilds, closing that path outright.
+Recovery separately gained a fail-closed adoption rule, reached only when the
+*selected forkmeta snapshot's freeze sequence* proves an unmatched ordered
+record's admission append had completed: a growth-class orphan (a plain GROW
+carrying the record's exact identity) is promoted back to a bound marker, and
+a commit-class orphan (a second below-floor/WAL-less rewrite of an
+already-sized block -- the FSM/VM pattern -- which never left a plain GROW
+behind even pre-fix) is proven safe by size instead and gets an inert marker;
+either logs one `adopting orphaned ordered ...` line and any other case stays
+refused.  A store written entirely by the fixed live path exercises this rule
+only through a separate, still-open finding (a pruned marker's record
+rescanned after a timeline-delete rewrite rebases the flush watermark; see
+`RELEASE_VALIDATION.md`, "Open: pruned ordered marker rescanned after a
+timeline-delete rewrite"), never through its own writes.  `integration_test.sh`
+now stops every cluster it started, reopens its own retained store against a
+fresh daemon, and asserts the reopen succeeds, that no segment tail was
+retired and no record was refused (both unconditionally fatal), and reports
+the adoption count as that open finding's detector (this run: zero) rather
+than asserting it can never fire, so this class of failure fails the script
+instead of requiring the separate manual check `RELEASE_VALIDATION.md` used to
+call out.  Known gap from the same review (not fixed in that PR): every
+commit-class rewrite leaves one inert marker event in a fork's in-memory
+history (bounded durably, since the snapshot builder drops a commit marker
+once its version is pruned, but unbounded live between prunes), and the
+marker-matching/adoption scans over a fork's event array are linear, so a
+fork with many inert markers -- an FSM/VM fork of a hot table -- costs O(N)
+per replayed record; a follow-up should index by `(lsn, admission_seq)`.  One
+gap remains documented in the check: a
 page-segment record can never be the only copy of a page, because a cleanly
 stopped daemon flushes its memtable into a layer before it exits, so every
 archived page is also in a layer and a read resolves there (`reads mem=0
