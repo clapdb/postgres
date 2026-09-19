@@ -589,7 +589,13 @@ databases' manifest/relmap data can be reclaimed after their last dependency
 is released. The launcher retires removed keys before replacing its durable
 database inventory, making interrupted cleanup retryable. Small lifecycle
 metadata tombstones remain to prevent resurrection; this does not promise
-bounded metadata for infinitely many distinct keys. See
+bounded metadata for infinitely many distinct keys. Admission refusals
+(an unfenced generation LSN, growth ordered before a forkmeta cutover) are
+named and leave the store otherwise untouched; only a real storage/sync
+failure fails the artifact path closed until reopen, and the cutoff
+derivation guarantees a generation at a pinned LSN is admitted after any
+forkmeta cutover (`cutoff <= frontier <= floor <= pin`; see
+`RELEASE_VALIDATION.md`'s R5-5 writeup). See
 [`ARTIFACT_LIFECYCLE.md`](ARTIFACT_LIFECYCLE.md) for retry, recovery, legacy
 migration and the minimum-reader store format.
 

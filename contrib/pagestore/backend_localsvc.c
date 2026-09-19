@@ -429,9 +429,13 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 
 	if (status == PS_STATUS_OK)
 		return;
-	/* An artifact BEGIN/COMMIT/DROP refusal carries its reason in ch->result
-	 * (pagestore_daemon.c logs the same reason plus the key/lsn/horizon
-	 * context); every other opcode still reports only the opcode number. */
+	/* An artifact BEGIN/COMMIT/DROP refusal, or a WRITE (EXTEND/WRITEV)
+	 * refusal on an SLRU/reader-artifact key, carries its reason in
+	 * ch->result (pagestore_daemon.c logs the same reason plus the
+	 * key/lsn/horizon context); every other opcode still reports only the
+	 * opcode number.  The message embeds enough of the key that a caller
+	 * that only sees edata->message (the automatic reader-snapshot worker's
+	 * WARNING sites) can still tell which generation was refused and why. */
 	if (status == PS_STATUS_ERROR &&
 		(ch->opcode == PS_OP_ARTIFACT_BEGIN || ch->opcode == PS_OP_ARTIFACT_COMMIT ||
 		 ch->opcode == PS_OP_ARTIFACT_DROP))
@@ -440,6 +444,14 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 						ch->opcode,
 						ch->opcode == PS_OP_ARTIFACT_BEGIN ? "begin" :
 						ch->opcode == PS_OP_ARTIFACT_COMMIT ? "commit" : "drop",
+						pagestore_artifact_refuse_reason_name((PsArtifactRefuseReason) ch->result))));
+	if (status == PS_STATUS_ERROR &&
+		(ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV) &&
+		(ch->key.klass == PS_KLASS_SLRU || ch->key.klass == PS_KLASS_READER_SNAPSHOT))
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: artifact write refused (klass=%u db=%u object=%u block=%u lsn=%X/%08X): %s",
+						ch->key.klass, ch->key.dbOid, ch->key.relNumber, ch->blocknum,
+						LSN_FORMAT_ARGS(ch->req_lsn),
 						pagestore_artifact_refuse_reason_name((PsArtifactRefuseReason) ch->result))));
 	ereport(ERROR,
 			(errmsg("pagestore localsvc: daemon reported error for op %u",

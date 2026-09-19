@@ -63,6 +63,18 @@ begin(uint64_t lsn)
 	check(rc == 0 && token != 0, "begin publication");
 	return token;
 }
+/* Reason-taking variant of begin(), for tests that must inspect the refusal
+ * reason (or non-refusal) instead of only pass/fail. */
+static int
+begin_reason(uint64_t lsn, uint64_t *token, PsArtifactRefuseReason *reason)
+{
+	int			rc;
+
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = ps_artifact_begin(0, &key, lsn, token, reason);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc;
+}
 static int
 write_page(uint64_t lsn, uint64_t token, uint32_t block, int value)
 {
@@ -70,8 +82,22 @@ write_page(uint64_t lsn, uint64_t token, uint32_t block, int value)
 
 	memset(page, value, sizeof(page));
 	ps_lock_shard_wr(ps_shard_of(&key));
-	int			rc = ps_artifact_write(0, &key, block, page, lsn, token, NULL);
+	int			rc = ps_artifact_write(0, &key, block, page, lsn, token, NULL, NULL);
 
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc;
+}
+/* Reason-taking variant of write_page(). */
+static int
+write_reason(uint64_t lsn, uint64_t token, uint32_t block, int value,
+			PsArtifactRefuseReason *reason)
+{
+	unsigned char page[8192];
+	int			rc;
+
+	memset(page, value, sizeof(page));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = ps_artifact_write(0, &key, block, page, lsn, token, NULL, reason);
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc;
 }
@@ -81,6 +107,18 @@ commit(uint64_t lsn, uint64_t token, uint64_t count)
 	ps_lock_shard_wr(ps_shard_of(&key));
 	int			rc = ps_artifact_commit(0, &key, lsn, token, count, NULL);
 
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc;
+}
+/* Reason-taking variant of commit(). */
+static int
+commit_reason(uint64_t lsn, uint64_t token, uint64_t count,
+			 PsArtifactRefuseReason *reason)
+{
+	int			rc;
+
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = ps_artifact_commit(0, &key, lsn, token, count, reason);
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc;
 }
@@ -193,7 +231,7 @@ test_reader_snapshot_owner_key_split(void)
 	check(rc == 0 && token != 0, "automatic generation begins at 900300");
 	ps_admission_read_lock();
 	ps_lock_shard_wr(ps_shard_of(&automatic_key));
-	rc = ps_artifact_write(0, &automatic_key, 0, page, 900300, token, NULL);
+	rc = ps_artifact_write(0, &automatic_key, 0, page, 900300, token, NULL, NULL);
 	ps_unlock_shard(ps_shard_of(&automatic_key));
 	ps_admission_read_unlock();
 	check(rc == 0, "automatic generation writes its page at 900300");
@@ -216,7 +254,7 @@ test_reader_snapshot_owner_key_split(void)
 		  "BEGIN at 900200 on the owner-scoped key succeeds despite the automatic 900300");
 	ps_admission_read_lock();
 	ps_lock_shard_wr(ps_shard_of(&explicit_key));
-	rc = ps_artifact_write(0, &explicit_key, 0, page, 900200, token, NULL);
+	rc = ps_artifact_write(0, &explicit_key, 0, page, 900200, token, NULL, NULL);
 	ps_unlock_shard(ps_shard_of(&explicit_key));
 	ps_admission_read_unlock();
 	check(rc == 0, "owner-scoped generation writes its page at 900200");
@@ -259,7 +297,7 @@ test_reader_snapshot_owner_key_split(void)
 	check(rc == 0, "a later automatic generation at 900400 still succeeds");
 	ps_admission_read_lock();
 	ps_lock_shard_wr(ps_shard_of(&automatic_key));
-	rc = ps_artifact_write(0, &automatic_key, 0, page, 900400, token, NULL);
+	rc = ps_artifact_write(0, &automatic_key, 0, page, 900400, token, NULL, NULL);
 	ps_unlock_shard(ps_shard_of(&automatic_key));
 	ps_admission_read_unlock();
 	check(rc == 0, "automatic generation at 900400 writes its page");
@@ -267,6 +305,203 @@ test_reader_snapshot_owner_key_split(void)
 	rc = ps_artifact_commit(0, &automatic_key, 900400, token, 1, NULL);
 	ps_unlock_shard(ps_shard_of(&automatic_key));
 	check(rc == 0, "automatic generation at 900400 commits");
+}
+
+/*
+ * T1: an admission refusal -- a BEGIN (or, on a pre-fix tree, its first data
+ * WRITE) at a generation LSN below the durable page-reclaimed frontier --
+ * must be reported by name and change no state.  Before the fix it poisoned
+ * artifact_io_failed, which then failed every other artifact BEGIN/COMMIT/
+ * DROP and every artifact read on every key until reopen: exactly the CI
+ * op-34/op-11 shape (RELEASE_VALIDATION.md).  This must not happen.
+ */
+static void
+test_admission_refusal_does_not_poison(void)
+{
+	uint64_t	f = 0,
+				fs = 0;
+	uint64_t	token = 0;
+	PsArtifactRefuseReason reason;
+	uint32_t	saved_rel = key.relNumber;
+	uint32_t	fence_before;
+
+	check(ps_test_page_frontier(0, &f, &fs) != 0 && f >= 500,
+		  "T1: the page-reclaimed frontier is established at or past 500 before the refusal test");
+
+	/* A fresh key's BEGIN at an unfenced LSN (below the frontier) is refused
+	 * by name; nothing is admitted. */
+	key.relNumber = 50;
+	fence_before = ps_test_artifact_fence_count(0);
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(begin_reason(f - 1, &token, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_UNFENCED,
+		  "T1: BEGIN at an unfenced LSN is refused as UNFENCED, not admitted");
+	/* Before B2's BEGIN-time gate existed, BEGIN was admitted and the first
+	 * data WRITE at that same unfenced LSN was the one refused instead;
+	 * cover that shape too without assuming which one fires. */
+	if (token != 0)
+	{
+		reason = PS_ARTIFACT_REFUSE_NONE;
+		check(write_reason(f - 1, token, 0, 0x50, &reason) != 0 &&
+			  reason == PS_ARTIFACT_REFUSE_UNFENCED,
+			  "T1: a data WRITE at an unfenced LSN is refused as UNFENCED");
+	}
+	/* The refused attempt reserved and released its fence cleanly, or (if
+	 * refused before ever reaching the fence check) reserved none at all --
+	 * either way the refusal alone must not change the fence count (a
+	 * *successful* fenced append legitimately keeps one until its control
+	 * image is later reclaimed, so this compares before/after the refusal
+	 * rather than asserting a global zero). */
+	check(ps_test_artifact_fence_count(0) == fence_before,
+		  "T1: the refused attempt left the artifact control-era fence count unchanged");
+
+	/* A second, unrelated key still gets a clean BEGIN/WRITE/COMMIT: the
+	 * refusal above must not have poisoned the store. */
+	key.relNumber = 51;
+	token = 0;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(begin_reason(f + 100, &token, &reason) == 0 && token != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T1: a valid BEGIN on another key still succeeds after the refusal above");
+	check(write_page(f + 100, token, 0, 0x51) == 0, "T1: its WRITE succeeds");
+	check(commit(f + 100, token, 1) == 0, "T1: its COMMIT succeeds");
+
+	/* The shared key's already-completed generation at 600 is still fully
+	 * servable: a plain read and EXISTS/NBLOCKS. */
+	key.relNumber = saved_rel;
+	check(read_value(0, 600, 0, 0x66),
+		  "T1: the committed generation at 600 is still readable after the refusal");
+	check(metadata_matches(0, 600, 0, 1, 1),
+		  "T1: EXISTS/NBLOCKS is still served for the completed generation at 600");
+
+	key.relNumber = saved_rel;
+}
+
+static int	fail_seg_write_at,
+			seg_write_calls;
+static int
+fault_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf, uint32_t len)
+{
+	if (++seg_write_calls == fail_seg_write_at)
+	{
+		errno = EIO;
+		return -1;
+	}
+	return PsStoragePosix.seg_write(shard, seg, off, buf, len);
+}
+
+/*
+ * T2: guards the behaviour T1 must NOT change -- a real storage failure
+ * (seg_write, or a sync that follows an appended lifecycle record) must
+ * still poison the artifact path.  A sync failure that precedes any append
+ * (nothing durable is now ambiguous) must not poison and must be reported
+ * as SYNC, retryable.  Must run last before ps_core_close(): it leaves the
+ * store poisoned.  Reopens the store internally once (between the seg_write
+ * and the post-record-sync scenarios), so each poisoning scenario starts
+ * from a clean, unpoisoned flag; take the store path so it can.
+ */
+static void
+test_io_failure_still_poisons(const char *store)
+{
+	uint64_t	f = 0,
+				fs = 0;
+	uint64_t	token = 0;
+	PsArtifactRefuseReason reason;
+	PsStorage	fault = PsStoragePosix;
+	uint32_t	saved_rel = key.relNumber;
+
+	fault.sync = fault_sync;
+	(void) ps_test_page_frontier(0, &f, &fs);
+
+	/* fail_sync_at = 1: the pre-record data sync in ps_artifact_commit fails
+	 * before anything is appended -- retryable, must not poison. */
+	key.relNumber = 60;
+	token = begin(f + 200);
+	check(write_page(f + 200, token, 0, 0x71) == 0,
+		  "T2: page write before the injected pre-record sync failure");
+	fail_sync_at = 1;
+	sync_calls = 0;
+	ps_storage = &fault;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(commit_reason(f + 200, token, 1, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_SYNC,
+		  "T2: a pre-record data sync failure is refused as SYNC, not STORE_RECORD");
+	ps_storage = &PsStoragePosix;
+	check(commit(f + 200, token, 1) == 0,
+		  "T2: the same token commits once storage is restored -- the SYNC refusal did not poison");
+
+	key.relNumber = 61;
+	token = 0;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(begin_reason(f + 210, &token, &reason) == 0 && token != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T2: a BEGIN on another key still succeeds -- the SYNC refusal above did not poison");
+	check(write_page(f + 210, token, 0, 0x72) == 0 && commit(f + 210, token, 1) == 0,
+		  "T2: its WRITE/COMMIT succeed");
+
+	/* A real seg_write() failure -- not merely a sync() failure -- is the
+	 * other IO_FAILED path through append_page_impl() (the header or page
+	 * body segment write, or fork_meta_persist_segment()), reached from
+	 * ps_artifact_write()'s append_page_raw_outcome() call.  It must poison
+	 * exactly like a post-record sync failure. */
+	key.relNumber = 64;
+	token = begin(f + 240);
+	fail_seg_write_at = 1;
+	seg_write_calls = 0;
+	fault.seg_write = fault_seg_write;
+	ps_storage = &fault;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(write_reason(f + 240, token, 0, 0x74, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_STORE_RECORD,
+		  "T2: a seg_write failure on the WRITE path is refused as STORE_RECORD");
+	ps_storage = &PsStoragePosix;
+	key.relNumber = 65;
+	token = 0;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(begin_reason(f + 310, &token, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_POISONED,
+		  "T2: the seg_write failure above poisoned too -- another key's BEGIN now fails as POISONED");
+
+	/* Reopen to clear the poison for the next scenario: each poisoning
+	 * scenario in this test needs to start from an unpoisoned store. */
+	ps_core_close();
+	check(ps_core_open(store) == 0, "T2: reopen clears the seg_write-failure poison");
+	ps_storage = &PsStoragePosix;
+	key.relNumber = saved_rel;
+	check(read_value(0, 600, 0, 0x66),
+		  "T2: the shared key's completed generation at 600 survives the reopen");
+
+	/* fail_sync_at = 2: the sync that follows the appended COMMIT record
+	 * fails.  The record is indexed in memory but not proven durable --
+	 * this must poison. */
+	key.relNumber = 62;
+	token = begin(f + 220);
+	check(write_page(f + 220, token, 0, 0x73) == 0,
+		  "T2: page write before the injected post-record sync failure");
+	fail_sync_at = 2;
+	sync_calls = 0;
+	ps_storage = &fault;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(commit_reason(f + 220, token, 1, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_STORE_RECORD,
+		  "T2: a post-record sync failure is refused as STORE_RECORD");
+	ps_storage = &PsStoragePosix;
+
+	/* From here on the store is poisoned until reopen: every other key's
+	 * BEGIN is refused as POISONED, and even the unrelated shared key's
+	 * completed generation can no longer be read. */
+	key.relNumber = 63;
+	token = 0;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(begin_reason(f + 300, &token, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_POISONED,
+		  "T2: a real storage failure poisons -- BEGIN on another key now fails as POISONED");
+	key.relNumber = saved_rel;
+	check(!read_value(0, 600, 0, 0x66),
+		  "T2: poisoned -- even the shared key's completed generation at 600 is no longer readable");
+
+	key.relNumber = saved_rel;
 }
 
 int
@@ -355,16 +590,43 @@ main(int argc, char **argv)
 	uint64_t	retry = begin(200);
 
 	check(write_page(200, token, 1, 0x22) != 0, "superseded attempt cannot append");
+	{
+		/* T4: pure observability -- same refusal, now checking its reason.
+		 * A refused write changes nothing, so repeating it is safe. */
+		PsArtifactRefuseReason t4_reason = PS_ARTIFACT_REFUSE_NONE;
+
+		check(write_reason(200, token, 1, 0x22, &t4_reason) != 0 &&
+			  t4_reason == PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH,
+			  "T4: a superseded attempt token is refused as ATTEMPT_MISMATCH");
+	}
 	check(write_page(200, retry, 1, 0x23) == 0 && commit(200, retry, 2) != 0, "retry cannot count previous attempt's pages");
 	check(write_page(200, retry, 1, 0x23) == 0 && commit(200, retry, 1) == 0,
 		  "overwriting a block counts once in sparse replacement");
 	check(metadata_matches(0, 0, 0, 1, 2), "sparse size uses maximum block, not page count");
 	check(read_value(0, 200, 0, -1) && read_value(0, 200, 1, 0x23), "absent blocks never inherit older pages");
 	check(write_page(200, retry, 1, 0x24) != 0 && write_page(200, 0, 1, 0x24) != 0, "committed interval immutable; legacy bypass refused");
+	{
+		PsArtifactRefuseReason t4_reason = PS_ARTIFACT_REFUSE_NONE;
+
+		check(write_reason(200, retry, 1, 0x24, &t4_reason) != 0 &&
+			  t4_reason == PS_ARTIFACT_REFUSE_IMMUTABLE_MISMATCH,
+			  "T4: a same-LSN retry with different bytes is refused as IMMUTABLE_MISMATCH");
+		t4_reason = PS_ARTIFACT_REFUSE_NONE;
+		check(write_reason(200, 0, 1, 0x24, &t4_reason) != 0 &&
+			  t4_reason == PS_ARTIFACT_REFUSE_LEGACY_BYPASS,
+			  "T4: an unversioned write to a key under protocol is refused as LEGACY_BYPASS");
+	}
 	token = begin(200);
 	check(metadata_matches(0, 0, 0, 1, 2) && metadata_matches(0, 200, token, 1, 2),
 		  "same-LSN retry retains completed metadata");
 	check(write_page(200, token, 1, 0x25) != 0 && read_value(0, 200, 1, 0x23), "same-LSN retry rejects changes to completed bytes");
+	{
+		PsArtifactRefuseReason t4_reason = PS_ARTIFACT_REFUSE_NONE;
+
+		check(write_reason(200, token, 1, 0x25, &t4_reason) != 0 &&
+			  t4_reason == PS_ARTIFACT_REFUSE_IMMUTABLE_MISMATCH,
+			  "T4: a same-LSN retry rejecting changed bytes is refused as IMMUTABLE_MISMATCH");
+	}
 	check(write_page(200, token, 1, 0x23) == 0 && commit(200, token, 1) == 0 &&
 		  read_value(0, 200, 1, 0x23), "identical same-LSN retry is idempotent");
 	ps_core_close();
@@ -422,6 +684,8 @@ main(int argc, char **argv)
 	token = begin(600);
 	check(write_page(600, token, 0, 0x66) == 0 && commit(600, token, 1) == 0 && read_value(0, 600, 0, 0x66), "recreate after drop");
 	test_reader_snapshot_owner_key_split();
+	test_admission_refusal_does_not_poison();
+	test_io_failure_still_poisons(store);
 	ps_core_close();
 	for (int phase = 1; phase <= 2; phase++)
 	{

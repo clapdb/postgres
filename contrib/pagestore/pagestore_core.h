@@ -71,7 +71,8 @@ extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 extern int ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn,
 	uint64_t *token, PsArtifactRefuseReason *reason);
 extern int ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
-	const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq);
+	const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq,
+	PsArtifactRefuseReason *reason);
 extern int ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	uint64_t token, uint64_t count, PsArtifactRefuseReason *reason);
 extern int ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,
@@ -199,6 +200,10 @@ extern uint64_t ps_test_fork_event_scan_steps(void);
 extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
 									uint32_t *nevents, uint32_t *nmarkers,
 									uint32_t *ninert);
+/* Test-only: the durable page-reclaimed frontier (lsn/seq each may be NULL);
+ * returns 1 if a frontier has been published for this timeline's current
+ * incarnation, 0 if not (both out values are 0 in that case). */
+extern int ps_test_page_frontier(uint32_t timeline, uint64_t *lsn, uint64_t *seq);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);

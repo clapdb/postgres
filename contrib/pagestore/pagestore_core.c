@@ -449,8 +449,26 @@ static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS]
 static int page_frontier_load(const char *store_dir);
 static void page_prune_mark_all_due_locked(void);
 static int key_eq(const PsKey *a, const PsKey *b);
-static int append_page_raw(uint32_t timeline, const PsKey *key, uint32_t block,
-	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq);
+
+/*
+ * append_page_impl() returns -1 both when it refuses to admit a request
+ * (nothing durable changed) and when a storage write actually failed (bytes
+ * may be on disk).  The lifecycle layer must poison the whole artifact path
+ * only for the latter; this classifies which happened without changing the
+ * -1/0 return contract any existing caller relies on.
+ */
+typedef enum PsAppendOutcome
+{
+	PS_APPEND_OK = 0,
+	PS_APPEND_REFUSED_INVALID,			/* forked child / admission allocator exhausted; nothing written */
+	PS_APPEND_REFUSED_UNFENCED,		/* artifact klass: lsn below the page frontier with no owner/branch fence; nothing written */
+	PS_APPEND_REFUSED_FORKMETA_CUTOFF, /* growth not future of the forkmeta snapshot cutoff; nothing written */
+	PS_APPEND_IO_FAILED,				/* seg_write / ordered marker append failed; bytes may be on disk */
+} PsAppendOutcome;
+
+static int append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq,
+	PsAppendOutcome *outcome);
 typedef struct ArtifactPruneCache ArtifactPruneCache;
 static void artifact_prune_cache_free(ArtifactPruneCache *cache);
 static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
@@ -4126,6 +4144,31 @@ page_frontier_structural_fence_active(uint32_t reader_timeline,
 	return 0;
 }
 
+/*
+ * An SLRU seed or reader snapshot resolves its control era from the newest
+ * control image at or below its cutoff, and registering it fences that
+ * image from then on.  Below the durable page frontier the image survives
+ * only at a fence that already existed when compaction ran, so a generation
+ * at an unfenced LSN is refused instead of being admitted as a durable
+ * version whose era is already gone.  Caller holds map_rd (or map_wr); this
+ * only reads, never reserves -- append_page_impl's data-append fence
+ * reservation must happen under the same lock acquisition as this check
+ * (control pruning plans under map-wr, so nothing can run between them), so
+ * that reservation stays inline in append_page_impl rather than here.  The
+ * artifact BEGIN-time gate (ps_artifact_begin, pagestore_artifact_lifecycle.inc)
+ * uses this same predicate with no reservation: the meta record it admits or
+ * refuses is not itself a control-era-bearing version.
+ */
+static int
+artifact_lsn_fenced(uint32_t timeline, uint64_t lsn)
+{
+	PsPruneFence frontier = page_frontier_current(timeline);
+
+	return lsn >= frontier.lsn ||
+		ps_retention_page_fence_at(timeline, lsn) ||
+		page_frontier_structural_fence_active(timeline, timeline, lsn);
+}
+
 static int
 page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 					 uint64_t lsn, uint64_t admission_seq)
@@ -7482,8 +7525,8 @@ static uint64_t fork_meta_snapshot_freeze_seq;
  * call (pagestore_daemon.c run_request(): ps_admission_read_lock() held
  * across run_request_admitted(), which dispatches PS_OP_EXTEND/PS_OP_WRITEV
  * through handle_request() -> ps_artifact_write() ->
- * append_page_raw()/append_page_impl(), released only after that call
- * returns).  So admission_seq <= freeze_seq implies the append that
+ * append_page_raw_outcome()/append_page_impl(), released only after that
+ * call returns).  So admission_seq <= freeze_seq implies the append that
  * produced it had already returned by that freeze -- but "returned" does
  * NOT mean "wrote a marker": a crash between the segment body write and
  * fork_meta_persist_segment() (torn append) also returns via _exit(), and
@@ -15269,36 +15312,41 @@ page_lsn(const unsigned char *page)
 static int append_page_impl(uint32_t timeline, const PsKey *key,
 							uint32_t block, const unsigned char *page,
 							uint64_t version, uint64_t *out_admission_seq,
-							uint64_t *artifact_lsn);
+							uint64_t *artifact_lsn, PsAppendOutcome *outcome);
 
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq)
 {
-	return ps_artifact_write(timeline, key, block, page, version, 0, out_admission_seq);
+	return ps_artifact_write(timeline, key, block, page, version, 0, out_admission_seq, NULL);
 }
 
 static int
-append_page_raw(uint32_t timeline, const PsKey *key, uint32_t block,
+append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
 			const unsigned char *page, uint64_t version,
-			uint64_t *out_admission_seq)
+			uint64_t *out_admission_seq, PsAppendOutcome *outcome)
 {
 	uint64_t	artifact_lsn = 0;
+	PsAppendOutcome local_outcome = PS_APPEND_OK;
 	int			rc = append_page_impl(timeline, key, block, page, version,
-									  out_admission_seq, &artifact_lsn);
+									  out_admission_seq, &artifact_lsn,
+									  &local_outcome);
 
 	/* An admitted artifact reserved its fence before the append; the version
 	 * itself made it durable on success, so the release only forgets the
 	 * fence of an append that failed. */
 	if (artifact_lsn != 0)
 		artifact_fence_release(timeline, artifact_lsn);
+	if (outcome)
+		*outcome = local_outcome;
 	return rc;
 }
 
 static int
 append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				 const unsigned char *page, uint64_t version,
-				 uint64_t *out_admission_seq, uint64_t *artifact_lsn)
+				 uint64_t *out_admission_seq, uint64_t *artifact_lsn,
+				 PsAppendOutcome *outcome)
 {
 	SegRecHdr	hdr;
 	SegRecHdrAdmission admission_hdr;
@@ -15320,13 +15368,19 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	growth_floor;
 
 	if (!core_process_valid())
+	{
+		*outcome = PS_APPEND_REFUSED_INVALID;
 		return -1;
+	}
 	admission_seq = admission_seq_alloc();
 	s = shard_for(key);
 	fe = fork_find(timeline, key);
 	growth_floor = fe ? fe->last_def_lsn : 0;
 	if (admission_seq == 0)
+	{
+		*outcome = PS_APPEND_REFUSED_INVALID;
 		return -1;
+	}
 
 	/* A branch-local version written after the branch snapshot must not become
 	 * visible AT that snapshot merely because copied bytes retain an older
@@ -15394,19 +15448,17 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * image from then on.  Below the durable page frontier the image survives
 	 * only at a fence that already existed when compaction ran, so an artifact
 	 * shipped late at an unfenced cutoff is refused instead of being admitted
-	 * as a durable version whose era is already gone.
+	 * as a durable version whose era is already gone.  artifact_lsn_fenced()
+	 * (this file, above) holds the shared predicate; ps_artifact_begin also
+	 * uses it, at BEGIN time, to refuse the same generation before any append.
 	 */
 	if ((key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_READER_SNAPSHOT) &&
 		hdr.lsn != 0)
 	{
-		PsPruneFence frontier;
 		int			fenced;
 
 		ps_lock_map_rd();
-		frontier = page_frontier_current(timeline);
-		fenced = hdr.lsn >= frontier.lsn ||
-			ps_retention_page_fence_at(timeline, hdr.lsn) ||
-			page_frontier_structural_fence_active(timeline, timeline, hdr.lsn);
+		fenced = artifact_lsn_fenced(timeline, hdr.lsn);
 		/* Reserve the artifact's fence while the fence that admitted it is
 		 * still held: control pruning plans under map-wr, so it cannot run
 		 * between this check and the reservation, and from here on the image
@@ -15420,7 +15472,10 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		}
 		ps_unlock_map();
 		if (!fenced)
+		{
+			*outcome = PS_APPEND_REFUSED_UNFENCED;
 			return -1;
+		}
 	}
 	hdr.len = page_size;
 
@@ -15484,7 +15539,10 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * segment, even when this is a non-growth commit marker. */
 	if ((ordered_record || segment_grows) &&
 		!fork_meta_mutation_future(hdr_grow_lsn, admission_seq))
+	{
+		*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
 		return -1;
+	}
 	if (ordered_record)
 	{
 		order_id = segment_order_id_alloc();
@@ -15509,7 +15567,10 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		bound_hdr.admission_seq = admission_seq;
 		if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off,
 								  &bound_hdr, sizeof(bound_hdr)) != 0)
+		{
+			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
+		}
 	}
 	else
 	{
@@ -15517,11 +15578,17 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		admission_hdr.admission_seq = admission_seq;
 		if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off,
 								  &admission_hdr, sizeof(admission_hdr)) != 0)
+		{
+			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
+		}
 	}
 	data_off = s->cur_off + header_size;
 	if (ps_storage->seg_write(s->id, s->cur_seg, data_off, page, page_size) != 0)
+	{
+		*outcome = PS_APPEND_IO_FAILED;
 		return -1;
+	}
 
 	/*
 	 * The segment record is the growth's durability; this metadata marker only
@@ -15536,6 +15603,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		/* The complete body is not committed without its marker.  Retire this
 		 * segment so a later torn header cannot reuse that stale body. */
 		s->cur_off = segment_size;
+		*outcome = PS_APPEND_IO_FAILED;
 		return -1;
 	}
 
@@ -16866,6 +16934,23 @@ artifact_fence_forget(uint32_t timeline)
 		nartifact_fences = w;
 	}
 	pthread_mutex_unlock(&artifact_fence_lock);
+}
+
+/* Test-only accessor for the durable page-reclaimed frontier a test relies
+ * on, so it can assert the position it depends on instead of assuming it. */
+int
+ps_test_page_frontier(uint32_t timeline, uint64_t *lsn, uint64_t *seq)
+{
+	PsPruneFence frontier;
+
+	ps_lock_map_rd();
+	frontier = page_frontier_current(timeline);
+	ps_unlock_map();
+	if (lsn)
+		*lsn = frontier.lsn;
+	if (seq)
+		*seq = frontier.admission_seq;
+	return frontier.lsn != 0 || frontier.admission_seq != 0;
 }
 
 uint32_t

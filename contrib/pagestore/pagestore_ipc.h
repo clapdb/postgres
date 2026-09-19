@@ -31,6 +31,14 @@
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
 #define PS_SHM_VERSION		47	/* 47: artifact publication and drop operations;
+								 * (no bump for the additional PsArtifactRefuseReason
+								 * values or the EXTEND/WRITEV ch->result use added
+								 * after 47: that value set is append-only for the
+								 * lifetime of one running (daemon, backend) pair,
+								 * same as #266's handling -- an old client talking
+								 * to a new daemon prints "unknown" for a value it
+								 * does not recognise instead of failing a version
+								 * check);
 								 * 46: block death as-of query (PS_OP_BLOCK_DEATH);
 								 * 45: relation inspection incarnation fence;
 								 * 44: isolated relation inspection request;
@@ -406,7 +414,9 @@ typedef struct PsChannel
 	uint32_t	result;			/* NBLOCKS -> count; EXISTS -> 0/1;
 								 * ARTIFACT_BEGIN/COMMIT/DROP error -> the
 								 * refusal reason (PsArtifactRefuseReason,
-								 * pagestore_artifact_format.h; append-only) */
+								 * pagestore_artifact_format.h; append-only);
+								 * EXTEND/WRITEV error on an SLRU/reader-
+								 * artifact klass -> the same refusal reason */
 	uint32_t	shard;			/* key-owner shard for this request */
 
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
