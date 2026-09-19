@@ -551,7 +551,7 @@ class PlanValidationTests(unittest.TestCase):
             scenario_dir / "wal_reclaim_before_dir_fsync.jsonl",
             scenario_dir / "timeline_delete_after_deleting.jsonl",
             scenario_dir / "timeline_delete_after_wal_cleanup.jsonl",
-            scenario_dir / "timeline_delete_after_segment_rewrite.jsonl",
+            scenario_dir / "timeline_delete_after_segment_tombstone.jsonl",
             scenario_dir / "timeline_delete_after_deleted.jsonl",
             scenario_dir / "manifest_compact_after_tmp_sync.jsonl",
             scenario_dir / "manifest_compact_after_rename.jsonl",

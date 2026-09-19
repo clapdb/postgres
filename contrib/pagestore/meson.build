@@ -856,7 +856,7 @@ foreach prune_fault_scenario : [
   'wal_reclaim_before_dir_fsync',
   'timeline_delete_after_deleting',
   'timeline_delete_after_wal_cleanup',
-  'timeline_delete_after_segment_rewrite',
+  'timeline_delete_after_segment_tombstone',
   'timeline_delete_after_deleted',
   'timeline_delete_before_deleting',
   'manifest_compact_after_tmp_sync',

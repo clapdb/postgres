@@ -3028,8 +3028,12 @@ test_deleting_timeline_page_cleanup(void)
 	for (int i = 0; i < 32; i++)
 		(void) ps_core_maintenance();
 	after = ps_storage->seg_size(0, 0);
-	check(after > 0 && after < before,
-		  "mixed segment is atomically filtered without unlinking it");
+	/* Invariant I3: the target's record is tombstoned in place (its bytes
+	 * become a hole record of identical size), never relocated -- the
+	 * segment's byte size is therefore unchanged, unlike the pre-fix
+	 * rewrite that shrank it. */
+	check(after > 0 && after == before,
+		  "mixed segment is tombstoned in place without changing its size");
 	memset(page, 0, sizeof(page));
 	check(read_test_page(1, 0, page) == 0,
 		  "target page and cache reference are gone");
@@ -3053,20 +3057,26 @@ test_deleting_timeline_page_cleanup(void)
 	close_store();
 	remove_tree(store);
 
-	/* A segment containing only the target becomes an empty canonical segment;
-	 * its identity remains so recovery and the append cursor stay unambiguous. */
+	/* A segment containing only the target keeps its bytes -- it becomes one
+	 * hole record, not an empty file; segment GC (not cleanup) reclaims it
+	 * once the watermark moves past it. */
 	strcpy(store, "/tmp/pagestore-timeline-page-cleanup-XXXXXX");
 	check(mkdtemp(store) != NULL, "create pure-target page-cleanup store");
 	configure_timeline_core();
 	segment_size = 16384;
 	flush_pages = 100;
 	check(ps_core_open(store) == 0 && create_branch(2, 0, 100) &&
-			write_timeline_layer(2, 0, 100) == 0 && begin_delete(2, 1, NULL),
+			write_timeline_layer(2, 0, 100) == 0,
 		  "write pure-target segment");
+	before = ps_storage->seg_size(0, 0);
+	check(before > 0 && begin_delete(2, 1, NULL),
+		  "begin pure-target page-segment deletion");
 	for (int i = 0; i < 32; i++)
 		(void) ps_core_maintenance();
-	check(ps_storage->seg_size(0, 0) == 0,
-		  "pure-target segment is replaced by an empty segment");
+	check(ps_storage->seg_size(0, 0) == before,
+		  "pure-target segment keeps its size, tombstoned in place");
+	check(state_of(2, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "pure-target cleanup still publishes DELETED");
 	close_store();
 	remove_tree(store);
 }
@@ -3111,16 +3121,21 @@ test_deleting_timeline_page_cleanup_backpressure_debt(void)
 	char store[] = "/tmp/pagestore-timeline-page-debt-XXXXXX";
 	PsShmHeader metrics;
 	int64_t first_size;
-	int rewrite_seen = 0;
+	int deleted_seen = 0;
+	int reclaimed_seen = 0;
+	PsTimelineState state;
 
 	/* Put the deleting timeline in segment 0 and a live sibling in segment 1,
-	 * so the target segment is one covered, nonempty PAGE debt unit. */
+	 * so the target segment is one covered, nonempty PAGE debt unit.  Under
+	 * tombstoning, cleanup itself never settles this debt (a tombstoned
+	 * segment keeps its bytes, so it is never "empty"); only segment GC's
+	 * later, ordinary whole-segment reclaim does, once DELETED unblocks it. */
 	configure_timeline_core();
 	segment_size = 16384;
 	flush_pages = 1;
 	segment_gc_enabled = 1;
 	check(ps_backpressure_configure(segment_size, 1, 0, 0) == 0,
-		  "configure PAGE debt for timeline deletion rewrite");
+		  "configure PAGE debt for timeline deletion tombstoning");
 	check(mkdtemp(store) != NULL, "create PAGE debt timeline-deletion store");
 	memset(&metrics, 0, sizeof(metrics));
 	ps_core_set_metrics_header(&metrics);
@@ -3140,24 +3155,40 @@ test_deleting_timeline_page_cleanup_backpressure_debt(void)
 	first_size = ps_storage->seg_size(0, 0);
 	check(first_size > 0 && ps_core_maintenance() == 1,
 		  "timeline deletion makes maintenance progress");
-	for (int i = 0; i < 64 && ps_storage->seg_size(0, 0) > 0; i++)
+	for (int i = 0; i < 64 && !deleted_seen; i++)
 	{
 		(void) ps_core_maintenance();
-		if (ps_storage->seg_size(0, 0) == 0)
-			rewrite_seen = 1;
+		if (state_of(2, &state, NULL) && state == PS_TIMELINE_DELETED)
+			deleted_seen = 1;
 	}
-	check(rewrite_seen,
-		  "successful timeline rewrite consumes the counted segment debt");
+	check(deleted_seen, "the target reaches DELETED with its segment intact");
+	check(ps_storage->seg_size(0, 0) == first_size,
+		  "the tombstoned segment keeps its bytes; cleanup alone never "
+		  "shrinks or unlinks it");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.throttled != 0 &&
+			metrics.page_backpressure.lag_bytes == segment_size,
+		  "the tombstoned-but-still-present segment stays counted as debt");
+	errno = 0;
+	for (int i = 0; i < 64 && ps_storage->seg_size(0, 0) >= 0; i++)
+	{
+		(void) ps_core_maintenance();
+		if (ps_storage->seg_size(0, 0) < 0 && errno == ENOENT)
+			reclaimed_seen = 1;
+	}
+	check(reclaimed_seen,
+		  "segment GC reclaims the tombstoned segment once DELETED "
+		  "unblocks it, consuming the debt it always represented");
 	ps_backpressure_refresh();
 	check(metrics.page_backpressure.lag_bytes == 0 &&
 			metrics.page_backpressure.throttled == 0,
-		  "empty rewrite reaches PAGE catch-up and releases throttle");
+		  "segment GC's reclaim reaches PAGE catch-up and releases throttle");
 	for (int i = 0; i < 64; i++)
 		(void) ps_core_maintenance();
 	ps_backpressure_refresh();
 	check(metrics.page_backpressure.lag_bytes == 0 &&
 			metrics.page_backpressure.throttle_exits == 1,
-		  "later segment GC does not decrement rewritten debt twice");
+		  "further maintenance does not double-count the reclaimed segment's debt");
 	close_store();
 	check(ps_core_open(store) == 0,
 		  "restart after timeline deletion debt cleanup");
@@ -3182,7 +3213,7 @@ test_deleting_timeline_page_cleanup_pending_remove(void)
 	PsShmHeader metrics;
 	int64_t size0;
 	int64_t size1;
-	int rewrite_seen = 0;
+	PsTimelineState state;
 
 	/* Build two covered debt segments ahead of the current boundary.  Segment 0
 	 * belongs only to the timeline that will be deleted; segment 1 remains live
@@ -3224,23 +3255,33 @@ test_deleting_timeline_page_cleanup_pending_remove(void)
 
 	check(begin_delete(2, 1, NULL),
 		  "begin deletion after a pending segment remove");
+	/* Tombstoning leaves the pending-remove victim's size unchanged (it is
+	 * never emptied by cleanup); only segment GC, once DELETED unblocks it,
+	 * actually reclaims the file -- the same pending-remove retry path a
+	 * covered segment with no deletion involved would take. */
 	for (int i = 0; i < 64; i++)
 	{
 		(void) ps_core_maintenance();
-		size0 = ps_storage->seg_size(0, 0);
-		if (size0 == 0)
-		{
-			rewrite_seen = 1;
+		if (state_of(2, &state, NULL) && state == PS_TIMELINE_DELETED)
 			break;
-		}
 	}
-	check(rewrite_seen,
-		  "timeline rewrite empties the victim with a pending remove");
+	check(state_of(2, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "target reaches DELETED with the pending-remove victim intact");
+	check(ps_storage->seg_size(0, 0) == size0,
+		  "cleanup's tombstone pass leaves the pending-remove victim's size "
+		  "unchanged");
+	errno = 0;
+	for (int i = 0; i < 64 && ps_storage->seg_size(0, 0) >= 0; i++)
+		(void) ps_core_maintenance();
+	check(ps_storage->seg_size(0, 0) < 0 && errno == ENOENT,
+		  "segment GC reclaims the pending-remove victim once DELETED "
+		  "unblocks it");
 	ps_backpressure_refresh();
 	size1 = ps_storage->seg_size(0, 1);
 	check(size1 > 0 && metrics.page_backpressure.lag_bytes == segment_size &&
 		  metrics.page_backpressure.throttled != 0,
-		  "rewrite settles only the victim and keeps the second debt throttled");
+		  "reclaiming the victim settles only its debt and keeps the "
+		  "second segment's debt throttled");
 	for (int i = 0; i < 64 && metrics.page_backpressure.lag_bytes != 0; i++)
 	{
 		(void) ps_core_maintenance();
@@ -3338,9 +3379,9 @@ test_deleting_timeline_page_cleanup_prefix_hole(void)
 			"remove prefix segment before deleting later target");
 	for (int i = 0; i < 32; i++)
 		(void) ps_core_maintenance();
-	check(ps_storage->seg_size(0, 1) > 0 &&
-			ps_storage->seg_size(0, 1) < before,
-			"cleanup crosses prefix hole and filters later mixed segment");
+	check(ps_storage->seg_size(0, 1) == before,
+			"cleanup crosses the missing prefix segment and tombstones the "
+			"later mixed segment in place, keeping its size");
 	memset(page, 0, sizeof(page));
 	check(read_test_page(1, 0, page) == 0,
 			"prefix-hole cleanup removes target page");
@@ -3389,8 +3430,9 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 	for (int i = 0; i < 32; i++)
 		(void) ps_core_maintenance();
 	after = ps_storage->seg_size(0, 0);
-	check(after > 0 && after < before,
-			"DELETING cleanup filters a retired short segment");
+	check(after > 0 && after == before,
+			"DELETING cleanup tombstones the retired short segment in "
+			"place, keeping its size");
 	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
 			"retired-segment cleanup permits durable DELETED publication");
 	memset(page, 0, sizeof(page));
