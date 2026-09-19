@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_walidx_snapshot.h"
@@ -696,6 +697,56 @@ test_unreplaceable_dependency_requests_once(void)
 		  ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
 		  next_generation <= 2,
 		  "no publication storm: at most one compacted publication while progress does not advance");
+	close_store();
+	remove_tree(store);
+}
+
+/* Runs synchronously inside wal_segment_reclaim_one, after the attempt's own
+ * progress was already captured (wal_reclaim_walidx_state_valid, before this
+ * hook point) but before wal_reclaim_backoff is called.  Advancing durable
+ * progress here, and so bumping the proof epoch, while the in-flight
+ * attempt's own decision is still based on the older value reproduces the
+ * ordering the lost-wakeup fix protects against. */
+static void
+advance_progress_before_floor(uint32_t timeline, void *arg)
+{
+	const uint64_t *end = arg;
+
+	(void) timeline;
+	check(wal_index_progress(0, WAL_SEGMENT, *end),
+		  "advance durable progress from inside the floor-scan hook");
+}
+
+/* wal_reclaim_backoff must record the proof epoch as it stood before this
+ * attempt read any proof input, not a fresh read at arm time: a fresh read
+ * can race with a proof-relevant event that lands after the stale input read
+ * but before the backoff is armed (here, forced synchronously via the
+ * floor-scan hook; in production, a PS_OP_RETENTION_PIN_DROP dispatched
+ * without the admission lock while this attempt has released
+ * walidx_prune_lock/wal_lock for the retention_effective_floor scan).  If the
+ * epoch is read fresh, it already reflects that event, so the next attempt
+ * finds no mismatch and waits out the full one-second backoff instead of
+ * retrying immediately -- the store would stay at 2 segments here instead of
+ * reclaiming to 0 on the very next, unslept call. */
+static void
+test_backoff_epoch_predates_attempt_inputs(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-epoch-order-XXXXXX";
+	uint64_t end = WAL_TOTAL;
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 0) &&
+		  wal_index_progress(0, 0, WAL_SEGMENT),
+		  "construct a WAL prefix whose durable progress covers only the first segment");
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 2,
+		  "reclaim advances to the aligned progress boundary");
+	ps_test_set_wal_reclaim_before_floor_hook(advance_progress_before_floor, &end);
+	check(ps_test_wal_reclaim_maintenance() == 0 && segment_count(store, 0) == 2,
+		  "this attempt's own progress read predates the hook's later advance");
+	ps_test_set_wal_reclaim_before_floor_hook(NULL, NULL);
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 0,
+		  "the epoch snapshotted before this attempt's inputs makes the advance"
+		  " due on the very next attempt, without sleeping out the backoff");
 	close_store();
 	remove_tree(store);
 }
@@ -1886,6 +1937,7 @@ main(void)
 	test_no_floor_or_progress();
 	test_preselection_skips_empty_reclaim();
 	test_no_progress_backoff_follows_proof();
+	test_backoff_epoch_predates_attempt_inputs();
 	test_stale_wal_index_requests_compaction();
 	test_unreplaceable_dependency_requests_once();
 	test_dependency_cutoffs();

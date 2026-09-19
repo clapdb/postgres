@@ -11054,16 +11054,21 @@ wal_reclaim_walidx_state_valid(uint32_t timeline, uint64_t *progress_out)
 	return 1;
 }
 
+/* epoch must be the proof epoch the caller read before it read any of the
+ * proof inputs (retention_floor, progress, raw_floor) that led to this
+ * backoff, not a fresh read here: a fresh read at arm time can race with a
+ * concurrent proof-relevant mutation that lands between the caller's (now
+ * stale) input read and this call, recording an epoch that already
+ * "catches up" to a change this attempt never actually observed and losing
+ * the wakeup for it (see the call site's comment). */
 static void
-wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
+wal_reclaim_backoff(uint32_t timeline, const struct timespec *now,
+					uint64_t epoch)
 {
 	wal_reclaim_retry_at[timeline] = *now;
 	if (wal_reclaim_retry_at[timeline].tv_sec < LONG_MAX)
 		wal_reclaim_retry_at[timeline].tv_sec++;
-	/* Record the epoch at arm time so a later proof-relevant event makes this
-	 * timeline due again without waiting for retry_at (wal_reclaim_retry_due). */
-	wal_reclaim_backoff_epoch[timeline] =
-		__atomic_load_n(&wal_reclaim_proof_epoch, __ATOMIC_ACQUIRE);
+	wal_reclaim_backoff_epoch[timeline] = epoch;
 }
 
 /* Read only stable per-timeline state while the WAL lock excludes append,
@@ -11074,9 +11079,11 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
  * honor_retry_at to avoid repeatedly draining admission for the same failure.
  * The no-progress backoff itself is proof-keyed (wal_reclaim_retry_due): it
  * ends at the earlier of one second or the next retention / WAL-index
- * publish-or-GC / durable-progress / timeline-delete event, so a failure that
- * is not proof-relevant (residual/storage errors) still waits out the full
- * second while a real floor advance is not delayed by the clock. */
+ * publish-or-GC / durable-progress / timeline-delete event.  A real floor
+ * advance is not delayed by the clock; a failure that is not proof-relevant
+ * (residual/storage errors) usually does wait out the full second, but an
+ * unrelated epoch bump can still cancel it early too -- a harmless extra
+ * retry, not something either path relies on. */
 static int
 wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
 						int *observation_error)
@@ -11164,6 +11171,7 @@ wal_segment_reclaim_one(void)
 		uint64_t candidate;
 		uint64_t target;
 		uint64_t residual_target = 0;
+		uint64_t proof_epoch = 0;
 		int attempt = 0;
 		int rc;
 		int walidx_valid;
@@ -11195,6 +11203,21 @@ wal_segment_reclaim_one(void)
 			continue;
 		}
 		pthread_rwlock_unlock(wal_lock);
+
+		/* Snapshot the proof epoch before reading any proof input below
+		 * (retention_floor, progress, raw_floor), so a concurrent
+		 * proof-relevant mutation that lands after this point is guaranteed
+		 * to bump the epoch past what wal_reclaim_backoff records for this
+		 * attempt, even if the inputs this attempt reads are already stale
+		 * relative to that mutation.  Some mutations that bump the epoch
+		 * (e.g. PS_OP_RETENTION_PIN_DROP) are dispatched without the
+		 * admission lock and run under only page_prune_lock/walidx_prune_lock,
+		 * both of which this attempt releases and reacquires below for the
+		 * retention_effective_floor scan; reading the epoch fresh at arm time
+		 * instead of here can race with exactly that window and record an
+		 * epoch that already "catches up" to a change this attempt never
+		 * actually observed -- a lost wakeup. */
+		proof_epoch = __atomic_load_n(&wal_reclaim_proof_epoch, __ATOMIC_ACQUIRE);
 
 		/* WAL-index writers take shard-wr before the publish read gate. */
 		for (uint32_t shard = 0; shard < nshards; shard++)
@@ -11326,7 +11349,7 @@ wal_segment_reclaim_one(void)
 					__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 1,
 									 __ATOMIC_RELEASE);
 			}
-			wal_reclaim_backoff(tl, &now);
+			wal_reclaim_backoff(tl, &now, proof_epoch);
 			goto selected_done;
 		}
 		if (target > store->end_lsn)
@@ -11344,7 +11367,7 @@ wal_segment_reclaim_one(void)
 
 retry_timeline:
 		if (attempt)
-			wal_reclaim_backoff(tl, &now);
+			wal_reclaim_backoff(tl, &now, proof_epoch);
 
 		/* Advance after every selected candidate, including fail-closed or failed
 		 * attempts, so it cannot starve later timelines on subsequent ticks. */
@@ -19351,6 +19374,19 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		   sizeof(walidx_snapshot_reshard_pending));
 	memset(walidx_snapshot_retry_at, 0, sizeof(walidx_snapshot_retry_at));
 	walidx_snapshot_cursor = 0;
+	/* An in-process reopen (close then open again in the same process, as
+	 * the standalone tests do) must not carry a forced/reclaim-due request
+	 * from the previous open's timelines into the new one: these otherwise
+	 * survive ps_core_close() and are reset only per-timeline on delete
+	 * (walidx_purge_timeline) or by the daemon's post-open backpressure
+	 * configuration call, neither of which runs between a bare close/open
+	 * pair. */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_snapshot_gc_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
+	}
 	memset(walidx_log_epoch, 0, sizeof(walidx_log_epoch));
 	memset(walidx_snapshot_gc_pending, 0,
 		   sizeof(walidx_snapshot_gc_pending));
