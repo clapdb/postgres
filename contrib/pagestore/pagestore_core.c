@@ -5988,9 +5988,35 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 	{
 		uint64_t	lsn = 1 + fork_event_selftest_rand(&rngstate) % 6;
 		uint64_t	admission_seq = seq_pool[i];
+		uint32_t	old_nev = fe.nev;
+		uint32_t	expected_slot;
 
 		if (legacy && (i % 7) == 6)
 			admission_seq = 0;
+
+		/*
+		 * Pin the arrival-order promise this whole index rests on (see the
+		 * header comment above fork_event_index_usable(), ~line 5043): the
+		 * slot fork_event_insert_pos() picks -- the fast path's
+		 * upper_bound(), or the fallback's backward walk, replicated here
+		 * read-only -- must be exactly where the new event lands.  Computed
+		 * before the insertion call, since both are side-effect-free reads
+		 * over the pre-insert array.
+		 */
+		if (fork_event_index_usable(&fe, admission_seq))
+			expected_slot = fork_event_upper_bound(&fe, lsn, admission_seq);
+		else
+		{
+			uint32_t	w = fe.nev;
+
+			while (w > 0 &&
+				   (fe.ev[w - 1].lsn > lsn ||
+					(fe.ev[w - 1].lsn == lsn && admission_seq != 0 &&
+					 fe.ev[w - 1].admission_seq != 0 &&
+					 fe.ev[w - 1].admission_seq > admission_seq)))
+				w--;
+			expected_slot = w;
+		}
 
 		if ((i & 1) == 0)
 		{
@@ -6000,6 +6026,15 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 
 			kind = roll == 0 ? FEV_SET : roll == 1 ? FEV_DEAD : FEV_GROW;
 			fork_event_add(&fe, lsn, admission_seq, nblocks, kind);
+			/* A GROW that does not raise the size at (lsn, admission_seq) is
+			 * deduped (fork_event_add() returns early, nev unchanged); the
+			 * slot promise has nothing to check in that case. */
+			FEV_ST_CHECK(fe.nev == old_nev || fe.nev == old_nev + 1);
+			if (fe.nev == old_nev + 1)
+				FEV_ST_CHECK(fe.ev[expected_slot].lsn == lsn &&
+							 fe.ev[expected_slot].admission_seq == admission_seq &&
+							 fe.ev[expected_slot].nblocks == nblocks &&
+							 fe.ev[expected_slot].kind == kind);
 		}
 		else
 		{
@@ -6010,6 +6045,12 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 
 			fork_event_add_seg_marker(&fe, lsn, nblocks, kind, order_id,
 									  admission_seq);
+			FEV_ST_CHECK(fe.nev == old_nev + 1);
+			FEV_ST_CHECK(fe.ev[expected_slot].lsn == lsn &&
+						 fe.ev[expected_slot].admission_seq == admission_seq &&
+						 fe.ev[expected_slot].order_id == order_id &&
+						 fe.ev[expected_slot].nblocks == nblocks &&
+						 fe.ev[expected_slot].kind == kind);
 			if (admission_seq != 0)
 			{
 				markers[nmarkers].lsn = lsn;
