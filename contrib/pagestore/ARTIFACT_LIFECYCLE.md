@@ -31,7 +31,11 @@ identity supplies the upper admission boundary.
    BEGIN checks this itself (not only the first WRITE), after the same-LSN
    completed-generation short-circuit, so an immutable re-ship of an
    already-published generation still works even once its LSN has fallen
-   behind the frontier; DROP is not fenced (see "Drop and reuse").
+   behind the frontier; DROP is not fenced (see "Drop and reuse"). The check
+   is on the generation's LSN, not on any data page, so it applies just as
+   much to an empty generation (BEGIN immediately followed by a zero-count
+   COMMIT) as to one with pages: an empty generation at an unfenced LSN is
+   refused at BEGIN too, before any COMMIT is attempted.
 2. Every staged page carries that token and the generation LSN. Pages remain
    hidden until completion. Pages can be sparse, and retries within an attempt
    may overwrite a block; the latest admitted copy is authoritative.
@@ -245,20 +249,47 @@ qualification remain required before release.
 ### Validation for the admission-refusal poisoning / forkmeta-cutoff fix (2026-09-20)
 
 Resolves the two R5-5 follow-ups above (see `RELEASE_VALIDATION.md`). New
-tests T1/T2/T4 (`pagestore_artifact_lifecycle_test.c`) and T5/T6
-(`pagestore_forkmeta_cutover_test.c`) each fail on the pre-fix tree and pass
-on this one (verified with the core change stashed and restored):
+tests: T1 `test_admission_refusal_does_not_poison`, T2
+`test_io_failure_still_poisons`, T4 (write-path reason observability) in
+`pagestore_artifact_lifecycle_test.c`; T5 `test_artifact_generation_vs_cutoff`,
+T6 `test_artifact_forkmeta_cutoff_reason`, T7
+`test_artifact_write_unfenced_after_pin_drop` in
+`pagestore_forkmeta_cutover_test.c`. Fail-before evidence is precise per test,
+not a blanket claim, since the fix is two independent mechanisms (the B2
+BEGIN-time fence gate, and the outcome-classified poisoning) and most tests
+only depend on one of them:
+- Removing only the B2 gate (the BEGIN-time `artifact_lsn_fenced()` check)
+  and keeping outcome-classified poisoning: exactly one failure each in T1
+  and T5 (both assert a BEGIN, not a WRITE, is refused UNFENCED), everything
+  else including T2/T4/T6/T7 unaffected.
+- Restoring blanket poisoning (poison on any nonzero `rc`, not just
+  `PS_APPEND_IO_FAILED`, in both `artifact_store_record()` and
+  `ps_artifact_write()`) and keeping the B2 gate: zero failures in
+  `pagestore_artifact_lifecycle_test` (T1's own WRITE-side case is dead once
+  B2 exists -- every unfenced *new* generation is now caught at BEGIN, so
+  T1 never reaches `ps_artifact_write`'s outcome-classified branch at all),
+  one failure in `pagestore_forkmeta_cutover_test` before T7 existed (T6:
+  its FORKMETA_CUTOFF-refused BEGIN goes through `artifact_store_record()`,
+  which would now poison, breaking its own "did not poison" assertion), and
+  seven more once T7 exists -- T7 is specifically the regression test for
+  this: it reaches `ps_artifact_write`'s outcome-classified branch through a
+  genuine TOCTOU race (BEGIN admitted while a pin fences its LSN; the pin is
+  then legitimately dropped and the frontier moves past that LSN before the
+  attempt's data WRITE runs), which T1 can no longer reach post-B2.
+- T2 and T4's fail-before evidence is compile-time, not run-time: the pre-fix
+  `ps_artifact_write()` has a different signature (no reason out-parameter)
+  and the pre-fix enum lacks the values these tests assert on, so the
+  unfixed test file does not build against the unfixed core at all.
+
 `pagestore_artifact_lifecycle_test` passed 96/96 in both SLRU and reader
-klass modes (was 73/73 before this change; the pre-fix test file does not
-even compile against the unfixed core, since the fix changes
-`ps_artifact_write`'s signature and adds new enum values the tests assert
-on); `pagestore_forkmeta_cutover_test` passed 527/527 (was 490/490 before).
-The standalone `-O2 -Wall -Wextra -Werror` build passed for the daemon and
-both affected test binaries. Full `meson test --suite pagestore` passed
-74/74. The three persisted-format fixture checks
-(`posix-mvp-baseline`+`posix-artifact-lifecycle`, `pgdata-artifacts`) passed
-unchanged, including `--require-build-match`: no persisted-format or fixture
-change. `KEEPTMP=1 integration_test.sh` passed, including the two new
+klass modes (was 73/73 before this change); `pagestore_forkmeta_cutover_test`
+passed 548/548 (was 490/490 before). The standalone `-O2 -Wall -Wextra
+-Werror` build passed for the daemon and both affected test binaries. Full
+`meson test --suite pagestore` passed 74/74. The three persisted-format
+fixture checks (`posix-mvp-baseline`+`posix-artifact-lifecycle`,
+`pgdata-artifacts`) passed unchanged, including `--require-build-match`: no
+persisted-format or fixture change. `KEEPTMP=1 integration_test.sh` passed,
+including the two new
 assertions (no `reason=poisoned`, no `reason=storage failure` in a passing
 run's daemon log); `mvp_golden_test.sh` and `branch_boot_test.sh` both
 passed. As with the entry above, this is local validation; the PR does not
