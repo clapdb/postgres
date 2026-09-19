@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "pagestore_forkmeta_snapshot.h"
+#include "pagestore_walidx_snapshot.h"
 
 #include "pagestore_core.h"
 #include "pagestore_retention.h"
@@ -600,6 +601,101 @@ test_preselection_skips_empty_reclaim(void)
 	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1,
 		  "boundary no-progress backoff skips repeated global drains");
 	ps_test_set_admission_write_lock_hook(NULL, NULL);
+	close_store();
+	remove_tree(store);
+}
+
+/* The no-progress backoff exists to avoid repeating the global drain while
+ * the candidate is genuinely unchanged; it must not make a proven segment
+ * wait out its full second once an owner WAL pin -- a retention-registry
+ * change -- releases the boundary.  Without proof-keyed cancellation
+ * (Task 2) this needs sleep(2) before the final call, exactly like
+ * test_failure_backoff. */
+static void
+test_no_progress_backoff_follows_proof(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-proof-backoff-XXXXXX";
+	AdmissionCallCounter counter = {0};
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, limited, 0, 1),
+		  "construct a WAL prefix whose control floor sits past the owner WAL pin");
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 2,
+		  "reclaim advances to the aligned owner-pin boundary");
+	ps_test_set_admission_write_lock_hook(count_admission_call, &counter);
+	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1 &&
+		  segment_count(store, 0) == 2,
+		  "the pin boundary is still current: the no-progress backoff arms");
+	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1,
+		  "an unexpired backoff with no proof-input change skips the global drain");
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
+	check(set_wal_pin(0, 100, WAL_TOTAL),
+		  "release the owner WAL pin to the end of the shipped log");
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 0,
+		  "a proof-input change cancels the no-progress backoff without waiting out its clock");
+	close_store();
+	remove_tree(store);
+}
+
+/* A complete segment blocked only by the stale raw WAL-index dependency
+ * requests one compacted WAL-index publication (Task 1), instead of waiting
+ * for the WAL-index controller's own tail trigger or high water.  This reuses
+ * the setup of "a durable stored page base releases the raw WAL-index
+ * dependency" above, but without PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES: the
+ * default 1 MiB tail trigger is nowhere near reached by one record, so
+ * nothing publishes on its own before Task 1. */
+static void
+test_stale_wal_index_requests_compaction(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-reclaim-due-XXXXXX";
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL),
+		  "construct a stored page base blocked only by the raw WAL-index dependency");
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 2,
+		  "reclaim advances to the aligned raw-dependency boundary");
+	check(ps_test_wal_reclaim_maintenance() == 0 &&
+		  ps_test_walidx_reclaim_due(0) == 1,
+		  "the stale raw dependency is the only thing blocking the segment: a compacted publication is requested");
+	check(maintenance_until_count(store, 0, 0),
+		  "the requested publication retires the raw dependency and the segment reclaims");
+	check(ps_test_walidx_reclaim_due(0) == 0,
+		  "the request is cleared once the publication it caused succeeds");
+	close_store();
+	remove_tree(store);
+}
+
+/* The sibling negative case: a stored page with no page-history owner cannot
+ * authorize a replacement base, so the raw dependency is genuinely
+ * unreplaceable and the segment stays blocked forever.  The request is
+ * still self-limiting (walidx_snapshot_end[tl] < progress): it fires once
+ * and does not storm every idle tick while durable progress does not
+ * advance again. */
+static void
+test_unreplaceable_dependency_requests_once(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-reclaim-once-XXXXXX";
+	char directory[512];
+	uint64_t next_generation = 0;
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100),
+		  "construct a stored page with no page-history owner to authorize replacement");
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "the unreplaceable raw dependency still blocks the segment after 64 passes");
+	check(ps_test_walidx_reclaim_due(0) == 0,
+		  "the one-shot compaction request does not stay armed once its publication completes");
+	check(snprintf(directory, sizeof(directory), "%s/walidx_snapshots_0", store) > 0 &&
+		  ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
+		  next_generation <= 2,
+		  "no publication storm: at most one compacted publication while progress does not advance");
 	close_store();
 	remove_tree(store);
 }
@@ -1789,6 +1885,9 @@ main(void)
 {
 	test_no_floor_or_progress();
 	test_preselection_skips_empty_reclaim();
+	test_no_progress_backoff_follows_proof();
+	test_stale_wal_index_requests_compaction();
+	test_unreplaceable_dependency_requests_once();
 	test_dependency_cutoffs();
 	test_death_base_survives_prefix_prune();
 	test_natural_nonzero_start();
