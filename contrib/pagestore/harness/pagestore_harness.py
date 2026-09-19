@@ -1634,6 +1634,17 @@ def remove_shm(shm: str) -> None:
         (Path("/dev/shm") / shm.removeprefix("/")).unlink()
     except FileNotFoundError:
         pass
+    # macOS: pagestore_shm.h backs the segment with a regular file.
+    if sys.platform == "darwin":
+        try:
+            shm_backing_path(shm).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def shm_backing_path(shm: str) -> Path:
+    """The macOS backing file for a shm name (see pagestore_shm.h)."""
+    return Path(f"/tmp/pagestore-shm-{os.getuid()}") / shm.removeprefix("/").replace("/", "_")
 
 
 def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
@@ -1675,8 +1686,43 @@ def require_signaled_process_stop(result: ProcessStopResult, target: str) -> Non
         )
 
 
+DARWIN_PROCESS_IDENTITY = sys.platform == "darwin"
+
+
+def darwin_process_starttime(pid: int) -> int | None:
+    """Read a process start time (microseconds) through libproc on macOS.
+
+    macOS has neither procfs nor pidfds.  proc_pidinfo(PROC_PIDTBSDINFO)
+    returns a struct proc_bsdinfo whose pbi_start_tvsec/pbi_start_tvusec pair
+    (offsets 120 and 128) identifies one incarnation of a pid.
+    """
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    proc_pidinfo = libproc.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    PROC_PIDTBSDINFO = 3
+    PROC_PIDTBSDINFO_SIZE = 136
+    buffer = ctypes.create_string_buffer(PROC_PIDTBSDINFO_SIZE)
+    copied = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buffer, PROC_PIDTBSDINFO_SIZE)
+    if copied == 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return None
+        raise PlanError(
+            f"cannot read process identity for pid {pid}: {os.strerror(error)}"
+        )
+    if copied != PROC_PIDTBSDINFO_SIZE:
+        raise PlanError(f"short process identity for pid {pid}: {copied} bytes")
+    tvsec, tvusec = struct.unpack_from("<QQ", buffer.raw, 120)
+    return tvsec * 1_000_000 + tvusec
+
+
 def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | None:
     """Read Linux proc stat field 22, parsing comm through its final ')' safely."""
+    if DARWIN_PROCESS_IDENTITY and proc_root == Path("/proc"):
+        return darwin_process_starttime(pid)
     stat_path = proc_root / str(pid) / "stat"
     try:
         text = stat_path.read_text(encoding="utf-8")
@@ -1702,6 +1748,9 @@ def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | N
 
 def procfs_available(proc_root: Path = Path("/proc")) -> bool:
     """Return whether this host exposes a usable procfs process view."""
+    if DARWIN_PROCESS_IDENTITY and proc_root == Path("/proc"):
+        # libproc stands in for procfs as the process identity source.
+        return True
     try:
         (proc_root / "self" / "stat").read_text(encoding="utf-8")
     except PermissionError as error:
@@ -1760,6 +1809,10 @@ def capture_process_identity(pid: int) -> ProcessIdentity:
             return ProcessIdentity(
                 pid, first_starttime, already_exited=True, status="already_exited"
             )
+        if DARWIN_PROCESS_IDENTITY and first_starttime is not None:
+            # No pidfd exists on macOS; the start time is the identity and is
+            # re-verified immediately before every signal and while waiting.
+            return ProcessIdentity(pid, first_starttime)
         raise PlanError(
             f"cannot capture live pid {pid}: pidfd support is unavailable"
         )
@@ -1848,7 +1901,9 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
         )
     before = read_process_starttime(identity.pid)
     if before is None:
-        if process_exists(identity.pid):
+        # libproc stops describing a process once it exits, even before it is
+        # reaped, while kill(pid, 0) still succeeds on the zombie.
+        if not DARWIN_PROCESS_IDENTITY and process_exists(identity.pid):
             raise PlanError(
                 f"cannot verify live pid {identity.pid} before SIGQUIT"
             )
@@ -1859,6 +1914,17 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
         identity.already_exited = True
         identity.status = "already_exited"
         return "pidfd-unavailable", "already_exited"
+    if DARWIN_PROCESS_IDENTITY:
+        try:
+            os.kill(identity.pid, signal.SIGQUIT)
+        except ProcessLookupError:
+            identity.already_exited = True
+            identity.status = "already_exited"
+            return "kill_starttime_verified", "already_exited"
+        except PermissionError as error:
+            raise PlanError(f"permission denied signalling pid {identity.pid}: {error}") from error
+        identity.status = "signaled"
+        return "kill_starttime_verified", "signaled"
     raise PlanError(
         f"cannot signal live pid {identity.pid}: pidfd identity is unavailable"
     )
@@ -1881,7 +1947,7 @@ def wait_process_exit(identity: ProcessIdentity, timeout: float) -> str:
     while time.monotonic() < deadline:
         current = read_process_starttime(identity.pid)
         if current is None:
-            if not process_exists(identity.pid):
+            if DARWIN_PROCESS_IDENTITY or not process_exists(identity.pid):
                 return "proc_starttime"
             raise PlanError(
                 f"cannot verify pid {identity.pid} while waiting: /proc identity unavailable"

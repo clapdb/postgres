@@ -52,6 +52,11 @@ def validate_authority_path(authority_dir: Path) -> os.stat_result:
     immediate = True
     while True:
         component_stat = os.lstat(component)
+        if stat.S_ISLNK(component_stat.st_mode) and component_stat.st_uid == 0:
+            # A root-owned symlink (macOS /var, /tmp, /etc) cannot be replaced
+            # by an unprivileged user; continue the walk on its target.
+            component = Path(os.path.realpath(component))
+            continue
         if not stat.S_ISDIR(component_stat.st_mode):
             raise ConfigError(
                 "retention_authority_dir ancestry must contain only directories"
