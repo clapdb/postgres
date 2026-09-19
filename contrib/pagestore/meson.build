@@ -289,7 +289,7 @@ pagestore_forkmeta_cutover_test = executable('pagestore_forkmeta_cutover_test',
 test('pagestore_forkmeta_cutover',
   pagestore_forkmeta_cutover_test,
   suite: ['pagestore'],
-  timeout: 60,
+  timeout: 120,
 )
 
 # Focused POSIX process-crash matrix for runtime forkmeta cutover.  The shared

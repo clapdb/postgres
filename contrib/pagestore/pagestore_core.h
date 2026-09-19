@@ -191,6 +191,14 @@ extern uint32_t ps_test_artifact_fence_count(uint32_t timeline);
  * failure). */
 extern int ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 											 uint32_t nqueries, int legacy);
+/* Test-only: total scan/bisection steps taken by the fork-event index and
+ * its fallback loops on this thread since the process started. */
+extern uint64_t ps_test_fork_event_scan_steps(void);
+/* Test-only: event counts for one fork (0 if not found).  nmarkers counts
+ * marker_kind != 0, ninert counts kind > FEV_DEAD (never activated). */
+extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
+									uint32_t *nevents, uint32_t *nmarkers,
+									uint32_t *ninert);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);

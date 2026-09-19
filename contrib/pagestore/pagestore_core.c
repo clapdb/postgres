@@ -5056,6 +5056,11 @@ fork_event_index_usable(const ForkEnt *e, uint64_t admission_seq)
 	return e->nlegacy_seq == 0 && admission_seq != 0;
 }
 
+/* Test-only: increments once per loop iteration of the bounded scans below,
+ * so a test can assert the fast paths stayed sublinear without a wall
+ * clock. */
+static _Thread_local uint64_t fork_event_scan_steps;
+
 /* First index whose (lsn, admission_seq) >= the argument tuple. */
 static uint32_t
 fork_event_lower_bound(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
@@ -5068,6 +5073,7 @@ fork_event_lower_bound(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
 		uint32_t	mid = lo + (hi - lo) / 2;
 		const ForkEvent *v = &e->ev[mid];
 
+		fork_event_scan_steps++;
 		if (v->lsn < lsn ||
 			(v->lsn == lsn && v->admission_seq < admission_seq))
 			lo = mid + 1;
@@ -5089,6 +5095,7 @@ fork_event_upper_bound(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
 		uint32_t	mid = lo + (hi - lo) / 2;
 		const ForkEvent *v = &e->ev[mid];
 
+		fork_event_scan_steps++;
 		if (v->lsn < lsn ||
 			(v->lsn == lsn && v->admission_seq <= admission_seq))
 			lo = mid + 1;
@@ -5182,6 +5189,7 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 		{
 			const ForkEvent *v = &e->ev[i];
 
+			fork_event_scan_steps++;
 			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
 				continue;
 			if (v->kind == FEV_GROW)
@@ -5372,6 +5380,7 @@ fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
 		{
 			const ForkEvent *v = &e->ev[i];
 
+			fork_event_scan_steps++;
 			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
 				continue;
 			if (v->kind == FEV_DEAD)
@@ -5443,6 +5452,7 @@ fork_event_insert_pos(ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
 			 e->ev[i - 1].admission_seq != 0 &&
 			 e->ev[i - 1].admission_seq > admission_seq)))
 	{
+		fork_event_scan_steps++;
 		e->ev[i] = e->ev[i - 1];
 		i--;
 	}
@@ -5592,6 +5602,7 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	{
 		ForkEvent  *v = &e->ev[i];
 
+		fork_event_scan_steps++;
 		if ((v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_COMMIT ||
 			 v->kind == FEV_SEG_GROW_BOUND ||
 			 v->kind == FEV_SEG_COMMIT_BOUND) &&
@@ -5669,6 +5680,7 @@ fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	{
 		ForkEvent  *v = &e->ev[i];
 
+		fork_event_scan_steps++;
 		if (v->kind == FEV_GROW && v->marker_kind == 0 && v->order_id == 0 &&
 			v->lsn == lsn && v->admission_seq == admission_seq &&
 			v->nblocks == nblocks)
@@ -5711,6 +5723,7 @@ fork_event_commit_adoptable(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	fork_event_identity_range(e, lsn, admission_seq, &start, &end);
 	for (uint32_t i = start; i < end; i++)
 	{
+		fork_event_scan_steps++;
 		if (e->ev[i].lsn == lsn && e->ev[i].admission_seq == admission_seq)
 			return 0;		/* already has an event at this identity */
 	}
@@ -6124,6 +6137,56 @@ done:
 	free(fe.ev);
 	free(fe.def_idx);
 	return rc;
+}
+
+/* Test-only: total scan/bisection steps taken by the loops above since the
+ * process started (or since last read; the counter never resets itself),
+ * thread-local so the test's own driver thread sees only its own writes. */
+uint64_t
+ps_test_fork_event_scan_steps(void)
+{
+	return fork_event_scan_steps;
+}
+
+/* Test-only: current event counts for one fork, under the shard read lock
+ * like ps_test_page_version_count(). */
+int
+ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
+						 uint32_t *nevents, uint32_t *nmarkers,
+						 uint32_t *ninert)
+{
+	ForkEnt    *e;
+	uint32_t	shard = ps_shard_of(key);
+
+	ps_lock_shard_rd(shard);
+	e = fork_find(timeline, key);
+	if (e == NULL)
+	{
+		ps_unlock_shard(shard);
+		return 0;
+	}
+	if (nevents)
+		*nevents = e->nev;
+	if (nmarkers)
+	{
+		uint32_t	n = 0;
+
+		for (uint32_t i = 0; i < e->nev; i++)
+			if (e->ev[i].marker_kind != 0)
+				n++;
+		*nmarkers = n;
+	}
+	if (ninert)
+	{
+		uint32_t	n = 0;
+
+		for (uint32_t i = 0; i < e->nev; i++)
+			if (e->ev[i].kind > FEV_DEAD)
+				n++;
+		*ninert = n;
+	}
+	ps_unlock_shard(shard);
+	return 1;
 }
 
 static int
@@ -8790,6 +8853,7 @@ fork_meta_snapshot_marker_present(const ForkMetaRecV2 *rec)
 	fork_event_identity_range(e, rec->lsn, rec->admission_seq, &start, &end);
 	for (uint32_t i = start; i < end; i++)
 	{
+		fork_event_scan_steps++;
 		if (e->ev[i].lsn == rec->lsn &&
 			e->ev[i].admission_seq == rec->admission_seq &&
 			e->ev[i].order_id == rec->order_id &&
