@@ -786,8 +786,8 @@ test_unreplaceable_dependency_requests_once(void)
 		  "the one-shot compaction request does not stay armed once its publication completes");
 	check(snprintf(directory, sizeof(directory), "%s/walidx_snapshots_0", store) > 0 &&
 		  ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
-		  next_generation <= 2,
-		  "no publication storm: at most one compacted publication while progress does not advance");
+		  next_generation == 2,
+		  "no publication storm: exactly one compacted publication while progress does not advance");
 	/* Durable WAL-index progress is published once per indexing batch in
 	 * production (continuously while WAL ships), so repeating the old
 	 * progress-keyed request on every advance would be a sustained

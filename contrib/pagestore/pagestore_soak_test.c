@@ -133,15 +133,28 @@
 #define WAL_SEGMENT_BYTES			(1u * 1024u * 1024u)	/* immutable segment granularity: the candidate is aligned down */
 #define FENCE_ROUNDS_MAX			(READER_LIFE + 37)		/* the fixed reader's drop age (soak's oldest fence) */
 #define FENCE_WAL_BYTES_MAX			((uint64_t) FENCE_ROUNDS_MAX * ROUND_WAL_BYTES_MAX)
-/* Floor refresh (control prune + WAL-index publish + GC) and the reclaim
- * pass itself: measured 3-6 ms (fix2-n1.log); two materializer intervals is
- * >= 330 ms on a hosted runner, far above that. */
+/* One WAL-index publication + GC + reclaim pass after the blocking
+ * condition clears, no earlier than 20 ms after the last no-progress arm
+ * (WAL_RECLAIM_REARM_MIN_NS, pagestore_core.c): a re-request is fence-keyed
+ * (re-issued only when the oldest raw dependency or a retention-registry
+ * fence changed since the last served request, not on every durable
+ * WAL-index progress op, which the backend materializer publishes once per
+ * indexing batch); a dependency that becomes replaceable through a later
+ * durable base with no fence change is picked up by the WAL-index
+ * controller's own trigger instead.  Two materializer intervals is
+ * >= 330 ms on a hosted runner, comfortably above the observed reaction
+ * latency. */
 #define RECLAIM_REACTION_WAL_BYTES	(INTERVAL_WAL_BYTES * 2)
 #define BRANCH_WAL_ALLOWANCE		(64u * 1024u)			/* the live branch's own flat log: BRANCH_LIFE/10 records of 1 KiB, plus store metadata */
 _Static_assert(FENCE_ROUNDS_MAX >= BRANCH_LIFE,
 			   "the WAL bound's fence term must dominate the branch cap's age");
 _Static_assert(FENCE_ROUNDS_MAX >= READER_LIFE,
 			   "the WAL bound's fence term must dominate the advancing reader's age");
+/* FENCE_ROUNDS_MAX's 7-round margin over BRANCH_LIFE (157 vs 150) is not
+ * slack: a branch cap is released only when its DELETING->DELETED
+ * transition is durably published, which is asynchronous maintenance work
+ * scheduled at BRANCH_LIFE, not an instantaneous release at that round, so
+ * the cap can still be the binding fence a few rounds past BRANCH_LIFE. */
 
 typedef struct Bounds
 {
