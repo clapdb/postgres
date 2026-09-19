@@ -692,11 +692,16 @@ randomized self-test, `ps_test_fork_event_index_selftest()`, cross-checking
 both paths including long equal-LSN runs, equal-tuple duplicates, activation,
 and zero-seq legacy events). A deterministic step-counter guard
 (`ps_test_fork_event_scan_steps()`) makes the regression reproducible without
-a wall clock: a 20,000-rewrite case asserts fewer than K*128 scan steps for
-the writes, the cutover, and the reopen, and fails deterministically on the
-unmodified algorithm (measured: 400,040,000 steps for the writes,
-200,030,000 for the cutover, 200,030,001 for the reopen -- all ~K^2 or
-~K^2/2, versus the 2,560,000 ceiling).
+a wall clock: a K=5,000-rewrite case asserts fewer than K*128 scan steps for
+the writes, the cutover, and the reopen (reopening with a raised
+`flush_pages` first, so the case's own cost is dominated by the index, not
+by a memtable flush -- and one image layer's worth of fsyncs -- on every
+single rewrite), and fails deterministically on the unmodified algorithm
+(measured: 25,010,000 steps for the writes, 12,507,500 for the cutover,
+12,507,501 for the reopen -- all ~K^2 or ~K^2/2, versus the 640,000
+ceiling). The wall clock is logged, not asserted (0.25 s on tmpfs, 2.5 s on
+a disk-backed directory for the whole case); the step counts are the actual
+guard.
 
 Measured on the microbenchmark (one fork, K commit-class WAL-less rewrites of
 one block; `contrib/pagestore/fev_bench.c`, tmpfs, `cc -O2`):
