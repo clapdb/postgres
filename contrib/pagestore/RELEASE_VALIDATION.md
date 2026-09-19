@@ -206,3 +206,78 @@ start `<build>/contrib/pagestore/pagestore_daemon` on the reported retained
 STORE after the script has stopped its processes. Preserve that store for
 forensic checks. Refresh `<build>/tmp_install` with the setup suite after
 rebuilding PostgreSQL producers, so the script loads the intended extension.
+
+## Integration-lane finding: a silent artifact key collision (PRs #264/#265/#266)
+
+Three independent PRs (#264, #265, and #266, which only added the CI log-dump
+diagnostics below) failed the integration lane identically: `ERROR: pagestore
+localsvc: daemon reported error for op 34` immediately followed by `FAIL -
+reader snapshot publishes as a multi-block page-store artifact`, with no
+daemon or server log lines in the job output to say why op 34 (`ARTIFACT_
+BEGIN`) was refused. The base branch had passed once, and every local run
+passed, which made this look environment-dependent; it is not.
+
+**Root cause.** Two producers publish generations of the same page-store
+artifact key (klass `PS_KLASS_READER_SNAPSHOT`, spc 0, db `InvalidOid`, rel
+`PS_READER_SNAPSHOT_DATA_OBJECT` = 1, fork 0): the automatic
+checkpoint-driven reader-artifact worker (`pagestore.auto_reader_artifacts =
+on`, one generation published at every checkpoint redo) and the explicit
+exact-R snapshot (`pagestore_publish_reader_snapshot_artifact`, published at
+a retention owner's pinned R). The artifact lifecycle admits only monotonic
+generations per key (`ps_artifact_begin`'s `artifact_mutation_horizon()` and
+commit-block checks), so once the automatic worker had already published a
+generation at a checkpoint redo newer than R, the explicit publish's BEGIN at
+R was refused -- and refused silently: the daemon mapped the refusal straight
+to `PS_STATUS_ERROR` with no log line, and the client reported only the
+opcode number. On a loaded CI runner the automatic worker's first cycle after
+a restart lands inside the roughly one-second window between the post-R
+checkpoint and the explicit publish; locally that cycle either runs before
+the checkpoint (nothing reserved yet) or five seconds after the publish, so
+the collision never landed there. This is the entire CI-vs-local difference;
+no forkmeta-cutoff or worker-poisoning hypothesis from an earlier pass at this
+failure was the cause (both are withdrawn).
+
+**Invariant.** One producer per artifact key, with monotonic generations per
+key; an artifact published at a controller-chosen LSN (an exact-R reader
+snapshot, R pinned by a retention owner) must live under a key owned by that
+request, never under the key of a checkpoint-driven producer.
+
+**Fix.**
+- The explicit exact-R publish and its loader use an owner-scoped key
+  (`dbOid` = the retention owner id that pinned R, truncated to 32 bits) for
+  the DATA and (per-database) MANIFEST objects; the automatic checkpoint
+  snapshot keeps `dbOid = InvalidOid`. `pagestore_publish_reader_snapshot_
+  artifact` and `pagestore_validate_published_reader_snapshot` both gained an
+  `owner bigint` argument (0 selects the automatic snapshot). The explicit
+  path no longer publishes the database-independent "global" manifest at
+  `InvalidOid` either -- nothing in the pinned-reader boot path reads that
+  fallback (it exists only for an advancing reader adopting the automatic
+  snapshot before `MyDatabaseId` is known at early backend init), and
+  publishing there re-opened the identical collision one field over.
+- Every `ps_artifact_begin`/`commit`/`drop` refusal now reports a reason
+  (`PsArtifactRefuseReason`, `pagestore_artifact_format.h`) through an
+  out-parameter. `pagestore_daemon.c` logs one stderr line per refusal
+  (`pagestore_daemon: artifact BEGIN refused: reason=... timeline=... key=(...)
+  lsn=... last_page_lsn=... last_commit=...`) and returns the reason in
+  `ch->result`; `backend_localsvc.c` appends it to the `ERROR` it raises. A
+  silent refusal was itself the diagnostic bug: with this in place, the
+  original CI failure would have named its cause in the same run.
+- `integration_test.sh`'s reader section now forces the exact collision order
+  CI hit instead of racing on worker timing: after the post-R checkpoint, it
+  polls `pagestore_validate_checkpoint_reader_snapshot()` at that checkpoint's
+  redo until the automatic generation exists, *then* runs the explicit
+  publish at R -- deterministically reproducing the refusal on a base without
+  the key split -- and asserts the daemon log contains no `artifact ...
+  refused` line at the end of a passing run.
+
+Format/identity impact: none. The key split changes which `dbOid` an object
+is stored under, not any on-disk payload layout or magic/version identity, so
+no fixture regeneration was needed (verified: the persisted-format,
+pgdata-artifact, and controller fixture checks below still pass unchanged).
+
+Unit regression: `pagestore_artifact_lifecycle_test.c`'s
+`test_reader_snapshot_owner_key_split()` completes an automatic generation,
+then shows BEGIN on the owner-scoped key succeeding at an older LSN (and
+reading back exactly), BEGIN on the automatic key being refused with reason
+`older generation exists`/`newer generation exists` instead of a silent -1,
+and a later automatic generation still succeeding.
