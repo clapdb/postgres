@@ -36,6 +36,11 @@ static int failed;
 #define TEST_SEG_CLAMPED_ORDERED_MAGIC 0x53454733U
 #define TEST_SEG_WALLESS_BOUND_MAGIC 0x53454734U
 #define TEST_SEG_MAGIC 0x53454732U
+#define TEST_SEG_WALLESS_MAGIC 0x53454730U
+#define TEST_SEG_CLAMPED_BOUND_MAGIC 0x53454735U
+#define TEST_SEG_ADMISSION_MAGIC 0x53454736U
+#define TEST_SEG_WALLESS_ADMISSION_MAGIC 0x53454737U
+#define TEST_SEG_CLAMPED_ADMISSION_MAGIC 0x53454738U
 #define TEST_SEG_HOLE48_MAGIC 0x53454830U
 #define TEST_SEG_HOLE56_MAGIC 0x53454831U
 #define TEST_SEG_HOLE64_MAGIC 0x53454832U
@@ -97,6 +102,83 @@ typedef struct TestSegRecHdrBound
 	TestSegRecHdr hdr;
 	uint64_t order_id;
 } TestSegRecHdrBound;
+
+/*
+ * Scan a segment end to end, mirroring recover()'s own walk: every record,
+ * live or a SEG_HOLE*-magic tombstone (invariant I3, see
+ * page_cleanup_tombstone_segment() in pagestore_core.c), is self-describing
+ * from its magic alone, so header_size + hdr.len always reaches the next
+ * record.  Reports the hole count and, if 'target_timeline' is nonnegative,
+ * the count of *non-hole* records still belonging to that timeline (which
+ * the Q1 crash-matrix follow-up asserts is zero: every target record must be
+ * a hole).  Returns 0 on success, -1 if a record's magic is unrecognized.
+ */
+static int
+scan_segment_holes(int shard, int seg, int64_t size,
+					int64_t target_timeline, int64_t *holes_out,
+					int64_t *target_live_out)
+{
+	int64_t		off = 0;
+	int64_t		holes = 0;
+	int64_t		target_live = 0;
+
+	while (off + (int64_t) sizeof(TestSegRecHdr) <= size)
+	{
+		TestSegRecHdr hdr;
+		uint64_t	header_size;
+		int			is_hole;
+		int			bound;
+		int			admission;
+
+		if (ps_storage->seg_read(shard, seg, (uint64_t) off, &hdr,
+								  sizeof(hdr)) != 0)
+			return -1;
+		is_hole = hdr.magic == TEST_SEG_HOLE48_MAGIC ||
+			hdr.magic == TEST_SEG_HOLE56_MAGIC ||
+			hdr.magic == TEST_SEG_HOLE64_MAGIC;
+		if (is_hole)
+		{
+			holes++;
+			header_size = hdr.magic == TEST_SEG_HOLE48_MAGIC ?
+				sizeof(TestSegRecHdr) :
+				hdr.magic == TEST_SEG_HOLE56_MAGIC ?
+					sizeof(TestSegRecHdr) + sizeof(uint64_t) :
+					sizeof(TestSegRecHdr) + 2 * sizeof(uint64_t);
+		}
+		else
+		{
+			bound = hdr.magic == TEST_SEG_WALLESS_BOUND_MAGIC ||
+				hdr.magic == TEST_SEG_CLAMPED_BOUND_MAGIC ||
+				hdr.magic == TEST_SEG_WALLESS_ADMISSION_MAGIC ||
+				hdr.magic == TEST_SEG_CLAMPED_ADMISSION_MAGIC;
+			admission = hdr.magic == TEST_SEG_ADMISSION_MAGIC ||
+				hdr.magic == TEST_SEG_WALLESS_ADMISSION_MAGIC ||
+				hdr.magic == TEST_SEG_CLAMPED_ADMISSION_MAGIC;
+			if (hdr.magic != TEST_SEG_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_ORDERED_MAGIC &&
+				hdr.magic != TEST_SEG_CLAMPED_ORDERED_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_BOUND_MAGIC &&
+				hdr.magic != TEST_SEG_CLAMPED_BOUND_MAGIC &&
+				hdr.magic != TEST_SEG_ADMISSION_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_ADMISSION_MAGIC &&
+				hdr.magic != TEST_SEG_CLAMPED_ADMISSION_MAGIC)
+				return -1;
+			header_size = sizeof(TestSegRecHdr) +
+				(bound ? sizeof(uint64_t) : 0) +
+				(admission ? sizeof(uint64_t) : 0);
+			if (target_timeline >= 0 &&
+				(int64_t) hdr.timeline == target_timeline)
+				target_live++;
+		}
+		off += (int64_t) header_size + (int64_t) hdr.len;
+	}
+	if (holes_out != NULL)
+		*holes_out = holes;
+	if (target_live_out != NULL)
+		*target_live_out = target_live;
+	return 0;
+}
 
 static void
 remove_tree(const char *path)
@@ -3836,60 +3918,82 @@ test_timeline_delete_reclaims_by_segment_gc(void)
 /*
  * ---- T3: a compaction publish never removes a version above the watermark ----
  *
- * page_remove_compacted_versions() runs only for versions a compaction
- * publish actually dropped, which is exactly the covered (already-flushed)
- * prefix -- a memtable-resident (unflushed) version can never be one of
- * them.  This drives a real compaction (compact_layers = 1: two flushed
- * layers of the same block trigger a merge that prunes the older,
- * now-superseded version) and then leaves one more revision unflushed in
- * the memtable, asserting it still resolves -- a cassert build additionally
+ * page_remove_compacted_versions() runs only for versions a *retention-pin-
+ * driven page prune* actually dropped: compaction merging layers alone does
+ * not call it (gdb-verified: a breakpoint on page_remove_compacted_versions
+ * with nrec > 0 is never hit by compact_layers/flush alone) -- pruning needs
+ * a durable retention floor past the superseded revisions and the frontier
+ * maintenance publishes once it reaches them, exactly the shape
+ * test_reclaimed_ordered_markers_pruned() and the T5 crash-matrix's
+ * "survivor A" setup below both use.  This drives that real prune (six
+ * same-LSN revisions of one block, a retention pin above them, wait for the
+ * durable frontier) and then leaves one more revision unflushed in the
+ * memtable, asserting it still resolves -- a cassert build additionally
  * trips the invariant check in page_remove_compacted_versions() itself
  * (~4820) if a pruned version's segment record were ever at or after the
- * watermark, which every other test in this binary already exercises on
- * every compaction they trigger.
+ * watermark, which the prune step above already exercises.
  */
 static void
 test_compaction_never_prunes_above_watermark(void)
 {
 	char		store[] = "/tmp/psforkmetawatermarkXXXXXX";
+	char		frontier[1200];
 	PsKey		key = {22, 22, 1, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
 	unsigned char page[8192];
 	uint64_t	seq = 0;
+	int			n;
 
 	check(mkdtemp(store) != NULL, "create I3 watermark-prune store");
-	compact_layers = 1;
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build I3 watermark-prune frontier path");
+	compact_layers = 2;
 	flush_pages = 1;
+	segment_gc_enabled = 0;
 	check(ps_core_open(store) == 0 &&
 		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
 		  "open I3 watermark-prune store and create fork");
-	/* Two flushed, same-LSN revisions: compact_layers = 1 makes the second
-	 * flush's publish merge past the first, superseded layer and drop its
-	 * now-covered version from memory (page_remove_compacted_versions()). */
-	check(append_relation_tag(&key, 0, 50, page, 0x01, &seq) == 0 &&
-		  append_relation_tag(&key, 0, 50, page, 0x02, &seq) == 0,
-		  "flush two revisions so compaction prunes the superseded one");
+	/* Six same-LSN, flushed revisions: a retention pin past all of them
+	 * lets the page-prune frontier durably reclaim the superseded ones,
+	 * actually calling page_remove_compacted_versions() with nrec > 0. */
+	for (int i = 0; i < 6; i++)
+		check(append_relation_tag(&key, 0, 50, page, (unsigned char) (0x10 + i),
+								  &seq) == 0,
+			  "write prunable revisions of the same block");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 220;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.lsn = 200;
+	pin.admission_seq = seq;
+	check(seq != 0 && ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "durable page-prune frontier reclaims the superseded revisions");
 	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
-		  page[128] == 0x02,
-		  "compaction publish leaves the newest flushed revision readable");
-	/* Now leave a third revision unflushed in the memtable: raise the
+		  page[128] == 0x15,
+		  "prune leaves the newest flushed revision readable");
+	/* Now leave a seventh revision unflushed in the memtable: raise the
 	 * threshold so append_page's own "memtable full" flush never fires. */
 	flush_pages = 1000000;
-	check(append_relation_tag(&key, 0, 50, page, 0x03, &seq) == 0,
+	check(append_relation_tag(&key, 0, 50, page, 0x20, &seq) == 0,
 		  "write a revision that stays memtable-resident, unflushed");
 	/* Give maintenance a few turns: if anything ever tried to treat the
-	 * memtable-resident version as compaction's business, it would either
-	 * assert (cassert build) or silently vanish here. */
+	 * memtable-resident version as prunable, it would either assert
+	 * (cassert build) or silently vanish here. */
 	for (int i = 0; i < 5; i++)
 		(void) ps_core_maintenance();
 	memset(page, 0, sizeof(page));
 	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
-		  page[128] == 0x03,
+		  page[128] == 0x20,
 		  "invariant I3: the unflushed memtable-resident revision survives "
-		  "in memory, untouched by compaction pruning");
+		  "in memory, untouched by page-prune pruning");
 	close_runtime();
 	remove_tree(store);
 	compact_layers = 0;
 	flush_pages = 1;
+	segment_gc_enabled = 0;
 }
 
 /*
@@ -3942,6 +4046,7 @@ test_timeline_delete_crash_matrix_case(const char *fault_name)
 	PsKey		survivor_a_key = {21, 21, 1, 0, PS_KLASS_RELATION};
 	PsKey		survivor_b_key = {21, 21, 2, 0, PS_KLASS_RELATION};
 	PsKey		target_key = {21, 21, 3, 0, PS_KLASS_RELATION};
+	PsKey		followup_key = {21, 21, 9, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
 	uint64_t	seq = 0;
 	PsRetentionPin pin;
@@ -4057,6 +4162,54 @@ test_timeline_delete_crash_matrix_case(const char *fault_name)
 		check(read_resolve_version(2, &survivor_b_key, 0, UINT64_MAX, 0, page,
 								   &ver, NULL) == 1,
 			  "the live survivor B resolves after the crash");
+	}
+	/*
+	 * Q1 follow-up: the data-loss scenario the plan set out to fix was
+	 * "drop a branch, write a page, restart" -- a write and a clean restart
+	 * *after* deletion completes, which used to rebase the flush watermark
+	 * past the rewritten segment.  Force exactly that here: one more write
+	 * past DELETED (flush_pages == 1 flushes it immediately, advancing the
+	 * watermark), then a second crash-free restart, and assert invariant I3
+	 * held throughout -- every byte already on disk when deletion completed
+	 * (the tombstoned prefix) is unchanged, and every remaining record
+	 * belonging to the deleted target within it is a hole.  The segment's
+	 * *total* size is expected to grow: the new write appends past that
+	 * prefix, it does not touch it.
+	 */
+	{
+		int64_t		after_crash_size = ps_storage->seg_size(0, 0);
+		int64_t		holes = 0;
+		int64_t		target_live = 0;
+		uint64_t	flush_seq = 0;
+		uint64_t	ver = 0;
+
+		check(after_crash_size > 0 &&
+				scan_segment_holes(0, 0, after_crash_size, 1, &holes,
+									&target_live) == 0 && target_live == 0,
+			  "Q1 follow-up: every remaining target-timeline record is a "
+			  "hole once deletion resumes and completes after the crash");
+		check(append_relation_timeline(2, &followup_key, 0, 10000, page,
+									   &flush_seq) == 0,
+			  "Q1 follow-up: write and flush past the deleted target");
+		close_runtime();
+		check(ps_core_open(store) == 0,
+			  "Q1 follow-up: second, crash-free restart after the flush");
+		check(ps_storage->seg_size(0, 0) >= after_crash_size,
+			  "Q1 follow-up: the later write only appends -- the segment "
+			  "never shrinks below the size it had when deletion completed");
+		check(scan_segment_holes(0, 0, after_crash_size, 1, &holes,
+								  &target_live) == 0 && target_live == 0,
+			  "Q1 follow-up: invariant I3 -- the tombstoned prefix still "
+			  "parses record by record with no live target-timeline record "
+			  "in it, after the later write and second restart");
+		memset(page, 0, sizeof(page));
+		check(read_resolve_version(2, &survivor_a_key, 0, UINT64_MAX, 0, page,
+								   &ver, NULL) == 1 && ver == 50,
+			  "Q1 follow-up: the pruned survivor A still resolves");
+		memset(page, 0, sizeof(page));
+		check(read_resolve_version(2, &survivor_b_key, 0, UINT64_MAX, 0, page,
+								   &ver, NULL) == 1,
+			  "Q1 follow-up: the live survivor B still resolves");
 	}
 	close_runtime();
 	remove_tree(store);
