@@ -412,7 +412,7 @@ scan-error zero-unlink behavior, complete per-segment validation, corrupt
 catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
 read-versus-reclaim mutex barrier.
 R3b-3 is the conservative POSIX/core policy integration.  It admits at most
-one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment.  The backoff is proof-keyed, not clock-only: after a 20 ms rate-limit floor (WAL_RECLAIM_REARM_MIN_NS -- every re-evaluation is a full drain, and a retention pin drop is dispatched without the admission lock, so an unrated cancellation would let drop-heavy churn turn every drop into a drain), it ends at the earlier of one second or the next event that can move a proof input (a WAL-index publication or GC, durable WAL-index progress, a retention-registry change, or a timeline reaching DELETED), so a floor advance past that 20 ms floor is not left waiting on the one-second clock.  When a complete segment's retention floor and durable progress have both passed the boundary but its raw WAL-index dependency has not, the reclaimer requests one compacted WAL-index publication on its own behalf instead of waiting for the WAL-index controller's own tail trigger or high water: one publication + GC + reclaim pass after the blocking condition clears, no earlier than the 20 ms floor after the last arm.  The request is fence-keyed, not progress-keyed: it is re-issued only when the oldest raw dependency or a retention-registry fence (a pin reserved/dropped -- including a WAL_INDEX-only pin, which the compaction plan fences exactly like a PAGE_HISTORY/WAL pin -- an artifact fence released/opened, a branch cap released) has changed since the last served request, because a durable WAL-index progress advance alone -- published once per indexing batch by the backend materializer -- can never retire the blocking item, and re-requesting on every advance would be a sustained non-compacting rewrite for as long as an unreplaceable dependency blocks the segment; a dependency that becomes replaceable through a later durable base with no fence change at all is left to the WAL-index controller's own trigger, as before this request existed.  A selected candidate drains ordinary admission before
+one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment.  The backoff is proof-keyed, not clock-only: after a 20 ms rate-limit floor (WAL_RECLAIM_REARM_MIN_NS -- every re-evaluation is a full drain, and a retention pin drop is dispatched without the admission lock, so an unrated cancellation would let drop-heavy churn turn every drop into a drain), it ends at the earlier of one second or the next event that can move a proof input (a WAL-index publication or GC, durable WAL-index progress, a retention-registry change, or a timeline reaching DELETED), so a floor advance past that 20 ms floor is not left waiting on the one-second clock.  When a complete segment's retention floor and durable progress have both passed the boundary but its raw WAL-index dependency has not, the reclaimer requests one compacted WAL-index publication on its own behalf instead of waiting for the WAL-index controller's own tail trigger or high water: one publication + GC + reclaim pass after the blocking condition clears, no earlier than the 20 ms floor after the last arm.  The request is fence-keyed, not progress-keyed: it is re-issued only when the oldest raw dependency or a retention-registry fence (a pin reserved/dropped -- including a WAL_INDEX-only pin, which the compaction plan fences exactly like a PAGE_HISTORY/WAL pin -- an artifact fence released/opened, a branch cap released) has changed since the last served request, because a durable WAL-index progress advance alone -- published once per indexing batch by the backend materializer -- can never retire the blocking item, and re-requesting on every advance would be a sustained non-compacting rewrite for as long as an unreplaceable dependency blocks the segment; when the request would be fruitless, the reclaimer records the blocking page and the exact event that would change its retirement -- a version in [item end, nearest horizon] becoming durable at a memtable flush, or (for a horizon whose owner holds no page history) a newer full-page-image item arriving at or below it -- and re-issues the request from that event alone (walidx_reclaim_base_epoch), at most once per flush that makes such a version durable.  Separately, when the retention floor alone holds the boundary and the note that sets it is superseded but still memtable-resident, the reclaimer requests a flush of the control shard so the next compaction can prune it; the newest note at or below a live fence is never touched.  A selected candidate drains ordinary admission before
 freezing the WAL index, snapshots raw WAL dependencies under short-lived
 shard/map protection, and releases all shard locks before control-image,
 layer, metadata, or unlink I/O.  Its deletion candidate is the aligned-down
@@ -674,6 +674,34 @@ against the 4667392 bound, with `wal_fence_slack_max` at 1568768 bytes. That
 is one dispatched run, not yet a scheduled-run history; the three-seed
 scheduled nightlies must still accumulate green runs against this revision
 before the final MVP status update.
+
+A later review of the soak's trace window (rounds 4860-4980) found the WAL
+floor's apparent stall there was not a pruning lag: `daemon_floor =
+16731136` was the redo of the control note written at round 4760, the
+newest note at or below the fixed reader's fence (pinned at round 4820, LSN
+16822272, between the notes of rounds 4760 and 4800) -- required retention
+under the newest-note-at-or-below-each-fence rule (`control_prune_fences`),
+not a bug.  When the reader re-pinned at round 4960 the note was released
+and the floor moved at round 4980, within one compaction pass.  Two
+residuals remained after the fix above, both closed here (2026-09-20): (1)
+a replacement base or full-page-image item that becomes durable/arrives
+with no retention-registry fence change at all was previously left to the
+WAL-index controller's own trigger; the reclaimer now watches the specific
+blocking page and re-issues its request from that event alone
+(`walidx_reclaim_base_epoch`).  (2) a superseded control note that is
+memtable-resident is invisible to compaction, which reads image layers
+only, so the WAL floor it sets stuck around until the control shard's
+memtable filled on its own (2 MiB of page writes at the default
+`flush_pages`); the reclaimer now requests a flush of the control shard
+when the note term alone holds the boundary.  Neither residual is
+exercised by the soak's own workload (it flushes every 8 pages and
+re-permits the request on every materializer publication anyway), so the
+soak's `wal_fence_slack_max` composition and acceptance bound are
+unchanged; see the new reclaim-core test cases
+(`test_late_durable_base_requests_compaction`,
+`test_late_fpi_requests_compaction`,
+`test_superseded_note_in_memtable_is_pruned`) and the soak comment for the
+closed mechanisms.
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):

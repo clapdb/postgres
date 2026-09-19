@@ -238,11 +238,22 @@ static unsigned int latest_verifications;
  * segment alignment below model_floor; up to one fully proven segment caught
  * between clearing its boundary and actually reclaiming -- a WAL-index
  * publication + GC + the 20 ms rate-limit floor + the reclaim pass itself,
- * bounded by RECLAIM_REACTION_WAL_BYTES (another <= 1 MiB); and up to a few
- * raw WAL-index items retained for a held reader or branch whose pin LSN sits
- * below its own horizon (observed ~130-200 KiB).  Together that is up to
- * roughly 2.1 MiB; a value near WAL_HIGH_WATER (2 MiB) on top of that would
- * be the signal worth investigating, not values in this range. */
+ * bounded by RECLAIM_REACTION_WAL_BYTES (another <= 1 MiB); and ~130-200 KiB
+ * of raw WAL-index items that are the chain from the newest replacement base
+ * at or below a held reader's or branch's pin up to that pin -- required
+ * retention, not a pruning lag: this workload writes only above g_wal_end,
+ * so no later write can ever become a base below an already-held pin, and
+ * the watch the reclaimer arms for a late-arriving base or FPI item (see
+ * wal_reclaim_watch in pagestore_core.c) therefore never fires here and this
+ * term is unaffected by it.  Together that is up to roughly 2.1 MiB; a value
+ * near WAL_HIGH_WATER (2 MiB) on top of that would be the signal worth
+ * investigating, not values in this range.  Also by design and unaffected by
+ * this soak: the note at or below a pin can be up to one MAT_INTERVAL older
+ * than the pin (restore-as-of needs it); once the pin is dropped, the note
+ * is superseded and pruned by the next compaction pass, which the reclaimer
+ * now requests directly when the note is still memtable-resident instead of
+ * waiting up to flush_pages worth of control-shard writes for an unrelated
+ * flush to expose it to compaction. */
 static uint64_t wal_fence_slack_max;
 
 typedef struct RelModel
