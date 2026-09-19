@@ -414,6 +414,7 @@ static uint64_t walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
 static uint64_t forkmeta_reclaim_lag_bytes(void);
 static int fork_meta_backpressure_throttled(void);
 static int admission_write_lock(void);
+static int fork_meta_orphan_proven(uint64_t admission_seq);
 static void backpressure_publish_locked(void);
 static void backpressure_update_locked(PsBackpressureController *controller,
 										 uint64_t lag, uint64_t high,
@@ -5448,6 +5449,149 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	return 0;
 }
 
+/*
+ * Recovery-only repair for an ordered record whose marker is missing from
+ * memory even though its admission identity (order_id, admission_seq) is
+ * nonzero and its segment/image-layer record survives.  Two distinct causes
+ * produce exactly this shape, both content-level: (1) the since-fixed
+ * live-path bug, where a live ordered write's marker existed only in memory
+ * as a plain FEV_GROW (marker_kind = 0, order_id = 0) instead of the
+ * recovery representation fork_event_activate_seg() expects, so a snapshot
+ * cutover could publish that plain GROW and strand the identity; (2) the
+ * snapshot builder degrading or dropping a marker whose page version had
+ * been pruned from memory, whose record is later rescanned after a timeline-
+ * delete rewrite rebases the flush watermark (tracked separately; see
+ * RELEASE_VALIDATION.md).  Both require fork_meta_orphan_proven() as a
+ * NECESSARY filter (see its header comment: by itself it is not proof
+ * against a torn append still in flight, because a refused record's
+ * admission_seq is still observed and can be covered by a *later* freeze,
+ * from a cutover after the refusal).
+ *
+ * Growth rule (this function; enabled unconditionally on both recovery
+ * paths -- image-layer and segment-suffix): the admission sequence is
+ * allocated once per append and shared only by a page record and its own
+ * fork event, so a plain GROW carrying the exact (lsn, admission_seq,
+ * nblocks) tuple of an otherwise-unmatched ordered record is that record's
+ * own marker, degraded.  Adopting it reproduces the in-memory state the
+ * live path would have produced without bug (1).  Any mismatch (wrong
+ * admission_seq/nblocks, a non-GROW kind, an event that already carries a
+ * marker, or the proof failing) is left untouched, so the caller still
+ * refuses the record.  No torn-append exposure beyond the necessary filter:
+ * a torn growth-class append never had a durable marker to begin with, so
+ * no durable source can ever hold a degraded GROW at its sequence, and
+ * admission sequences are never reused (segment_order_id_observe()/
+ * admission_seq_observe() are called for every replayed record, refused or
+ * not, precisely to prevent that -- skipping them to make the freeze proof
+ * sound would let a post-crash retry collide with the torn record's
+ * identity instead), so a later legitimate GROW at the same position always
+ * carries a different admission_seq and this rule stays sound.
+ *
+ * Commit rule (fork_event_adopt_orphaned_commit_seg(), below): unlike the
+ * growth rule, it is NOT torn-append-safe by construction alone and needs
+ * an additional, path-specific proof; see its own header comment.
+ */
+static int
+fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+							  uint64_t order_id, uint64_t admission_seq)
+{
+	if (order_id == 0 || !fork_meta_orphan_proven(admission_seq))
+		return 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		ForkEvent  *v = &e->ev[i];
+
+		if (v->kind == FEV_GROW && v->marker_kind == 0 && v->order_id == 0 &&
+			v->lsn == lsn && v->admission_seq == admission_seq &&
+			v->nblocks == nblocks)
+		{
+			fprintf(stderr, "pagestore: adopting orphaned ordered record as bound marker "
+					"(timeline=%u lsn=%llu seq=%llu order=%llu nblocks=%u)\n",
+					e->timeline, (unsigned long long) lsn,
+					(unsigned long long) admission_seq,
+					(unsigned long long) order_id, nblocks);
+			v->marker_kind = FEV_SEG_GROW_BOUND;
+			v->order_id = order_id;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Preconditions shared by every commit-class adoption site (direct, below,
+ * and recover()'s deferred look-ahead): fe exists, the record's identity is
+ * nonzero and fork_meta_orphan_proven() (a necessary filter only -- see its
+ * header comment), and the fork's size at this position already covers the
+ * block -- the same decision the live write made (segment_grows == 0) --
+ * with no event already occupying this exact (lsn, admission_seq).  An
+ * inert marker never contributes to fork_size_asof_hop() (only GROW/SET/DEAD
+ * do), so the only effect of admitting it is to admit the page version.
+ */
+static int
+fork_event_commit_adoptable(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+							uint64_t order_id, uint64_t admission_seq)
+{
+	uint32_t	i;
+
+	if (e == NULL || order_id == 0 || !fork_meta_orphan_proven(admission_seq))
+		return 0;
+	if (fork_size_asof_hop(e, lsn, admission_seq) < nblocks)
+		return 0;
+	for (i = 0; i < e->nev; i++)
+		if (e->ev[i].lsn == lsn && e->ev[i].admission_seq == admission_seq)
+			return 0;		/* already has an event at this identity */
+	return 1;
+}
+
+/*
+ * Commit-class companion to fork_event_adopt_orphaned_seg(), tried only
+ * after activation and the growth rule have both already failed: a second
+ * below-floor/WAL-less rewrite of an already-sized block (the FSM/VM
+ * pattern -- rewritten at every checkpoint) never left a plain GROW behind
+ * to begin with, even before the live-path fix, because fork_event_add()
+ * returns early for a GROW that does not raise fork_size_asof_hop() past
+ * its nblocks; there is no degraded identity to promote, only a missing
+ * one.  Insert the inert FEV_SEG_COMMIT_BOUND marker recovery itself would
+ * have loaded instead.
+ *
+ * Unlike the growth rule, fork_meta_orphan_proven() alone does not exclude
+ * a torn append here (a crashed writer's in-flight commit-class body has no
+ * identity of its own to collide with, but it can still satisfy the
+ * predicate on a later rescan after an intervening cutover -- see that
+ * function's header comment).  This function is reached only from
+ * recover_layer_prefix() (replay_page_record()'s allow_commit_adopt = 1);
+ * the real torn-exclusion proof there is residency: ps_memtable_put() stages
+ * a record into the memtable, and later into a layer, only after
+ * fork_meta_persist_segment() returned from an fsynced append, so a
+ * layer-resident record's marker append cannot still be in flight -- it
+ * either completed (this rule is adopting a builder-degraded marker, F1/F3)
+ * or the whole append failed and nothing was staged at all.  recover()'s
+ * segment-suffix path does NOT call this function directly (it passes
+ * allow_commit_adopt = 0): a segment-resident record has no such residency
+ * guarantee, and instead proves non-torn-ness by look-ahead (see recover());
+ * that path calls fork_event_commit_adoptable() itself and inserts the
+ * marker inline so it can log which following record proved it, rather than
+ * going through this function.  For the F3 pruned-marker case reached via
+ * the layer path (a live version pruned from memory, then its record
+ * rescanned) this re-admits an already-pruned version -- a pruning
+ * reversal, not new data; see RELEASE_VALIDATION.md for the open follow-up.
+ */
+static int
+fork_event_adopt_orphaned_commit_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+									 uint64_t order_id, uint64_t admission_seq)
+{
+	if (!fork_event_commit_adoptable(e, lsn, nblocks, order_id, admission_seq))
+		return 0;
+	fprintf(stderr, "pagestore: adopting orphaned ordered commit record as inert "
+			"bound marker (timeline=%u lsn=%llu seq=%llu order=%llu nblocks=%u)\n",
+			e->timeline, (unsigned long long) lsn,
+			(unsigned long long) admission_seq,
+			(unsigned long long) order_id, nblocks);
+	fork_event_add_seg_marker(e, lsn, nblocks, FEV_SEG_COMMIT_BOUND, order_id,
+							  admission_seq);
+	return 1;
+}
+
 static int
 fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				   uint64_t lsn, uint64_t admission_seq)
@@ -6688,6 +6832,52 @@ static uint64_t fork_meta_snapshot_generation;
 static uint64_t fork_meta_snapshot_cutoff_lsn;
 static uint64_t fork_meta_snapshot_cutoff_seq;
 static uint64_t fork_meta_snapshot_freeze_seq;
+
+/*
+ * NECESSARY, not sufficient: proof that this admission_seq's append had
+ * returned by the time some selected generation's freeze was taken -- not
+ * proof that it left a durable marker.  fork_meta_snapshot_maintenance()
+ * computes freeze_seq = next_admission_seq - 1 (below) while holding
+ * admission_write_lock(), which blocks until every in-flight append has
+ * released the admission *read* lock (admission_active_readers == 0) -- and
+ * every append holds that read lock across its entire append_page_impl()
+ * call (pagestore_daemon.c run_request(): ps_admission_read_lock() held
+ * across run_request_admitted(), which dispatches PS_OP_EXTEND/PS_OP_WRITEV
+ * through handle_request() -> ps_artifact_write() ->
+ * append_page_raw()/append_page_impl(), released only after that call
+ * returns).  So admission_seq <= freeze_seq implies the append that
+ * produced it had already returned by that freeze -- but "returned" does
+ * NOT mean "wrote a marker": a crash between the segment body write and
+ * fork_meta_persist_segment() (torn append) also returns via _exit(), and
+ * admission_seq_observe() (16764-ish, called on every replayed record,
+ * including a refused one, to prevent identity reuse -- see
+ * fork_event_adopt_orphaned_seg()'s header comment) advances
+ * next_admission_seq past a torn record's sequence on the very recovery
+ * pass that refuses it.  A *later* cutover in that same or a subsequent
+ * lifetime then freezes at or above the torn sequence, so this predicate
+ * alone would say a torn append is "proven" on any rescan after that
+ * cutover -- it excludes a torn append only on the first recovery
+ * immediately following the crash, not on every later one.  The actual
+ * torn-exclusion proof is structural, applied by the two call sites
+ * separately: residency (fork_event_adopt_orphaned_seg(),
+ * fork_event_adopt_orphaned_commit_seg() called directly from the
+ * image-layer path -- a layer-resident record was staged only after its
+ * marker append returned from an fsynced write, so it cannot be torn) or
+ * "a complete record follows in the same segment" (the segment-suffix
+ * path in recover(): append_page_impl() advances a shard's cursor past a
+ * record only after its marker append succeeded, and sets the segment-
+ * retired sentinel on failure, so a torn body is always the last complete
+ * record of its segment and nothing can ever follow it there).  Use this
+ * predicate only as a cheap necessary filter before that structural proof,
+ * never as a proof by itself.
+ */
+static int
+fork_meta_orphan_proven(uint64_t admission_seq)
+{
+	return fork_meta_snapshot_generation != 0 && admission_seq != 0 &&
+		admission_seq <= fork_meta_snapshot_freeze_seq;
+}
+
 /* The selected source is a compacted baseline, not controller debt.  Only
  * bytes appended after this baseline are charged.  The value is rebuilt after
  * recovery and advanced only after a durable source rewrite. */
@@ -14748,8 +14938,34 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * former one-shot fork_grow after a batch.)  The WAL-less format stores a
 	 * zero-version page/object's growth floor in the same record while its
 	 * version stays 0.
+	 *
+	 * An ordered record's durable marker (fork_meta_persist_segment() above)
+	 * carries order_id/admission_seq; the in-memory history must end up with
+	 * the identical representation, because the forkmeta snapshot is
+	 * serialized from memory and, after a cutover, is the only durable copy
+	 * of the pre-cutover metadata.  fork_grow_apply() -> fork_event_add()
+	 * always stamps order_id = 0 / marker_kind = 0, so a plain apply here
+	 * would silently drop the identity from memory while it still lives in
+	 * the segment and (until the next cutover) the source log; a later
+	 * cutover would then publish a plain GROW that recovery can no longer
+	 * match.  Insert exactly what recovery itself rebuilds instead: add the
+	 * bound marker and activate it against this page record.  The marker
+	 * kind must mirror the one just persisted above (same segment_grows
+	 * expression).
 	 */
-	fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn, admission_seq);
+	if (ordered_record)
+	{
+		ForkEnt    *ofe = fork_get_or_create(timeline, key);
+
+		fork_event_add_seg_marker(ofe, hdr_grow_lsn, block + 1,
+								  segment_grows ? FEV_SEG_GROW_BOUND :
+								  FEV_SEG_COMMIT_BOUND,
+								  order_id, admission_seq);
+		(void) fork_event_activate_seg(ofe, hdr_grow_lsn, block + 1,
+									   order_id, admission_seq);
+	}
+	else
+		fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn, admission_seq);
 	if (out_admission_seq)
 		*out_admission_seq = admission_seq;
 	return 0;
@@ -16857,12 +17073,21 @@ layer_recover_cmp(const void *pa, const void *pb)
 		(a->layer_id > b->layer_id ? 1 : 0);
 }
 
-/* Replay the index and fork-growth effects shared by layer and segment input. */
+/*
+ * Replay the index and fork-growth effects shared by layer and segment
+ * input.  allow_commit_adopt gates fork_event_adopt_orphaned_commit_seg():
+ * recover_layer_prefix() (the image-layer path) passes 1, since residency
+ * proves a layer-resident record's marker append cannot be in flight; the
+ * segment-suffix scan in recover() passes 0 and instead applies its own
+ * look-ahead proof itself (see there) before ever admitting a commit-class
+ * orphan.  The growth rule is unaffected and runs on both paths.
+ */
 static int
 replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 				   uint64_t page_lsn, uint64_t admission_seq,
 				   uint64_t growth_lsn, uint64_t order_id,
-				   uint32_t flags, uint32_t shard, int seg, uint64_t off)
+				   uint32_t flags, uint32_t shard, int seg, uint64_t off,
+				   int allow_commit_adopt)
 {
 	int			ordered = (flags & PS_IMG_REC_ORDERED) != 0;
 	int			wal_less = (flags & PS_IMG_REC_WALLESS) != 0;
@@ -16875,7 +17100,16 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		ForkEnt    *fe = fork_find(timeline, key);
 
+		/* fork_event_adopt_orphaned_seg() and fork_event_adopt_orphaned_commit_seg()
+		 * repair a proven orphan's marker (see their header comments); neither
+		 * runs unless the normal marker match above already failed, and the
+		 * commit rule only after the growth rule has also failed. */
 		if ((!fe || !fork_event_activate_seg(fe, growth_lsn, block + 1,
+												 order_id, admission_seq)) &&
+			(!fe || !fork_event_adopt_orphaned_seg(fe, growth_lsn, block + 1,
+												 order_id, admission_seq)) &&
+			(!allow_commit_adopt || !fe ||
+			 !fork_event_adopt_orphaned_commit_seg(fe, growth_lsn, block + 1,
 												 order_id, admission_seq)) &&
 			!fork_meta_legacy)
 			return 0;
@@ -17040,8 +17274,27 @@ recover_layer_prefix(uint32_t shard)
 		if (!replay_page_record(recs[i].timeline, &e->key, e->block, e->lsn,
 								e->admission_seq, e->growth_lsn, e->order_id,
 								e->flags,
-								shard, -1, 0))
+								shard, -1, 0, 1))
+		{
+			/* An unmatched ordered record with no orphan-adoption match
+			 * (fork_event_adopt_orphaned_seg() already tried and failed) is
+			 * fatal -- there is no size event to trust for this page.  Leave
+			 * a diagnostic identifying the exact tuple instead of the bare,
+			 * stale-errno "storage open: Invalid argument" this used to
+			 * surface as. */
+			fprintf(stderr, "pagestore_daemon: shard %u layer %llu: refusing "
+					"unmatched ordered record timeline=%u key=(klass=%u spc=%u "
+					"db=%u rel=%u fork=%d) block=%u lsn=%llu admission_seq=%llu "
+					"growth_lsn=%llu order_id=%llu flags=%#x\n",
+					shard, (unsigned long long) recs[i].layer_id, recs[i].timeline,
+					e->key.klass, e->key.spcOid, e->key.dbOid, e->key.relNumber,
+					e->key.forkNum, e->block, (unsigned long long) e->lsn,
+					(unsigned long long) e->admission_seq,
+					(unsigned long long) e->growth_lsn,
+					(unsigned long long) e->order_id, e->flags);
+			errno = EINVAL;
 			goto fail;
+		}
 	}
 	free(recs);
 	return 0;
@@ -17075,6 +17328,19 @@ recover(uint32_t shard)
 			s->flush_watermark.seg_off : 0;
 		int64_t		seg_bytes;
 		int			retire_segment = 0;
+		/* At most one refused-but-commit-adoptable ordered record is held
+		 * here while the scan looks for the torn-exclusion proof this path
+		 * uses (see replay_page_record()'s header comment): a complete
+		 * record following it in this same segment.  Reset per segment --
+		 * the proof does not carry across a segment boundary. */
+		int			pending_valid = 0;
+		uint64_t	pending_off = 0;
+		SegRecHdr	pending_hdr;
+		uint64_t	pending_data_off = 0;
+		uint64_t	pending_order_id = 0;
+		uint64_t	pending_admission_seq = 0;
+		uint32_t	pending_flags = 0;
+		uint64_t	pending_page_version = 0;
 
 		errno = 0;
 		seg_bytes = ps_storage->seg_size(shard, id);
@@ -17146,6 +17412,60 @@ recover(uint32_t shard)
 				break;
 			if (seg_bytes < (int64_t) (off + header_size + hdr.len))
 				break;
+
+			/* This record parsed completely, which is itself the proof a
+			 * stashed commit-class orphan needed: a torn append is always
+			 * the last complete record of its segment (append_page_impl()
+			 * advances a shard's cursor only after the marker append
+			 * succeeded, and sets the segment-retired sentinel on failure),
+			 * so anything complete following it means it was not torn.
+			 * Resolve it before doing anything else with the current
+			 * record. */
+			if (pending_valid)
+			{
+				ForkEnt    *pfe = fork_get_or_create(pending_hdr.timeline,
+													 &pending_hdr.key);
+
+				fprintf(stderr, "pagestore_daemon: shard %u segment %d: adopting "
+						"orphaned ordered commit record as inert bound marker "
+						"(timeline=%u key=(klass=%u spc=%u db=%u rel=%u fork=%d) "
+						"block=%u lsn=%llu admission_seq=%llu order_id=%llu) "
+						"followed by a complete record at offset %llu\n",
+						shard, id, pending_hdr.timeline, pending_hdr.key.klass,
+						pending_hdr.key.spcOid, pending_hdr.key.dbOid,
+						pending_hdr.key.relNumber, pending_hdr.key.forkNum,
+						pending_hdr.block, (unsigned long long) pending_hdr.lsn,
+						(unsigned long long) pending_admission_seq,
+						(unsigned long long) pending_order_id,
+						(unsigned long long) off);
+				fork_event_add_seg_marker(pfe, pending_hdr.lsn,
+										  pending_hdr.block + 1,
+										  FEV_SEG_COMMIT_BOUND, pending_order_id,
+										  pending_admission_seq);
+				/* The marker just inserted matches this exact tuple, so
+				 * fork_event_activate_seg() must find it now; a refusal here
+				 * would be a logic bug, not a data problem. */
+				if (!replay_page_record(pending_hdr.timeline, &pending_hdr.key,
+									pending_hdr.block, pending_page_version,
+									pending_admission_seq, pending_hdr.lsn,
+									pending_order_id, pending_flags,
+									shard, id, pending_data_off, 0))
+					goto fail;
+				if (s->memtable && timeline_recovery_allowed(pending_hdr.timeline))
+				{
+					if (ps_storage->seg_read(shard, id, pending_data_off, page,
+											 page_size) != 0 ||
+						ps_memtable_put(s->memtable, pending_hdr.timeline,
+									&pending_hdr.key, pending_hdr.block,
+									pending_page_version, page,
+									pending_admission_seq, pending_hdr.lsn,
+									pending_order_id, (uint32_t) id,
+									pending_data_off, pending_flags) != 0)
+						goto fail;
+				}
+				pending_valid = 0;
+			}
+
 			data_off = off + header_size;
 			if (ordered)
 				flags |= PS_IMG_REC_ORDERED;
@@ -17160,8 +17480,50 @@ recover(uint32_t shard)
 				!replay_page_record(hdr.timeline, &hdr.key, hdr.block,
 								page_version, admission_seq, hdr.lsn, order_id,
 								flags,
-								shard, id, data_off))
+								shard, id, data_off, 0))
 			{
+				ForkEnt    *fe = ordered ? fork_find(hdr.timeline, &hdr.key) : NULL;
+
+				/* A commit-class orphan here does not yet have the segment
+				 * path's torn-exclusion proof (a complete record following
+				 * it in this segment); stash it and keep scanning instead of
+				 * retiring immediately.  The growth rule needs no such
+				 * look-ahead -- it is sound unconditionally on both paths --
+				 * so fork_event_adopt_orphaned_seg() inside replay_page_record()
+				 * already ran and failed by the time we get here.  See
+				 * fork_event_commit_adoptable()'s and replay_page_record()'s
+				 * header comments. */
+				if (ordered && fork_event_commit_adoptable(fe, hdr.lsn,
+														   hdr.block + 1,
+														   order_id,
+														   admission_seq))
+				{
+					pending_valid = 1;
+					pending_off = off;
+					pending_hdr = hdr;
+					pending_data_off = data_off;
+					pending_order_id = order_id;
+					pending_admission_seq = admission_seq;
+					pending_flags = flags;
+					pending_page_version = page_version;
+					off += header_size + hdr.len;
+					continue;
+				}
+				/* An unmatched ordered record here silently discards the
+				 * rest of this segment below instead of failing recovery
+				 * outright -- log the tuple so that discard is visible,
+				 * matching the diagnostic in recover_layer_prefix(). */
+				fprintf(stderr, "pagestore_daemon: shard %u segment %d: retiring "
+						"tail at offset %llu on unmatched ordered record "
+						"timeline=%u key=(klass=%u spc=%u db=%u rel=%u fork=%d) "
+						"block=%u lsn=%llu admission_seq=%llu order_id=%llu "
+						"flags=%#x\n",
+						shard, id, (unsigned long long) off, hdr.timeline,
+						hdr.key.klass, hdr.key.spcOid, hdr.key.dbOid,
+						hdr.key.relNumber, hdr.key.forkNum, hdr.block,
+						(unsigned long long) hdr.lsn,
+						(unsigned long long) admission_seq,
+						(unsigned long long) order_id, flags);
 				retire_segment = 1;
 				break;
 			}
@@ -17178,6 +17540,26 @@ recover(uint32_t shard)
 			if (s->memtable && ps_memtable_full(s->memtable) &&
 				flush_memtable(s, (uint32_t) id, off) != 0)
 				goto fail;
+		}
+		/* The scan ended (any break above, including a clean end-of-segment)
+		 * without a complete record ever following the stashed orphan in
+		 * this segment: the torn-exclusion proof never arrived, so retire it
+		 * exactly as an unmatched, non-adoptable record would be. */
+		if (pending_valid)
+		{
+			fprintf(stderr, "pagestore_daemon: shard %u segment %d: retiring "
+					"tail at offset %llu on unmatched ordered record "
+					"timeline=%u key=(klass=%u spc=%u db=%u rel=%u fork=%d) "
+					"block=%u lsn=%llu admission_seq=%llu order_id=%llu "
+					"flags=%#x: no complete record follows in this segment\n",
+					shard, id, (unsigned long long) pending_off,
+					pending_hdr.timeline, pending_hdr.key.klass,
+					pending_hdr.key.spcOid, pending_hdr.key.dbOid,
+					pending_hdr.key.relNumber, pending_hdr.key.forkNum,
+					pending_hdr.block, (unsigned long long) pending_hdr.lsn,
+					(unsigned long long) pending_admission_seq,
+					(unsigned long long) pending_order_id, pending_flags);
+			retire_segment = 1;
 		}
 		s->cur_seg = id;
 		s->cur_off = retire_segment ? segment_size : off;

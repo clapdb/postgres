@@ -752,7 +752,7 @@ bytes, so a flipped byte inside a record is rejected at open; FKM2 records
 stay readable, and `fixtures/posix-mvp-baseline` (FKM2) is kept as the legacy
 fixture that must keep reopening while `fixtures/posix-forkmeta-crc` is the
 current one that pins the compiled identities and takes every mutation.  This
-was the first format change to go through the fixture process.  Five findings
+was the first format change to go through the fixture process.  Six findings
 were fixed on the way: a store reopened at a new path was refused because
 layer locations recorded their absolute parent directory (a missing parent now
 rebases onto the store's own leaf; a foreign existing parent is still
@@ -766,7 +766,59 @@ the same fork -- a below-floor copy followed by a higher-LSN write on the same
 relation published a snapshot the daemon then could not open, so each part is
 now sorted into per-fork order before it is written; and a torn legacy prefix
 stayed repairable only after the unknown-magic check learned to read a legacy
-record first.  One gap remains documented in the check: a
+record first; and, found during PR #262 review, a live ordered write's bound
+marker existed only in the forkmeta source log -- the in-memory fork history
+recorded a plain GROW instead -- so a second forkmeta cutover in the same
+daemon lifetime published that plain GROW and the store could not reopen
+(`storage open: Invalid argument`).  Live writes now insert the marker-plus-
+activation representation recovery itself rebuilds, closing that path outright.
+Recovery separately gained a fail-closed adoption rule for an unmatched
+ordered record whose *selected forkmeta snapshot's freeze sequence* covers its
+admission sequence.  That freeze condition is only a NECESSARY filter, not
+proof against a torn append: a refused record's admission sequence is still
+observed to prevent identity reuse on retry, so a later cutover can freeze
+past a torn record's sequence too (review finding R2-F1, from independent
+re-review after F2/F3).  A growth-class orphan (a plain GROW carrying the
+record's exact identity) is promoted back to a bound marker -- sound
+unconditionally, since a torn growth append never leaves a durable marker or
+an in-memory event to begin with.  A commit-class orphan (a second
+below-floor/WAL-less rewrite of an already-sized block -- the FSM/VM pattern
+-- which never left a plain GROW behind even pre-fix) is proven safe by size
+instead and gets an inert marker, but only after an additional,
+path-specific torn-exclusion proof: residency on the image-layer path (a
+layer-resident record's marker append cannot still be in flight, since
+staging happens only after that append returns), or, on the segment-suffix
+path, that at least one complete record follows it in the same segment (a
+torn body is always the last complete record of its segment, so nothing
+can ever follow it there); a commit-class record that is last in its segment
+is retired instead, since it cannot be told apart from a torn append at scan
+time -- for a store written entirely by the fixed live path this is a
+genuine F3 pruned survivor, so nothing acknowledged is lost, but for a
+pre-fix store that crashed after two same-lifetime cutovers (no close-time
+flush) it can instead be that record's own last acknowledged commit-class
+write, torn-indistinguishable, so retiring it falls back to serving the
+previous version.  Either adoption logs one `adopting orphaned ordered ...`
+line and any other case stays refused or retired.  A store written entirely
+by the fixed live path
+exercises this rule only through a separate, still-open finding (a pruned
+marker's record rescanned after a timeline-delete rewrite rebases the flush
+watermark; see `RELEASE_VALIDATION.md`, "Open: pruned ordered marker
+rescanned after a timeline-delete rewrite"), never through its own writes.
+`integration_test.sh`
+now stops every cluster it started, reopens its own retained store against a
+fresh daemon, and asserts the reopen succeeds, that no segment tail was
+retired and no record was refused (both unconditionally fatal), and reports
+the adoption count as that open finding's detector (this run: zero) rather
+than asserting it can never fire, so this class of failure fails the script
+instead of requiring the separate manual check `RELEASE_VALIDATION.md` used to
+call out.  Known gap from the same review (not fixed in that PR): every
+commit-class rewrite leaves one inert marker event in a fork's in-memory
+history (bounded durably, since the snapshot builder drops a commit marker
+once its version is pruned, but unbounded live between prunes), and the
+marker-matching/adoption scans over a fork's event array are linear, so a
+fork with many inert markers -- an FSM/VM fork of a hot table -- costs O(N)
+per replayed record; a follow-up should index by `(lsn, admission_seq)`.  One
+gap remains documented in the check: a
 page-segment record can never be the only copy of a page, because a cleanly
 stopped daemon flushes its memtable into a layer before it exits, so every
 archived page is also in a layer and a read resolves there (`reads mem=0

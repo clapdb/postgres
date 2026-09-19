@@ -62,7 +62,12 @@ assert() {  # $1=actual $2=expected $3=message
 	fi
 }
 
-wait_daemon_ready() {
+# Poll for $DPID publishing a valid ready shared-memory header; return 0/1
+# without printing or exiting, so a caller can decide whether a failure to
+# come up is fatal to the whole script (wait_daemon_ready below) or just one
+# assertion (the reopen guard near the end, which must still print the
+# summary line on failure).
+daemon_shm_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
 	local expected_version="$IPC_VERSION"
@@ -75,9 +80,7 @@ wait_daemon_ready() {
 
 	for ((i = 0; i < 400; i++)); do
 		if ! kill -0 "$DPID" 2>/dev/null; then
-			echo "FAIL - pagestore daemon exited before publishing shared memory"
-			tail -100 "$DATA/daemon.log" 2>/dev/null || true
-			exit 1
+			return 1
 		fi
 		if [ -r "$shm_path" ]; then
 			read -r magic version page_size io_unit nchannels nshards < <(
@@ -92,8 +95,14 @@ wait_daemon_ready() {
 		fi
 		sleep 0.05
 	done
+	return 1
+}
 
-	echo "FAIL - pagestore daemon did not publish a ready shared-memory header"
+wait_daemon_ready() {
+	if daemon_shm_ready; then
+		return 0
+	fi
+	echo "FAIL - pagestore daemon did not publish a ready shared-memory header (or exited first)"
 	tail -100 "$DATA/daemon.log" 2>/dev/null || true
 	exit 1
 }
@@ -2327,6 +2336,64 @@ assert "$artifact_after" "$artifact_before" "retained database artifacts stay by
 # the owner-scoped key split instead of merely not hitting the race.
 assert "$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)" "0" \
 	"no artifact BEGIN/COMMIT/DROP was refused during the run"
+
+# --- 33. clean-shutdown reopen: the retained store opens without a live compute --
+# A live ordered write's durable bound marker used to exist only in memory
+# until a second forkmeta cutover in the same daemon lifetime degraded it to
+# a plain GROW, so a retained store could fail "storage open: Invalid
+# argument" on its very next reopen (see RELEASE_VALIDATION.md).  Stop every
+# cluster this run started, shut the daemon down cleanly, and reopen it alone
+# against the same store: it must come back up.  Recovery now also adopts an
+# orphaned ordered record whose selected forkmeta snapshot proves its append
+# completed (see RELEASE_VALIDATION.md); a store built entirely by the fixed
+# live path exercises that rule only through the still-open F3 pruned-marker
+# rescan path (a timeline-delete rewrite that rebases the flush watermark),
+# never through its own live writes.  So an adoption count above zero here is
+# not itself a failure, but it is the F3 detector: a nonzero count means F3
+# fired during this run and must be investigated (its evidence preserved with
+# KEEPTMP=1), not silently retried.  A retired segment tail or a bare refusal
+# is unconditionally fatal: the adoption rule (F2) is supposed to turn every
+# reachable case of either into a logged adoption instead.
+"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${READERDATA:-}" ] && "$BIN/pg_ctl" -D "$READERDATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${ADVANCINGDATA:-}" ] && "$BIN/pg_ctl" -D "$ADVANCINGDATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null	# clean shutdown: ps_core_close() runs
+rm -f "/dev/shm$SHM"
+"$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
+DPID=$!
+if daemon_shm_ready; then
+	reopen_ok=ok
+else
+	reopen_ok=FAIL
+fi
+assert "$reopen_ok" "ok" "retained store reopens independently after clean shutdown"
+# Count both adoption line shapes: the growth-class rule ("...ordered record
+# as bound marker") and the commit-class rule ("...ordered commit record as
+# inert bound marker").
+adopt_count=$(grep -c "adopting orphaned ordered" "$DATA/daemon.log" 2>/dev/null)
+adopt_count=${adopt_count:-0}
+retire_count=$(grep -c "retiring tail at offset" "$DATA/daemon.log" 2>/dev/null)
+retire_count=${retire_count:-0}
+refuse_count=$(grep -c "refusing unmatched ordered record" "$DATA/daemon.log" 2>/dev/null)
+refuse_count=${refuse_count:-0}
+assert "$adopt_count" "0" \
+	"no orphaned ordered records were adopted on reopen (F3 detector: a nonzero count here means F3 fired and needs investigation, not a retry) (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
+# A "retiring tail" on a clean-shutdown reopen is always a defect here, never
+# an expected torn-append signature: a torn record requires a crash, and this
+# reopen follows a clean kill+wait shutdown, so nothing in this store can be
+# torn.  The only OTHER way recover() retires a proven, size-covered record is
+# a last-in-segment pruned survivor with no complete record behind it (R2-F1);
+# that needs a deletion rewrite to have dropped records behind it, which this
+# script's branch drops could produce.  If this count is ever nonzero, it is
+# the F3 signal (see RELEASE_VALIDATION.md's open finding), not noise.
+assert "$retire_count" "0" \
+	"no segment tail was retired on reopen (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
+assert "$refuse_count" "0" \
+	"no ordered record was refused on reopen (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 
 echo "----"
 if [ "$fail" = 0 ]; then

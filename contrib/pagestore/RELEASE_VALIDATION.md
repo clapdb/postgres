@@ -218,7 +218,7 @@ The release record should distinguish:
 
 No production sign-off is implied by the current assessment.
 
-## Additional recovery finding during PR #262 review
+## Recovery finding during PR #262 review (resolved)
 
 A cassert integration run passed with the final artifact publication producers,
 but reopening its retained store after shutdown failed in
@@ -233,10 +233,162 @@ The failure was reproduced on the unmodified `pagestore` baseline
 `2b2349887c2` in an isolated cassert build: its integration script passed, then
 its own daemon failed reopening the retained store. Debugging found the same
 FSM key and block, LSN 318767144 and order ID 2; the recovered GROW events again
-had zero order IDs. This predates the artifact changes. Diagnosis and repair
-of the lost ordering marker remain separate release work. Treat independent
-reopen of the full integration store as a release blocker; do not generalize
-the script's PASS into a claim that this additional recovery check passed.
+had zero order IDs. This predates the artifact changes.
+
+**Diagnosis.** A live ordered page write (a WAL-less or below-floor "clamped"
+relation page) durably persists a bound marker (`FEV_SEG_GROW_BOUND` or
+`FEV_SEG_COMMIT_BOUND`, carrying its `order_id`) to the forkmeta source log,
+but the *in-memory* fork history recorded it as a plain `FEV_GROW` with
+`marker_kind = 0` and `order_id = 0` -- `append_page_impl()`'s live path called
+the same `fork_grow_apply()` used for ordinary writes instead of inserting the
+marker-plus-activation recovery itself would rebuild. The forkmeta snapshot
+serializer builds a new generation from memory and compensates only by
+rescuing markers still present in the *current* source log; the first cutover
+after the write keeps the marker (copied from the source log) and resets the
+source log to a bare epoch record, but a *second* cutover in the same daemon
+lifetime finds the marker in neither memory nor the (already-reset) source log
+and publishes a plain GROW. On the next open, the image-layer index still
+carries the record's `order_id`; `fork_event_activate_seg()` finds no matching
+marker, `recover_layer_prefix()` fails, and the daemon exits with a stale
+`storage open: Invalid argument` (or whatever `errno` a prior syscall left
+behind). Nothing in the persisted formats was wrong; the in-memory
+representation had diverged from the one recovery reconstructs.
+
+**Fix.** The live path now inserts exactly the representation recovery would
+rebuild: `fork_event_add_seg_marker()` followed by `fork_event_activate_seg()`,
+using the same growth/commit distinction as the durable
+`fork_meta_persist_segment()` call a few lines above. This closes the live-path
+bug (finding F1) outright: a store written entirely by the fixed daemon never
+degrades its own marker to a plain GROW.
+
+Recovery additionally gained an explicit, logged, **fail-closed** adoption
+rule for an ordered record whose marker is missing from memory even though its
+admission identity (`order_id`, `admission_seq`, both nonzero) survives on its
+segment/image-layer record. The rule requires a proof, not just a nonzero
+identity (review finding F2): the *selected forkmeta snapshot's freeze
+sequence* must be at or above `admission_seq`
+(`fork_meta_orphan_proven()`, `pagestore_core.c`). `fork_meta_snapshot_maintenance()`
+computes that freeze sequence while holding the admission *write* lock, which
+blocks until every in-flight append -- each holding the admission *read* lock
+across the whole of `append_page_impl()` -- has returned; a failed marker
+append poisons forkmeta, so a proven admission_seq's append had returned by
+that freeze. **This alone is a NECESSARY condition, not sufficient proof
+against a torn append (finding R2-F1, from independent re-review of F2/F3):**
+a crash between a record's segment body write and its marker append also
+returns via `_exit()`, and the refused record's `admission_seq` is still
+observed (`admission_seq_observe()`/`segment_order_id_observe()`, kept
+deliberately -- see below) on the very recovery pass that refuses it; a
+*later* cutover in that same or a subsequent daemon lifetime then freezes at
+or above the torn sequence, so the predicate alone would call a torn append
+"proven" on any rescan after that cutover, not only the first one immediately
+following the crash. The real torn-exclusion proof is structural and applied
+separately by each of the two adoption sites below:
+
+- **Growth class**: a plain `GROW` event with the record's exact `(lsn,
+  admission_seq, nblocks)` is that record's own marker, degraded (the shape
+  the F1 bug produces). It is promoted back into a bound marker; one
+  `pagestore: adopting orphaned ordered record as bound marker ...` line is
+  logged. Sound on both recovery paths unconditionally, with no look-ahead
+  needed: a torn growth-class append never left a durable marker to begin
+  with (the crash precedes any in-memory bookkeeping too), so no durable
+  source can ever hold a degraded `GROW` at a torn sequence, and sequences
+  are never reused (see below), so this rule has no torn-append exposure.
+- **Commit class** (review finding F2, initially missed): a second below-floor
+  or WAL-less rewrite of an already-sized block -- the FSM/VM pattern,
+  rewritten at every checkpoint -- never left a plain `GROW` behind even
+  before the live-path bug, because the in-memory apply short-circuits for a
+  growth event that does not raise the fork's size. There is no degraded
+  identity to promote for this shape, only a missing one, so the rule instead
+  proves the record safe to admit **by size**: if the fork's size at this
+  position already covers the block, an inert `FEV_SEG_COMMIT_BOUND` marker
+  (the one recovery itself would have loaded) is inserted at its recorded
+  position; one `pagestore: adopting orphaned ordered commit record as inert
+  bound marker ...` line is logged. Unlike the growth rule, the freeze proof
+  alone is not torn-safe here, so each recovery path supplies its own
+  additional proof:
+  - **Image-layer path** (`recover_layer_prefix()`): adopts directly.
+    Residency is the proof -- a layer-resident record was staged into the
+    memtable only after its marker append returned from an fsynced segment
+    write, so a layer-resident record's marker append cannot still be in
+    flight.
+  - **Segment-suffix path** (`recover()`): does **not** adopt directly. It
+    requires, in addition, that **at least one complete record follows the
+    unmatched record in the same segment**. `append_page_impl()` advances a
+    shard's append cursor only after the marker append for the *previous*
+    record succeeded (and sets the segment-retired sentinel, `cur_off =
+    segment_size`, on failure), and every append holds the shard write lock,
+    so a torn body is always the last complete record of its segment and
+    nothing can ever be appended after it there -- on any rescan, not only
+    the first. `recover()` therefore stashes a refused, otherwise-adoptable
+    commit-class record (at most one at a time) and keeps scanning; if the
+    next record parses completely, the stashed one adopts (logging which
+    offset proved it: `... followed by a complete record at offset N`); if
+    the scan instead ends (any reason, including a clean end of written
+    data) with the stash still unresolved, it is retired exactly as an
+    unmatched, non-adoptable record would be, now saying so explicitly
+    (`... no complete record follows in this segment`). A record that is
+    last in its segment is retired unconditionally on the segment path,
+    because it cannot be told apart from a torn append by any proof
+    available at scan time, and the two possible identities it can have
+    differ in what is lost: for a store written entirely by the fixed live
+    path this is a genuine F3 survivor (see the F3 section below), so
+    retiring it loses only an already-pruned version, nothing acknowledged;
+    for a store written by the pre-fix daemon that crashed (no close-time
+    flush) after two same-lifetime cutovers, it can instead be that record's
+    own last acknowledged commit-class write (the F2 shape --
+    `test_orphaned_commit_marker_segment_path_last_is_retired()` -- which is
+    exactly why that test calls it torn-indistinguishable), so retiring it
+    falls back to serving the previous version rather than losing data.
+
+Why `admission_seq_observe()`/`segment_order_id_observe()` are kept for a
+refused record, rather than removed to make the freeze proof itself
+torn-safe: a post-crash retry of the same page write would then be allocated
+the torn record's own sequence and, for a clamped rewrite of the same block,
+the same growth LSN and (if the order-id observe were skipped too) the same
+order id -- a full identity collision, where a later rescan could match the
+torn body to the retry's legitimate marker and admit it as that record's
+version. Identities must never be reused; keeping both calls is what makes
+that true, at the cost of the freeze predicate alone no longer being a
+complete proof -- which is exactly why the two adoption sites above supply
+their own additional, path-specific proof instead of trusting it alone.
+
+`recover_layer_prefix()` and `recover()` also now print the refused/retired
+record's full tuple (and `recover_layer_prefix()` sets `errno = EINVAL`)
+before failing, so a bare, stale-errno `storage open: Invalid argument` cannot
+come back unexplained. No persisted format changed; `pagestore_format_versions`
+output and all format fixtures are unaffected.
+
+Precise scope of what "self-heals": a store whose only broken records are
+growth-class orphans of the fixed live-path bug (F1) opens via adoption and
+publishes proper markers at its next cutover -- this was the retained
+integration store's failure and is now closed by the F1 fix, with F2 as an
+independent generalization. A store carrying a *commit*-class orphan from the
+pre-F2 code (F1 fixed, F2 not applied) could not adopt it and stayed refused;
+F2 closes that gap, on the image-layer path unconditionally and on the
+segment-suffix path when a complete record follows it. **Recovery adopts an
+orphaned ordered record only when the selected forkmeta snapshot proves the
+append completed AND either a plain GROW with the identical identity exists
+(growth class, either path) or the fork's size at that position already
+covers the block AND (residency on the image-layer path, or a following
+complete record in the same segment on the segment-suffix path) (commit
+class); every other unmatched ordered record is refused (layer prefix) or
+retires the segment tail (segment suffix), with a logged tuple either way.**
+A store written entirely by the fixed live path exercises this rule only
+through the F3 path below, never through its own writes -- it does not
+"never need the adoption rule": it needs it if and only if F3 fires. See
+"Open: pruned ordered marker rescanned after a timeline-delete rewrite (F3)"
+below.
+
+`integration_test.sh` now stops every cluster and daemon it started, then
+starts a fresh daemon against the same retained store and asserts it reopens
+independently, with `ok - retained store reopens independently after clean
+shutdown`, `ok - no orphaned ordered records were adopted on reopen` (the F3
+detector: nonzero means F3 fired during this run and needs investigation, not
+a retry), `ok - no segment tail was retired on reopen`, and `ok - no ordered
+record was refused on reopen` (both unconditionally fatal: the adoption rule
+is supposed to turn every reachable case of either into a logged adoption
+instead). Independent reopen of the full integration store is now part of the
+script's PASS, not a separate manual step.
 
 Reproduce with `KEEPTMP=1 contrib/pagestore/integration_test.sh <build>`, then
 start `<build>/contrib/pagestore/pagestore_daemon` on the reported retained
@@ -376,3 +528,144 @@ above is the test that does.
   unit test: its LSNs had to be chosen comfortably ahead of the page-prune
   frontier `pagestore_artifact_lifecycle_test.c`'s other tests had already
   advanced, or the fence refused them). Needs a reproducer and its own fix.
+
+## Open: pruned ordered marker rescanned after a timeline-delete rewrite (F3)
+
+**Release blocking.** Found during independent review of the fix above.
+Mechanism, confirmed from the code (not yet from a synthetic worst-case
+reproduction beyond the regression tests below):
+
+- `fork_meta_snapshot_build()` keeps a non-future marker only while
+  `fork_meta_snapshot_marker_page_retained()` finds a live in-memory page
+  version at the marker's admission sequence; otherwise a growth marker
+  degrades to a plain `GROW` (still adoptable by identity, per F2 above) and a
+  commit marker is dropped outright (nothing to adopt by identity; F2's size
+  proof covers it instead).
+- `page_remove_compacted_versions()` removes in-memory page versions once a
+  compacted layer publishes. The segment record bytes are untouched. This is
+  harmless on its own: the record stays below the durable flush watermark, and
+  `recover_layer_prefix()` only replays the covered prefix from layer indexes,
+  where the dropped identity no longer exists, so recovery never rescans it.
+- `page_cleanup_rewrite_segment()` (timeline delete) rewrites a segment and,
+  when bytes inside the covered prefix moved, rebases the shard's flush
+  watermark to `(seg, 0)`. The next open then rescans the *whole* segment from
+  offset 0 and meets that now-orphaned record: no marker in memory, no size
+  covering it. Before this PR, `recover()` silently retired the rest of the
+  segment (a commit-class record) or was incidentally saved by growth
+  adoption once F1 existed (a growth-class record); after this PR, F2's
+  generalized adoption rule turns the commit-class outcome into a logged
+  pruning reversal too -- the pruned version becomes visible again, which is
+  strictly better than discarding every record after it in the segment, but
+  it is still stale data resurfacing, not the invariant holding.
+
+**Invariant I3** (the one a follow-up must restore): a page version is removed
+from memory only while its segment record is, and remains, below the durable
+flush watermark; equivalently, every record a recovery rescan can encounter
+has a live in-memory identity, and therefore a retained marker. The deletion
+rewrite's watermark rebase-to-zero violates the "remains" half.
+
+**Retirement is logical, not physical** (a known property, not itself part of
+this finding, but relevant to how it manifests): `recover()`'s retirement of
+a segment tail -- whether the plain, pre-R2-F1 form or the last-in-segment
+case the segment-path look-ahead (R2-F1) still retires -- only sets the
+in-memory cursor sentinel (`cur_off = segment_size`); it never truncates or
+overwrites the segment file. The retired bytes remain on disk exactly as
+written, unreachable through the live index but not destroyed, until a later
+flush moves the durable watermark past them (at which point a fresh open
+never rescans that region again). Until then, **every** open re-rescans and
+re-retires the same tail; this is why `test_torn_commit_append_never_adopted()`
+must reopen a third time (lifetime 3, after an intervening cutover) to prove
+the freeze proof alone would have let the torn record through, and why the
+log line differs between the first refusal (no generation selected yet, so
+`fork_meta_orphan_proven()` is trivially false and the record never reaches
+the look-ahead stash) and every later one (`... no complete record follows in
+this segment`). A follow-up that wants a retirement to become durable -- so a
+later open does not have to re-derive it -- must do so by recording the
+retire boundary in forkmeta or manifest metadata (a D5 format change with a
+fixture), never by truncating or rewriting page bytes: physical truncation
+during open would make a forensic or read-only reopen mutate the store, is
+unavailable on SPDK (`storage_spdk.c` has no `seg_rewrite`), and -- the
+reason this matters most for F3 specifically -- it would make F3's data loss
+irreversible: the records after an unmatched ordered record are acknowledged
+data a root fix is meant to recover, and today they are only *logically*
+discarded (unreachable through the index, but the bytes are still there for
+that fix to find); truncating them would foreclose that.
+
+**Evidence in this PR** (regression tests, `pagestore_forkmeta_cutover_test.c`):
+`test_deletion_filtered_forkmeta` asserts, after its final reopen, that the
+pinned sibling timeline's page version at LSN 200 is still resolvable
+(`read_resolve_version(...) == 1 && ver == 200`); on the unmodified baseline
+this returns `rc == 0` -- the version is silently gone. A commit-shape variant,
+`test_deletion_filtered_forkmeta_commit_shape` (one extra WAL-less rewrite of
+the same block before the pinned write, producing a commit-class orphan for
+the rescan to meet), asserts the reopen logs no `retiring tail` and no
+`refusing unmatched` line, at least one adoption line, and the newest served
+version is still LSN 200; on the unmodified baseline these also fail.
+`test_torn_commit_append_never_adopted` (folding in the reviewer's standalone
+`torn_test.c` reproduction, R2-F1) proves the freeze proof alone is not a
+torn-append exclusion: it crashes a commit-class write after its segment body
+but before its marker, reopens a third time (with an intervening cutover in
+between so the torn sequence is frozen-covered), and asserts the tail is
+retired again -- with `... no complete record follows in this segment` --
+and the block still serves the last acknowledged tag; on the branch as it
+stood after F2 alone (segment-path commit adoption gated only by the freeze
+proof, no look-ahead) this instead adopts the torn body and serves the
+never-acknowledged tag. `test_torn_growth_append_never_adopted` proves the
+growth rule has no equivalent exposure on either lifetime.
+
+**Why a follow-up PR, and what it must do.** This is a distinct, pre-existing
+defect in the timeline-delete rewrite / watermark design (not introduced by
+F1's fix or by F2's generalization), it needs its own crash-matrix coverage,
+and there is an adjacent open question (Q1 below) that may widen it. Keeping
+it out of this PR keeps the blocker fix reviewable; this PR's mitigation (F2's
+generalized adoption) is a logged pruning reversal, not a claim that I3 holds.
+The follow-up must:
+
+1. In `page_cleanup_rewrite_segment()`, copy a survivor record only if its
+   identity `(timeline, key, block, lsn or 0 for WAL-less, admission_seq)` has
+   a live `PageVer` in memory (matched by identity, not by `seg`/`off`,
+   because versions rebuilt from layers carry `seg == -1`); an
+   `admission_seq == 0` (legacy) record is always kept. On a match, stamp the
+   version's `seg`/`off` with the new location so relocation is visible.
+   Locks: the rewrite already holds every shard write lock and the map write
+   lock, so memory is the complete live set. Result: after a rewrite the
+   rescan set equals memory, and every ordered record in it has a retained
+   marker.
+2. Close the post-rebase window: while a shard's watermark sits at a rebased
+   position, the prune path must not remove a version whose record is at or
+   after the watermark until a later flush moves the watermark past it;
+   verify the deferred removal is retried rather than leaked until restart.
+3. **Q1** (must be answered with a test): after a rewrite rebases the
+   watermark and a later flush advances it again, image-layer index entries
+   for that segment carry stale pre-rewrite offsets; `recover_layer_prefix()`'s
+   coverage test and `recover()`'s scan start both use physical offsets, so a
+   survivor whose stale index offset exceeds the new watermark while its true
+   offset is below it may be replayed from neither the layer nor the segment
+   rescan. Test: drop a timeline whose records precede live sibling records in
+   the same segment, flush a small memtable so the watermark moves past the
+   survivors, crash-restart, and assert every surviving version is indexed. If
+   a manifest record is needed to fix it, that is a D5 format change with a
+   fixture.
+4. Tighten this PR's two regression tests to assert zero adoption lines (the
+   mitigation must no longer be exercised once I3 holds), and add
+   crash-matrix cases around `PS_FAULT_POINT_TIMELINE_DELETE_AFTER_SEGMENT_REWRITE`
+   with a pruned ordered record before and after the removed target records.
+5. Keep the refuse/retire diagnostics and the integration guard's zero-retire
+   /zero-refuse assertions as fatal signals; they must stay green throughout.
+
+## Note: linear event scans over inert commit markers (F5)
+
+Found during the same review. Every commit-class rewrite of a fork leaves one
+inert `FEV_SEG_GROW_BOUND`/`FEV_SEG_COMMIT_BOUND`-derived event in memory
+(exactly the post-restart state already, since markers are loaded from the
+log/snapshot and never compacted within a lifetime); the snapshot builder
+drops a commit marker once its version is pruned, so the *durable* count is
+bounded by live versions. The cost is not memory (40 bytes/event) but
+algorithmic: `fork_event_activate_seg()`, both `fork_event_adopt_orphaned_*()`
+rules, and `fork_meta_snapshot_marker_present()` scan a fork's event array
+linearly, so a fork with N inert markers costs O(N) per replayed record --
+O(N^2) per fork at recovery and per cutover. FSM/VM forks of hot tables are
+exactly the forks that accumulate these. Not a correctness issue and not fixed
+in this PR; tracked in `MVP_STATUS.md`'s known gaps for a follow-up (binary
+search on the sorted `(lsn, admission_seq)` order, or a hash on
+`admission_seq`).
