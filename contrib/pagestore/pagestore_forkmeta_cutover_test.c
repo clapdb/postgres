@@ -2966,6 +2966,294 @@ test_torn_growth_append_never_adopted(void)
 	remove_tree(store);
 }
 
+/*
+ * Small artifact-lifecycle op wrappers, matching pagestore_artifact_
+ * lifecycle_test.c's begin()/write_page()/commit()/read_value() but keyed
+ * by an explicit PsKey argument (this file has no single shared `key`).
+ */
+static int
+artifact_begin_request(const PsKey *key, uint64_t lsn, uint64_t *token,
+					   PsArtifactRefuseReason *reason)
+{
+	int rc;
+
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = ps_artifact_begin(0, key, lsn, token, reason);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
+static int
+artifact_write_request(const PsKey *key, uint32_t block, uint64_t lsn,
+					   uint64_t token, int fill, PsArtifactRefuseReason *reason)
+{
+	unsigned char page[8192];
+	int rc;
+
+	memset(page, fill, sizeof(page));
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = ps_artifact_write(0, key, block, page, lsn, token, NULL, reason);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
+static int
+artifact_commit_request(const PsKey *key, uint64_t lsn, uint64_t token,
+						uint64_t count, PsArtifactRefuseReason *reason)
+{
+	int rc;
+
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = ps_artifact_commit(0, key, lsn, token, count, reason);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
+/* 1 = read back and matches fill, 0 = absent, -1 = error or content mismatch. */
+static int
+artifact_read_at(const PsKey *key, uint64_t horizon, uint32_t block, int fill)
+{
+	unsigned char page[8192];
+	uint64_t lsn = 0;
+	int rc;
+
+	ps_lock_shard_rd(ps_shard_of(key));
+	rc = read_resolve(0, key, block, horizon, 0, page, &lsn);
+	ps_unlock_shard(ps_shard_of(key));
+	if (rc != 1)
+		return rc;
+	for (size_t i = 0; i < sizeof(page); i++)
+		if (page[i] != (unsigned char) fill)
+			return -1;
+	return 1;
+}
+
+/*
+ * T5: the forkmeta cutoff derivation (2.2/2.4) implies cutoff <= frontier <=
+ * floor <= every active same-timeline page-history pin, so a generation at a
+ * PINNED LSN is never below the cutoff and publishes cleanly after a
+ * cutover; an unpinned LSN just below that same pin is refused, by name, as
+ * UNFENCED (not the forkmeta growth check -- the data-page fence already
+ * refuses it), and a generation exactly AT the cutoff LSN is future and
+ * admitted.  Mirrors repro_b.c scenario 2, plus the BEGIN/WRITE/COMMIT
+ * coverage repro_b did not have room for.
+ */
+static void
+test_artifact_generation_vs_cutoff(void)
+{
+	char		store[] = "/tmp/psforkmetaartifactcutoffXXXXXX";
+	char		snapshots[1024];
+	char		manifest[1200];
+	char		frontier[1200];
+	PsKey		pin_key = {6, 6, 900, 0, PS_KLASS_RELATION};
+	PsKey		keyA = {0, 0, 901, 0, PS_KLASS_READER_SNAPSHOT};
+	PsKey		keyB = {0, 0, 902, 0, PS_KLASS_READER_SNAPSHOT};
+	PsKey		keyC = {0, 0, 903, 0, PS_KLASS_READER_SNAPSHOT};
+	PsKey		keyD = {0, 0, 904, 0, PS_KLASS_READER_SNAPSHOT};
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	TestSnapshotHeader hdr;
+	uint64_t	s100 = 0, s150 = 0, s200 = 0, token = 0;
+	uint64_t	f = 0, fs = 0;
+	PsArtifactRefuseReason reason;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "T5: create artifact-vs-cutoff store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots), "T5: build snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "T5: build manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "T5: build frontier path");
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "T5: open store, defer cutover");
+	check(meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &s100) == 0 &&
+		  append_relation(&pin_key, 0, 150, page, &s150) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &s200) == 0,
+		  "T5: relation history at 100/150/200");
+
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.owner_id = 78;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 150;
+	pin.admission_seq = s150;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK, "T5: pin@150 (owner 78)");
+	pin.owner_id = 77;
+	pin.lsn = 200;
+	pin.admission_seq = s200;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK, "T5: pin@200 (owner 77)");
+	check(run_maintenance_until(frontier, 1), "T5: durable frontier published");
+	check(ps_test_page_frontier(0, &f, &fs) != 0 && f == 150,
+		  "T5: the earlier pin@150 holds the durable frontier down to 150");
+
+	check(append_growth_batch(2200, 500) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1) &&
+		  read_selected_header(snapshots, &hdr) == 0,
+		  "T5: forkmeta cutover");
+	check(hdr.cutoff_lsn <= 150,
+		  "T5: the cutoff never passes an active same-timeline page-history pin");
+
+	/* A new key's generation at the pinned LSN publishes cleanly after the
+	 * cutover: it is never below the cutoff. */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(artifact_begin_request(&keyA, 150, &token, &reason) == 0 && token != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T5: BEGIN at the pinned LSN 150 publishes after the cutover");
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_write_request(&keyA, 0, 150, token, 0xA0, &reason) == 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE, "T5: keyA WRITE block 0");
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_write_request(&keyA, 1, 150, token, 0xA1, &reason) == 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE, "T5: keyA WRITE block 1");
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_commit_request(&keyA, 150, token, 2, &reason) == 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE, "T5: keyA COMMIT");
+	check(artifact_read_at(&keyA, 150, 0, 0xA0) == 1 &&
+		  artifact_read_at(&keyA, 150, 1, 0xA1) == 1,
+		  "T5: keyA reads back at exactly 150");
+
+	/* A new key's BEGIN one below the pin is refused by name, not admitted:
+	 * the data-page fence (not the forkmeta growth check) is what applies
+	 * pre-cutover-derivation to an unpinned LSN; the fence refuses it at
+	 * BEGIN time now (B2), so it never poisons. */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(artifact_begin_request(&keyB, 149, &token, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_UNFENCED,
+		  "T5: BEGIN one below the pin at 149 is refused as UNFENCED");
+
+	/* Collateral check: the refusal above did not poison anything. */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(artifact_begin_request(&keyC, 500, &token, &reason) == 0 && token != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T5: BEGIN on another key at 500 still succeeds after the refusal above");
+	check(artifact_read_at(&keyA, 150, 0, 0xA0) == 1,
+		  "T5: keyA's committed generation is still readable after the refusal");
+
+	/* A generation exactly AT the cutoff LSN is future (fresh admission
+	 * sequence) and publishes. */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(artifact_begin_request(&keyD, hdr.cutoff_lsn, &token, &reason) == 0 &&
+		  token != 0 && reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T5: BEGIN exactly at the cutoff LSN publishes");
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_write_request(&keyD, 0, hdr.cutoff_lsn, token, 0xD0, &reason) == 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE, "T5: keyD WRITE at the cutoff LSN");
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_commit_request(&keyD, hdr.cutoff_lsn, token, 1, &reason) == 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE, "T5: keyD COMMIT at the cutoff LSN");
+
+	/* Drop pin 78; T1 (pagestore_artifact_lifecycle_test.c) is where the
+	 * frontier's post-drop position is asserted, not here. */
+	check(ps_retention_drop(0, PS_RETENTION_OWNER_READER, 78, 1) == PS_RETENTION_OK,
+		  "T5: drop pin 78");
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
+ * T6 (artificial): the one theoretical gap in 2.2's implication chain -- a
+ * live child that already has its own durable frontier while the parent's
+ * frontier has passed the branch point -- is not reachable through the
+ * daemon's own admission gates (a new same-timeline pin below the durable
+ * frontier is refused by page_frontier_ancestry_allows(), core.c:6015).  To
+ * exercise PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF at all, this test installs a
+ * pin below the frontier through the raw registry write ps_retention_set()
+ * directly, bypassing that daemon gate -- not a claim that a real producer
+ * can reach this path, only a way to prove the reason is reported correctly
+ * and does not poison when the (structural, defence-in-depth) forkmeta
+ * growth check is what fires instead of the data-page fence.
+ */
+static void
+test_artifact_forkmeta_cutoff_reason(void)
+{
+	char		store[] = "/tmp/psforkmetaartifactreasonXXXXXX";
+	char		snapshots[1024];
+	char		manifest[1200];
+	char		frontier[1200];
+	PsKey		pin_key = {6, 6, 910, 0, PS_KLASS_RELATION};
+	PsKey		keyE = {0, 0, 911, 0, PS_KLASS_READER_SNAPSHOT};
+	PsKey		keyF = {0, 0, 912, 0, PS_KLASS_READER_SNAPSHOT};
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	TestSnapshotHeader hdr;
+	uint64_t	s100 = 0, s200 = 0, token = 0;
+	uint32_t	fence_before;
+	PsArtifactRefuseReason reason;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "T6: create forkmeta-cutoff-reason store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots), "T6: build snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "T6: build manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "T6: build frontier path");
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "T6: open store, defer cutover");
+	check(meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &s100) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &s200) == 0,
+		  "T6: relation history at 100/200");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.owner_id = 77;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = s200;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1), "T6: pin@200, durable frontier published");
+	check(append_growth_batch(2300, 600) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1) &&
+		  read_selected_header(snapshots, &hdr) == 0,
+		  "T6: forkmeta cutover, cutoff == frontier (200)");
+	check(hdr.cutoff_lsn == 200, "T6: cutoff lands exactly at the frontier");
+
+	/* Bypass the daemon's own admission gate (see the comment above) to
+	 * install a pin below the now-fixed cutoff. */
+	pin.owner_id = 78;
+	pin.lsn = 150;
+	pin.admission_seq = s100;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK,
+		  "T6: raw registry pin@150, below the cutoff (bypasses the daemon gate)");
+
+	fence_before = ps_test_artifact_fence_count(0);
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(artifact_begin_request(&keyE, 150, &token, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF,
+		  "T6: the data-page fence admits (pinned), but the forkmeta growth check refuses -- named FORKMETA_CUTOFF");
+	check(ps_test_artifact_fence_count(0) == fence_before,
+		  "T6: the meta record path never reserves a fence, so the refusal changed nothing");
+
+	/* And, critically, it did not poison: another key's BEGIN still works. */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(artifact_begin_request(&keyF, 300, &token, &reason) == 0 && token != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T6: BEGIN on another key at 300 still succeeds -- FORKMETA_CUTOFF did not poison");
+
+	close_runtime();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -3546,6 +3834,8 @@ main(void)
 	test_orphaned_commit_marker_size_mismatch();
 	test_torn_commit_append_never_adopted();
 	test_torn_growth_append_never_adopted();
+	test_artifact_generation_vs_cutoff();
+	test_artifact_forkmeta_cutoff_reason();
 	if (!failed)
 		remove_tree(store);
 	else

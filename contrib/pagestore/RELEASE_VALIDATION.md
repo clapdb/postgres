@@ -518,24 +518,91 @@ broken -- the bug was entirely `pagestore.c` choosing the *same* key
 test reaches -- so it cannot fail on an unfixed base. The integration block
 above is the test that does.
 
-## Open follow-up work from the artifact-key-collision fix (R5-5, not blocking)
+## Resolved follow-up work from the artifact-key-collision fix (R5-5)
 
-- **Admission-refusal poisoning.** `artifact_store_record()` sets
-  `artifact_io_failed` on any storage/admission failure
-  (`pagestore_artifact_lifecycle.inc`'s `append_page_raw` callers), which
-  then refuses every subsequent artifact BEGIN/COMMIT/DROP for the rest of
-  the daemon's lifetime (`PS_ARTIFACT_REFUSE_STORE_RECORD`/
-  `PS_ARTIFACT_REFUSE_POISONED` now make this visible instead of a bare -1;
-  it was always the behavior). Whether one transient admission refusal should
-  poison the whole process needs its own semantics review.
-- **forkmeta-cutoff vs. fenced-artifact refusal.** `append_page_impl`'s
-  page-prune-frontier fence for `PS_KLASS_SLRU`/`PS_KLASS_READER_SNAPSHOT`
-  objects can refuse a late-shipped artifact at or below the cutoff even when
-  its key and generation ordering are otherwise fine -- a real, separate
-  hazard from the key collision fixed here (surfaced writing this fix's own
-  unit test: its LSNs had to be chosen comfortably ahead of the page-prune
-  frontier `pagestore_artifact_lifecycle_test.c`'s other tests had already
-  advanced, or the fence refused them). Needs a reproducer and its own fix.
+Both items below were opened as follow-ups from the key-collision fix above
+and are now resolved.
+
+- **Admission-refusal poisoning.** `append_page_impl()` returned the same
+  `-1` both when it refused to admit a request (nothing durable changed:
+  a forked child, an exhausted admission allocator, an unfenced generation
+  LSN, or growth ordered before the forkmeta snapshot cutoff) and when a
+  storage write actually failed (bytes may be on disk). The lifecycle layer
+  could not tell the two apart, so `artifact_store_record()` and
+  `ps_artifact_write()` poisoned `artifact_io_failed` on *any* nonzero `rc`
+  -- an admission refusal was indistinguishable from a real I/O failure, and
+  poisoning fails every artifact BEGIN/COMMIT/DROP **and every artifact read
+  on every key** until the daemon reopens (`artifact_record()`, the read-side
+  validator, is gated by the same flag). One late, unfenced automatic
+  reader-snapshot publication was enough to take the whole artifact path
+  down: this is the exact shape the original CI failure hit (op 34/`BEGIN`
+  on one attempt, op 11/`READ_AT` on another, plus a `WARNING: pagestore:
+  automatic reader snapshot publication failed at ...` from the worker).
+  Fix: a `PsAppendOutcome` out-parameter classifies every `append_page_impl`
+  return site (`append_page_raw_outcome()`; the plain `append_page_raw()`
+  wrapper keeps its old contract for every other caller). The lifecycle
+  layer now poisons only when the outcome is a real storage I/O failure, or
+  when an append succeeded but the sync that must follow it failed (the
+  record is indexed in memory but not proven durable) -- exactly the cases
+  where durable state may now differ from in-memory state. Every other
+  refusal returns a named, non-poisoning `PsArtifactRefuseReason`
+  (`PS_ARTIFACT_REFUSE_UNFENCED`, `_FORKMETA_CUTOFF`, `_SYNC`,
+  `_LEGACY_BYPASS`, `_IMMUTABLE_MISMATCH`, appended to the existing
+  append-only enum; no `PS_SHM_VERSION` bump, matching how #266 added the
+  first set of reasons). `ps_artifact_write()` gained the same reason
+  out-parameter WRITE never had; the daemon now logs a WRITE refusal and
+  returns its reason in `ch->result` for `EXTEND`/`WRITEV` on an SLRU/
+  reader-artifact key, and the client message carries
+  klass/db/object/block/LSN/reason, so the reader-artifact worker WARNING
+  sites get that context for free (they already log `edata->message`).
+  Evidence: `test_admission_refusal_does_not_poison` (T1) and
+  `test_io_failure_still_poisons` (T2) in
+  `pagestore_artifact_lifecycle_test.c`, and
+  `test_artifact_generation_vs_cutoff` (T5) in
+  `pagestore_forkmeta_cutover_test.c`, each fail on an unfixed tree and pass
+  on this one; `integration_test.sh` now also asserts `reason=poisoned` and
+  `reason=store record` never appear in a passing run's daemon log.
+- **forkmeta-cutoff vs. fenced-artifact refusal.** This is *not* a separate
+  hazard from the key collision fixed above -- the hazard was the poisoning
+  above; once that no longer poisons, a refused generation here was already
+  the correct outcome, just misreported. The cutoff derivation chain proves
+  it cannot conflict with a fenced artifact: the page-history retention
+  floor is the minimum of every active same-timeline `PAGE_HISTORY` pin and
+  the control checkpoint cutoff (`retention_effective_floor_internal`), the
+  durable page frontier never exceeds that floor (`page_frontier_advance`),
+  a new same-timeline pin below the frontier is refused by the daemon
+  (`page_frontier_ancestry_allows`), and the forkmeta cutoff is the
+  lexicographic minimum of every fork-owning timeline's frontier
+  (`fork_meta_snapshot_cutoff`; a live child without its own durable
+  frontier caps it at its branch point). So `cutoff <= frontier <= floor <=
+  every active pin`: a generation at a pinned LSN is never below the cutoff,
+  and at the cutoff LSN itself a fresh admission sequence is future and
+  admitted. What *was* wrong: the artifact BEGIN/COMMIT/DROP lifecycle
+  records were not fence-checked at all. Before a forkmeta cutover, a BEGIN
+  at an unfenced LSN was admitted and its first data WRITE was refused
+  instead (the write-side fence already existed and was correct); after a
+  cutover, the same BEGIN was refused by the forkmeta growth check instead
+  -- two different gates reporting the same rule, both as a bare
+  `PS_ARTIFACT_REFUSE_STORE_RECORD` (or `-1`), and both poisoning before the
+  fix above. Fix: `ps_artifact_begin` now checks the same fence predicate
+  used by the data append (`artifact_lsn_fenced()`, extracted so both share
+  it) before admitting a *new* generation -- ordered after the same-LSN
+  completed-generation short-circuit, so an immutable re-ship of an
+  already-published generation keeps working even once its LSN has fallen
+  behind the frontier -- and refuses by name
+  (`PS_ARTIFACT_REFUSE_UNFENCED`). The forkmeta growth check stays in place
+  as defence in depth for the one remaining theoretical gap (a live child
+  that already has its own durable frontier while the parent's frontier has
+  passed the branch point; page-history retention does not treat a
+  descendant's branch point as a floor, only as a fence) and is now reported
+  by name too (`PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF`) if it ever fires; no
+  producer clamps its LSN and the cutoff derivation still does not consult
+  retention owners, so R6's bounded space is unchanged. Evidence:
+  `test_artifact_generation_vs_cutoff` (T5) and
+  `test_artifact_forkmeta_cutoff_reason` (T6, which installs a pin below the
+  cutoff through the raw retention registry -- bypassing the daemon's own
+  admission gate -- specifically to exercise the theoretical gap) in
+  `pagestore_forkmeta_cutover_test.c`.
 
 ## Open: pruned ordered marker rescanned after a timeline-delete rewrite (F3)
 

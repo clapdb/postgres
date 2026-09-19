@@ -4146,6 +4146,31 @@ page_frontier_structural_fence_active(uint32_t reader_timeline,
 	return 0;
 }
 
+/*
+ * An SLRU seed or reader snapshot resolves its control era from the newest
+ * control image at or below its cutoff, and registering it fences that
+ * image from then on.  Below the durable page frontier the image survives
+ * only at a fence that already existed when compaction ran, so a generation
+ * at an unfenced LSN is refused instead of being admitted as a durable
+ * version whose era is already gone.  Caller holds map_rd (or map_wr); this
+ * only reads, never reserves -- append_page_impl's data-append fence
+ * reservation must happen under the same lock acquisition as this check
+ * (control pruning plans under map-wr, so nothing can run between them), so
+ * that reservation stays inline in append_page_impl rather than here.  The
+ * artifact BEGIN-time gate (ps_artifact_begin, pagestore_artifact_lifecycle.inc)
+ * uses this same predicate with no reservation: the meta record it admits or
+ * refuses is not itself a control-era-bearing version.
+ */
+static int
+artifact_lsn_fenced(uint32_t timeline, uint64_t lsn)
+{
+	PsPruneFence frontier = page_frontier_current(timeline);
+
+	return lsn >= frontier.lsn ||
+		ps_retention_page_fence_at(timeline, lsn) ||
+		page_frontier_structural_fence_active(timeline, timeline, lsn);
+}
+
 static int
 page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 					 uint64_t lsn, uint64_t admission_seq)
@@ -15434,19 +15459,17 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * image from then on.  Below the durable page frontier the image survives
 	 * only at a fence that already existed when compaction ran, so an artifact
 	 * shipped late at an unfenced cutoff is refused instead of being admitted
-	 * as a durable version whose era is already gone.
+	 * as a durable version whose era is already gone.  artifact_lsn_fenced()
+	 * (this file, above) holds the shared predicate; ps_artifact_begin also
+	 * uses it, at BEGIN time, to refuse the same generation before any append.
 	 */
 	if ((key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_READER_SNAPSHOT) &&
 		hdr.lsn != 0)
 	{
-		PsPruneFence frontier;
 		int			fenced;
 
 		ps_lock_map_rd();
-		frontier = page_frontier_current(timeline);
-		fenced = hdr.lsn >= frontier.lsn ||
-			ps_retention_page_fence_at(timeline, hdr.lsn) ||
-			page_frontier_structural_fence_active(timeline, timeline, hdr.lsn);
+		fenced = artifact_lsn_fenced(timeline, hdr.lsn);
 		/* Reserve the artifact's fence while the fence that admitted it is
 		 * still held: control pruning plans under map-wr, so it cannot run
 		 * between this check and the reservation, and from here on the image

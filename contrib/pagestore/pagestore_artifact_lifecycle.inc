@@ -574,6 +574,28 @@ ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
 		return 0;
 	}
 
+	/*
+	 * A *new* generation must be admissible at its LSN by the same rule the
+	 * data append enforces (artifact_lsn_fenced(), pagestore_core.c): at or
+	 * above the durable page-reclaimed frontier, or fenced by an active
+	 * page-history owner pin, or the branch point of a live child.  Checking
+	 * it here too -- not only on the first data WRITE -- means a BEGIN that
+	 * will never be able to write a page is refused up front instead of
+	 * leaving an open attempt behind; it must run after the same-LSN
+	 * completed-generation short-circuit above so an immutable re-ship of an
+	 * already-published generation keeps working even once its LSN has since
+	 * fallen behind the frontier (the DROP path is deliberately not fenced;
+	 * see ps_artifact_drop).
+	 */
+	{
+		int			fenced;
+
+		ps_lock_map_rd();
+		fenced = artifact_lsn_fenced(tl, lsn);
+		ps_unlock_map();
+		if (!fenced)
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_UNFENCED);
+	}
 	memset(&record, 0, sizeof(record));
 	{
 		PsAppendOutcome outcome;
