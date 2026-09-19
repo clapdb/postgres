@@ -364,6 +364,114 @@ static unsigned char walidx_snapshot_reclaim_due[MAX_TIMELINES];
 static uint64_t walidx_reclaim_request_raw[MAX_TIMELINES];
 static uint64_t walidx_reclaim_request_fence_epoch[MAX_TIMELINES];
 static uint64_t walidx_reclaim_request_generation[MAX_TIMELINES];
+
+/*
+ * Watch armed when a reclaim-due request would be fruitless-suppressed (see
+ * walidx_reclaim_request_raw's comment): names the exact future event that
+ * would change the oldest raw WAL-index item's retirement answer, so the
+ * reclaimer does not have to wait for a retention-registry fence change or
+ * the WAL-index controller's own unrelated publication trigger.
+ *
+ * WAL_RECLAIM_WATCH_BASE: a durable version of (key,block) appears in
+ * [lo,hi] -- fired by flush_memtable, the only place a version becomes
+ * durable on the live write path.
+ * WAL_RECLAIM_WATCH_FPI: a new full-page-image WAL-index item for
+ * (key,block) is added in [lo,hi] -- fired by walidx_add_batch_locked.
+ *
+ * Entries are exact (a single specific page and LSN window); a timeline
+ * whose blocking minimum LSN has more than WAL_RECLAIM_WATCH_MAX items
+ * (a multi-block record) instead sets its overflow flag, which the fire
+ * sites treat as "any flush/FPI-add on this timeline may be relevant" --
+ * still bounded by the fruitless-suppression it feeds and by the 20 ms
+ * no-progress rate limit, never a drain on every write. */
+#define WAL_RECLAIM_WATCH_MAX 8
+
+typedef enum WalReclaimWatchKind
+{
+	WAL_RECLAIM_WATCH_NONE = 0,
+	WAL_RECLAIM_WATCH_BASE,
+	WAL_RECLAIM_WATCH_FPI,
+} WalReclaimWatchKind;
+
+typedef struct WalReclaimWatchEntry
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lo;				/* inclusive: the blocking item's end_lsn */
+	uint64_t	hi;				/* inclusive: the nearest horizon (h_cap) */
+	unsigned char kind;			/* WalReclaimWatchKind */
+} WalReclaimWatchEntry;
+
+static pthread_mutex_t wal_reclaim_watch_lock = PTHREAD_MUTEX_INITIALIZER;
+static WalReclaimWatchEntry wal_reclaim_watch[MAX_TIMELINES][WAL_RECLAIM_WATCH_MAX];
+static uint32_t wal_reclaim_watch_n[MAX_TIMELINES];
+static unsigned char wal_reclaim_watch_overflow[MAX_TIMELINES];
+/* Count of timelines with a nonempty watch, maintained under
+ * wal_reclaim_watch_lock.  The fire sites read it once, relaxed, without the
+ * mutex: the common case (nothing watched anywhere) then costs one load
+ * instead of a MAX_TIMELINES scan on every memtable flush. */
+static uint32_t wal_reclaim_watch_timelines_active;
+
+/* Bumped by a fire site when a watched event is observed; joins
+ * walidx_reclaim_request_raw/_fence_epoch/_generation as a fourth key a
+ * served request is checked against, so a served-but-fruitless request is
+ * retried once the exact event it named happens, without waiting for a
+ * fence change or the WAL-index controller's own trigger. */
+static uint64_t walidx_reclaim_base_epoch;
+static uint64_t walidx_reclaim_request_base_epoch[MAX_TIMELINES];
+
+/* Arm timeline tl's watch with 'n' entries (0 clears it); 'overflow' records
+ * that more than WAL_RECLAIM_WATCH_MAX raw items shared the blocking minimum
+ * LSN.  Replaces any previous watch for tl outright: the caller recomputes
+ * the full set at every NOPROGRESS evaluation. */
+static void
+wal_reclaim_watch_arm(uint32_t tl, const WalReclaimWatchEntry *entries,
+					  uint32_t n, unsigned char overflow)
+{
+	if (tl >= MAX_TIMELINES || n > WAL_RECLAIM_WATCH_MAX)
+		return;
+	pthread_mutex_lock(&wal_reclaim_watch_lock);
+	if (n != 0)
+		memcpy(wal_reclaim_watch[tl], entries, (size_t) n * sizeof(*entries));
+	if (wal_reclaim_watch_n[tl] == 0 && n != 0)
+		wal_reclaim_watch_timelines_active++;
+	else if (wal_reclaim_watch_n[tl] != 0 && n == 0)
+		wal_reclaim_watch_timelines_active--;
+	wal_reclaim_watch_n[tl] = n;
+	wal_reclaim_watch_overflow[tl] = overflow;
+	pthread_mutex_unlock(&wal_reclaim_watch_lock);
+}
+
+/* Drop timeline tl's watch: a successful reclaim, a served request whose raw
+ * floor moved, or timeline open/reset all make any armed entries stale. */
+static void
+wal_reclaim_watch_clear(uint32_t tl)
+{
+	if (tl >= MAX_TIMELINES)
+		return;
+	pthread_mutex_lock(&wal_reclaim_watch_lock);
+	if (wal_reclaim_watch_n[tl] != 0)
+	{
+		wal_reclaim_watch_n[tl] = 0;
+		wal_reclaim_watch_timelines_active--;
+	}
+	wal_reclaim_watch_overflow[tl] = 0;
+	pthread_mutex_unlock(&wal_reclaim_watch_lock);
+}
+
+uint32_t
+ps_test_wal_reclaim_watch_count(uint32_t tl)
+{
+	uint32_t	n;
+
+	if (tl >= MAX_TIMELINES)
+		return 0;
+	pthread_mutex_lock(&wal_reclaim_watch_lock);
+	n = wal_reclaim_watch_n[tl];
+	pthread_mutex_unlock(&wal_reclaim_watch_lock);
+	return n;
+}
+
 static uint64_t walidx_observation_next_ns;
 static uint64_t walidx_observation_count;
 #define WALIDX_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
@@ -1078,7 +1186,9 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 		__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
 		walidx_reclaim_request_raw[tl] = 0;
 		walidx_reclaim_request_fence_epoch[tl] = 0;
+		walidx_reclaim_request_base_epoch[tl] = 0;
 		walidx_reclaim_request_generation[tl] = 0;
+		wal_reclaim_watch_clear(tl);
 	}
 	__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&backpressure_shutdown_requested, 0, __ATOMIC_RELEASE);
@@ -11958,12 +12068,25 @@ walidx_base_version_durable(const PageVer *v)
 }
 
 /* Caller holds all shard write locks and map-rd.  The scan only touches the
- * in-memory WAL-index; it deliberately performs no I/O while map-rd is held. */
+ * in-memory WAL-index; it deliberately performs no I/O while map-rd is held.
+ *
+ * watch_out/watch_n_out/watch_overflow_out are optional (NULL when the
+ * caller has no use for the watch, e.g. the backpressure lag estimator).
+ * When given, the scan also records the (key, block, end_lsn) of up to
+ * WAL_RECLAIM_WATCH_MAX items at the minimum LSN -- the same items that
+ * define *floor_out -- for the WAL reclaimer's fruitless-request watch (see
+ * wal_reclaim_watch's comment).  Only .key/.block/.lo are filled in; the
+ * caller fills .hi/.kind once it knows the governing horizon. */
 static int
 wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
-								 uint64_t *floor_out)
+								 uint64_t *floor_out,
+								 WalReclaimWatchEntry *watch_out,
+								 uint32_t *watch_n_out,
+								 unsigned char *watch_overflow_out)
 {
 	uint64_t floor = 0;
+	uint32_t wn = 0;
+	unsigned char overflow = 0;
 
 	for (uint32_t shard = 0; shard < core_shards(); shard++)
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
@@ -11990,11 +12113,98 @@ wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
 							 item->end_lsn <= item->lsn)
 							return -1;
 						if (floor == 0 || item->lsn < floor)
+						{
 							floor = item->lsn;
+							wn = 0;
+							overflow = 0;
+						}
+						if (watch_out != NULL && item->lsn == floor)
+						{
+							if (wn < WAL_RECLAIM_WATCH_MAX)
+							{
+								memset(&watch_out[wn], 0, sizeof(watch_out[wn]));
+								watch_out[wn].key = entry->key;
+								watch_out[wn].block = entry->block;
+								watch_out[wn].lo = item->end_lsn;
+								wn++;
+							}
+							else
+								overflow = 1;
+						}
 					}
 				}
 	*floor_out = floor;
+	if (watch_n_out != NULL)
+		*watch_n_out = wn;
+	if (watch_overflow_out != NULL)
+		*watch_overflow_out = overflow;
 	return 0;
+}
+
+/* Caller holds map-rd (taken here if not already held elsewhere by the
+ * request path; this helper takes it itself).  Answers, for one horizon LSN
+ * h on timeline tl, whether h is a *protected* horizon in the sense
+ * walidx_plan_bases_build (the WAL-index compaction planner) uses: only a
+ * protected horizon's chain is led by a durable replacement base; an
+ * unprotected horizon's chain is led by the newest FPI at or below it.  See
+ * that function's comment for the full rationale; this mirrors its
+ * protected-set construction for a single horizon instead of the whole
+ * table, since the reclaimer only needs one horizon's answer per watched
+ * item and does not hold the locks that function's full build requires. */
+static int
+walidx_horizon_protected_owner(uint32_t tl, uint64_t h)
+{
+	PsPruneFence *fences = NULL;
+	uint32_t	nfences = 0;
+	PsRetentionPin *pins = NULL;
+	uint32_t	npins = 0;
+	uint64_t	materializer_lsn = 0;
+	int			protected_horizon = 0;
+	int			rc;
+
+	if (h == 0)
+		return 0;
+	ps_lock_map_rd();
+	rc = page_prune_fences(tl, &fences, &nfences);
+	ps_unlock_map();
+	if (rc != 0)
+		return 0;
+	for (uint32_t i = 0; i < nfences && !protected_horizon; i++)
+		if (fences[i].lsn == h)
+			protected_horizon = 1;
+	free(fences);
+	if (protected_horizon)
+		return 1;
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return 0;
+	for (uint32_t i = 0; i < npins; i++)
+		if (pins[i].timeline == tl &&
+			pins[i].owner_kind == PS_RETENTION_OWNER_MATERIALIZER &&
+			(pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+			(materializer_lsn == 0 || pins[i].lsn < materializer_lsn))
+			materializer_lsn = pins[i].lsn != 0 ? pins[i].lsn : 1;
+	if (materializer_lsn == h)
+	{
+		int			shared = 0;
+
+		for (uint32_t i = 0; i < npins && !shared; i++)
+		{
+			uint64_t	projected = pins[i].lsn;
+
+			if (pins[i].timeline == tl &&
+				pins[i].owner_kind == PS_RETENTION_OWNER_MATERIALIZER)
+				continue;
+			if ((pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+				(pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0 &&
+				retention_project_lsn(pins[i].timeline, tl, &projected) &&
+				projected == h)
+				shared = 1;
+		}
+		if (!shared)
+			protected_horizon = 1;
+	}
+	free(pins);
+	return protected_horizon;
 }
 
 /* Caller holds walidx_meta_lock.  A progress value initialized from the first
@@ -12150,7 +12360,11 @@ wal_segment_reclaim_one(void)
 		uint64_t residual_target = 0;
 		uint64_t proof_epoch = 0;
 		uint64_t fence_epoch = 0;
+		uint64_t base_epoch = 0;
 		uint64_t snapshot_generation = 0;
+		WalReclaimWatchEntry watch_items[WAL_RECLAIM_WATCH_MAX];
+		uint32_t watch_n = 0;
+		unsigned char watch_overflow = 0;
 		int attempt = 0;
 		int rc;
 		int walidx_valid;
@@ -12198,6 +12412,7 @@ wal_segment_reclaim_one(void)
 		 * actually observed -- a lost wakeup. */
 		proof_epoch = __atomic_load_n(&wal_reclaim_proof_epoch, __ATOMIC_ACQUIRE);
 		fence_epoch = __atomic_load_n(&walidx_reclaim_fence_epoch, __ATOMIC_ACQUIRE);
+		base_epoch = __atomic_load_n(&walidx_reclaim_base_epoch, __ATOMIC_ACQUIRE);
 
 		/* WAL-index writers take shard-wr before the publish read gate. */
 		for (uint32_t shard = 0; shard < nshards; shard++)
@@ -12239,6 +12454,7 @@ wal_segment_reclaim_one(void)
 			{
 				memset(&wal_reclaim_retry_at[tl], 0,
 					   sizeof(wal_reclaim_retry_at[tl]));
+				wal_reclaim_watch_clear(tl);
 				did = 1;
 				goto selected_done;
 			}
@@ -12256,7 +12472,8 @@ wal_segment_reclaim_one(void)
 		rc = 0;
 		if (walidx_valid)
 			rc = wal_reclaim_raw_dependency_floor(tl, store->start_lsn,
-										 &raw_floor);
+										 &raw_floor, watch_items, &watch_n,
+										 &watch_overflow);
 		ps_unlock_map();
 		for (uint32_t shard = nshards; shard > 0; shard--)
 			ps_unlock_shard(shard - 1);
@@ -12360,20 +12577,93 @@ wal_segment_reclaim_one(void)
 				 * before its first publish, when walidx_snapshot_generation
 				 * is still 0), but a request is recorded only when raw_floor
 				 * was already confirmed nonzero below, so 0 there is
-				 * unambiguous. */
+				 * unambiguous.
+				 *
+				 * base_epoch joins the key: a served request that dropped
+				 * nothing stays fruitless until the raw floor changes, a
+				 * fence changes, OR the watch armed below observes the exact
+				 * event (a replacement base becoming durable, or a newer FPI
+				 * arriving) that would let the *next* publication drop the
+				 * blocking item -- residual 1 in the design doc. */
 				fruitless = served && walidx_reclaim_request_raw[tl] != 0 &&
 					raw_floor == walidx_reclaim_request_raw[tl] &&
-					fence_epoch == walidx_reclaim_request_fence_epoch[tl];
+					fence_epoch == walidx_reclaim_request_fence_epoch[tl] &&
+					base_epoch == walidx_reclaim_request_base_epoch[tl];
 				if (raw_floor != 0 && raw_floor < proven &&
 					proven_target > store->start_lsn &&
 					!fruitless && !already_due)
 				{
 					walidx_reclaim_request_raw[tl] = raw_floor;
 					walidx_reclaim_request_fence_epoch[tl] = fence_epoch;
+					walidx_reclaim_request_base_epoch[tl] = base_epoch;
 					walidx_reclaim_request_generation[tl] = snapshot_generation;
 					__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 1,
 									 __ATOMIC_RELEASE);
+					wal_reclaim_watch_clear(tl);
 				}
+				else if (raw_floor != 0 && fruitless)
+				{
+					/* Name the exact event that would change item(s) at
+					 * raw_floor's retirement answer, from the up-to-8 items
+					 * the raw-floor scan recorded above.  Cheap (one
+					 * WAL-index fence snapshot plus O(watch_n * nver) reads)
+					 * and only reached in the already-suppressed case. */
+					WalReclaimWatchEntry armed[WAL_RECLAIM_WATCH_MAX];
+					uint32_t narmed = 0;
+					uint64_t *idx_fences = NULL;
+					uint32_t n_idx_fences = 0;
+
+					ps_lock_map_rd();
+					(void) walidx_prune_fences(tl, &idx_fences, &n_idx_fences);
+					ps_unlock_map();
+					for (uint32_t wi = 0; wi < watch_n &&
+						 narmed < WAL_RECLAIM_WATCH_MAX; wi++)
+					{
+						uint64_t h_cap = progress;
+
+						for (uint32_t fi = 0; fi < n_idx_fences; fi++)
+							if (idx_fences[fi] >= watch_items[wi].lo &&
+								idx_fences[fi] < h_cap)
+								h_cap = idx_fences[fi];
+						if (h_cap < watch_items[wi].lo)
+							continue;
+						if (walidx_horizon_protected_owner(tl, h_cap))
+						{
+							const PageEnt *pe = page_find(tl,
+														  &watch_items[wi].key,
+														  watch_items[wi].block);
+							int have = 0;
+
+							if (pe != NULL)
+								for (int vi = 0; vi < pe->nver && !have; vi++)
+								{
+									const PageVer *v = &pe->vers[vi];
+
+									if (v->lsn >= watch_items[wi].lo &&
+										v->lsn <= h_cap &&
+										!walidx_base_version_durable(v))
+										have = 1;
+								}
+							if (!have)
+								continue;
+							armed[narmed] = watch_items[wi];
+							armed[narmed].hi = h_cap;
+							armed[narmed].kind = WAL_RECLAIM_WATCH_BASE;
+							narmed++;
+						}
+						else
+						{
+							armed[narmed] = watch_items[wi];
+							armed[narmed].hi = h_cap;
+							armed[narmed].kind = WAL_RECLAIM_WATCH_FPI;
+							narmed++;
+						}
+					}
+					free(idx_fences);
+					wal_reclaim_watch_arm(tl, armed, narmed, watch_overflow);
+				}
+				else
+					wal_reclaim_watch_clear(tl);
 			}
 			wal_reclaim_backoff(tl, &now, proof_epoch);
 			goto selected_done;
@@ -12387,6 +12677,7 @@ wal_segment_reclaim_one(void)
 		{
 			memset(&wal_reclaim_retry_at[tl], 0,
 				   sizeof(wal_reclaim_retry_at[tl]));
+			wal_reclaim_watch_clear(tl);
 			did = 1;
 			goto selected_done;
 		}
@@ -12525,7 +12816,9 @@ walidx_purge_timeline(uint32_t tl)
 	__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
 	walidx_reclaim_request_raw[tl] = 0;
 	walidx_reclaim_request_fence_epoch[tl] = 0;
+	walidx_reclaim_request_base_epoch[tl] = 0;
 	walidx_reclaim_request_generation[tl] = 0;
+	wal_reclaim_watch_clear(tl);
 	memset(&walidx_snapshot_gc_retry_at[tl], 0,
 		   sizeof(walidx_snapshot_gc_retry_at[tl]));
 	memset(&walidx_snapshot_cleanup[tl], 0,
@@ -17479,7 +17772,8 @@ wal_reclaim_lag_bytes(void)
 		pthread_mutex_unlock(&walidx_meta_lock);
 		ps_lock_map_rd();
 		if (walidx_valid)
-			proof_rc = wal_reclaim_raw_dependency_floor(tl, start, &raw_floor);
+			proof_rc = wal_reclaim_raw_dependency_floor(tl, start, &raw_floor,
+														NULL, NULL, NULL);
 		ps_unlock_map();
 		for (uint32_t shard = core_shards(); shard > 0; shard--)
 			ps_unlock_shard(shard - 1);
@@ -20761,7 +21055,9 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
 		walidx_reclaim_request_raw[tl] = 0;
 		walidx_reclaim_request_fence_epoch[tl] = 0;
+		walidx_reclaim_request_base_epoch[tl] = 0;
 		walidx_reclaim_request_generation[tl] = 0;
+		wal_reclaim_watch_clear(tl);
 	}
 	memset(walidx_log_epoch, 0, sizeof(walidx_log_epoch));
 	memset(walidx_snapshot_gc_pending, 0,

@@ -206,6 +206,7 @@ extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
 extern int ps_test_page_frontier(uint32_t timeline, uint64_t *lsn, uint64_t *seq);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
+extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
