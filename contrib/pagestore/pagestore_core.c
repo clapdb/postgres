@@ -9235,12 +9235,26 @@ static uint32_t wal_reclaim_cursor;
  * exists to avoid repeating the global drain on every idle tick while the
  * candidate is genuinely unchanged, not to make the reclaimer wait out a
  * fixed timer after a proof input has actually moved.  Every timeline's
- * armed retry records the epoch at arm time; a later global bump (retention
- * change, WAL-index publish/GC, durable progress, timeline delete) makes the
- * timeline due again immediately.  The 1 s timer remains as the fallback for
- * fail-closed errors, which are not proof-input events. */
+ * armed retry records the epoch as of just before that attempt read any
+ * proof input (not a fresh read at arm time -- see wal_reclaim_backoff); a
+ * later global bump (retention change, WAL-index publish/GC, durable
+ * progress, timeline delete) makes the timeline due again, but not before
+ * WAL_RECLAIM_REARM_MIN_NS after the arm: every re-evaluation is a full
+ * drain (admission write lock, all shard write locks, the whole-index raw
+ * floor scan, the control-image floor read), and PS_OP_RETENTION_PIN_DROP is
+ * dispatched without the admission lock, so a drop-heavy client pinned on one
+ * stuck segment would otherwise turn every drop into a drain at up to one per
+ * maintenance-thread idle tick.  20 ms caps that at 50 drains/s per timeline
+ * -- the same order as the 100 ms WAL-index observer -- while still being
+ * invisible against the soak's reaction-latency allowance.  The 1 s timer
+ * remains as the fallback for fail-closed errors, which are not proof-input
+ * events, though an unrelated epoch bump can still cancel a fail-closed
+ * backoff early once the floor has passed; that is a harmless extra retry,
+ * not a correctness requirement. */
 static uint64_t wal_reclaim_proof_epoch;
 static uint64_t wal_reclaim_backoff_epoch[MAX_TIMELINES];
+static struct timespec wal_reclaim_armed_at[MAX_TIMELINES];
+#define WAL_RECLAIM_REARM_MIN_NS 20000000L
 
 static inline void
 wal_reclaim_proof_changed(void)
@@ -9251,6 +9265,21 @@ wal_reclaim_proof_changed(void)
 static inline int
 wal_reclaim_retry_due(uint32_t tl, const struct timespec *now)
 {
+	struct timespec min_at = wal_reclaim_armed_at[tl];
+
+	/* The rate-limit floor comes first and is unconditional: an epoch change
+	 * inside the window still makes the timeline due once the window ends
+	 * (wal_reclaim_backoff_epoch was recorded before this attempt read any
+	 * proof input, so the mismatch persists), it just is not honored early. */
+	min_at.tv_nsec += WAL_RECLAIM_REARM_MIN_NS;
+	if (min_at.tv_nsec >= 1000000000L)
+	{
+		min_at.tv_sec += min_at.tv_nsec / 1000000000L;
+		min_at.tv_nsec %= 1000000000L;
+	}
+	if (now->tv_sec < min_at.tv_sec ||
+		(now->tv_sec == min_at.tv_sec && now->tv_nsec < min_at.tv_nsec))
+		return 0;
 	if (__atomic_load_n(&wal_reclaim_proof_epoch, __ATOMIC_ACQUIRE) !=
 		wal_reclaim_backoff_epoch[tl])
 		return 1;
@@ -11068,6 +11097,7 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now,
 	wal_reclaim_retry_at[timeline] = *now;
 	if (wal_reclaim_retry_at[timeline].tv_sec < LONG_MAX)
 		wal_reclaim_retry_at[timeline].tv_sec++;
+	wal_reclaim_armed_at[timeline] = *now;
 	wal_reclaim_backoff_epoch[timeline] = epoch;
 }
 
@@ -11077,13 +11107,15 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now,
  * the WAL-index gates have drained.  Observation ignores retry_at so a failed
  * reclaim cannot make real physical debt disappear; maintenance passes
  * honor_retry_at to avoid repeatedly draining admission for the same failure.
- * The no-progress backoff itself is proof-keyed (wal_reclaim_retry_due): it
+ * The no-progress backoff itself is proof-keyed (wal_reclaim_retry_due), rate
+ * limited to at most once per WAL_RECLAIM_REARM_MIN_NS: after that floor, it
  * ends at the earlier of one second or the next retention / WAL-index
  * publish-or-GC / durable-progress / timeline-delete event.  A real floor
- * advance is not delayed by the clock; a failure that is not proof-relevant
- * (residual/storage errors) usually does wait out the full second, but an
- * unrelated epoch bump can still cancel it early too -- a harmless extra
- * retry, not something either path relies on. */
+ * advance is not delayed by the clock past the rate-limit floor; a failure
+ * that is not proof-relevant (residual/storage errors) usually does wait out
+ * the full second, but an unrelated epoch bump can still cancel it early once
+ * the rate-limit floor has passed -- a harmless extra retry, not something
+ * either path relies on. */
 static int
 wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
 						int *observation_error)
@@ -11393,6 +11425,12 @@ int
 ps_test_wal_reclaim_maintenance(void)
 {
 	return wal_segment_reclaim_one();
+}
+
+void
+ps_test_wal_reclaim_proof_changed(void)
+{
+	wal_reclaim_proof_changed();
 }
 
 int
@@ -19402,6 +19440,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	wal_reclaim_cursor = 0;
 	__atomic_store_n(&wal_reclaim_proof_epoch, 0, __ATOMIC_RELEASE);
 	memset(wal_reclaim_backoff_epoch, 0, sizeof(wal_reclaim_backoff_epoch));
+	memset(wal_reclaim_armed_at, 0, sizeof(wal_reclaim_armed_at));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 

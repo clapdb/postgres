@@ -272,6 +272,10 @@ extern void ps_test_set_walidx_observation_error_hook(
 extern void ps_test_set_backpressure_slow_path_hook(
 	PsBackpressureSlowPathTestHook hook, void *arg);
 extern int ps_test_wal_reclaim_maintenance(void);
+/* Test-only: bump the WAL-reclaim proof epoch directly, without going
+ * through a real proof-relevant event, to exercise the reclaim backoff's
+ * epoch-cancellation and rate-limit interaction deterministically. */
+extern void ps_test_wal_reclaim_proof_changed(void);
 extern int ps_test_wal_retained_base(uint32_t timeline, uint64_t *base_out);
 extern int ps_test_walidx_frontier_exception_active(uint32_t timeline,
 	uint64_t lsn);

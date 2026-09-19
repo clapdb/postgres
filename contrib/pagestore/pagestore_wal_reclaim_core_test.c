@@ -552,8 +552,21 @@ static int
 maintenance_until_count(const char *store, uint32_t timeline,
 						unsigned int wanted)
 {
-	for (int i = 0; i < 64 && segment_count(store, timeline) > wanted; i++)
-		(void) ps_core_maintenance();
+	/* The WAL reclaimer's no-progress backoff is now rate-limited to one
+	 * re-evaluation per WAL_RECLAIM_REARM_MIN_NS (20 ms) regardless of epoch
+	 * changes, so a caller driving maintenance right after an arm needs real
+	 * wall-clock time to elapse before the next attempt is honored, not just
+	 * more tight-loop iterations.  An idle pass (no work done at all) sleeps
+	 * briefly to make that time pass efficiently; a store with other work
+	 * pending (e.g. an unrelated forkmeta cutover step) instead reports work
+	 * done every pass without ever idling, so the iteration count alone must
+	 * also be generous enough to accumulate 20 ms of real per-pass cost
+	 * (observed up to ~350 passes here).  Both paths converge quickly for
+	 * the common case (no arm to wait out), since the loop exits as soon as
+	 * the count is reached. */
+	for (int i = 0; i < 2048 && segment_count(store, timeline) > wanted; i++)
+		if (!ps_core_maintenance())
+			usleep(1000);
 	return segment_count(store, timeline) == wanted;
 }
 
@@ -609,15 +622,23 @@ test_preselection_skips_empty_reclaim(void)
 /* The no-progress backoff exists to avoid repeating the global drain while
  * the candidate is genuinely unchanged; it must not make a proven segment
  * wait out its full second once an owner WAL pin -- a retention-registry
- * change -- releases the boundary.  Without proof-keyed cancellation
- * (Task 2) this needs sleep(2) before the final call, exactly like
- * test_failure_backoff. */
+ * change -- releases the boundary.  It also must not be honored inside the
+ * WAL_RECLAIM_REARM_MIN_NS (20 ms) rate-limit floor, which exists so a
+ * drop-heavy client pinned on one stuck segment cannot turn every drop into a
+ * full drain: the call immediately after the pin advance still returns 0,
+ * and only a later call (bounded well under the 1 s clock, proving the
+ * epoch-keyed cancellation actually fired rather than the timer) reclaims.
+ * Without proof-keyed cancellation (Task 2) this needs sleep(2) before that
+ * later call, exactly like test_failure_backoff. */
 static void
 test_no_progress_backoff_follows_proof(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
 	char store[] = "/tmp/pagestore-wal-policy-proof-backoff-XXXXXX";
 	AdmissionCallCounter counter = {0};
+	struct timespec t0, t1;
+	int reclaimed;
+	double elapsed_ms = 0.0;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, limited, 0, 1),
@@ -633,8 +654,78 @@ test_no_progress_backoff_follows_proof(void)
 	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	check(set_wal_pin(0, 100, WAL_TOTAL),
 		  "release the owner WAL pin to the end of the shipped log");
-	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 0,
-		  "a proof-input change cancels the no-progress backoff without waiting out its clock");
+	check(ps_test_wal_reclaim_maintenance() == 0,
+		  "the epoch change is not honored before the 20 ms rate-limit floor");
+	reclaimed = 0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;)
+	{
+		if (ps_test_wal_reclaim_maintenance() == 1)
+			reclaimed = 1;
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		elapsed_ms = (double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
+			(double) (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		if (reclaimed || elapsed_ms >= 300.0)
+			break;
+		usleep(1000);
+	}
+	check(reclaimed && segment_count(store, 0) == 0 && elapsed_ms < 300.0,
+		  "once the rate-limit floor passes, the epoch-cancelled retry"
+		  " reclaims well under the 1 s clock");
+	close_store();
+	remove_tree(store);
+}
+
+/* WAL_RECLAIM_REARM_MIN_NS caps re-evaluation at one full R3b-3 drain per
+ * 20 ms per timeline, regardless of how many proof-relevant events land in
+ * that window: every re-evaluation is the whole drain (admission write lock,
+ * all shard write locks, the raw-floor scan, the control-image floor read),
+ * and PS_OP_RETENTION_PIN_DROP is dispatched without the admission lock, so
+ * a drop-heavy client pinned on one stuck segment must not turn every drop
+ * into a drain. ps_test_wal_reclaim_proof_changed() bumps the epoch directly
+ * (as a real proof event would) without changing any proof input, so the
+ * pin still blocks every attempt and only the drain count is under test. */
+static void
+test_epoch_retries_are_rate_limited(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-epoch-rate-XXXXXX";
+	AdmissionCallCounter counter = {0};
+	struct timespec t0, t1;
+	double loop_ms;
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, limited, 0, 1),
+		  "construct a WAL prefix reclaimable only up to the owner pin");
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 2,
+		  "reclaim advances to the aligned owner-pin boundary");
+	check(ps_test_wal_reclaim_maintenance() == 0 && segment_count(store, 0) == 2,
+		  "the pin boundary is still current: the no-progress backoff arms");
+	ps_test_set_admission_write_lock_hook(count_admission_call, &counter);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (int i = 0; i < 20; i++)
+	{
+		ps_test_wal_reclaim_proof_changed();
+		(void) ps_test_wal_reclaim_maintenance();
+		check(counter.calls <= 1,
+			  "the rate-limit floor admits at most one drain across repeated epoch bumps");
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	loop_ms = (double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
+		(double) (t1.tv_nsec - t0.tv_nsec) / 1e6;
+	if (loop_ms < 20.0)
+		check(counter.calls == 0,
+			  "fast host (loop < 20 ms): the rate-limit floor admits zero drains");
+	else
+		check(1,
+			  "slow host (loop >= 20 ms): skipping the zero-drain assertion, "
+			  "the <= 1 invariant above still held every iteration");
+	usleep(25000);
+	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1 &&
+		  segment_count(store, 0) == 2,
+		  "the pending epoch change is honored exactly once past the"
+		  " rate-limit floor, but the pin still blocks the reclaim");
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	close_store();
 	remove_tree(store);
 }
@@ -726,13 +817,17 @@ advance_progress_before_floor(uint32_t timeline, void *arg)
  * walidx_prune_lock/wal_lock for the retention_effective_floor scan).  If the
  * epoch is read fresh, it already reflects that event, so the next attempt
  * finds no mismatch and waits out the full one-second backoff instead of
- * retrying immediately -- the store would stay at 2 segments here instead of
- * reclaiming to 0 on the very next, unslept call. */
+ * being due as soon as the WAL_RECLAIM_REARM_MIN_NS rate-limit floor passes
+ * -- the store would stay at 2 segments through the bounded poll below
+ * instead of reclaiming to 0 well inside it. */
 static void
 test_backoff_epoch_predates_attempt_inputs(void)
 {
 	char store[] = "/tmp/pagestore-wal-policy-epoch-order-XXXXXX";
 	uint64_t end = WAL_TOTAL;
+	struct timespec t0, t1;
+	int reclaimed;
+	double elapsed_ms = 0.0;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 0) &&
@@ -744,9 +839,22 @@ test_backoff_epoch_predates_attempt_inputs(void)
 	check(ps_test_wal_reclaim_maintenance() == 0 && segment_count(store, 0) == 2,
 		  "this attempt's own progress read predates the hook's later advance");
 	ps_test_set_wal_reclaim_before_floor_hook(NULL, NULL);
-	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 0,
+	reclaimed = 0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;)
+	{
+		if (ps_test_wal_reclaim_maintenance() == 1)
+			reclaimed = 1;
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		elapsed_ms = (double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
+			(double) (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		if (reclaimed || elapsed_ms >= 300.0)
+			break;
+		usleep(1000);
+	}
+	check(reclaimed && segment_count(store, 0) == 0 && elapsed_ms < 300.0,
 		  "the epoch snapshotted before this attempt's inputs makes the advance"
-		  " due on the very next attempt, without sleeping out the backoff");
+		  " due once the rate-limit floor passes, well under the 1 s clock");
 	close_store();
 	remove_tree(store);
 }
@@ -1937,6 +2045,7 @@ main(void)
 	test_no_floor_or_progress();
 	test_preselection_skips_empty_reclaim();
 	test_no_progress_backoff_follows_proof();
+	test_epoch_retries_are_rate_limited();
 	test_backoff_epoch_predates_attempt_inputs();
 	test_stale_wal_index_requests_compaction();
 	test_unreplaceable_dependency_requests_once();
