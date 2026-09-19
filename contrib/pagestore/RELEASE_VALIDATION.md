@@ -83,9 +83,17 @@ could never drop more.  The soak's `wal` bound is restated from five
 declared terms (18 KiB tighter, 4667392) with a per-sample check tying
 physical WAL to the soak's own fences, and seed 20260909 at 8000 rounds now
 peaks at ~1.7-1.8 MiB across repeated local runs, plain and CPU-contended.
-The first post-fix nightly dispatch is run
-<PAGESTORE_NIGHTLY_POSTFIX_RUN_ID> (to be filled in after this change merges
-to `pagestore` and the nightly lane runs against it).
+The first post-fix nightly dispatch is
+[run 35458043758](https://github.com/clapdb/postgres/actions/runs/35458043758),
+manually dispatched on 2026-09-19 against `316401d8d4b` (the #264 merge
+commit on `pagestore`, with this fix -- #265 -- already merged in its
+ancestry): seed 20260909 at 8000 rounds passed with 45024 checks, 0 failures,
+and both the during-run and quiescent bounds satisfied; physical WAL peaked
+at 1736704 bytes against the 4667392 bound, with `wal_fence_slack_max` at
+1568768 bytes, inside the ~2.1 MiB expected range from the previous section.
+This is one dispatched run against the fix, not yet a scheduled-run history:
+the three-seed scheduled nightlies must still accumulate green runs against
+this revision before the final MVP status update.
 
 ## Gaps in release evidence
 
