@@ -100,8 +100,21 @@
  *              before compaction merges them; a merged layer holds the live
  *              set plus the history above the materializer floor (at most one
  *              MAT_INTERVAL of writes, bounded by 4 pages per round).
- *   WAL:       controller high-water plus the 1 MiB immutable segment
- *              granularity and one interval of un-materialized WAL.
+ *   WAL:       the R3b-3 candidate rule applied to the soak's own fences: the
+ *              controller's proven-lag high-water (never engaged here, since
+ *              an unproven interval is not lag), plus the 1 MiB immutable
+ *              segment granularity the candidate is aligned down to, plus the
+ *              longest-lived fence any round can hold open (the fixed
+ *              reader's drop age -- longer than the advancing reader's
+ *              re-pin age, the branch's life, and the materializer interval),
+ *              plus the daemon's reaction latency (one WAL-index publication
+ *              + GC + reclaim pass, so a segment blocked only by the raw
+ *              WAL-index dependency clears without waiting on the WAL-index
+ *              controller's own cadence -- see wal_segment_reclaim_one's
+ *              on-demand compaction request), plus a live branch's own flat
+ *              WAL log.  A per-sample check below ties physical WAL to these
+ *              same fences directly, independent of the WAL-index
+ *              controller's cadence.
  *   WAL index: controller high-water plus one snapshot generation.
  *   forkmeta:  controller high-water plus one snapshot generation.
  *   registry/timeline logs: tiny, compacted off the request path.
@@ -110,6 +123,25 @@
 #define ROUND_WAL_BYTES_MAX		((uint64_t) 2048 + 4 * 1024)
 #define INTERVAL_PAGE_BYTES		((uint64_t) MAT_INTERVAL * ROUND_WRITE_BYTES_MAX)
 #define INTERVAL_WAL_BYTES		((uint64_t) MAT_INTERVAL * ROUND_WAL_BYTES_MAX)
+
+/* WAL during-bound terms (R3b-3 candidate rule: aligned-down minimum of the
+ * effective retention floor, durable WAL-index progress, and the raw
+ * WAL-index dependency, applied to the fences this soak itself holds).
+ * FENCE_ROUNDS_MAX must dominate every fence age in the workload below, or
+ * the bound no longer covers the round that set it; the assertion after the
+ * bound catches a workload change that silently widens a fence. */
+#define WAL_SEGMENT_BYTES			(1u * 1024u * 1024u)	/* immutable segment granularity: the candidate is aligned down */
+#define FENCE_ROUNDS_MAX			(READER_LIFE + 37)		/* the fixed reader's drop age (soak's oldest fence) */
+#define FENCE_WAL_BYTES_MAX			((uint64_t) FENCE_ROUNDS_MAX * ROUND_WAL_BYTES_MAX)
+/* Floor refresh (control prune + WAL-index publish + GC) and the reclaim
+ * pass itself: measured 3-6 ms (fix2-n1.log); two materializer intervals is
+ * >= 330 ms on a hosted runner, far above that. */
+#define RECLAIM_REACTION_WAL_BYTES	(INTERVAL_WAL_BYTES * 2)
+#define BRANCH_WAL_ALLOWANCE		(64u * 1024u)			/* the live branch's own flat log: BRANCH_LIFE/10 records of 1 KiB, plus store metadata */
+_Static_assert(FENCE_ROUNDS_MAX >= BRANCH_LIFE,
+			   "the WAL bound's fence term must dominate the branch cap's age");
+_Static_assert(FENCE_ROUNDS_MAX >= READER_LIFE,
+			   "the WAL bound's fence term must dominate the advancing reader's age");
 
 typedef struct Bounds
 {
@@ -127,7 +159,8 @@ typedef struct Bounds
 static const Bounds during_bound = {
 	.page = PAGE_HIGH_WATER + 2u * NSHARDS * SEGMENT_SIZE + FLUSH_PAGES * PAGE_SIZE * NSHARDS + 4u * NSHARDS * SEGMENT_SIZE,
 	.layers = (COMPACT_LAYERS + 2) * (LIVE_BYTES_MAX + INTERVAL_PAGE_BYTES * 2) * 2,
-	.wal = WAL_HIGH_WATER + 2u * 1024u * 1024u + INTERVAL_WAL_BYTES * 2,
+	.wal = WAL_HIGH_WATER + WAL_SEGMENT_BYTES + FENCE_WAL_BYTES_MAX +
+		RECLAIM_REACTION_WAL_BYTES + BRANCH_WAL_ALLOWANCE,
 	.walidx = WALIDX_HIGH_WATER * 4,
 	.forkmeta = FORKMETA_HIGH_WATER * 4,
 	.retention = 256u * 1024u,
@@ -183,6 +216,12 @@ static unsigned int branches_deleted;
 static unsigned int reader_pins;
 static unsigned int reader_verifications;
 static unsigned int latest_verifications;
+/* Maximum observed slack of the per-sample WAL fence check below:
+ * sample.wal - (g_wal_end - model_floor).  Reported so nightly drift toward
+ * the allowance (WAL_SEGMENT_BYTES + WAL_HIGH_WATER +
+ * RECLAIM_REACTION_WAL_BYTES + BRANCH_WAL_ALLOWANCE) is visible even while
+ * the check itself still passes. */
+static uint64_t wal_fence_slack_max;
 
 typedef struct RelModel
 {
@@ -1934,7 +1973,7 @@ write_report(FILE *out, int rounds, uint64_t seed, const Physical *max,
 			"\"timelines\":%llu,\"other\":%llu,\"files\":%llu},"
 			"\"reclaimers\":{"
 			"\"page\":{\"high_water\":%u,\"catch_up\":%u,\"throttle_enters\":%llu,\"wait_ms\":%llu,\"final_lag\":%llu},"
-			"\"wal\":{\"high_water\":%u,\"catch_up\":%u,\"throttle_enters\":%llu,\"wait_ms\":%llu,\"final_lag\":%llu},"
+			"\"wal\":{\"high_water\":%u,\"catch_up\":%u,\"throttle_enters\":%llu,\"wait_ms\":%llu,\"final_lag\":%llu,\"wal_fence_slack_max\":%llu},"
 			"\"walidx\":{\"high_water\":%u,\"catch_up\":%u,\"throttle_enters\":%llu,\"wait_ms\":%llu,\"final_lag\":%llu},"
 			"\"forkmeta\":{\"high_water\":%u,\"catch_up\":%u,\"throttle_enters\":%llu,\"wait_ms\":%llu,\"final_lag\":%llu},"
 			"\"catch_up_seconds\":%.2f,\"catch_up_limit_seconds\":%d},"
@@ -1990,6 +2029,7 @@ write_report(FILE *out, int rounds, uint64_t seed, const Physical *max,
 			(unsigned long long) m->wal.throttle_enters,
 			(unsigned long long) (m->wal.foreground_wait_ns / 1000000),
 			(unsigned long long) m->wal.lag_bytes,
+			(unsigned long long) wal_fence_slack_max,
 			WALIDX_HIGH_WATER, WALIDX_CATCH_UP,
 			(unsigned long long) m->walidx.throttle_enters,
 			(unsigned long long) (m->walidx.foreground_wait_ns / 1000000),
@@ -2102,6 +2142,52 @@ main(int argc, char **argv)
 			{
 				during_ok = 0;
 				during_violations++;
+			}
+			/* The R3b-3 candidate rule (aligned-down minimum of the effective
+			 * retention floor, durable WAL-index progress, and the raw
+			 * WAL-index dependency) applied to the fences this soak itself
+			 * holds: the materializer's own pin, durable progress, every
+			 * currently held reader, and a live branch's cap.  This is the
+			 * regression guard for the reclaimer latency hole fixed by the
+			 * on-demand WAL-index compaction request and the proof-keyed
+			 * backoff (wal_segment_reclaim_one): before that fix the raw
+			 * floor lagged the fences by up to a WAL-index publication
+			 * interval (~3 MiB here), which this check catches independent
+			 * of the WAL-index controller's own cadence. */
+			{
+				uint64_t	model_floor = g_mat_lsn < g_progress ?
+					g_mat_lsn : g_progress;
+
+				for (uint32_t i = 0; i < NREADERS; i++)
+					if (readers[i].held && readers[i].lsn < model_floor)
+						model_floor = readers[i].lsn;
+				if (branch.state != 0 && branch.branch_lsn < model_floor)
+					model_floor = branch.branch_lsn;
+				check(model_floor <= g_wal_end,
+					  "round %d: the WAL fence model floor %llu does not"
+					  " exceed the shipped tail %llu", round,
+					  (unsigned long long) model_floor,
+					  (unsigned long long) g_wal_end);
+				if (model_floor <= g_wal_end)
+				{
+					uint64_t	fence_lag = g_wal_end - model_floor;
+					uint64_t	allowance = WAL_SEGMENT_BYTES + WAL_HIGH_WATER +
+						RECLAIM_REACTION_WAL_BYTES + BRANCH_WAL_ALLOWANCE;
+
+					check(sample.wal <= fence_lag + allowance,
+						  "round %d: physical wal %llu exceeds the R3b-3"
+						  " candidate rule applied to this soak's own fences"
+						  " (wal_end=%llu model_floor=%llu fence_lag=%llu"
+						  " allowance=%llu)", round,
+						  (unsigned long long) sample.wal,
+						  (unsigned long long) g_wal_end,
+						  (unsigned long long) model_floor,
+						  (unsigned long long) fence_lag,
+						  (unsigned long long) allowance);
+					if (sample.wal > fence_lag &&
+						sample.wal - fence_lag > wal_fence_slack_max)
+						wal_fence_slack_max = sample.wal - fence_lag;
+				}
 			}
 			read_metrics(&m);
 			check(!poisoned(&m), "round %d: no registry or manifest is poisoned",
