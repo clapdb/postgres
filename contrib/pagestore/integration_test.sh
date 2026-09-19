@@ -1622,11 +1622,11 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_writer_handoff_token' LANGUAGE C;
        CREATE FUNCTION pagestore_reader_handoff_ready(bytea) RETURNS boolean
          AS 'pagestore','pagestore_reader_handoff_ready' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_publish_reader_snapshot_artifact(text, int, pg_lsn) RETURNS bigint
+       CREATE FUNCTION pagestore_publish_reader_snapshot_artifact(text, int, pg_lsn, bigint) RETURNS bigint
          AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_checkpoint_reader_snapshot(pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_validate_checkpoint_reader_snapshot' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_validate_published_reader_snapshot(int, pg_lsn) RETURNS bigint
+       CREATE FUNCTION pagestore_validate_published_reader_snapshot(int, pg_lsn, bigint) RETURNS bigint
          AS 'pagestore','pagestore_validate_published_reader_snapshot' LANGUAGE C STRICT;" >/dev/null
 # A prepared XID remains in progress across the stopped copy at R.  Its 20000
 # released subtransactions exceed the normal snapshot subxid capacity; the
@@ -1680,6 +1680,27 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \
 	"writer sees the prepared transaction committed after R"
 readerRunningXid=$($P -c "SELECT xmin::text FROM reader_running;")
+# Force the exact collision order that broke PR #264/#265/#266 in CI instead
+# of racing on worker timing: the automatic checkpoint-driven reader-artifact
+# worker (pagestore.auto_reader_artifacts=on) publishes a generation at every
+# checkpoint redo, including this one, which is already newer than R.  Wait
+# for that automatic generation to exist before the explicit exact-R publish
+# below runs, so a base without the owner-scoped key split
+# (pagestore_publish_reader_snapshot_artifact's 4th argument) refuses BEGIN
+# deterministically -- see RELEASE_VALIDATION.md.
+readerPostRRedo=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+readerAutoAheadPublished=no
+for ((i = 0; i < 300; i++)); do
+	if $P -c "SELECT pagestore_validate_checkpoint_reader_snapshot('$readerPostRRedo');" >/dev/null 2>&1; then
+		readerAutoAheadPublished=yes
+		break
+	fi
+	sleep 0.1
+done
+if [ "$readerAutoAheadPublished" != "yes" ]; then
+	echo "FAIL - automatic reader-artifact worker never published a generation at the post-R checkpoint redo $readerPostRRedo"
+	fail=1
+fi
 READERPREP=$(mktemp -d)
 BADREADERPREP=$(mktemp -d)
 readerDbOid=$($P -c "SELECT oid FROM pg_database WHERE datname = current_database();")
@@ -1703,7 +1724,7 @@ assert "$([ "${readerSeeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"reader prepare materializes local SLRUs as of checkpoint R"
 assert "$($P -c "SELECT pagestore_validate_reader_manifest('$READERPREP', 0, '$readerR');")" "t" \
 	"reader manifest records the source timeline and read horizon"
-readerSnapshotBlocks=$($P -c "SELECT pagestore_publish_reader_snapshot_artifact('$READERPREP', 0, '$readerR');")
+readerSnapshotBlocks=$($P -c "SELECT pagestore_publish_reader_snapshot_artifact('$READERPREP', 0, '$readerR', 8001);")
 assert "$([ "${readerSnapshotBlocks:-0}" -gt 1 ] && echo ok || echo no)" "ok" \
 	"reader snapshot publishes as a multi-block page-store artifact"
 # A prepared snapshot is inseparable from its timeline and R identity.  A
@@ -2070,7 +2091,7 @@ if $P -v ON_ERROR_STOP=1 -c \
 else
 	echo "ok   - fixed reader rejects reserved generation zero"
 fi
-assert "$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR') > 20000;")" "t" \
+assert "$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR', 8001) > 20000;")" "t" \
 	"reader loads and validates the exact-R multi-block snapshot from the page store"
 reader_v=$($PR -c "SELECT v FROM reader_t WHERE id = 1;")
 if [ "$reader_v" != "v1" ]; then
@@ -2143,7 +2164,7 @@ readerAutoR=
 for ((i = 0; i < 100; i++)); do
 	readerAutoR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();" 2>/dev/null || true)
 	if [ -n "$readerAutoR" ] &&
-		[ "$($P -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerAutoR');" 2>/dev/null)" = "0" ]; then
+		[ "$($P -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerAutoR', 0);" 2>/dev/null)" = "0" ]; then
 		readerAutoPublished=yes
 		break
 	fi
@@ -2298,6 +2319,14 @@ assert "$artifact_dropped" "1" "database removal retires its manifest and relmap
 artifact_after=$("$artifact_probe" --reader-artifacts "$SHM" "$artifact_db_oid" "$artifact_old_lsn" present)
 assert "$?" "0" "old reader still resolves dropped database artifacts"
 assert "$artifact_after" "$artifact_before" "retained database artifacts stay byte-identical after drop"
+
+# R5-2 regression: a passing run must never have silently refused an
+# artifact BEGIN/COMMIT/DROP.  The daemon logs one "refused" line per
+# refusal (pagestore_daemon.c); its absence here is the deterministic
+# collision-order check above (readerAutoAheadPublished) actually exercising
+# the owner-scoped key split instead of merely not hitting the race.
+assert "$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)" "0" \
+	"no artifact BEGIN/COMMIT/DROP was refused during the run"
 
 echo "----"
 if [ "$fail" = 0 ]; then

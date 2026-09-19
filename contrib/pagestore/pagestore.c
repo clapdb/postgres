@@ -8494,8 +8494,16 @@ pagestore_load_reader_snapshot(const char *dir, uint32 timeline,
 	return snapshot;
 }
 
+/*
+ * dbid is InvalidOid for the automatic checkpoint-driven snapshot (a single
+ * producer, one generation per checkpoint redo) and the retention owner that
+ * pinned R for an explicit exact-R publish -- a distinct key per owner, so
+ * an explicit publish at an older R never collides with an automatic
+ * generation already published at a later checkpoint (see
+ * pagestore_artifact_format.h's reader-snapshot-objects comment).
+ */
 static BlockNumber
-pagestore_publish_reader_snapshot_data(PagestoreReaderSnapshot *snapshot)
+pagestore_publish_reader_snapshot_data(PagestoreReaderSnapshot *snapshot, Oid dbid)
 {
 	PageStoreRelKey data_key;
 	char	   *artifact;
@@ -8514,7 +8522,7 @@ pagestore_publish_reader_snapshot_data(PagestoreReaderSnapshot *snapshot)
 		memcpy(artifact + sizeof(snapshot->header), snapshot->xids, xids_size);
 
 	data_key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_DATA_OBJECT, InvalidOid);
+		PAGESTORE_READER_SNAPSHOT_DATA_OBJECT, dbid);
 	token = pagestore_localsvc_artifact_begin(PS_KLASS_READER_SNAPSHOT,
 		&data_key, (uint64) snapshot->header.read_lsn, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 	for (BlockNumber block = 0; block < block_count; block++)
@@ -8732,7 +8740,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		snapshot.header.xmax = next_xid;
 		snapshot.xids = xids;
 		pagestore_reader_snapshot_crc(&snapshot.header, xids);
-		blocks = pagestore_publish_reader_snapshot_data(&snapshot);
+		blocks = pagestore_publish_reader_snapshot_data(&snapshot, InvalidOid);
 
 		/* READY stages the database-independent snapshot. Database workers
 		 * publish the final global manifest after validating the exact-R map,
@@ -9010,9 +9018,19 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 	PG_RETURN_LSN((XLogRecPtr) resolved);
 }
 
+/*
+ * owner is the retention owner id that pinned read_lsn (R); it must not be
+ * InvalidOid, or this publish would alias the automatic checkpoint
+ * snapshot's key (pagestore_artifact_format.h).  Unlike the automatic path,
+ * this does not also publish the database-independent "global" manifest at
+ * InvalidOid: nothing reads that fallback for an explicit snapshot (only
+ * early-boot advancing-reader adoption does, before MyDatabaseId is known,
+ * which never applies to a pinned reader), and publishing it here would
+ * reopen the same collision against the automatic manifest one field over.
+ */
 static BlockNumber
 pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
-								  XLogRecPtr read_lsn)
+								  XLogRecPtr read_lsn, Oid owner)
 {
 	PagestoreReaderSnapshot *snapshot;
 	PagestoreReaderSnapshotManifest manifest;
@@ -9023,11 +9041,15 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	Size		xids_size;
 	Size		artifact_size;
 
+	if (!OidIsValid(owner))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader snapshot owner must not be zero")));
 	snapshot = pagestore_load_reader_snapshot(dir, timeline, read_lsn,
 										 CurrentMemoryContext, ERROR);
 	xids_size = snapshot->header.count * sizeof(TransactionId);
 	artifact_size = sizeof(snapshot->header) + xids_size;
-	block_count = pagestore_publish_reader_snapshot_data(snapshot);
+	block_count = pagestore_publish_reader_snapshot_data(snapshot, owner);
 
 	memset(&manifest, 0, sizeof(manifest));
 	manifest.read_lsn = read_lsn;
@@ -9044,9 +9066,8 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
-	pagestore_publish_global_reader_manifest(&manifest);
 	manifest_key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, owner);
 	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
 		PS_KLASS_READER_SNAPSHOT, &manifest_key,
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
@@ -9062,9 +9083,19 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	return block_count;
 }
 
+/*
+ * owner selects which producer's generation to load: InvalidOid resolves
+ * the automatic checkpoint-driven manifest (per-database once attached,
+ * else the database-independent fallback used only during early backend
+ * init before MyDatabaseId is known -- see
+ * pagestore_publish_reader_snapshot()'s comment on why an explicit publish
+ * does not populate that fallback); a valid owner resolves the exact-R
+ * snapshot that owner's retention pin published.
+ */
 static PagestoreReaderSnapshot *
 pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
-										MemoryContext context, int elevel)
+										Oid owner, MemoryContext context,
+										int elevel)
 {
 	PagestoreReaderSnapshotManifest manifest;
 	PagestoreReaderSnapshotManifest checked_manifest;
@@ -9077,6 +9108,7 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT,
+		OidIsValid(owner) ? owner :
 		OidIsValid(MyDatabaseId) && DatabasePath != NULL ?
 		MyDatabaseId : InvalidOid);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
@@ -9103,7 +9135,7 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 
 	artifact = MemoryContextAlloc(context, (Size) manifest.artifact_size);
 	key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_DATA_OBJECT, InvalidOid);
+		PAGESTORE_READER_SNAPSHOT_DATA_OBJECT, owner);
 	for (BlockNumber block = 0; block < manifest.block_count; block++)
 	{
 		Size		offset = (Size) block * BLCKSZ;
@@ -9207,6 +9239,7 @@ pagestore_publish_reader_snapshot_artifact(PG_FUNCTION_ARGS)
 	char	   *dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	int32		timeline = PG_GETARG_INT32(1);
 	XLogRecPtr	read_lsn = PG_GETARG_LSN(2);
+	int64		owner_arg = PG_GETARG_INT64(3);
 	BlockNumber blocks;
 
 	if (!superuser())
@@ -9217,6 +9250,13 @@ pagestore_publish_reader_snapshot_artifact(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid reader timeline or read LSN")));
+	/* dbOid is 32 bits; owner ids a controller assigns to pin a reader fit
+	 * comfortably, unlike the full 64-bit retention-owner space used
+	 * elsewhere (see pagestore_artifact_format.h). */
+	if (owner_arg <= 0 || owner_arg > PG_UINT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader snapshot owner must be a positive id below 2^32")));
 	if (!pagestore_branch_backend_active())
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be \"localsvc\" to publish a reader snapshot")));
@@ -9225,7 +9265,7 @@ pagestore_publish_reader_snapshot_artifact(PG_FUNCTION_ARGS)
 				(errmsg("reader timeline %d is not the active localsvc timeline %u",
 						timeline, pagestore_localsvc_timeline())));
 	blocks = pagestore_publish_reader_snapshot(dir, (uint32) timeline,
-										 read_lsn);
+										 read_lsn, (Oid) owner_arg);
 	PG_RETURN_INT64((int64) blocks);
 }
 
@@ -9235,6 +9275,7 @@ pagestore_validate_published_reader_snapshot(PG_FUNCTION_ARGS)
 {
 	int32		timeline = PG_GETARG_INT32(0);
 	XLogRecPtr	read_lsn = PG_GETARG_LSN(1);
+	int64		owner_arg = PG_GETARG_INT64(2);
 	PagestoreReaderSnapshot *snapshot;
 	uint32		count;
 
@@ -9246,8 +9287,14 @@ pagestore_validate_published_reader_snapshot(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid reader timeline or read LSN")));
+	/* 0 selects the automatic checkpoint-driven snapshot; a positive id
+	 * selects the exact-R snapshot that retention owner published. */
+	if (owner_arg < 0 || owner_arg > PG_UINT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader snapshot owner must be a non-negative id below 2^32")));
 	snapshot = pagestore_load_published_reader_snapshot((uint32) timeline,
-		read_lsn, CurrentMemoryContext, ERROR);
+		read_lsn, (Oid) owner_arg, CurrentMemoryContext, ERROR);
 	count = snapshot->header.count;
 	if (snapshot->xids != NULL)
 		pfree(snapshot->xids);
@@ -9399,7 +9446,8 @@ pagestore_adopt_reader_view_at_xact_start_impl(void)
 		if (valid)
 		{
 			snapshot = pagestore_load_published_reader_snapshot(
-				pagestore_localsvc_timeline(), published, snapshot_context, ERROR);
+				pagestore_localsvc_timeline(), published, InvalidOid,
+				snapshot_context, ERROR);
 			if (OidIsValid(MyDatabaseId) && DatabasePath != NULL)
 				pagestore_validate_database_reader_manifest(published);
 		}
