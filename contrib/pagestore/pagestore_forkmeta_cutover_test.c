@@ -1535,9 +1535,15 @@ test_fork_event_index_selftest(void)
  * loaded CI runner.  Sanity-run with fork_event_index_usable() forced to
  * return 0 (the counted fallback loops are the unmodified O(N) scans, so
  * this reproduces the pre-index cost exactly) confirmed all three fail
- * deterministically: writes 400,040,000 steps (~K^2), cutover 200,030,000,
- * reopen 200,030,001 (~K^2/2 each, one triangular pass per phase), all far
- * past the K*128 ceiling (2,560,000).
+ * deterministically at K=5000: writes 25,010,000 steps (~K^2), cutover
+ * 12,507,500, reopen 12,507,501 (~K^2/2 each, one triangular pass per
+ * phase), all far past the K*128 ceiling (640,000).
+ *
+ * The K rewrites reopen with a raised flush_pages (see below) so the
+ * dominant cost is the index's own O(log N) work, not memtable-flush
+ * fsyncs; measured 0.25s on tmpfs and 2.5s on a disk-backed directory
+ * (XFS/NVMe) for the whole case.  The wall clock is logged, not
+ * asserted, below.
  */
 static void
 test_fork_event_index_scaling(void)
@@ -1548,7 +1554,7 @@ test_fork_event_index_scaling(void)
 	char		frontier[1200];
 	PsKey		key = {6, 6, 6, 3, PS_KLASS_RELATION};
 	PsKey		pin_key = {6, 6, 21, 1, PS_KLASS_RELATION};
-	const uint32_t K = 20000;
+	const uint32_t K = 5000;
 	uint64_t	first_seq = 0,
 				second_seq = 0,
 				seq = 0;
@@ -1594,6 +1600,22 @@ test_fork_event_index_scaling(void)
 	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
 		  "create the FSM-like fork at LSN 300");
 
+	/*
+	 * flush_pages is captured by ps_memtable_create() at ps_core_open(), so
+	 * flush_pages == 1 above (needed to get the frontier published from
+	 * just two writes, matching every other test in this file) stays in
+	 * effect for the rest of this open -- one memtable flush per K rewrite
+	 * below, each with its own fsyncs.  Cheap on tmpfs, 10s-100s of seconds
+	 * on a real disk (the standalone CI lane's store).  Close and reopen
+	 * with a flush threshold above K: the K rewrites below then flush at
+	 * most once (at close), and the fsync cost this test pays scales with
+	 * K, not with K times a per-write flush.
+	 */
+	close_runtime();
+	flush_pages = (int) K + 1000;
+	check(ps_core_open(store) == 0,
+		  "reopen with a flush threshold above K for the scaling rewrites");
+
 	/* K WAL-less rewrites of block 0: the first grows the fork (activated
 	 * SEG_GROW_BOUND), every later one is an inert SEG_COMMIT_BOUND at the
 	 * same floor LSN -- long equal-LSN runs, the shape the index exists
@@ -1631,9 +1653,17 @@ test_fork_event_index_scaling(void)
 		  page[128] == (unsigned char) (K - 1),
 		  "newest tag readable after reopen");
 
+	/*
+	 * A wall-clock catastrophe check would be redundant with the step-count
+	 * assertions above (the real guard) and flaky across CI hardware/disk
+	 * speed (M1 review finding); log it instead of asserting it.
+	 */
 	clock_gettime(CLOCK_MONOTONIC, &t1);
-	check((t1.tv_sec - t0.tv_sec) < 60,
-		  "whole case finishes well inside the catastrophe ceiling");
+	if (t1.tv_sec - t0.tv_sec >= 60)
+		fprintf(stderr,
+				"WARN: test_fork_event_index_scaling took %lds (informational only; "
+				"the scan-step assertions above are the real guard)\n",
+				(long) (t1.tv_sec - t0.tv_sec));
 
 	close_runtime();
 	remove_tree(store);
