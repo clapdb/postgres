@@ -204,6 +204,9 @@ static void retention_floor_add(uint64_t candidate, uint64_t *floor);
 static int wal_reclaim_frontier_ancestry_allows(uint32_t timeline,
 											uint64_t lsn);
 static int wal_segment_reclaim_one(void);
+/* Fire site for the WAL-reclaim watch (see wal_reclaim_watch's comment):
+ * called from flush_memtable, defined near wal_reclaim_raw_dependency_floor. */
+static void wal_reclaim_watch_fire_flush(uint32_t shard_id);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -2330,6 +2333,12 @@ flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 	s->flush_watermark.seg_id = seg_id;
 	s->flush_watermark.seg_off = seg_off;
 	s->flush_watermark_valid = 1;
+	/* Residual 1 (a late durable base): this watermark advance may be the
+	 * exact event a WAL reclaim watch is waiting for -- a replacement base
+	 * becoming durable with no retention-registry fence change at all.  The
+	 * relaxed load is the fast path for the common case (nothing watched). */
+	if (__atomic_load_n(&wal_reclaim_watch_timelines_active, __ATOMIC_RELAXED) != 0)
+		wal_reclaim_watch_fire_flush(s->id);
 	if (s->note_flush_pending)
 	{
 		/* the checkpoint note staged earlier is durable now: the cutoff it
@@ -12207,6 +12216,152 @@ walidx_horizon_protected_owner(uint32_t tl, uint64_t h)
 	return protected_horizon;
 }
 
+/* Fire site for wal_reclaim_watch's BASE-kind entries: called from
+ * flush_memtable, after it publishes the shard's durable flush watermark, for
+ * the shard just flushed.  A watched page's replacement base may have just
+ * become durable with no retention-registry fence change at all -- exactly
+ * the event residual 1 exists to catch.  Every watched timeline is checked
+ * (a shard's memtable holds versions from every timeline whose keys hash to
+ * it, not just one), but only entries whose key belongs to this shard do any
+ * work; the caller already holds this shard's write lock and map-wr, the
+ * same locks walidx_plan_bases_build's own base-durability reads require. */
+static void
+wal_reclaim_watch_fire_flush(uint32_t shard_id)
+{
+	int			fired = 0;
+
+	pthread_mutex_lock(&wal_reclaim_watch_lock);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		uint32_t	n = wal_reclaim_watch_n[tl];
+
+		if (n == 0)
+			continue;
+		if (wal_reclaim_watch_overflow[tl])
+		{
+			wal_reclaim_watch_n[tl] = 0;
+			wal_reclaim_watch_overflow[tl] = 0;
+			wal_reclaim_watch_timelines_active--;
+			fired = 1;
+			continue;
+		}
+		for (uint32_t i = 0; i < n; )
+		{
+			WalReclaimWatchEntry *e = &wal_reclaim_watch[tl][i];
+			int			match = 0;
+
+			if (e->kind == WAL_RECLAIM_WATCH_BASE &&
+				ps_shard_of(&e->key) == shard_id)
+			{
+				const PageEnt *pe = page_find(tl, &e->key, e->block);
+
+				if (pe != NULL)
+					for (int vi = 0; vi < pe->nver && !match; vi++)
+					{
+						const PageVer *v = &pe->vers[vi];
+
+						if (v->lsn >= e->lo && v->lsn <= e->hi &&
+							walidx_base_version_durable(v))
+							match = 1;
+					}
+			}
+			if (match)
+			{
+				wal_reclaim_watch[tl][i] = wal_reclaim_watch[tl][n - 1];
+				n--;
+				fired = 1;
+			}
+			else
+				i++;
+		}
+		if (n != wal_reclaim_watch_n[tl])
+		{
+			wal_reclaim_watch_n[tl] = n;
+			if (n == 0)
+				wal_reclaim_watch_timelines_active--;
+		}
+	}
+	pthread_mutex_unlock(&wal_reclaim_watch_lock);
+	if (fired)
+	{
+		__atomic_fetch_add(&walidx_reclaim_base_epoch, 1, __ATOMIC_ACQ_REL);
+		wal_reclaim_proof_changed();
+	}
+}
+
+/* Fire site for wal_reclaim_watch's FPI-kind entries: called from
+ * walidx_add_batch_locked, after its records are durable and added to the
+ * in-memory WAL index, for exactly the timeline the batch belongs to.
+ * Caller holds that timeline's affected shard's write lock and the
+ * WAL-index publish read gate -- what walidx_add_memory itself needed -- so
+ * no further locking is required here; the watch's own state is protected
+ * by wal_reclaim_watch_lock. */
+static void
+wal_reclaim_watch_fire_fpi(uint32_t tl, const WalIdxRec *records,
+						   uint32_t nrecords)
+{
+	int			fired = 0;
+
+	if (tl >= MAX_TIMELINES)
+		return;
+	pthread_mutex_lock(&wal_reclaim_watch_lock);
+	if (wal_reclaim_watch_n[tl] == 0)
+	{
+		pthread_mutex_unlock(&wal_reclaim_watch_lock);
+		return;
+	}
+	if (wal_reclaim_watch_overflow[tl])
+	{
+		for (uint32_t r = 0; r < nrecords && !fired; r++)
+			if ((records[r].flags & PS_WAL_INDEX_FLAG_FPI) != 0)
+				fired = 1;
+		if (fired)
+		{
+			wal_reclaim_watch_n[tl] = 0;
+			wal_reclaim_watch_overflow[tl] = 0;
+			wal_reclaim_watch_timelines_active--;
+		}
+	}
+	else
+	{
+		uint32_t	n = wal_reclaim_watch_n[tl];
+
+		for (uint32_t i = 0; i < n; )
+		{
+			WalReclaimWatchEntry *e = &wal_reclaim_watch[tl][i];
+			int			match = 0;
+
+			if (e->kind == WAL_RECLAIM_WATCH_FPI)
+				for (uint32_t r = 0; r < nrecords && !match; r++)
+					if ((records[r].flags & PS_WAL_INDEX_FLAG_FPI) != 0 &&
+						records[r].block == e->block &&
+						records[r].lsn >= e->lo && records[r].lsn <= e->hi &&
+						key_eq(&records[r].key, &e->key))
+						match = 1;
+			if (match)
+			{
+				wal_reclaim_watch[tl][i] = wal_reclaim_watch[tl][n - 1];
+				n--;
+				fired = 1;
+			}
+			else
+				i++;
+		}
+		if (n != wal_reclaim_watch_n[tl])
+		{
+			wal_reclaim_watch_n[tl] = n;
+			if (n == 0)
+				wal_reclaim_watch_timelines_active--;
+		}
+	}
+	pthread_mutex_unlock(&wal_reclaim_watch_lock);
+	if (fired)
+	{
+		__atomic_fetch_add(&walidx_reclaim_base_epoch, 1, __ATOMIC_ACQ_REL);
+		wal_reclaim_proof_changed();
+	}
+}
+
 /* Caller holds walidx_meta_lock.  A progress value initialized from the first
  * append is not durable and is intentionally rejected here. */
 static int
@@ -14615,6 +14770,11 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 			free(records);
 			return -1;
 		}
+	/* Residual 1 (a late FPI arrival): these records are durable and now
+	 * visible to the WAL-index plan builder.  See wal_reclaim_watch's
+	 * comment; the relaxed load is the fast path for the common case. */
+	if (__atomic_load_n(&wal_reclaim_watch_timelines_active, __ATOMIC_RELAXED) != 0)
+		wal_reclaim_watch_fire_fpi(tl, records, nrecords);
 	free(records);
 	return 0;
 }

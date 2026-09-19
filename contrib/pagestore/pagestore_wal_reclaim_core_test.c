@@ -871,6 +871,156 @@ test_unreplaceable_dependency_requests_once(void)
 	remove_tree(store);
 }
 
+/*
+ * Residual 1a: a replacement base that becomes durable with no fence change
+ * at all.  The reclaim-due request is served once, drops nothing (the base
+ * is not yet durable), and becomes fruitless-suppressed; the watch this
+ * fixes for arms on that same evaluation and fires once flush_memtable makes
+ * the base durable, re-issuing the request without waiting for a fence
+ * change or the WAL-index controller's own 1 MiB-tail trigger.  See
+ * plan-reclaim-residuals.md section 1.  Before the fix (git stash the core
+ * change): the negative-bound writes and the real base both leave the store
+ * stuck at 2 segments for the whole 1 s maintenance_until_count window.
+ */
+static void
+test_late_durable_base_requests_compaction(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-late-base-XXXXXX";
+	char directory[512];
+	uint64_t next_generation = 0;
+	uint64_t before_negative;
+
+	configure_core();
+	flush_pages = 4;
+	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL),
+		  "construct a raw dependency whose horizon a materializer pin protects");
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "segment 0 goes; segment 1 is blocked, and the request is served fruitless");
+	check(ps_test_walidx_reclaim_due(0) == 0,
+		  "the served publication dropped nothing and is fruitless-suppressed");
+	check(snprintf(directory, sizeof(directory), "%s/walidx_snapshots_0", store) > 0 &&
+		  ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0,
+		  "read the snapshot generation before the watch is exercised");
+	before_negative = next_generation;
+
+	/* Negative bound first, while the store is still stuck at 2 segments and
+	 * the watch is live: a version written and flushed durable *above* the
+	 * watch's hi bound must not fire it.  Uses blocks other than 0-3, which
+	 * the positive case below still needs untouched. */
+	check(write_relation_page(0, 0, WAL_TOTAL + 4096),
+		  "write block 0's base above the watched horizon");
+	check(write_relation_page(0, 90, WAL_TOTAL + 5000) &&
+		  write_relation_page(0, 91, WAL_TOTAL + 5100) &&
+		  write_relation_page(0, 92, WAL_TOTAL + 5200),
+		  "three more writes fill the memtable (flush_pages = 4) and flush it");
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "a base above the horizon does not fire the watch");
+	check(ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
+		  next_generation == before_negative,
+		  "no publication from a flush the watch does not care about");
+
+	/* The real base for the blocking raw item, but memtable-resident: the
+	 * fix must not fire before it is durable. */
+	check(write_relation_page(0, 0, limited + 100),
+		  "write the base that would retire the blocking raw item");
+	{
+		struct timespec t0, t1;
+		double elapsed_ms;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		do
+		{
+			(void) ps_core_maintenance();
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			elapsed_ms = (double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
+				(double) (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		} while (elapsed_ms < 100.0);
+	}
+	check(segment_count(store, 0) == 2,
+		  "a non-durable version is not a base; the fix must not fire early");
+	check(ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
+		  next_generation == before_negative,
+		  "still no publication: the base has not reached a layer yet");
+
+	/* Three more writes on other blocks fill the memtable and flush it,
+	 * making the real base durable: the watch fires. */
+	check(write_relation_page(0, 1, limited + 200) &&
+		  write_relation_page(0, 2, limited + 300) &&
+		  write_relation_page(0, 3, limited + 400),
+		  "fill the memtable so flush_memtable runs");
+	check(maintenance_until_count(store, 0, 0),
+		  "the watch fired, the request was re-issued, and the segment reclaimed");
+	check(ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
+		  next_generation == before_negative + 1,
+		  "exactly one more compacted publication from the watch firing");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * Residual 1b: the same shape for an unprotected horizon (a WAL_INDEX-only
+ * pin, no page history), where the event that can shorten the chain is a
+ * newer full-page-image item instead of a durable base.
+ */
+static void
+test_late_fpi_requests_compaction(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-late-fpi-XXXXXX";
+	char directory[512];
+	uint64_t next_generation = 0;
+	uint64_t before_fire;
+
+	configure_core();
+	flush_pages = 4;
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 1) &&
+		  wal_index_add_record(0, limited, 0, /* fpi */ 0) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
+					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL),
+		  "construct a non-FPI raw item whose only horizon is an unprotected"
+		  " WAL_INDEX-only pin");
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "segment 0 goes; segment 1 is blocked, and the request is served fruitless");
+	check(ps_test_walidx_reclaim_due(0) == 0,
+		  "the served publication dropped nothing and is fruitless-suppressed");
+	check(wal_index_count(0, 0, WAL_TOTAL) == 1,
+		  "one raw item (the non-FPI known record) indexes the block so far");
+	check(snprintf(directory, sizeof(directory), "%s/walidx_snapshots_0", store) > 0 &&
+		  ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0,
+		  "read the snapshot generation before the watch is exercised");
+	before_fire = next_generation;
+
+	check(wal_index_add_record(0, limited + 4096, 0, /* fpi */ 1),
+		  "a newer FPI item for the same block arrives within the watched window");
+	/* The reader's WAL_INDEX-only pin still needs *some* record to
+	 * reconstruct the page as of its horizon, so the newer FPI item itself
+	 * remains indexed (it is now the chain's own anchor) -- the segment does
+	 * not reclaim further on this alone.  What the fix buys back is that the
+	 * now-superseded older record is retired *immediately* on the FPI's
+	 * arrival, via the watch's own re-issued request, instead of waiting
+	 * for the WAL-index controller's unrelated 1 MiB-tail trigger.  Drive
+	 * for the full no-progress window (bounded, not open-ended: the request
+	 * is still one-shot per event, matching test_unreplaceable_dependency's
+	 * own bound) and check the retirement and the single extra publication
+	 * directly, since segment_count alone cannot observe it here. */
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "the reader's pin still blocks the segment; expected, not the fix's job");
+	check(wal_index_count(0, 0, WAL_TOTAL) == 1,
+		  "the watch fired: the superseded non-FPI record was retired,"
+		  " leaving only the new FPI item; before the fix, still 2");
+	check(ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
+		  next_generation >= before_fire + 1,
+		  "at least one more compacted publication from the watch firing"
+		  " (the controller may also publish on its own schedule during the"
+		  " 1 s drive; the fix's contribution is the retirement asserted"
+		  " above, which does not happen at all without it)");
+	close_store();
+	remove_tree(store);
+}
+
 /* A WAL_INDEX-only pin is not caught by page_prune_mark_all_due's
  * (PAGE_HISTORY|WAL) test, but walidx_prune_fences still fences the
  * compaction plan on every WAL_INDEX pin: dropping or moving a WAL_INDEX-only
@@ -2167,6 +2317,8 @@ main(void)
 	test_backoff_epoch_predates_attempt_inputs();
 	test_stale_wal_index_requests_compaction();
 	test_unreplaceable_dependency_requests_once();
+	test_late_durable_base_requests_compaction();
+	test_late_fpi_requests_compaction();
 	test_walidx_only_pin_drop_requests_compaction();
 	test_dependency_cutoffs();
 	test_death_base_survives_prefix_prune();
