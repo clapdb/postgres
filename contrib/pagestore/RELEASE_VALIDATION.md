@@ -682,9 +682,12 @@ this segment`). A follow-up that wants a retirement to become durable -- so a
 later open does not have to re-derive it -- must do so by recording the
 retire boundary in forkmeta or manifest metadata (a D5 format change with a
 fixture), never by truncating or rewriting page bytes: physical truncation
-during open would make a forensic or read-only reopen mutate the store, is
-unavailable on SPDK (`storage_spdk.c` has no `seg_rewrite`), and -- the
-reason this matters most for F3 specifically -- it would make F3's data loss
+during open would make a forensic or read-only reopen mutate the store, has
+no safe same-id whole-segment replacement primitive to build it on any more
+(the storage backends' `seg_rewrite` existed only for the pre-fix rewrite
+path below and was removed as dead code once tombstoning replaced it), and
+-- the reason this matters most for F3 specifically -- it would make F3's
+data loss
 irreversible: the records after an unmatched ordered record are acknowledged
 data a root fix is meant to recover, and today they are only *logically*
 discarded (unreachable through the index, but the bytes are still there for
@@ -723,29 +726,70 @@ tracking which relocated versions are still live in memory. Space is
 reclaimed the way any other covered-prefix segment already is: by segment GC
 once the whole segment is below the watermark. This is a persisted-format
 change (D5): the three hole magics are registered in
-`pagestore_format_versions`, and `fixtures/posix-artifact-lifecycle` was
-recaptured with a deleted branch whose target records sit between two live
-sibling records in the same segment, so the fixture's own reopen and
-mutation checks exercise a tombstoned segment. Older fixtures keep reopening
-unchanged: no hole magics exist in a store written before this fix, and a
-rebased watermark left by a pre-fix deletion is simply a valid (low, never
-retreating further) watermark to the new daemon.
+`pagestore_format_versions`; per D5 rules 2-3, `fixtures/posix-artifact-lifecycle`
+(the format that shipped before this PR) was demoted to `role: legacy`
+rather than recaptured in place, and `fixtures/posix-timeline-delete-holes`
+is the new current-role fixture, capturing a deleted branch whose target
+records are still memtable-resident (unflushed) at the extend daemon's clean
+stop, so the holes land *above* the final flush watermark -- inside the
+region a reopen actually rescans, which is what lets the fixture prove the
+pre-fix daemon binary fails closed on it (`incompatible record magic
+0x53454831`) instead of silently accepting the new format. See the D5 note
+in `MVP_COMPLETION_PLAN.md` for the fixture-capture detail and the exact
+downgrade behavior: an older daemon fails closed on a hole only when it
+lies in that daemon's own rescan region (above its last flush watermark); a
+hole below the watermark is invisible to an older `recover()`, which reopens
+successfully but then stalls any later deletion that touches that segment in
+DELETING (pass 1 has no path that expects a hole magic). Older fixtures
+(everything at `role: legacy`) keep reopening unchanged: no hole magics
+exist in a store written before this fix, and a rebased watermark left by a
+pre-fix deletion is simply a valid (low, never retreating further) watermark
+to the new daemon.
 
-**What is not yet fixed (follow-up, not blocking).** A store that already
-underwent a timeline deletion before this fix may have lost survivors to Q1
-(entries whose stale, pre-rewrite offset sits above the now-rebased
-watermark): those versions are not recovered by this PR. Repairing them --
-rebuilding lost versions by identity from the pre-rewrite layer entries the
-manifest's rebase record still identifies, which needs identity-level dedup
-in `page_add_version()` and an "already activated identical identity"
-acceptance in `fork_event_activate_seg()` (Q1c) -- is task T7 in the
-implementation plan, tracked as a separate PR with its own tests, plus a
-`pagestore_inspect` report so operators can tell whether a store is
-affected. Until then, a pre-fix deletion's F3 orphans are still adopted by
-the rules above (unchanged, and documented as recovery for pre-fix stores in
-`fork_event_adopt_orphaned_seg()`/`_commit_seg()`'s header comments); do not
-remove that adoption code before a release that no longer supports opening
-a store written by a pre-fix daemon.
+**SPDK is unaffected and remains unable to complete a timeline deletion,
+unchanged by this PR.** `timeline_delete_page_cleanup_one()` and
+`timeline_delete_publish_ready()` gate on `ps_storage->seg_write`, which SPDK
+does implement, so this PR removes the previous (already stale, since
+tombstoning never called `seg_rewrite`) blanket refusal on that backend.
+Tombstoning's pass 1 still cannot get past its very first segment there:
+`spdk_seg_size()` reports the backend's fixed `g_segsize` for every segment
+regardless of how much of it actually holds records, so the validation scan
+runs straight into the unwritten tail as if it were a torn record and fails
+closed as malformed, forever retryable and never destructive. This is a
+pre-existing SPDK gap, not introduced or widened by this PR, and SPDK is out
+of the MVP deployment boundary per D6 in `MVP_COMPLETION_PLAN.md`.
+
+**What is not yet fixed (follow-up, not blocking), and how little evidence
+of it survives.** A store that already underwent a timeline deletion before
+this fix may have lost survivors to Q1 (entries whose stale, pre-rewrite
+offset sits above the now-rebased watermark): those versions are not
+recovered by this PR, and plainly: a store that deleted a timeline under the
+old daemon and was then flushed -- ordinary operation, not a rare condition
+-- has already lost those versions, and nothing in this PR recovers them.
+
+The `PS_MANIFEST_REBASE_FLUSH_WATERMARK` record `ps_manifest_rebase_flush_watermark()`
+wrote for the old rewrite never carried the *pre*-rebase watermark to begin
+with -- its payload is the same `PsFlushWatermark {shard, seg_id, seg_off}`
+as an ordinary `SET_FLUSH_WATERMARK` record, just tagged with a different
+opcode so a reader could tell a rebase happened at all. And even that tag is
+not durable: `ps_manifest_compact()` (routine maintenance once the manifest
+log has grown past the live layer count, `pagestore_core.c` ~19764) rewrites
+every shard's current watermark out as a plain `SET_FLUSH_WATERMARK`
+(`pagestore_manifest.c` ~1289), so the very next compaction after a pre-fix
+deletion erases the last trace that a rebase ever happened. A prospective
+repair tool (task T7 in the implementation plan) cannot reconstruct the lost
+versions' identities from the manifest at all once that compaction has run;
+it would have to fall back to scanning layer files directly for entries a
+deletion's rebase could have invalidated, independent of manifest history,
+or accept that a store past that point is simply unrepairable by inspection
+and can only be diagnosed as *possibly* affected. T7 is tracked as a
+separate PR with its own tests and a `pagestore_inspect` report so operators
+can at least tell whether a store selected a rebased watermark at any
+`ps_core_open()` in its history. Until then, a pre-fix deletion's F3 orphans
+are still adopted by the rules above (unchanged, and documented as recovery
+for pre-fix stores in `fork_event_adopt_orphaned_seg()`/`_commit_seg()`'s
+header comments); do not remove that adoption code before a release that no
+longer supports opening a store written by a pre-fix daemon.
 
 ## Resolved: linear event scans over inert commit markers (F5)
 

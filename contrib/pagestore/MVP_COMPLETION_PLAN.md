@@ -1680,21 +1680,50 @@ pins to a fixture: the daemon writes only admission-era records today
 (56/64-byte headers), so `SEG_HOLE48_MAGIC` -- reachable only by tombstoning
 a legacy 48-byte-header record, never produced by a live write -- stays a
 readable format without a fixture requiring an instance of it, the same
-precedent the pre-admission live magics above it already follow.  An older
-daemon opening a store containing a hole fails closed at `recover()`'s magic
-check ("incompatible record magic"); the new daemon reads every older store
-unchanged (no hole magics exist in them, and a rebased watermark from a
-pre-fix deletion is simply a valid, never-retreating-further watermark).
-`fixtures/posix-artifact-lifecycle` (the current-role fixture) was
-recaptured: its deleted branch (`FIXTURE_DELETED_BRANCH`) now writes a plain
-and a zero-version record before deletion, with a live sibling write
-interleaved between them, so the fixture's own segment carries a hole with
-survivors both before and after it, and `check_segment_formats()` (every
-current fixture must carry an instance of every identity the compiled daemon
-advertises) sees both new magics.  The manifest's flush-watermark rebase
-record (`PS_MANIFEST_REBASE_FLUSH_WATERMARK`) is no longer written -- its
-parser stays, permanently, to replay a pre-fix manifest -- so this is not a
-manifest format change, only the page-segment family's.
+precedent the pre-admission live magics above it already follow.
+
+Following D5 rules 2-3, the format change demoted the fixture that shipped
+at the pre-fix commit and added a new one rather than recapturing in place:
+`fixtures/posix-artifact-lifecycle` (the format that shipped before this PR)
+now carries `role: legacy` with its tarball, `format.json`, and `fixture.json`
+restored byte-identical from `origin/pagestore`, so it still proves the new
+daemon opens a store written by the previous format unchanged.
+`fixtures/posix-timeline-delete-holes` is the new current-role fixture: a
+full `fixture`-workload capture (`check_segment_formats()`/
+`check_archived_identities()` require every advertised identity present in
+some current fixture) whose deleted branch's target records are still
+memtable-resident, unflushed, when the extend-phase daemon's clean stop
+happens -- `ps_memtable_discard_timeline()` empties the memtable of exactly
+the target's own entries during deletion cleanup, so with no other write
+left in the memtable, `ps_core_close()`'s unconditional flush-if-nonempty
+never fires and the captured holes sit *above* the final flush watermark,
+inside the region a reopen actually rescans.  That placement is deliberate
+and load-bearing for the fixture's mutation check
+(`page_segment.hole_bad_len`, a corrupted hole `len` must be refused) and for
+proving the base daemon's own failure mode directly: opening the archived
+store with the pre-fix `pagestore_daemon` binary fails closed with
+`incompatible record magic 0x53454831` at the first hole's offset, not a
+silent stale-format acceptance.
+
+An older (pre-fix) daemon opening a store containing a hole fails closed
+this way only when the hole lies in the region that daemon's `recover()`
+actually rescans -- above its own last flush watermark.  A hole the fixed
+daemon tombstoned and then flushed past (the ordinary case) sits below the
+watermark, where a downgraded daemon's `recover()` never revisits it at all
+and reopens successfully, oblivious to the hole; that store is fine to keep
+reading, but is not a store to run a further timeline deletion against on
+the old daemon -- `timeline_delete_page_cleanup_one()`'s validate-only pass 1
+never expects a `SEG_HOLE*_MAGIC` word and has no path that produces one, so
+any deletion whose target shares a segment with an existing hole stalls in
+DELETING, retryable but never progressing, until the store is reopened by a
+daemon that understands holes.  The new daemon reads every store written
+entirely before this fix unchanged (no hole magics exist in them, and a
+rebased watermark from a pre-fix deletion is simply a valid,
+never-retreating-further watermark to the new daemon).  The manifest's
+flush-watermark rebase record (`PS_MANIFEST_REBASE_FLUSH_WATERMARK`) is no
+longer written -- its parser stays, permanently, to replay a pre-fix
+manifest -- so this is not a manifest format change, only the page-segment
+family's.
 
 ### D6. MVP deployment boundary
 

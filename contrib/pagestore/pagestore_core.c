@@ -18163,18 +18163,26 @@ recover(uint32_t shard)
 			{
 				/*
 				 * A hole's header size is carried by its magic alone (see
-				 * SEG_HOLE*_MAGIC); its body is never read or observed.  Its
-				 * len is the tombstoned record's original len, copied
-				 * verbatim (only the magic word changes when a record is
-				 * tombstoned) and therefore always page_size on a store this
-				 * daemon wrote -- unlike a live record's length, which can
-				 * legitimately be short at the tail of a torn append, a
-				 * hole's magic is written only after its body is zeroed, so
-				 * a torn hole write always leaves the OLD (pre-tombstone)
-				 * magic in place.  A hole magic paired with the wrong len is
-				 * therefore not a truncation to recover from -- it is
-				 * corruption, and recovery fails closed rather than
-				 * skipping an unknown number of bytes on a guess.
+				 * SEG_HOLE*_MAGIC); its body is never read or observed by
+				 * any reader, here or anywhere else, so it does not matter
+				 * whether the body-zeroing write's bytes are actually
+				 * durable by the time the magic word is: the two are two
+				 * separate seg_write() calls with no fsync between them in
+				 * page_cleanup_tombstone_segment(), so only their program
+				 * order is guaranteed, not their relative durability order.
+				 * "Body zeroed" is best-effort hygiene (not leaving live
+				 * page bytes reachable under a magic that claims they are
+				 * gone) -- a hole magic over a body that has not actually
+				 * been zeroed yet is still perfectly safe.  Its len is the
+				 * tombstoned record's original len, copied verbatim (only
+				 * the magic word changes when a record is tombstoned) and
+				 * therefore always page_size on a store this daemon wrote --
+				 * unlike a live record's length, which can legitimately be
+				 * short at the tail of a torn append: a hole magic paired
+				 * with the wrong len is therefore not a truncation to
+				 * recover from -- it is corruption, and recovery fails
+				 * closed rather than skipping an unknown number of bytes on
+				 * a guess.
 				 */
 				if (hdr.len != page_size)
 				{
