@@ -1500,6 +1500,32 @@ test_live_ordered_marker_walless_survives_two_cutovers(void)
 }
 
 /*
+ * F5: randomized cross-check of the (lsn, admission_seq) position index
+ * (fork_event_lower_bound()/upper_bound()/identity_range()/insert_pos())
+ * against the linear scans it replaces, on a private in-core fork that
+ * needs no store.  See ps_test_fork_event_index_selftest()'s header comment
+ * in pagestore_core.h for what each run covers.
+ */
+static void
+test_fork_event_index_selftest(void)
+{
+	static const uint64_t seeds[] = {1, 2, 3};
+
+	for (int legacy = 0; legacy <= 1; legacy++)
+		for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++)
+		{
+			int			rc = ps_test_fork_event_index_selftest(seeds[i], 2000,
+																4000, legacy);
+			char		msg[128];
+
+			snprintf(msg, sizeof(msg),
+					 "fork-event index selftest seed=%llu legacy=%d (failed check %d)",
+					 (unsigned long long) seeds[i], legacy, rc);
+			check(rc == 0, msg);
+		}
+}
+
+/*
  * ---- recovery adopts an orphaned ordered record, with diagnostics ----
  *
  * Recovery adopts an unmatched ordered record only when the selected
@@ -2830,6 +2856,9 @@ main(void)
 	off_t source_before_fault;
 	off_t poison_source_size;
 	int n;
+
+	/* Needs no store; runs first. */
+	test_fork_event_index_selftest();
 
 	check(mkdtemp(store) != NULL, "create runtime cutover store");
 	page_size = sizeof(page);

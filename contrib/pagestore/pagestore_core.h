@@ -184,6 +184,13 @@ extern int ps_test_forkmeta_serviceable_work_due(void);
 extern uint32_t ps_test_page_version_count(uint32_t timeline, const PsKey *key,
 										   uint32_t block);
 extern uint32_t ps_test_artifact_fence_count(uint32_t timeline);
+/* Test-only: randomized cross-check of the (lsn, admission_seq) position
+ * index against the linear scans it replaces.  legacy != 0 seeds some
+ * sequence-zero events so the fallback path is exercised.  Returns 0 on
+ * success or the 1-based number of the failed check (-1 on allocation
+ * failure). */
+extern int ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
+											 uint32_t nqueries, int legacy);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);

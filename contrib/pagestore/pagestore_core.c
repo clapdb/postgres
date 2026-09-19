@@ -5449,6 +5449,32 @@ fork_event_insert_pos(ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
 	return i;
 }
 
+/* Debug-only (never called from a production path: it is O(N)): walk the
+ * array once and confirm the invariant fork_event_insert_pos() relies on --
+ * nondecreasing lsn; within equal lsn, nonzero admission sequences
+ * nondecreasing when nlegacy_seq == 0; nlegacy_seq equal to the count of
+ * zero-sequence events.  Returns 1 if the invariant holds, 0 otherwise. */
+static int
+fork_event_check_order(const ForkEnt *e)
+{
+	uint32_t	zero = 0;
+
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		if (e->ev[i].admission_seq == 0)
+			zero++;
+		if (i == 0)
+			continue;
+		if (e->ev[i - 1].lsn > e->ev[i].lsn)
+			return 0;
+		if (e->ev[i - 1].lsn == e->ev[i].lsn && e->nlegacy_seq == 0 &&
+			e->ev[i - 1].admission_seq != 0 && e->ev[i].admission_seq != 0 &&
+			e->ev[i - 1].admission_seq > e->ev[i].admission_seq)
+			return 0;
+	}
+	return zero == e->nlegacy_seq;
+}
+
 /*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
@@ -5738,6 +5764,366 @@ fork_event_adopt_orphaned_commit_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	fork_event_add_seg_marker(e, lsn, nblocks, FEV_SEG_COMMIT_BOUND, order_id,
 							  admission_seq);
 	return 1;
+}
+
+/*
+ * Test-only oracles: the pre-index algorithms, verbatim, so the self-test
+ * below can cross-check the fast paths in fork_asof_hop()/
+ * fork_inheritance_fenced() against them even on a fork where the fast path
+ * itself would run (nlegacy_seq == 0).  Kept only for that purpose; never
+ * called from a production path.
+ */
+static int
+fork_asof_hop_reference(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
+						uint32_t *nb_out)
+{
+	*nb_out = 0;
+	if (seq_cap == 0)
+	{
+		uint32_t lo = 0;
+		uint32_t hi = e->nev;
+
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (e->ev[mid].lsn <= cap)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo == 0)
+			return FORK_HOP_NONE;
+		*nb_out = e->ev[lo - 1].cached_nblocks;
+		return e->ev[lo - 1].cached_state;
+	}
+	{
+		uint32_t	first = 0;
+		uint32_t	end = e->nev;
+		uint8_t		state;
+		uint32_t	nb;
+
+		while (first < end)
+		{
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
+		}
+		state = first == 0 ? FORK_HOP_NONE : e->ev[first - 1].cached_state;
+		nb = first == 0 ? 0 : e->ev[first - 1].cached_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_GROW)
+			{
+				if (v->nblocks > nb)
+					nb = v->nblocks;
+				state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+					FORK_HOP_GROW : FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_SET)
+			{
+				nb = v->nblocks;
+				state = FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_DEAD)
+			{
+				nb = 0;
+				state = FORK_HOP_DEAD;
+			}
+		}
+		*nb_out = nb;
+		return state;
+	}
+}
+
+static int
+fork_inheritance_fenced_reference(const ForkEnt *e, uint32_t block,
+								  uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL)
+		return 0;
+	if (seq_cap == 0)
+	{
+		uint32_t lo = 0;
+		uint32_t hi = e->nev;
+
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (e->ev[mid].lsn <= cap)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		return lo != 0 && e->ev[lo - 1].cached_fence_nblocks != UINT32_MAX &&
+			block >= e->ev[lo - 1].cached_fence_nblocks;
+	}
+	{
+		uint32_t first = 0;
+		uint32_t end = e->nev;
+		uint32_t fence;
+
+		while (first < end)
+		{
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
+		}
+		fence = first == 0 ? UINT32_MAX :
+			e->ev[first - 1].cached_fence_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_DEAD)
+				fence = 0;
+			else if (v->kind == FEV_SET && v->nblocks < fence)
+				fence = v->nblocks;
+		}
+		return fence != UINT32_MAX && block >= fence;
+	}
+}
+
+/* Deterministic xorshift64* generator for the self-test below: no libc PRNG
+ * dependency, reproducible across platforms from the same seed. */
+static uint64_t
+fork_event_selftest_rand(uint64_t *state)
+{
+	uint64_t	x = *state;
+
+	x ^= x >> 12;
+	x ^= x << 25;
+	x ^= x >> 27;
+	*state = x;
+	return x * 0x2545F4914F6CDD1DULL;
+}
+
+typedef struct FevSelftestMarker
+{
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint64_t	order_id;
+	uint32_t	nblocks;
+	uint8_t		kind;
+} FevSelftestMarker;
+
+/*
+ * Randomized cross-check of the (lsn, admission_seq) position index against
+ * the linear scans it replaces.  See pagestore_core.h for the calling
+ * convention.  legacy != 0 seeds some sequence-zero events so the fallback
+ * path (nlegacy_seq != 0) is exercised instead of the index.
+ */
+int
+ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
+								  uint32_t nqueries, int legacy)
+{
+	ForkEnt		fe;
+	uint64_t	rngstate = seed ? seed : 1;
+	uint64_t   *seq_pool;
+	FevSelftestMarker *markers;
+	uint32_t	nmarkers = 0;
+	int			rc = 0;
+	int			checkno = 0;
+
+#define FEV_ST_CHECK(cond) \
+	do { \
+		checkno++; \
+		if (!(cond)) \
+		{ \
+			rc = checkno; \
+			goto done; \
+		} \
+	} while (0)
+
+	memset(&fe, 0, sizeof(fe));
+	seq_pool = malloc((size_t) nevents * sizeof(*seq_pool));
+	markers = malloc((size_t) nevents * sizeof(*markers));
+	if (seq_pool == NULL || markers == NULL)
+	{
+		rc = -1;
+		goto done;
+	}
+
+	/* A shuffled permutation of 1..nevents: unique, nonzero, random-ordered
+	 * admission sequences so inserts land at random positions, not just the
+	 * tail. */
+	for (uint32_t i = 0; i < nevents; i++)
+		seq_pool[i] = i + 1;
+	for (uint32_t i = nevents; i > 1; i--)
+	{
+		uint32_t	j = (uint32_t) (fork_event_selftest_rand(&rngstate) % i);
+		uint64_t	tmp = seq_pool[i - 1];
+
+		seq_pool[i - 1] = seq_pool[j];
+		seq_pool[j] = tmp;
+	}
+
+	for (uint32_t i = 0; i < nevents; i++)
+	{
+		uint64_t	lsn = 1 + fork_event_selftest_rand(&rngstate) % 6;
+		uint64_t	admission_seq = seq_pool[i];
+
+		if (legacy && (i % 7) == 6)
+			admission_seq = 0;
+
+		if ((i & 1) == 0)
+		{
+			uint8_t		kind;
+			uint32_t	roll = (uint32_t) (fork_event_selftest_rand(&rngstate) % 8);
+			uint32_t	nblocks = (uint32_t) (fork_event_selftest_rand(&rngstate) % 9);
+
+			kind = roll == 0 ? FEV_SET : roll == 1 ? FEV_DEAD : FEV_GROW;
+			fork_event_add(&fe, lsn, admission_seq, nblocks, kind);
+		}
+		else
+		{
+			uint8_t		kind = (fork_event_selftest_rand(&rngstate) & 1) ?
+				FEV_SEG_GROW_BOUND : FEV_SEG_COMMIT_BOUND;
+			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rngstate) % 8);
+			uint64_t	order_id = 1 + fork_event_selftest_rand(&rngstate) % UINT32_MAX;
+
+			fork_event_add_seg_marker(&fe, lsn, nblocks, kind, order_id,
+									  admission_seq);
+			if (admission_seq != 0)
+			{
+				markers[nmarkers].lsn = lsn;
+				markers[nmarkers].admission_seq = admission_seq;
+				markers[nmarkers].order_id = order_id;
+				markers[nmarkers].nblocks = nblocks;
+				markers[nmarkers].kind = kind;
+				nmarkers++;
+			}
+		}
+		FEV_ST_CHECK(fork_event_check_order(&fe));
+	}
+	FEV_ST_CHECK(fe.nlegacy_seq <= fe.nev);
+
+	/* Activate a subset of the growth markers; a second activation of the
+	 * same GROW_BOUND tuple must fail (its kind is no longer a SEG_* kind).
+	 * Also deliberately duplicate a subset of the commit markers' tuples
+	 * with a plain GROW (fork_restore_later_page_growth()'s real shape),
+	 * exercising identity lookups over a multi-element group. */
+	for (uint32_t i = 0; i < nmarkers; i++)
+	{
+		FevSelftestMarker *m = &markers[i];
+
+		if (i % 3 == 0)
+		{
+			FEV_ST_CHECK(fork_event_activate_seg(&fe, m->lsn, m->nblocks,
+												  m->order_id,
+												  m->admission_seq) == 1);
+			FEV_ST_CHECK(fork_event_check_order(&fe));
+			if (m->kind == FEV_SEG_GROW_BOUND)
+				FEV_ST_CHECK(fork_event_activate_seg(&fe, m->lsn, m->nblocks,
+													  m->order_id,
+													  m->admission_seq) == 0);
+		}
+		else if (i % 3 == 1 && m->kind == FEV_SEG_COMMIT_BOUND)
+		{
+			fork_event_add(&fe, m->lsn, m->admission_seq, 100, FEV_GROW);
+			FEV_ST_CHECK(fork_event_check_order(&fe));
+		}
+	}
+
+	/* Query cross-checks. */
+	for (uint32_t i = 0; i < nqueries; i++)
+	{
+		uint64_t	cap;
+		uint64_t	seq_cap;
+		uint32_t	roll = (uint32_t) (fork_event_selftest_rand(&rngstate) % 4);
+
+		if (fe.nev > 0 && roll == 0)
+		{
+			uint32_t	idx = (uint32_t) (fork_event_selftest_rand(&rngstate) % fe.nev);
+
+			cap = fe.ev[idx].lsn;
+			seq_cap = fe.ev[idx].admission_seq;
+		}
+		else
+		{
+			cap = 1 + fork_event_selftest_rand(&rngstate) % 8;
+			seq_cap = (roll == 1) ? 0 :
+				1 + fork_event_selftest_rand(&rngstate) % (nevents + 5);
+		}
+
+		{
+			uint32_t	nb_fast = 0,
+						nb_ref = 0;
+			int			s_fast = fork_asof_hop(&fe, cap, seq_cap, &nb_fast);
+			int			s_ref = fork_asof_hop_reference(&fe, cap, seq_cap, &nb_ref);
+
+			FEV_ST_CHECK(s_fast == s_ref && nb_fast == nb_ref);
+		}
+		{
+			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rngstate) % 12);
+			int			f_fast = fork_inheritance_fenced(&fe, block, cap, seq_cap);
+			int			f_ref = fork_inheritance_fenced_reference(&fe, block, cap,
+																	 seq_cap);
+
+			FEV_ST_CHECK((f_fast != 0) == (f_ref != 0));
+		}
+		{
+			uint32_t	start = 0,
+						end = 0;
+
+			fork_event_identity_range(&fe, cap, seq_cap, &start, &end);
+			if (fork_event_index_usable(&fe, seq_cap))
+			{
+				for (uint32_t j = 0; j < fe.nev; j++)
+				{
+					int			has = fe.ev[j].lsn == cap &&
+						fe.ev[j].admission_seq == seq_cap;
+					int			inrange = j >= start && j < end;
+
+					FEV_ST_CHECK(has == inrange);
+				}
+			}
+			else
+				FEV_ST_CHECK(start == 0 && end == fe.nev);
+		}
+		if (fork_event_index_usable(&fe, seq_cap))
+		{
+			uint32_t	walk = fe.nev;
+
+			while (walk > 0 &&
+				   (fe.ev[walk - 1].lsn > cap ||
+					(fe.ev[walk - 1].lsn == cap && seq_cap != 0 &&
+					 fe.ev[walk - 1].admission_seq != 0 &&
+					 fe.ev[walk - 1].admission_seq > seq_cap)))
+				walk--;
+			FEV_ST_CHECK(walk == fork_event_upper_bound(&fe, cap, seq_cap));
+		}
+	}
+
+	{
+		uint32_t	zero = 0;
+
+		for (uint32_t i = 0; i < fe.nev; i++)
+			if (fe.ev[i].admission_seq == 0)
+				zero++;
+		FEV_ST_CHECK(zero == fe.nlegacy_seq);
+	}
+
+#undef FEV_ST_CHECK
+done:
+	free(seq_pool);
+	free(markers);
+	free(fe.ev);
+	free(fe.def_idx);
+	return rc;
 }
 
 static int
