@@ -84,7 +84,20 @@ typedef enum PsArtifactRefuseReason
 	PS_ARTIFACT_REFUSE_DROPPED,		/* same-LSN retry of an already-dropped generation */
 	PS_ARTIFACT_REFUSE_BEGIN_NEWER,	/* a newer BEGIN is already in flight or abandoned */
 	PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH,	/* commit/drop token or page count does not match the open attempt */
-	PS_ARTIFACT_REFUSE_STORE_RECORD,	/* admission or storage failure recording the lifecycle page */
+	PS_ARTIFACT_REFUSE_STORE_RECORD,	/* storage failure recording the lifecycle page (artifact path poisoned until reopen) */
+	/*
+	 * Appended after #266 without a PS_SHM_VERSION bump (see pagestore_ipc.h
+	 * next to PS_SHM_VERSION 47): the reason value set crosses the
+	 * daemon/client boundary in ch->result and is append-only for the
+	 * lifetime of a running (daemon, backend) pair, so a new value never
+	 * requires a protocol bump -- an old client talking to a new daemon
+	 * prints "unknown" for one of these instead of the real name.
+	 */
+	PS_ARTIFACT_REFUSE_UNFENCED,			/* generation LSN below the page-reclaimed frontier and not fenced by an owner pin or branch point */
+	PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF,	/* growth ordered before the fork-metadata snapshot cutoff */
+	PS_ARTIFACT_REFUSE_SYNC,				/* data sync before the completion record failed; nothing recorded, retryable */
+	PS_ARTIFACT_REFUSE_LEGACY_BYPASS,		/* unversioned write to a key already under the lifecycle protocol */
+	PS_ARTIFACT_REFUSE_IMMUTABLE_MISMATCH,	/* same-LSN retry bytes differ from the completed generation */
 } PsArtifactRefuseReason;
 
 static inline const char *
@@ -101,7 +114,7 @@ pagestore_artifact_refuse_reason_name(PsArtifactRefuseReason reason)
 			 * (pagestore_core.c) rejected the request first. */
 			return "refused before admission (timeline/klass gate)";
 		case PS_ARTIFACT_REFUSE_POISONED:
-			return "poisoned";
+			return "poisoned by an earlier storage failure (reopen the daemon)";
 		case PS_ARTIFACT_REFUSE_INVALID:
 			return "invalid request";
 		case PS_ARTIFACT_REFUSE_WRITE_LOCK:
@@ -117,7 +130,17 @@ pagestore_artifact_refuse_reason_name(PsArtifactRefuseReason reason)
 		case PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH:
 			return "attempt token or page count mismatch";
 		case PS_ARTIFACT_REFUSE_STORE_RECORD:
-			return "store record failure";
+			return "storage failure recording the lifecycle page (artifact path poisoned until reopen)";
+		case PS_ARTIFACT_REFUSE_UNFENCED:
+			return "generation LSN below the page-reclaimed frontier and unfenced";
+		case PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF:
+			return "growth ordered before the forkmeta cutoff";
+		case PS_ARTIFACT_REFUSE_SYNC:
+			return "data sync failed before the completion record (retryable)";
+		case PS_ARTIFACT_REFUSE_LEGACY_BYPASS:
+			return "legacy write refused: key is under the lifecycle protocol";
+		case PS_ARTIFACT_REFUSE_IMMUTABLE_MISMATCH:
+			return "immutable generation bytes differ";
 	}
 	return "unknown";
 }

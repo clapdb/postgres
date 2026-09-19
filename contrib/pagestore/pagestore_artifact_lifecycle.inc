@@ -408,16 +408,56 @@ artifact_prune_versions(uint32_t tl, const PsKey *key, uint32_t block,
 	return 1;
 }
 
+/* Map a classified append outcome (or "append ok, sync failed") to the
+ * reason a begin/commit/drop caller reports.  Both an I/O failure writing
+ * the record and a failed sync after it landed are STORE_RECORD -- either
+ * way durable state may now differ from in-memory state, and the caller
+ * must poison. */
+static PsArtifactRefuseReason
+artifact_reason_for_outcome(PsAppendOutcome outcome)
+{
+	switch (outcome)
+	{
+		case PS_APPEND_OK:
+			return PS_ARTIFACT_REFUSE_NONE;
+		case PS_APPEND_REFUSED_INVALID:
+			return PS_ARTIFACT_REFUSE_INVALID;
+		case PS_APPEND_REFUSED_UNFENCED:
+			return PS_ARTIFACT_REFUSE_UNFENCED;
+		case PS_APPEND_REFUSED_FORKMETA_CUTOFF:
+			return PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF;
+		case PS_APPEND_IO_FAILED:
+			return PS_ARTIFACT_REFUSE_STORE_RECORD;
+	}
+	return PS_ARTIFACT_REFUSE_STORE_RECORD;
+}
+
+/*
+ * Append a lifecycle record and, on success, sync it durable.  Poisons the
+ * artifact path (artifact_io_failed) only when the append's outcome was a
+ * real storage I/O failure (bytes may be on disk, in-memory state may now
+ * disagree with durable state) or when the append succeeded but the
+ * following sync failed (the record is indexed in memory but not proven
+ * durable).  An admission refusal -- outcome != PS_APPEND_IO_FAILED --
+ * leaves no state behind and must not poison anything else.  *outcome is
+ * always set on a nonzero return; the caller maps it to a reason.
+ */
 static int
 artifact_store_record(uint32_t tl, const PsKey *key, uint32_t block,
-					  uint64_t lsn, PsArtifactLifecycle *record, uint64_t *seq)
+					  uint64_t lsn, PsArtifactLifecycle *record, uint64_t *seq,
+					  PsAppendOutcome *outcome)
 {
 	PsKey		meta = artifact_meta_key(key);
 	unsigned char *page = calloc(1, page_size);
 	int			rc;
+	PsAppendOutcome local_outcome = PS_APPEND_REFUSED_INVALID;
 
 	if (!page)
+	{
+		if (outcome)
+			*outcome = PS_APPEND_REFUSED_INVALID;
 		return -1;
+	}
 	record->magic = PS_ARTIFACT_LIFECYCLE_MAGIC;
 	record->version = PS_ARTIFACT_LIFECYCLE_VERSION;
 	record->generation = lsn;
@@ -430,12 +470,18 @@ artifact_store_record(uint32_t tl, const PsKey *key, uint32_t block,
 	record->crc = ~ps_crc32c_update(UINT32_MAX, record,
 									offsetof(PsArtifactLifecycle, crc));
 	memcpy(page, record, sizeof(*record));
-	rc = append_page_raw(tl, &meta, block, page, lsn, seq);
+	rc = append_page_raw_outcome(tl, &meta, block, page, lsn, seq, &local_outcome);
 	free(page);
 	if (rc == 0)
+	{
 		rc = ps_storage->sync();
-	if (rc != 0)
+		if (rc != 0)
+			local_outcome = PS_APPEND_IO_FAILED;
+	}
+	if (rc != 0 && local_outcome == PS_APPEND_IO_FAILED)
 		__atomic_store_n(&artifact_io_failed, 1, __ATOMIC_RELEASE);
+	if (outcome)
+		*outcome = local_outcome;
 	return rc;
 }
 
@@ -527,9 +573,15 @@ ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
 		*token = record.begin_seq;
 		return 0;
 	}
+
 	memset(&record, 0, sizeof(record));
-	if (artifact_store_record(tl, key, PS_ARTIFACT_BEGIN_BLOCK, lsn, &record, token) != 0)
-		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+	{
+		PsAppendOutcome outcome;
+
+		if (artifact_store_record(tl, key, PS_ARTIFACT_BEGIN_BLOCK, lsn, &record,
+								  token, &outcome) != 0)
+			return artifact_refuse(reason, artifact_reason_for_outcome(outcome));
+	}
 	{
 		ForkEnt    *fork = fork_get_or_create(tl, key);
 
@@ -593,26 +645,30 @@ artifact_completed_attempt(uint32_t tl, const PsKey *key, uint64_t lsn,
 
 int
 ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
-				  const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq)
+				  const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq,
+				  PsArtifactRefuseReason *reason)
 {
 	ForkEnt    *fork;
 	PageEnt    *entry;
 	PsArtifactLifecycle completed;
 	int			state;
+	PsAppendOutcome outcome;
 
+	if (reason)
+		*reason = PS_ARTIFACT_REFUSE_NONE;
 	if (!artifact_data_key(key))
 		return append_page_raw(tl, key, block, page, lsn, seq);
 	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE))
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_POISONED);
 	if (token == 0)
 	{
 		if (artifact_has_protocol(tl, key))
-			return -1;
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_LEGACY_BYPASS);
 		return append_page_raw(tl, key, block, page, lsn, seq);
 	}
 	state = artifact_completed_attempt(tl, key, lsn, token, &completed);
 	if (state < 0)
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
 	if (state > 0)
 	{
 		unsigned char *durable = malloc(page_size);
@@ -620,7 +676,7 @@ ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 		int			identical;
 
 		if (!durable)
-			return -1;
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_INVALID);
 		identical = read_resolve(tl, key, block, lsn, 0, durable, &resolved) == 1 &&
 			resolved == lsn && memcmp(durable, page, page_size) == 0;
 		if (!identical)
@@ -630,18 +686,22 @@ ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 		free(durable);
 		if (identical && seq)
 			*seq = token;
-		return identical ? 0 : -1;
+		return identical ? 0 : artifact_refuse(reason, PS_ARTIFACT_REFUSE_IMMUTABLE_MISMATCH);
 	}
 	if (block == UINT32_MAX || !artifact_attempt(tl, key, lsn, token))
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
 	fork = fork_find(tl, key);
 	if (!fork || fork->artifact_attempt_seq != token)
-		return -1;
-	if (append_page_raw(tl, key, block, page, lsn, seq) != 0)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
+	if (append_page_raw_outcome(tl, key, block, page, lsn, seq, &outcome) != 0)
 	{
-		/* An ambiguous append must not escape the attempt's counters. */
-		__atomic_store_n(&artifact_io_failed, 1, __ATOMIC_RELEASE);
-		return -1;
+		/* An ambiguous append must not escape the attempt's counters -- poison
+		 * only when the append's outcome was a real storage I/O failure; an
+		 * admission refusal (unfenced LSN, forkmeta cutoff) leaves no state
+		 * behind and must not take the rest of the artifact path down. */
+		if (outcome == PS_APPEND_IO_FAILED)
+			__atomic_store_n(&artifact_io_failed, 1, __ATOMIC_RELEASE);
+		return artifact_refuse(reason, artifact_reason_for_outcome(outcome));
 	}
 	entry = page_find(tl, key, block);
 	if (entry->artifact_attempt_seq != token)
@@ -687,11 +747,18 @@ ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	if (!fork || fork->artifact_attempt_seq != token ||
 		fork->artifact_page_count != count)
 		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
+	/* Nothing appended yet: a failure here is retryable and must not poison
+	 * the store, unlike a failure recording the COMMIT record below. */
 	if (ps_storage->sync() != 0)
-		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_SYNC);
 	record.nblocks = fork->artifact_nblocks;
-	if (artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL) != 0)
-		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+	{
+		PsAppendOutcome outcome;
+
+		if (artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record,
+								  NULL, &outcome) != 0)
+			return artifact_refuse(reason, artifact_reason_for_outcome(outcome));
+	}
 	return 0;
 }
 
@@ -736,8 +803,13 @@ ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,
 			return 0;
 		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_OLDER_GENERATION);
 	}
-	if (artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL) != 0)
-		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+	{
+		PsAppendOutcome outcome;
+
+		if (artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record,
+								  NULL, &outcome) != 0)
+			return artifact_refuse(reason, artifact_reason_for_outcome(outcome));
+	}
 	return 0;
 }
 
