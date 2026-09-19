@@ -243,41 +243,99 @@ snapshot, R pinned by a retention owner) must live under a key owned by that
 request, never under the key of a checkpoint-driven producer.
 
 **Fix.**
-- The explicit exact-R publish and its loader use an owner-scoped key
-  (`dbOid` = the retention owner id that pinned R, truncated to 32 bits) for
-  the DATA and (per-database) MANIFEST objects; the automatic checkpoint
-  snapshot keeps `dbOid = InvalidOid`. `pagestore_publish_reader_snapshot_
-  artifact` and `pagestore_validate_published_reader_snapshot` both gained an
-  `owner bigint` argument (0 selects the automatic snapshot). The explicit
-  path no longer publishes the database-independent "global" manifest at
-  `InvalidOid` either -- nothing in the pinned-reader boot path reads that
-  fallback (it exists only for an advancing reader adopting the automatic
-  snapshot before `MyDatabaseId` is known at early backend init), and
-  publishing there re-opened the identical collision one field over.
+- The explicit exact-R publish and its loader use an owner-scoped key for the
+  DATA object (`dbOid` = the retention owner id that pinned R); the automatic
+  checkpoint snapshot keeps `dbOid = InvalidOid`. The owner id is
+  range-checked to fit `dbOid`'s 32 bits, not truncated:
+  `pagestore_publish_reader_snapshot_artifact` errors if it is not a positive
+  value `<= 2^32 - 1` (owner 0 is rejected outright -- it would alias the
+  automatic key); `pagestore_validate_published_reader_snapshot` additionally
+  accepts 0, meaning "look up the automatic snapshot instead of an owner's".
+  A controller that assigns 64-bit owner ids with the high bit set therefore
+  cannot publish an exact-R snapshot for that owner under the current 32-bit
+  `dbOid` encoding.
+- The manifest does **not** reuse the automatic path's MANIFEST object
+  (`PS_READER_SNAPSHOT_MANIFEST_OBJECT`, object 0) with the owner id in its
+  `dbOid` slot: that slot is the automatic per-database manifest's own
+  namespace -- real database OIDs, written by the reader-artifact database
+  workers at every checkpoint redo and tracked/retired by the reader database
+  barrier (`pagestore.c`'s `pagestore_publish_database_reader_manifest`,
+  `pagestore_reader_database_dir_valid`, and the barrier's per-database
+  drop). An owner id that happened to equal a live database's OID would
+  alias that database's manifest slot and could be dropped by the barrier's
+  cleanup of databases no longer in the catalog set. The explicit publish's
+  manifest instead uses a new, dedicated object,
+  `PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT`, keyed by the same owner id --
+  an additive namespace entry alongside MANIFEST/DATA/READY/RELMAP/
+  DATABASE_BARRIER, not a change to any of them.
+- The explicit path no longer publishes the database-independent "global"
+  manifest at `InvalidOid` either -- nothing in the pinned-reader boot path
+  reads that fallback (it exists only for an advancing reader adopting the
+  automatic snapshot before `MyDatabaseId` is known at early backend init),
+  and publishing there re-opened the identical DATA-object collision one
+  field over.
 - Every `ps_artifact_begin`/`commit`/`drop` refusal now reports a reason
-  (`PsArtifactRefuseReason`, `pagestore_artifact_format.h`) through an
-  out-parameter. `pagestore_daemon.c` logs one stderr line per refusal
-  (`pagestore_daemon: artifact BEGIN refused: reason=... timeline=... key=(...)
-  lsn=... last_page_lsn=... last_commit=...`) and returns the reason in
-  `ch->result`; `backend_localsvc.c` appends it to the `ERROR` it raises. A
-  silent refusal was itself the diagnostic bug: with this in place, the
-  original CI failure would have named its cause in the same run.
+  (`PsArtifactRefuseReason`, `pagestore_artifact_format.h`, append-only)
+  through an out-parameter. `pagestore_daemon.c` logs one stderr line per
+  refusal (`pagestore_daemon: artifact BEGIN refused: reason=... timeline=...
+  key=(...) lsn=... last_page_lsn=... last_commit=...`) and returns the
+  reason in `ch->result`; `backend_localsvc.c` appends it to the `ERROR` it
+  raises. When the daemon refuses an artifact op before
+  `ps_artifact_begin`/`commit`/`drop` even runs -- the opcode/klass gate in
+  `pagestore_daemon.c`'s `handle_request()`, or the timeline-incarnation gate
+  in `ps_handle_meta()` -- `ch->result` stays 0
+  (`PS_ARTIFACT_REFUSE_NONE`), which is reported as "refused before admission
+  (timeline/klass gate)", not a bare "none". A silent refusal was itself the
+  diagnostic bug: with this in place, the original CI failure would have
+  named its cause in the same run.
 - `integration_test.sh`'s reader section now forces the exact collision order
   CI hit instead of racing on worker timing: after the post-R checkpoint, it
   polls `pagestore_validate_checkpoint_reader_snapshot()` at that checkpoint's
   redo until the automatic generation exists, *then* runs the explicit
-  publish at R -- deterministically reproducing the refusal on a base without
-  the key split -- and asserts the daemon log contains no `artifact ...
-  refused` line at the end of a passing run.
+  publish at R -- and asserts the daemon log contains no `artifact ...
+  refused` line at the end of a passing run. This block *is* the regression
+  test for the key split: reverting `pagestore.c`'s owner-scoped key back to
+  `InvalidOid` (as base had it) makes it fail deterministically, the explicit
+  publish's `ERROR: pagestore localsvc: daemon reported error for op 34
+  (artifact begin: newer generation exists)` -- confirmed by reverting and
+  rerunning.
 
-Format/identity impact: none. The key split changes which `dbOid` an object
-is stored under, not any on-disk payload layout or magic/version identity, so
-no fixture regeneration was needed (verified: the persisted-format,
-pgdata-artifact, and controller fixture checks below still pass unchanged).
+Format/identity impact: none. The key split and the new OWNER_MANIFEST_OBJECT
+change which `dbOid`/object an artifact is stored under, not any on-disk
+payload layout or magic/version identity, so no fixture regeneration was
+needed (verified: the persisted-format, pgdata-artifact, and controller
+fixture checks below -- including `--require-build-match` -- still pass
+unchanged).
 
-Unit regression: `pagestore_artifact_lifecycle_test.c`'s
-`test_reader_snapshot_owner_key_split()` completes an automatic generation,
-then shows BEGIN on the owner-scoped key succeeding at an older LSN (and
-reading back exactly), BEGIN on the automatic key being refused with reason
-`older generation exists`/`newer generation exists` instead of a silent -1,
-and a later automatic generation still succeeding.
+Unit coverage: `pagestore_artifact_lifecycle_test.c`'s
+`test_reader_snapshot_owner_key_split()` exercises the refusal-reason
+plumbing (R5-2) and pins the per-`dbOid` producer independence the key split
+(R5-1) relies on -- BEGIN on a second key that differs only in `dbOid`
+succeeds at an older LSN despite a completed generation on the first (and
+reads back exactly), while a same-key BEGIN at that LSN is refused with a
+reason naming an older/superseded generation instead of a silent -1. This is
+*not* a regression test for the base bug: `ps_artifact_begin`'s per-key
+independence (two different `dbOid` values are unrelated keys) was never
+broken -- the bug was entirely `pagestore.c` choosing the *same* key
+(`InvalidOid`) for both producers, one call site up from anything this unit
+test reaches -- so it cannot fail on an unfixed base. The integration block
+above is the test that does.
+
+## Open follow-up work from the artifact-key-collision fix (R5-5, not blocking)
+
+- **Admission-refusal poisoning.** `artifact_store_record()` sets
+  `artifact_io_failed` on any storage/admission failure
+  (`pagestore_artifact_lifecycle.inc`'s `append_page_raw` callers), which
+  then refuses every subsequent artifact BEGIN/COMMIT/DROP for the rest of
+  the daemon's lifetime (`PS_ARTIFACT_REFUSE_STORE_RECORD`/
+  `PS_ARTIFACT_REFUSE_POISONED` now make this visible instead of a bare -1;
+  it was always the behavior). Whether one transient admission refusal should
+  poison the whole process needs its own semantics review.
+- **forkmeta-cutoff vs. fenced-artifact refusal.** `append_page_impl`'s
+  page-prune-frontier fence for `PS_KLASS_SLRU`/`PS_KLASS_READER_SNAPSHOT`
+  objects can refuse a late-shipped artifact at or below the cutoff even when
+  its key and generation ordering are otherwise fine -- a real, separate
+  hazard from the key collision fixed here (surfaced writing this fix's own
+  unit test: its LSNs had to be chosen comfortably ahead of the page-prune
+  frontier `pagestore_artifact_lifecycle_test.c`'s other tests had already
+  advanced, or the fence refused them). Needs a reproducer and its own fix.
