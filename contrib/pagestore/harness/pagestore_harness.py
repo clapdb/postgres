@@ -2324,7 +2324,8 @@ GC_WORKLOADS: dict[str, dict[str, Any]] = {
         "faults": {
             "timeline_delete.after_deleting",
             "timeline_delete.after_wal_cleanup",
-            "timeline_delete.after_segment_rewrite",
+            "timeline_delete.mid_segment_tombstone",
+            "timeline_delete.after_segment_tombstone",
             "timeline_delete.after_deleted",
         },
         # small segments and an eager flush give the branch an owner layer
@@ -2414,7 +2415,8 @@ GC_STAGES = {
     "wal_reclaim.before_dir_fsync": "reclaim_before_dir_fsync",
     "timeline_delete.after_deleting": "delete_deleting",
     "timeline_delete.after_wal_cleanup": "delete_wal_cleanup",
-    "timeline_delete.after_segment_rewrite": "delete_segment_rewrite",
+    "timeline_delete.mid_segment_tombstone": "delete_mid_segment_tombstone",
+    "timeline_delete.after_segment_tombstone": "delete_segment_tombstone",
     "timeline_delete.after_deleted": "delete_deleted",
     "timeline_delete.before_deleting": "delete_before_deleting",
     "manifest_compact.after_tmp_sync": "manifest_tmp_sync",
@@ -2539,6 +2541,11 @@ SEG_HEADER_BYTES = {
     0x53454734: 56, 0x53454735: 56, 0x53454736: 56,                   # SEG4/5 bound, SEG6 admission
     0x53454737: 64, 0x53454738: 64,                                   # SEG7/8 bound + admission
 }
+# SEH0/1/2: timeline-delete tombstone holes, keyed by header size like the
+# live magics above, but never a live record's owner: a segment scan must
+# step over one (not stop at it, and not count its leftover timeline field
+# as still owning the record) to find survivors recorded after it.
+SEG_HOLE_HEADER_BYTES = {0x53454830: 48, 0x53454831: 56, 0x53454832: 64}
 TIMELINE_META_MAGIC = 0x324D4C54
 TIMELINE_EVENT_STATE = 2
 FORKMETA_PAYLOAD_MAGIC = 0x31534D46
@@ -2554,14 +2561,42 @@ def _segment_record_timelines(path: Path) -> list[int]:
     while offset + 48 <= len(data):
         magic, timeline = struct.unpack_from("=II", data, offset)
         header = SEG_HEADER_BYTES.get(magic)
+        is_hole = header is None
+        if is_hole:
+            header = SEG_HOLE_HEADER_BYTES.get(magic)
         if header is None:
             break
         length = struct.unpack_from("=I", data, offset + 40)[0]
         if offset + header + length > len(data):
             break
-        timelines.append(timeline)
+        if not is_hole:
+            timelines.append(timeline)
         offset += header + length
     return timelines
+
+
+def _segment_hole_count(path: Path) -> int:
+    """Count of SEG_HOLE*-magic tombstone records in one segment file (see
+    SEG_HOLE_HEADER_BYTES above): the same scan as _segment_record_timelines,
+    but counting holes instead of skipping past them silently."""
+    data = path.read_bytes()
+    holes = 0
+    offset = 0
+    while offset + 48 <= len(data):
+        magic, _timeline = struct.unpack_from("=II", data, offset)
+        header = SEG_HEADER_BYTES.get(magic)
+        is_hole = header is None
+        if is_hole:
+            header = SEG_HOLE_HEADER_BYTES.get(magic)
+            if header is not None:
+                holes += 1
+        if header is None:
+            break
+        length = struct.unpack_from("=I", data, offset + 40)[0]
+        if offset + header + length > len(data):
+            break
+        offset += header + length
+    return holes
 
 
 def _timeline_events(store: Path) -> list[dict[str, int]]:
@@ -3589,10 +3624,11 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
         raise OracleMismatch(
             f"after_{stage} crash left private WAL artifacts {wal!r}"
         )
-    if stage == "delete_segment_rewrite":
-        # the probe fires after one shared segment was atomically rewritten
-        # without the owner's records: some segment must now hold survivors
-        # of timeline 0 and nothing of the deleted owner
+    if stage == "delete_segment_tombstone":
+        # the probe fires once this segment's holes are durably synced
+        # (invariant I3: bytes are tombstoned in place, never relocated), so
+        # some segment must now hold survivors of timeline 0 and nothing of
+        # the deleted owner, while every segment keeps its original size
         rewritten = [
             path.name for path in sorted(store.glob("seg_*"))
             for owners in [_segment_record_timelines(path)]
@@ -3600,8 +3636,37 @@ def _check_delete_crash_snapshot(store: Path, stage: str) -> None:
         ]
         if not rewritten:
             raise OracleMismatch(
-                "after_segment_rewrite crash left no shared segment rewritten "
+                "after_segment_tombstone crash left no shared segment tombstoned "
                 "without the deleted owner's records"
+            )
+        # Absence of the deleted owner is necessary but not sufficient: a
+        # segment the workload never gave the owner a record in would pass
+        # that check too, without proving anything tombstoned. Require the
+        # positive signal directly -- at least one SEG_HOLE*-magic record.
+        holed = [
+            path.name for path in sorted(store.glob("seg_*"))
+            if _segment_hole_count(path) > 0
+        ]
+        if not holed:
+            raise OracleMismatch(
+                "after_segment_tombstone crash left no segment carrying a "
+                "SEG_HOLE*-magic tombstone record"
+            )
+    if stage == "delete_mid_segment_tombstone":
+        # the probe fires right after the first hole of one segment is
+        # written -- before the rest of that segment's target records are
+        # tombstoned and before this pass's sync.  Invariant I3 already
+        # holds for that one hole the instant it is written (a tombstoned
+        # byte never reverts), so this proves the write order is safe to
+        # observe mid-pass; it does not require the whole segment be done.
+        holed = [
+            path.name for path in sorted(store.glob("seg_*"))
+            if _segment_hole_count(path) > 0
+        ]
+        if not holed:
+            raise OracleMismatch(
+                "mid_segment_tombstone crash left no segment carrying a "
+                "SEG_HOLE*-magic tombstone record"
             )
     if stage == "delete_deleted":
         if artifacts:

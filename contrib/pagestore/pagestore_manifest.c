@@ -1155,6 +1155,16 @@ ps_manifest_set_flush_watermark(uint32_t shard, uint32_t seg_id,
 	return 0;
 }
 
+/*
+ * No longer called from the daemon: timeline-delete tombstones target
+ * records in place instead of rewriting a segment (invariant I3, see
+ * page_cleanup_tombstone_segment() in pagestore_core.c), so the watermark
+ * this once rebased for a rewritten segment never needs to move.  Kept only
+ * so pagestore_manifest_test.c can construct a manifest carrying a
+ * PS_MANIFEST_REBASE_FLUSH_WATERMARK record and prove manifest_replay()
+ * still reads one written by a pre-fix daemon -- that parser stays
+ * permanently, because an old manifest may still contain the record.
+ */
 int
 ps_manifest_rebase_flush_watermark(uint32_t shard, uint32_t seg_id,
 							   uint64_t seg_off)

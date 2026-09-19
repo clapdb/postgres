@@ -62,6 +62,21 @@
 #include "pagestore_forkmeta_prune.h"
 #include "pagestore_forkmeta_snapshot.h"
 
+/*
+ * Debug-only invariant checks, matching the project's cassert convention:
+ * live only when meson.build's PAGESTORE_ASSERT_CHECKING is defined (its
+ * own cassert build option; not this project's -- and not this file's --
+ * standalone lane), so they cost nothing and prove nothing in a release
+ * daemon.  A failed check is a logic bug in this file, never a storage
+ * fault; production code must never rely on one to fail closed.
+ */
+#ifdef PAGESTORE_ASSERT_CHECKING
+#include <assert.h>
+#define PS_ASSERT(cond) assert(cond)
+#else
+#define PS_ASSERT(cond) ((void) 0)
+#endif
+
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
 uint64_t	segment_size = 8 * 1024 * 1024;
@@ -3489,6 +3504,22 @@ out:
 #define SEG_ADMISSION_MAGIC 0x53454736 /* "SEG6": SEG2 + admission sequence */
 #define SEG_WALLESS_ADMISSION_MAGIC 0x53454737 /* "SEG7": SEG4 + admission */
 #define SEG_CLAMPED_ADMISSION_MAGIC 0x53454738 /* "SEG8": SEG5 + admission */
+/*
+ * Tombstone of a target-timeline record, written in place of it by timeline
+ * deletion (see page_cleanup_tombstone_segment()): one magic per header
+ * shape, so the header size is carried by the magic alone and a hole is
+ * parseable from its first word, exactly like a live record.  The rest of
+ * the original header (timeline, key, block, lsn, len) is left untouched --
+ * only the magic changes -- and the body is zeroed; every reader treats a
+ * hole as "skip header_size(magic) + hdr.len bytes" without looking at
+ * anything inside it.  See invariant I3 in page_cleanup_tombstone_segment()'s
+ * header comment: segment bytes are immutable once written, so a survivor is
+ * never relocated and a hole never replaces anything other than a
+ * target-timeline record.
+ */
+#define SEG_HOLE48_MAGIC 0x53454830 /* "SEH0": tombstone of a 48-byte-header record */
+#define SEG_HOLE56_MAGIC 0x53454831 /* "SEH1": tombstone of a 56-byte-header record (bound or admission) */
+#define SEG_HOLE64_MAGIC 0x53454832 /* "SEH2": tombstone of a 64-byte-header record (bound + admission) */
 
 /*
  * On-disk layout of one appended page version: this header immediately
@@ -3526,32 +3557,31 @@ typedef struct SegRecHdrBoundAdmission
 	uint64_t	admission_seq;
 } SegRecHdrBoundAdmission;
 
-typedef struct SegmentReloc
-{
-	uint32_t	timeline;
-	PsKey		key;
-	uint32_t	block;
-	uint64_t	lsn;
-	uint64_t	admission_seq;
-	uint64_t	old_off;
-	uint64_t	new_off;
-} SegmentReloc;
-
 static int
 segment_record_shape(uint32_t magic, uint64_t *header_size, int *wal_less,
-					 int *bound, int *admission)
+					 int *bound, int *admission, int *hole)
 {
-	*wal_less = magic == SEG_WALLESS_MAGIC ||
+	*hole = magic == SEG_HOLE48_MAGIC || magic == SEG_HOLE56_MAGIC ||
+		magic == SEG_HOLE64_MAGIC;
+	*wal_less = !*hole && (magic == SEG_WALLESS_MAGIC ||
 		magic == SEG_WALLESS_ORDERED_MAGIC ||
 		magic == SEG_WALLESS_BOUND_MAGIC ||
-		magic == SEG_WALLESS_ADMISSION_MAGIC;
-	*bound = magic == SEG_WALLESS_BOUND_MAGIC ||
+		magic == SEG_WALLESS_ADMISSION_MAGIC);
+	*bound = !*hole && (magic == SEG_WALLESS_BOUND_MAGIC ||
 		magic == SEG_CLAMPED_BOUND_MAGIC ||
 		magic == SEG_WALLESS_ADMISSION_MAGIC ||
-		magic == SEG_CLAMPED_ADMISSION_MAGIC;
-	*admission = magic == SEG_ADMISSION_MAGIC ||
+		magic == SEG_CLAMPED_ADMISSION_MAGIC);
+	*admission = !*hole && (magic == SEG_ADMISSION_MAGIC ||
 		magic == SEG_WALLESS_ADMISSION_MAGIC ||
-		magic == SEG_CLAMPED_ADMISSION_MAGIC;
+		magic == SEG_CLAMPED_ADMISSION_MAGIC);
+	if (*hole)
+	{
+		*header_size = magic == SEG_HOLE48_MAGIC ? sizeof(SegRecHdr) :
+			magic == SEG_HOLE56_MAGIC ?
+				sizeof(SegRecHdr) + sizeof(uint64_t) :
+				sizeof(SegRecHdr) + 2 * sizeof(uint64_t);
+		return 0;
+	}
 	if (magic != SEG_MAGIC && magic != SEG_WALLESS_MAGIC &&
 		magic != SEG_WALLESS_ORDERED_MAGIC && magic != SEG_CLAMPED_ORDERED_MAGIC &&
 		magic != SEG_WALLESS_BOUND_MAGIC && magic != SEG_CLAMPED_BOUND_MAGIC &&
@@ -3562,6 +3592,20 @@ segment_record_shape(uint32_t magic, uint64_t *header_size, int *wal_less,
 		(*bound ? sizeof(uint64_t) : 0) +
 		(*admission ? sizeof(uint64_t) : 0);
 	return 0;
+}
+
+/* The three hole header sizes, matching the three live header shapes 48/56/64
+ * bytes wide.  Used by the tombstone writer to pick the right magic for a
+ * target record it is about to overwrite in place. */
+static uint32_t
+segment_hole_magic_for_header_size(uint64_t header_size)
+{
+	if (header_size == sizeof(SegRecHdr))
+		return SEG_HOLE48_MAGIC;
+	if (header_size == sizeof(SegRecHdr) + sizeof(uint64_t))
+		return SEG_HOLE56_MAGIC;
+	PS_ASSERT(header_size == sizeof(SegRecHdr) + 2 * sizeof(uint64_t));
+	return SEG_HOLE64_MAGIC;
 }
 
 /*
@@ -4458,23 +4502,62 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 	return NULL;
 }
 
-/* Rewrite one POSIX segment after validating every record in it.  The raw
- * record bytes are copied unchanged for survivors; only their physical
- * offsets move.  Caller holds every shard write lock and map write lock. */
+/*
+ * Tombstone every target-timeline record in one segment: each is overwritten
+ * where it sits with a hole record of identical size (its body zeroed, only
+ * its magic changed to one of SEG_HOLE*_MAGIC).  This is invariant I3:
+ * segment bytes are immutable once written, a record's (seg_id, seg_off)
+ * never changes, and the flush watermark never retreats.  A survivor is
+ * therefore never relocated, no image-index entry ever goes stale, and the
+ * page index and memtable need no update -- nothing moved.  Space is
+ * reclaimed the way every covered prefix already is: by segment GC once the
+ * whole segment is below the watermark (a tombstoned segment, holes and all,
+ * is never "empty" the way an old fully-rewritten one briefly could be, so
+ * cleanup settles no PAGE debt itself).
+ *
+ * Write order for one target record at (off, header_size, hdr.len):
+ *   1. zero the body [off+header_size, off+header_size+hdr.len);
+ *   2. write the hole magic at off (the 4-byte first word);
+ *   3. after the whole segment: ps_storage->sync().
+ * Every intermediate state is safe.  Before step 2 the record still parses
+ * as an ordinary record of a DELETING timeline, which recovery already
+ * skips (timeline_recovery_allowed()); after step 2 it is a hole, which
+ * recovery also skips, by magic instead of by owner.  A torn 4-byte-aligned
+ * write is not a realistic failure mode; if one is ever observed, the next
+ * record's boundary is unchanged either way, so recovery fails closed
+ * (an unrecognized magic) rather than misparsing.
+ *
+ * Two passes.  Pass 1 walks and validates every record exactly as a
+ * read-only scan would (no write), collecting the target's; a parse failure
+ * here leaves the segment completely untouched, so a malformed segment
+ * fails closed and stays retryable without ever writing a hole for data it
+ * could not fully account for.  Pass 2 (only once pass 1 has validated the
+ * whole segment) writes the collected holes; a failure here is a genuine
+ * storage I/O failure, not a data problem, and leaves some records already
+ * tombstoned and some not -- both states are safe per the write order
+ * above, and the next maintenance turn resumes, since an already-holed
+ * record is recognized by its magic and skipped, making the retry
+ * idempotent.
+ *
+ * Caller holds every shard write lock and map write lock.  Returns 1 when
+ * this pass tombstoned at least one record, 0 when no target record remains
+ * in this segment, -1 on failure.
+ */
+typedef struct SegmentHole
+{
+	uint64_t	off;
+	uint64_t	header_size;
+	uint32_t	len;
+} SegmentHole;
+
 static int
-page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
+page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 {
 	int64_t bytes;
-	unsigned char *replacement = NULL;
-	SegmentReloc *relocs = NULL;
-	uint32_t nrelocs = 0, reloc_cap = 0;
-	uint64_t off = 0, out_off = 0;
-	uint64_t watermark_new = 0, cursor_new = 0;
-	int watermark_seen = 0, cursor_seen = 0, cursor_retired = 0, found = 0;
-	int counted_debt = 0;
-	PsFlushWatermark watermark = {0};
-	int have_watermark = s->flush_watermark_valid &&
-		s->flush_watermark.seg_id == (uint32_t) seg;
+	unsigned char *zero_body = NULL;
+	SegmentHole *holes = NULL;
+	uint32_t nholes = 0, hole_cap = 0;
+	uint64_t off = 0;
 
 	errno = 0;
 	bytes = ps_storage->seg_size(s->id, seg);
@@ -4482,208 +4565,112 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 		(uint64_t) bytes > SIZE_MAX ||
 		(uint64_t) bytes > (uint64_t) LLONG_MAX)
 		return -1;
-	/* PAGE debt is an aggregate of nonempty, covered segments in the
-	 * reclaimable prefix.  A successful deletion rewrite can turn one such
-	 * segment into an empty file before segment GC sees it. */
-	counted_debt = !s->gc_storage_error && !s->gc_debt_unavailable &&
-		bytes > 0 &&
-		s->flush_watermark_valid && (uint32_t) seg < s->flush_watermark.seg_id &&
-		(uint32_t) seg >= s->gc_next_seg && s->gc_debt_segments != 0;
-	if (have_watermark)
-	{
-		watermark = s->flush_watermark;
-		if (watermark.seg_off > (uint64_t) bytes)
-			return -1;
-		watermark_seen = watermark.seg_off == 0;
-		watermark_new = 0;
-	}
-	if (s->cur_seg == seg)
-	{
-		if (s->cur_off > (uint64_t) bytes)
-		{
-			/* Recovery uses segment_size as a retirement sentinel when an
-			 * ordered record is physically present but its forkmeta marker is
-			 * missing.  It is not an append cursor into this short segment:
-			 * cleanup may rewrite the physical bytes, but must preserve the
-			 * sentinel so the next append rolls to a new segment. */
-			if (s->cur_off != segment_size ||
-				(uint64_t) bytes >= segment_size)
-				return -1;
-			cursor_retired = 1;
-		}
-		else
-			cursor_seen = s->cur_off == 0;
-	}
-	replacement = malloc((size_t) bytes ? (size_t) bytes : 1);
-	if (!replacement)
-		return -1;
+	/* Pass 1: validate, no writes. */
 	while (off < (uint64_t) bytes)
 	{
 		SegRecHdr hdr;
 		uint64_t header_size, rec_len, end;
 		uint64_t order_id = 0, admission_seq = 0;
-		int wal_less, bound, admission;
-		unsigned char *raw;
+		int wal_less, bound, admission, hole;
 
 		if ((uint64_t) bytes - off < sizeof(hdr) ||
 			ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0 ||
 			segment_record_shape(hdr.magic, &header_size, &wal_less,
-								 &bound, &admission) != 0 ||
-			hdr.timeline >= MAX_TIMELINES || hdr.len != page_size ||
-			header_size > UINT64_MAX - hdr.len)
+								 &bound, &admission, &hole) != 0 ||
+			hdr.len != page_size || header_size > UINT64_MAX - hdr.len)
 			goto fail;
 		rec_len = header_size + hdr.len;
 		if (rec_len > UINT32_MAX || rec_len > (uint64_t) bytes - off)
 			goto fail;
 		end = off + rec_len;
-		if (bound &&
-			(ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
-							   sizeof(order_id)) != 0 || order_id == 0))
-			goto fail;
-		if (admission &&
-			(ps_storage->seg_read(s->id, seg,
-							 off + header_size - sizeof(admission_seq),
-							 &admission_seq, sizeof(admission_seq)) != 0 ||
-			 admission_seq == 0))
-			goto fail;
-		raw = malloc((size_t) rec_len);
-		if (!raw || ps_storage->seg_read(s->id, seg, off, raw, (uint32_t) rec_len) != 0)
+		if (!hole)
 		{
-			free(raw);
-			goto fail;
-		}
-		if (hdr.timeline == target)
-		{
-			found = 1;
-			free(raw);
-		}
-		else
-		{
-			uint64_t new_data_off = out_off + header_size;
-
-			if (out_off > (uint64_t) bytes - rec_len)
-			{
-				free(raw);
+			if (hdr.timeline >= MAX_TIMELINES)
 				goto fail;
-			}
-			memcpy(replacement + out_off, raw, (size_t) rec_len);
-			if (nrelocs == reloc_cap)
+			if (bound &&
+				(ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
+								   sizeof(order_id)) != 0 || order_id == 0))
+				goto fail;
+			if (admission &&
+				(ps_storage->seg_read(s->id, seg,
+								 off + header_size - sizeof(admission_seq),
+								 &admission_seq, sizeof(admission_seq)) != 0 ||
+				 admission_seq == 0))
+				goto fail;
+			if (hdr.timeline == target)
 			{
-				uint32_t new_cap;
-				size_t alloc_size;
-				SegmentReloc *nr;
+				if (nholes == hole_cap)
+				{
+					uint32_t new_cap;
+					size_t alloc_size;
+					SegmentHole *nh;
 
-				if (reloc_cap != 0 && reloc_cap > UINT32_MAX / 2)
-				{
-					free(raw);
-					goto fail;
+					if (hole_cap != 0 && hole_cap > UINT32_MAX / 2)
+						goto fail;
+					new_cap = hole_cap ? hole_cap * 2 : 128;
+					alloc_size = (size_t) new_cap * sizeof(*holes);
+					if (new_cap != 0 && alloc_size / sizeof(*holes) != (size_t) new_cap)
+						goto fail;
+					nh = realloc(holes, alloc_size);
+					if (!nh)
+						goto fail;
+					holes = nh;
+					hole_cap = new_cap;
 				}
-				new_cap = reloc_cap ? reloc_cap * 2 : 128;
-				alloc_size = (size_t) new_cap * sizeof(*relocs);
-				if (new_cap != 0 &&
-					alloc_size / sizeof(*relocs) != (size_t) new_cap)
-				{
-					free(raw);
-					goto fail;
-				}
-				nr = realloc(relocs, alloc_size);
-
-				if (!nr)
-				{
-					free(raw);
-					goto fail;
-				}
-				relocs = nr;
-				reloc_cap = new_cap;
+				holes[nholes].off = off;
+				holes[nholes].header_size = header_size;
+				holes[nholes].len = hdr.len;
+				nholes++;
 			}
-			relocs[nrelocs++] = (SegmentReloc) {
-				.timeline = hdr.timeline,
-				.key = hdr.key,
-				.block = hdr.block,
-				.lsn = wal_less ? 0 : hdr.lsn,
-				.admission_seq = admission_seq,
-				.old_off = off + header_size,
-				.new_off = new_data_off
-			};
-			out_off += rec_len;
-			free(raw);
-		}
-		if (have_watermark && end == watermark.seg_off)
-		{
-			watermark_seen = 1;
-			watermark_new = out_off;
-		}
-		if (s->cur_seg == seg && end == s->cur_off)
-		{
-			cursor_seen = 1;
-			cursor_new = out_off;
 		}
 		off = end;
 	}
-	if (have_watermark && !watermark_seen)
-		goto fail;
-	if (s->cur_seg == seg && !cursor_seen && !cursor_retired)
-		goto fail;
-	if (!found)
-		goto no_rewrite;
-	if (ps_storage->seg_rewrite == NULL)
-		goto fail;
-	/* Retreat the recovery boundary before replacement.  This is conservative
-	 * when a crash occurs between the two operations: either old or new bytes
-	 * are scanned, and durable layers still cover the original prefix. */
-	if (have_watermark && watermark_new < watermark.seg_off)
+	if (nholes == 0)
 	{
-		/* Image indexes retain source-segment offsets.  Once bytes inside the
-		 * covered prefix move, an index entry after the removed record can no
-		 * longer be used as a recovery hint.  Rewind the whole segment boundary
-		 * so recovery rebuilds those entries from the replacement bytes instead
-		 * of consulting stale layer offsets. */
-		watermark_new = 0;
-		if (ps_manifest_rebase_flush_watermark(s->id, (uint32_t) seg,
-											watermark_new) != 0)
-			goto fail;
-		s->flush_watermark.seg_off = watermark_new;
+		free(holes);
+		return 0;
 	}
-	if (ps_storage->seg_rewrite(s->id, seg, replacement, out_off) != 0)
-		goto fail;
-	/* The rewritten segment is durable; recovery rescans it, so the in-memory
-	 * relocation below is the only state a crash here can lose. */
-	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_SEGMENT_REWRITE) != 0)
-		goto fail;
-	for (uint32_t i = 0; i < nrelocs; i++)
+	zero_body = calloc(1, page_size ? page_size : 1);
+	if (!zero_body)
 	{
-		SegmentReloc *r = &relocs[i];
+		free(holes);
+		return -1;
+	}
+	/* Pass 2: write the holes the validated scan found. */
+	for (uint32_t i = 0; i < nholes; i++)
+	{
+		uint32_t hole_magic =
+			segment_hole_magic_for_header_size(holes[i].header_size);
 
-		for (uint32_t sh = 0; sh < core_shards(); sh++)
-			for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
-				for (PageEnt *e = g_shards[sh].page_idx[bucket]; e; e = e->next)
-					if (e->timeline == r->timeline && e->block == r->block &&
-						key_eq(&e->key, &r->key))
-						for (int v = 0; v < e->nver; v++)
-							if (e->vers[v].shard == s->id &&
-								e->vers[v].seg == seg &&
-								e->vers[v].off == r->old_off &&
-								e->vers[v].lsn == r->lsn &&
-								e->vers[v].admission_seq == r->admission_seq)
-								e->vers[v].off = r->new_off;
-		ps_memtable_rewrite_segment(s->memtable, (uint32_t) seg,
-								r->old_off, r->new_off);
+		if (ps_storage->seg_write(s->id, seg,
+								  holes[i].off + holes[i].header_size,
+								  zero_body, holes[i].len) != 0 ||
+			ps_storage->seg_write(s->id, seg, holes[i].off, &hole_magic,
+								  sizeof(hole_magic)) != 0)
+			goto write_fail;
+		/* Fires once, after the first hole of this segment and before the
+		 * rest, for the crash matrix (task T5). */
+		if (i == 0 &&
+			ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_MID_SEGMENT_TOMBSTONE) != 0)
+			goto write_fail;
 	}
-	if (s->cur_seg == seg)
-		s->cur_off = cursor_retired ? segment_size : cursor_new;
-	if (out_off == 0 && counted_debt)
-		page_gc_debt_settle(s, (uint32_t) seg, 1);
-	free(relocs);
-	free(replacement);
+	if (ps_storage->sync == NULL || ps_storage->sync() != 0)
+		goto write_fail;
+	/* Every hole this pass wrote is now durable; a crash after this point
+	 * loses nothing (there is no in-memory relocation left to lose). */
+	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_SEGMENT_TOMBSTONE) != 0)
+		goto write_fail;
+	free(holes);
+	free(zero_body);
 	return 1;
 
-no_rewrite:
-	free(relocs);
-	free(replacement);
-	return 0;
+write_fail:
+	free(holes);
+	free(zero_body);
+	return -1;
+
 fail:
-	free(relocs);
-	free(replacement);
+	free(holes);
 	return -1;
 }
 
@@ -4777,7 +4764,7 @@ page_cleanup_scan_timeline_locked(uint32_t timeline)
 				return -1;
 			}
 			{
-				int rc = page_cleanup_rewrite_segment(s, seg, timeline);
+				int rc = page_cleanup_tombstone_segment(s, seg, timeline);
 
 				if (rc < 0)
 					return -1;
@@ -4866,6 +4853,21 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 			if (lo < end && recs[lo].lsn == v->lsn &&
 				recs[lo].admission_seq == v->admission_seq)
 				remove = 1;
+			/*
+			 * Invariant I3 (debug build only, PS_ASSERT): segment bytes
+			 * are immutable once written, so a version is dropped from
+			 * memory only once it is below the flush watermark --
+			 * otherwise a rescan on the next open would meet it with no
+			 * in-memory identity to retain its marker (the F3/Q1 defect
+			 * this invariant rules out; see page_cleanup_tombstone_segment()).
+			 * A layer-origin version (seg == -1, already retargeted by
+			 * segment GC or never segment-backed) is covered by definition.
+			 */
+			PS_ASSERT(!remove || v->seg < 0 ||
+				(g_shards[v->shard].flush_watermark_valid &&
+				 ((uint32_t) v->seg < g_shards[v->shard].flush_watermark.seg_id ||
+				  ((uint32_t) v->seg == g_shards[v->shard].flush_watermark.seg_id &&
+				   v->off + page_size <= g_shards[v->shard].flush_watermark.seg_off))));
 			if (!remove)
 				e->vers[out++] = *v;
 			else if (e->key.klass == PS_KLASS_SLRU ||
@@ -5678,9 +5680,16 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
  * recovery representation fork_event_activate_seg() expects, so a snapshot
  * cutover could publish that plain GROW and strand the identity; (2) the
  * snapshot builder degrading or dropping a marker whose page version had
- * been pruned from memory, whose record is later rescanned after a timeline-
- * delete rewrite rebases the flush watermark (tracked separately; see
- * RELEASE_VALIDATION.md).  Both require fork_meta_orphan_proven() as a
+ * been pruned from memory, whose record was later rescanned after a
+ * timeline-delete rewrite rebased the flush watermark (F3/Q1,
+ * RELEASE_VALIDATION.md) -- fixed by tombstoning in place instead of
+ * rewriting (page_cleanup_tombstone_segment(), invariant I3), so cause (2)
+ * cannot occur in a store any of whose timeline deletions ran under the
+ * fixed daemon.  This adoption path therefore stays, unchanged, purely as
+ * recovery for a store that had a timeline deleted by a pre-fix daemon (its
+ * rebased watermark still causes one rescan of a possibly pruned survivor
+ * on the next open); do not remove it before a release that no longer needs
+ * to open a pre-fix store.  Both causes require fork_meta_orphan_proven() as a
  * NECESSARY filter (see its header comment: by itself it is not proof
  * against a torn append still in flight, because a refused record's
  * admission_seq is still observed and can be covered by a *later* freeze,
@@ -5804,7 +5813,12 @@ fork_event_commit_adoptable(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
  * going through this function.  For the F3 pruned-marker case reached via
  * the layer path (a live version pruned from memory, then its record
  * rescanned) this re-admits an already-pruned version -- a pruning
- * reversal, not new data; see RELEASE_VALIDATION.md for the open follow-up.
+ * reversal, not new data.  Since the fix
+ * (page_cleanup_tombstone_segment(), invariant I3), a timeline deletion
+ * never rebases the watermark, so no store this daemon has ever deleted a
+ * timeline in can create that rescan; this stays, unchanged, as recovery
+ * for a store whose timeline was deleted by a pre-fix daemon.  See
+ * RELEASE_VALIDATION.md.
  */
 static int
 fork_event_adopt_orphaned_commit_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
@@ -12643,8 +12657,20 @@ timeline_delete_wal_cleanup_one(void)
 static int
 timeline_delete_page_cleanup_one(void)
 {
-	if (ps_storage->seg_rewrite == NULL)
-		return 0; /* SPDK has no safe same-id replacement primitive. */
+	/*
+	 * Tombstoning writes holes in place (page_cleanup_tombstone_segment())
+	 * with seg_read/seg_size/seg_write/sync alone; it needs no same-id
+	 * whole-segment replacement primitive.  seg_read/seg_size are already
+	 * required elsewhere in this path, so the one capability worth gating on
+	 * here is seg_write.  SPDK does implement it, but its seg_size always
+	 * reports the fixed g_segsize for every segment rather than how much of
+	 * it actually holds records, so pass 1's validation scan runs into the
+	 * unwritten tail padding and fails closed as malformed: SPDK timeline
+	 * deletion still cannot complete, for that structural reason, not a
+	 * missing capability (out of MVP scope, see D6 in MVP_STATUS.md).
+	 */
+	if (ps_storage->seg_write == NULL)
+		return 0;
 	for (uint32_t pass = 0; pass < MAX_TIMELINES; pass++)
 	{
 		uint32_t tl = 1 + (timeline_page_cleanup_cursor + pass) % (MAX_TIMELINES - 1);
@@ -12876,13 +12902,15 @@ timeline_delete_publish_ready(uint32_t timeline)
 		state != PS_TIMELINE_DELETING || timeline_meta_poisoned_load() ||
 		ps_manifest_poisoned() || fork_meta_poisoned_load())
 		return 0;
-	/* A missing capability is never interpreted as an empty consumer.  In
-	 * particular this keeps SPDK's NULL same-id rewrite fail-closed. */
+	/* A missing capability is never interpreted as an empty consumer.  Page
+	 * cleanup tombstones records in place with seg_read/seg_size/seg_write
+	 * (see timeline_delete_page_cleanup_one()); there is no separate
+	 * same-id whole-segment replacement primitive to require here. */
 	if (ps_storage->meta_append == NULL || ps_storage->fork_meta_read == NULL ||
 		ps_storage->fork_meta_rewrite == NULL ||
 		ps_storage->timeline_wal_cleanup == NULL ||
 		ps_storage->seg_read == NULL || ps_storage->seg_size == NULL ||
-		ps_storage->seg_rewrite == NULL ||
+		ps_storage->seg_write == NULL ||
 		(use_layers && (ps_layer_store == NULL ||
 			ps_layer_store->layer_exists_local == NULL ||
 			ps_layer_store->delete_local_layer == NULL ||
@@ -18103,34 +18131,75 @@ recover(uint32_t shard)
 			int			has_admission;
 			int			ordered;
 			int			wal_less;
+			int			is_hole;
 
 			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0 ||
 				hdr.magic == 0)
 				break;
-			wal_less = hdr.magic == SEG_WALLESS_MAGIC ||
+			is_hole = hdr.magic == SEG_HOLE48_MAGIC ||
+				hdr.magic == SEG_HOLE56_MAGIC || hdr.magic == SEG_HOLE64_MAGIC;
+			wal_less = !is_hole && (hdr.magic == SEG_WALLESS_MAGIC ||
 				hdr.magic == SEG_WALLESS_ORDERED_MAGIC ||
 				hdr.magic == SEG_WALLESS_BOUND_MAGIC ||
-				hdr.magic == SEG_WALLESS_ADMISSION_MAGIC;
-			bound = hdr.magic == SEG_WALLESS_BOUND_MAGIC ||
+				hdr.magic == SEG_WALLESS_ADMISSION_MAGIC);
+			bound = !is_hole && (hdr.magic == SEG_WALLESS_BOUND_MAGIC ||
 				hdr.magic == SEG_CLAMPED_BOUND_MAGIC ||
 				hdr.magic == SEG_WALLESS_ADMISSION_MAGIC ||
-				hdr.magic == SEG_CLAMPED_ADMISSION_MAGIC;
-			has_admission = hdr.magic == SEG_ADMISSION_MAGIC ||
+				hdr.magic == SEG_CLAMPED_ADMISSION_MAGIC);
+			has_admission = !is_hole && (hdr.magic == SEG_ADMISSION_MAGIC ||
 				hdr.magic == SEG_WALLESS_ADMISSION_MAGIC ||
-				hdr.magic == SEG_CLAMPED_ADMISSION_MAGIC;
-			ordered = hdr.magic == SEG_WALLESS_ORDERED_MAGIC ||
-				hdr.magic == SEG_CLAMPED_ORDERED_MAGIC || bound;
-			if (hdr.magic != SEG_MAGIC && hdr.magic != SEG_ADMISSION_MAGIC &&
-				!wal_less && !ordered)
+				hdr.magic == SEG_CLAMPED_ADMISSION_MAGIC);
+			ordered = !is_hole && (hdr.magic == SEG_WALLESS_ORDERED_MAGIC ||
+				hdr.magic == SEG_CLAMPED_ORDERED_MAGIC || bound);
+			if (!is_hole && hdr.magic != SEG_MAGIC &&
+				hdr.magic != SEG_ADMISSION_MAGIC && !wal_less && !ordered)
 			{
 				fprintf(stderr, "pagestore_daemon: shard %u segment %d: incompatible "
 						"record magic %#x at offset %llu\n", shard, id, hdr.magic,
 						(unsigned long long) off);
 				goto fail;
 			}
-			if (hdr.len != page_size)
+			if (is_hole)
+			{
+				/*
+				 * A hole's header size is carried by its magic alone (see
+				 * SEG_HOLE*_MAGIC); its body is never read or observed by
+				 * any reader, here or anywhere else, so it does not matter
+				 * whether the body-zeroing write's bytes are actually
+				 * durable by the time the magic word is: the two are two
+				 * separate seg_write() calls with no fsync between them in
+				 * page_cleanup_tombstone_segment(), so only their program
+				 * order is guaranteed, not their relative durability order.
+				 * "Body zeroed" is best-effort hygiene (not leaving live
+				 * page bytes reachable under a magic that claims they are
+				 * gone) -- a hole magic over a body that has not actually
+				 * been zeroed yet is still perfectly safe.  Its len is the
+				 * tombstoned record's original len, copied verbatim (only
+				 * the magic word changes when a record is tombstoned) and
+				 * therefore always page_size on a store this daemon wrote --
+				 * unlike a live record's length, which can legitimately be
+				 * short at the tail of a torn append: a hole magic paired
+				 * with the wrong len is therefore not a truncation to
+				 * recover from -- it is corruption, and recovery fails
+				 * closed rather than skipping an unknown number of bytes on
+				 * a guess.
+				 */
+				if (hdr.len != page_size)
+				{
+					fprintf(stderr, "pagestore_daemon: shard %u segment %d: hole "
+							"record at offset %llu has len %u, expected page_size "
+							"%u\n", shard, id, (unsigned long long) off, hdr.len,
+							page_size);
+					goto fail;
+				}
+				header_size = hdr.magic == SEG_HOLE48_MAGIC ? sizeof(SegRecHdr) :
+					hdr.magic == SEG_HOLE56_MAGIC ?
+						sizeof(SegRecHdr) + sizeof(uint64_t) :
+						sizeof(SegRecHdr) + 2 * sizeof(uint64_t);
+			}
+			else if (hdr.len != page_size)
 				break;
-			if (bound)
+			else if (bound)
 			{
 				header_size = has_admission ? sizeof(SegRecHdrBoundAdmission) :
 					sizeof(SegRecHdrBound);
@@ -18203,6 +18272,15 @@ recover(uint32_t shard)
 						goto fail;
 				}
 				pending_valid = 0;
+			}
+
+			/* Invariant I3: a hole is a tombstoned target record.  It has no
+			 * live identity, so it contributes no replay, no memtable put,
+			 * and no image-index observation -- skip straight past it. */
+			if (is_hole)
+			{
+				off += header_size + hdr.len;
+				continue;
 			}
 
 			data_off = off + header_size;
@@ -21070,6 +21148,15 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		 SEG_WALLESS_ADMISSION_MAGIC, 0},
 		{"page_segment", "seg_* record (clamped below-floor page)",
 		 SEG_CLAMPED_ADMISSION_MAGIC, 0},
+		/* SEG_HOLE48_MAGIC tombstones a legacy 48-byte-header record (no
+		 * admission sequence); the daemon writes only admission-era records
+		 * today (56/64-byte headers), so -- like the legacy live magics
+		 * above it never pins -- it stays a readable format without a
+		 * fixture requiring an instance of it. */
+		{"page_segment", "seg_* tombstone (56-byte-header hole)",
+		 SEG_HOLE56_MAGIC, 0},
+		{"page_segment", "seg_* tombstone (64-byte-header hole)",
+		 SEG_HOLE64_MAGIC, 0},
 		{"wal_log", "wal_<tl> record", WAL_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> record", WALIDX_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> progress record",

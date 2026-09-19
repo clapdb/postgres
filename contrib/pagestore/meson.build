@@ -1,5 +1,12 @@
 # Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
+# The daemon core's own debug-only invariant checks (pagestore_core.c's
+# assert()s, gated on this macro so a cassert=false release daemon or the
+# standalone cc lane -- which does not define it -- compiles them out
+# rather than paying for them, or trusting them, in production): live only
+# in a cassert build, matching the rest of the project's cassert convention.
+pagestore_cassert_c_args = get_option('cassert') ? ['-DPAGESTORE_ASSERT_CHECKING'] : []
+
 pagestore_sources = files(
   'backend_localsvc.c',
   'backend_passthrough.c',
@@ -85,6 +92,7 @@ pagestore_daemon = executable('pagestore_daemon',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_daemon
@@ -110,6 +118,7 @@ pagestore_format_versions = executable('pagestore_format_versions',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c', 'pagestore_spdk_super.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 
@@ -264,6 +273,7 @@ pagestore_tiering_test = executable('pagestore_tiering_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_tiering',
@@ -284,6 +294,7 @@ pagestore_forkmeta_cutover_test = executable('pagestore_forkmeta_cutover_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_forkmeta_cutover',
@@ -305,6 +316,7 @@ pagestore_forkmeta_crash_matrix_test = executable('pagestore_forkmeta_crash_matr
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_forkmeta_crash_matrix',
@@ -326,7 +338,8 @@ pagestore_timeline_test = executable('pagestore_timeline_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
-  c_args: ['-DPAGESTORE_RETENTION_TEST', '-DPAGESTORE_RELATION_INSPECTION_TEST'],
+  c_args: ['-DPAGESTORE_RETENTION_TEST', '-DPAGESTORE_RELATION_INSPECTION_TEST']
+          + pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_timeline',
@@ -346,6 +359,7 @@ pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_wal_reclaim_core',
@@ -367,6 +381,7 @@ pagestore_control_prune_test = executable('pagestore_control_prune_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_control_prune',
@@ -385,6 +400,7 @@ pagestore_artifact_lifecycle_test = executable('pagestore_artifact_lifecycle_tes
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_artifact_lifecycle',
@@ -413,6 +429,7 @@ pagestore_lifecycle_prune_test = executable('pagestore_lifecycle_prune_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_lifecycle_prune',
@@ -447,7 +464,7 @@ pagestore_backpressure_test = executable('pagestore_backpressure_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
-  c_args: ['-DPAGESTORE_BACKPRESSURE_TEST'],
+  c_args: ['-DPAGESTORE_BACKPRESSURE_TEST'] + pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_backpressure',
@@ -790,6 +807,7 @@ test('pagestore_fixture_identities',
          meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
          meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
          meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes',
          meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
          '--format-tool', pagestore_format_versions],
   depends: [pagestore_format_versions],
@@ -804,6 +822,7 @@ test('pagestore_persisted_format_fixture',
          meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
          meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
          meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes',
          '--daemon-binary', pagestore_daemon,
          '--client-binary', pagestore_gc_crash_client,
          '--inspect-binary', pagestore_inspect,
@@ -856,7 +875,8 @@ foreach prune_fault_scenario : [
   'wal_reclaim_before_dir_fsync',
   'timeline_delete_after_deleting',
   'timeline_delete_after_wal_cleanup',
-  'timeline_delete_after_segment_rewrite',
+  'timeline_delete_mid_segment_tombstone',
+  'timeline_delete_after_segment_tombstone',
   'timeline_delete_after_deleted',
   'timeline_delete_before_deleting',
   'manifest_compact_after_tmp_sync',
