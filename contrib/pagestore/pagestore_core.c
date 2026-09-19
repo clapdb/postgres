@@ -11429,7 +11429,13 @@ wal_segment_reclaim_one(void)
 			 * request exists to react to.  A base that becomes durable with
 			 * no fence change at all is not detected here; it is left to the
 			 * WAL-index controller's own trigger, as before this request
-			 * existed. */
+			 * existed.  The request is not additionally gated on
+			 * walidx_snapshot_end[tl] < progress: a fence change can make the
+			 * plan drop more at the very same end_lsn a prior publication
+			 * already covered (walidx_snapshot_publish_one's write-section
+			 * guard admits end_lsn == previous_end when reclaim_due is set,
+			 * for exactly this case), so "already covers current progress"
+			 * is not evidence that nothing more can be dropped. */
 			{
 				uint64_t proven = retention_floor < progress ?
 					retention_floor : progress;
@@ -11459,7 +11465,6 @@ wal_segment_reclaim_one(void)
 					fence_epoch == walidx_reclaim_request_fence_epoch[tl];
 				if (raw_floor != 0 && raw_floor < proven &&
 					proven_target > store->start_lsn &&
-					walidx_snapshot_end[tl] < progress &&
 					!fruitless && !already_due)
 				{
 					walidx_reclaim_request_raw[tl] = raw_floor;
@@ -17945,6 +17950,20 @@ ps_handle_meta(PsChannel *ch)
 							 (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 							  PS_RETENTION_RESOURCE_WAL)) != 0)
 							page_prune_mark_all_due();
+						/* A WAL_INDEX-only pin change (no PAGE_HISTORY/WAL
+						 * bit) does not go through page_prune_mark_all_due
+						 * above, but walidx_prune_fences still fences the
+						 * compaction plan on WAL_INDEX pins: without this,
+						 * setting or moving one leaves a fruitless reclaim
+						 * request stuck until the WAL-index controller's own
+						 * trigger notices. */
+						if ((((old_found == 1 ? old_pin.resources : 0) |
+							  pin.resources) &
+							 PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+						{
+							walidx_reclaim_fence_changed();
+							wal_reclaim_proof_changed();
+						}
 					}
 					pthread_rwlock_unlock(&walidx_prune_lock);
 					pthread_rwlock_unlock(&page_prune_lock);
@@ -18040,6 +18059,19 @@ ps_handle_meta(PsChannel *ch)
 						 (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 						  PS_RETENTION_RESOURCE_WAL)) != 0)
 						page_prune_mark_all_due();
+					/* A WAL_INDEX-only pin change (no PAGE_HISTORY/WAL bit)
+					 * does not go through page_prune_mark_all_due above, but
+					 * walidx_prune_fences still fences the compaction plan
+					 * on WAL_INDEX pins: without this, reserving or moving
+					 * one leaves a fruitless reclaim request stuck until the
+					 * WAL-index controller's own trigger notices. */
+					if ((((old_found == 1 ? old_pin.resources : 0) |
+						  pin.resources) &
+						 PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+					{
+						walidx_reclaim_fence_changed();
+						wal_reclaim_proof_changed();
+					}
 				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
@@ -18079,6 +18111,18 @@ ps_handle_meta(PsChannel *ch)
 					(old_pin.resources & (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 										  PS_RETENTION_RESOURCE_WAL)) != 0)
 					page_prune_mark_all_due();
+				/* A WAL_INDEX-only pin drop does not go through
+				 * page_prune_mark_all_due above, but walidx_prune_fences
+				 * still fences the compaction plan on WAL_INDEX pins:
+				 * without this, dropping one leaves a fruitless reclaim
+				 * request stuck until the WAL-index controller's own
+				 * trigger notices. */
+				if (ret == PS_RETENTION_OK && old_found == 1 &&
+					(old_pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+				{
+					walidx_reclaim_fence_changed();
+					wal_reclaim_proof_changed();
+				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
 				if (ret == PS_RETENTION_STALE)

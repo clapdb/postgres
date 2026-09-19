@@ -556,17 +556,29 @@ maintenance_until_count(const char *store, uint32_t timeline,
 	 * re-evaluation per WAL_RECLAIM_REARM_MIN_NS (20 ms) regardless of epoch
 	 * changes, so a caller driving maintenance right after an arm needs real
 	 * wall-clock time to elapse before the next attempt is honored, not just
-	 * more tight-loop iterations.  An idle pass (no work done at all) sleeps
-	 * briefly to make that time pass efficiently; a store with other work
-	 * pending (e.g. an unrelated forkmeta cutover step) instead reports work
-	 * done every pass without ever idling, so the iteration count alone must
-	 * also be generous enough to accumulate 20 ms of real per-pass cost
-	 * (observed up to ~350 passes here).  Both paths converge quickly for
-	 * the common case (no arm to wait out), since the loop exits as soon as
-	 * the count is reached. */
-	for (int i = 0; i < 2048 && segment_count(store, timeline) > wanted; i++)
+	 * more tight-loop iterations or a bounded iteration count: a store with
+	 * other work pending (e.g. an unrelated forkmeta cutover step) can report
+	 * work done on every single pass without ever idling, so an idle-only
+	 * sleep never triggers and a fixed iteration budget's real wall-clock
+	 * cost is scenario-dependent (observed both ~350 busy passes and, in a
+	 * smaller store, still under 20 ms after 2048).  Bound this on wall-clock
+	 * time directly instead: keep driving maintenance (sleeping briefly on an
+	 * idle pass to make that time pass efficiently) until either the count is
+	 * reached or a full second -- 50x the rate-limit floor -- has elapsed.
+	 * The common case (no arm to wait out) still converges in well under a
+	 * millisecond, since the loop exits as soon as the count is reached. */
+	struct timespec t0, t1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (segment_count(store, timeline) > wanted)
+	{
 		if (!ps_core_maintenance())
 			usleep(1000);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		if ((double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
+			(double) (t1.tv_nsec - t0.tv_nsec) / 1e6 >= 1000.0)
+			break;
+	}
 	return segment_count(store, timeline) == wanted;
 }
 
@@ -636,9 +648,10 @@ test_no_progress_backoff_follows_proof(void)
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
 	char store[] = "/tmp/pagestore-wal-policy-proof-backoff-XXXXXX";
 	AdmissionCallCounter counter = {0};
-	struct timespec t0, t1;
+	struct timespec t_arm, t0, t1;
 	int reclaimed;
 	double elapsed_ms = 0.0;
+	double since_arm_ms;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, limited, 0, 1),
@@ -649,13 +662,31 @@ test_no_progress_backoff_follows_proof(void)
 	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1 &&
 		  segment_count(store, 0) == 2,
 		  "the pin boundary is still current: the no-progress backoff arms");
+	clock_gettime(CLOCK_MONOTONIC, &t_arm);
 	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1,
 		  "an unexpired backoff with no proof-input change skips the global drain");
 	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	check(set_wal_pin(0, 100, WAL_TOTAL),
 		  "release the owner WAL pin to the end of the shipped log");
-	check(ps_test_wal_reclaim_maintenance() == 0,
-		  "the epoch change is not honored before the 20 ms rate-limit floor");
+	/* set_wal_pin's two fsyncs (control-image plus retention publication) can
+	 * themselves cost close to the 20 ms rate-limit floor on a loaded host,
+	 * so only assert "not yet honored" when this check is still inside the
+	 * floor measured from the arm above; a host slow enough to cross it
+	 * before reaching here would make the assertion flake on timing that is
+	 * not what this test is about (mirrors the fast/slow-host branch in
+	 * test_epoch_retries_are_rate_limited). */
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	since_arm_ms = (double) (t1.tv_sec - t_arm.tv_sec) * 1000.0 +
+		(double) (t1.tv_nsec - t_arm.tv_nsec) / 1e6;
+	if (since_arm_ms < 20.0)
+		check(ps_test_wal_reclaim_maintenance() == 0,
+			  "fast host (< 20 ms since arm): the epoch change is not honored"
+			  " before the rate-limit floor");
+	else
+		check(1,
+			  "slow host (>= 20 ms since arm): skipping the not-yet-honored"
+			  " assertion, the bounded poll below still proves the epoch"
+			  " cancellation fired");
 	reclaimed = 0;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (;;)
@@ -693,6 +724,7 @@ test_epoch_retries_are_rate_limited(void)
 	AdmissionCallCounter counter = {0};
 	struct timespec t0, t1;
 	double loop_ms;
+	unsigned int calls_before;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, limited, 0, 1),
@@ -720,8 +752,18 @@ test_epoch_retries_are_rate_limited(void)
 		check(1,
 			  "slow host (loop >= 20 ms): skipping the zero-drain assertion, "
 			  "the <= 1 invariant above still held every iteration");
+	/* Read the count after the loop rather than assume it is 0: on a slow
+	 * host the loop itself may already have crossed the floor and drained
+	 * once (still consistent with the <= 1 invariant above).  Bump the
+	 * epoch once more explicitly so there is always a fresh, unconsumed
+	 * change for the floor-past call below to react to, and assert the
+	 * drain count advances by exactly one, not that it lands on an
+	 * absolute value. */
+	calls_before = counter.calls;
+	ps_test_wal_reclaim_proof_changed();
 	usleep(25000);
-	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1 &&
+	check(ps_test_wal_reclaim_maintenance() == 0 &&
+		  counter.calls == calls_before + 1 &&
 		  segment_count(store, 0) == 2,
 		  "the pending epoch change is honored exactly once past the"
 		  " rate-limit floor, but the pin still blocks the reclaim");
@@ -825,6 +867,45 @@ test_unreplaceable_dependency_requests_once(void)
 			  next_generation <= 3,
 			  "the fence-triggered request adds exactly one more compacted publication");
 	}
+	close_store();
+	remove_tree(store);
+}
+
+/* A WAL_INDEX-only pin is not caught by page_prune_mark_all_due's
+ * (PAGE_HISTORY|WAL) test, but walidx_prune_fences still fences the
+ * compaction plan on every WAL_INDEX pin: dropping or moving a WAL_INDEX-only
+ * pin can turn an unreplaceable chain into a replaceable one exactly like a
+ * PAGE_HISTORY/WAL pin change does, so it must also bump
+ * walidx_reclaim_fence_epoch (and the backoff's proof epoch), or the
+ * reclaimer stays fruitless-suppressed until the WAL-index controller's own
+ * trigger notices independently. */
+static void
+test_walidx_only_pin_drop_requests_compaction(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-walidx-pin-XXXXXX";
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  write_relation_page(0, 0, limited + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
+					  PS_RETENTION_RESOURCE_WAL_INDEX, limited + 200) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL),
+		  "construct a stored page base whose chain a WAL_INDEX-only reader still fences");
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 2,
+		  "reclaim advances to the aligned raw-dependency boundary");
+	check(ps_test_wal_reclaim_maintenance() == 0 &&
+		  ps_test_walidx_reclaim_due(0) == 1,
+		  "the stale raw dependency looks compactable, so a publication is requested");
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "the WAL_INDEX-only reader still fences the plan after that publication");
+	check(ps_test_walidx_reclaim_due(0) == 0,
+		  "the one-shot request does not stay armed once its fruitless publication completes");
+	check(drop_wal_pin(0, 301, 1),
+		  "drop the WAL_INDEX-only reader pin, with no durable-progress op at all");
+	check(maintenance_until_count(store, 0, 0),
+		  "the dropped WAL_INDEX pin re-issues the request and the chain now retires");
 	close_store();
 	remove_tree(store);
 }
@@ -2086,6 +2167,7 @@ main(void)
 	test_backoff_epoch_predates_attempt_inputs();
 	test_stale_wal_index_requests_compaction();
 	test_unreplaceable_dependency_requests_once();
+	test_walidx_only_pin_drop_requests_compaction();
 	test_dependency_cutoffs();
 	test_death_base_survives_prefix_prune();
 	test_natural_nonzero_start();
