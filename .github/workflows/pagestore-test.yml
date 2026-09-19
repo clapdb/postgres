@@ -435,6 +435,19 @@ jobs:
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
 
+      # On a FAIL, integration_test.sh has already stashed a tail of the
+      # daemon log and every cluster's server log it created under
+      # build/pagestore-integration-logs; upload them so the failing op can
+      # be identified without a local repro.
+      - name: Upload pagestore integration test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagestore-integration-logs
+          path: build/pagestore-integration-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Run WAL-redo worker demo
         run: contrib/pagestore/redo_worker_demo.sh "$(pwd)/build"
 

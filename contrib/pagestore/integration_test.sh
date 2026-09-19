@@ -98,6 +98,43 @@ wait_daemon_ready() {
 	exit 1
 }
 
+# Print a labelled tail of one log file, if it currently exists, and (for CI)
+# stash a copy under $BUILD so a workflow step can upload it as an artifact.
+# Never fails the caller: a missing/unreadable log is silently skipped.
+_dump_log() {  # $1=banner label $2=filename slug (for the stashed copy) $3=path
+	local label=$1 slug=$2 path=$3
+
+	if [ -r "$path" ]; then
+		echo "===== $label (last 200 lines) ====="
+		tail -n 200 "$path"
+		echo
+		if [ -n "${FAILDUMP_DIR:-}" ]; then
+			cp -f "$path" "$FAILDUMP_DIR/$slug.log" 2>/dev/null || true
+		fi
+	fi
+}
+
+# On a hard FAIL, print the daemon log and every cluster's server log that
+# exists at this point (the writer, and whichever of the branch/reader/
+# advancing-reader/bad-reader/unprepared-branch clusters this run created),
+# so a CI failure is diagnosable from the job output alone.  Also copies them
+# into $BUILD/pagestore-integration-logs for the workflow to upload as an
+# artifact.  Called only from the final fail-path, before the EXIT trap
+# removes the temporary directories.
+dump_failure_logs() {
+	FAILDUMP_DIR="$BUILD/pagestore-integration-logs"
+	rm -rf "$FAILDUMP_DIR" 2>/dev/null
+	mkdir -p "$FAILDUMP_DIR" 2>/dev/null || FAILDUMP_DIR=
+
+	_dump_log "daemon.log" "daemon" "$DATA/daemon.log"
+	_dump_log "writer server.log" "writer-server" "$DATA/server.log"
+	[ -n "${BRANCHDATA:-}" ] && _dump_log "branch server.log" "branch-server" "$BRANCHDATA/server.log"
+	[ -n "${UNPREPARED:-}" ] && _dump_log "unprepared-branch server.log" "unprepared-server" "$UNPREPARED/server.log"
+	[ -n "${READERDATA:-}" ] && _dump_log "reader server.log" "reader-server" "$READERDATA/server.log"
+	[ -n "${ADVANCINGDATA:-}" ] && _dump_log "advancing-reader server.log" "advancing-server" "$ADVANCINGDATA/server.log"
+	[ -n "${BADREADER:-}" ] && _dump_log "bad-reader server.log" "badreader-server" "$BADREADER/server.log"
+}
+
 # KEEPTMP=1 keeps the data/store directories for post-mortem debugging
 # (servers and daemon are still stopped).
 cleanup() {
@@ -2263,5 +2300,10 @@ assert "$?" "0" "old reader still resolves dropped database artifacts"
 assert "$artifact_after" "$artifact_before" "retained database artifacts stay byte-identical after drop"
 
 echo "----"
-[ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
+if [ "$fail" = 0 ]; then
+	echo "integration test: PASS"
+else
+	echo "integration test: FAIL"
+	dump_failure_logs
+fi
 exit $fail
