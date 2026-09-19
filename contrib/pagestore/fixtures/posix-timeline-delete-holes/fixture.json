@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "name": "posix-artifact-lifecycle",
-  "role": "legacy",
+  "name": "posix-timeline-delete-holes",
+  "role": "current",
   "workload": "fixture",
   "daemon_args": [
     "--page-size",
@@ -36,9 +36,9 @@
     ".pagestore-nshards",
     "forkmeta",
     "forkmeta_snapshots",
-    "forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
+    "forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000002",
     "forkmeta_snapshots/forkmeta_manifest_v1",
-    "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001",
+    "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000002",
     "layer_0_000000000000000b",
     "layer_0_000000000000000c",
     "layers.manifest",

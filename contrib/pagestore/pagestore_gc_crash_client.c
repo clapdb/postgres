@@ -166,6 +166,19 @@ fixture_role_legacy(void)
 	return 0;
 }
 
+/* posix-timeline-delete-holes' capture sets this so the same "fixture"
+ * workload also seeds its deleted-branch-with-holes scenario; absent (every
+ * other "fixture"-workload capture, including posix-artifact-lifecycle),
+ * fixture_extend()/fixture_verify() run exactly as before this fixture
+ * existed. */
+static int
+fixture_capture_holes(void)
+{
+	const char *v = getenv("PAGESTORE_FIXTURE_DELETE_HOLES");
+
+	return v != NULL && *v != '\0' && strcmp(v, "0") != 0;
+}
+
 static uint16_t
 fixture_xlp_magic(void)
 {
@@ -216,6 +229,12 @@ typedef struct FixtureXLogLongPageHeaderData
 #define FIXTURE_WALLESS_BLOCK 4u
 #define FIXTURE_TAIL_REL 8000u
 #define FIXTURE_TAIL_LSN UINT64_C(9000)
+/* posix-timeline-delete-holes only (PAGESTORE_FIXTURE_DELETE_HOLES): a third
+ * scenario, appended in the extension phase so its records land past the
+ * post-recovery flush and stay unflushed through to the archive (see
+ * fixture_extend_holes()'s header comment). */
+#define FIXTURE_HOLES_TARGET_BRANCH 3u
+#define FIXTURE_HOLES_LSN (FIXTURE_FORK_LSN + UINT64_C(6000))
 
 static void *shm_base;
 static int shm_fd = -1;
@@ -1426,7 +1445,6 @@ fixture_seed(void)
 	unsigned char *page = malloc(page_size);
 	uint64_t	lsn = 0;
 	uint64_t	incarnation;
-	uint64_t	branch_incarnation;
 
 	if (page == NULL)
 		die("out of memory");
@@ -1483,7 +1501,6 @@ fixture_seed(void)
 	walidx_batch_and_commit(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
 	/* a live branch with its own page version, and a deleted branch */
 	incarnation = fixture_create_branch(FIXTURE_BRANCH);
-	branch_incarnation = incarnation;
 	delete_write_block(page, FIXTURE_BRANCH, incarnation, 0,
 					   FIXTURE_BRANCH_LSN, 0x77);
 	/* the branch's own shipped WAL; its WAL-index interval is added by the
@@ -1497,22 +1514,6 @@ fixture_seed(void)
 	delete_write_block(page, FIXTURE_BRANCH, incarnation, FIXTURE_WALLESS_BLOCK,
 					   0, 0x66);
 	incarnation = fixture_create_branch(FIXTURE_DELETED_BRANCH);
-	/* One record of each admission-era page-segment header shape (56-byte
-	 * plain, 64-byte ordered/zero-version) before the branch is deleted, so
-	 * timeline deletion's cleanup tombstones both shapes in place
-	 * (invariant I3, page_cleanup_tombstone_segment()) -- otherwise this
-	 * fixture would carry no instance of either SEG_HOLE56_MAGIC or
-	 * SEG_HOLE64_MAGIC, which check_segment_formats() requires of every
-	 * page-segment identity the compiled daemon advertises.  A live
-	 * sibling record sits between the two target records (T6, D5): the
-	 * shared segment then holds survivors both before and after a hole,
-	 * matching the layout task T2's own test exercises. */
-	delete_write_block(page, FIXTURE_DELETED_BRANCH, incarnation, 0,
-					   FIXTURE_FORK_LSN + 5000, 0x99);
-	delete_write_block(page, FIXTURE_BRANCH, branch_incarnation, 5,
-					   FIXTURE_FORK_LSN + 5500, 0x88);
-	delete_write_block(page, FIXTURE_DELETED_BRANCH, incarnation, 1,
-					   0, 0x9a);
 	set_relation(ch);
 	set_timeline(ch, FIXTURE_DELETED_BRANCH, incarnation);
 	ch->opcode = PS_OP_BEGIN_DELETE;
@@ -1522,6 +1523,9 @@ fixture_seed(void)
 	free(page);
 }
 
+static void fixture_extend_holes(void);
+static void fixture_verify_holes(void);
+
 /* Fork-size events appended after the snapshot cutover live in the source
  * epoch's tail rather than in the checkpoint, so the fixture carries both. */
 static void
@@ -1530,6 +1534,14 @@ fixture_extend(void)
 	PsChannel  *ch = ps_channel(shm_base, channel);
 	uint64_t	incarnation = 0;
 
+	/* posix-timeline-delete-holes' scenario runs first: BEGIN_DELETE forces
+	 * its own forkmeta snapshot cutover (deletion durably filters the
+	 * target's own events before DELETED), which would otherwise absorb
+	 * the tail_rel growth event below into a new checkpoint and leave the
+	 * source epoch back at its bare marker -- exactly what this function's
+	 * own header comment says must not happen to that record. */
+	if (fixture_capture_holes())
+		fixture_extend_holes();
 	forkmeta_create_grow(FIXTURE_TAIL_REL, FIXTURE_TAIL_LSN, 2);
 	/* The cutover leaves every epoch log empty, so the records of the
 	 * WAL-index log format itself are appended afterwards, on the branch
@@ -1560,6 +1572,73 @@ fixture_extend(void)
 	ch->req_seq = FIXTURE_FORK_LSN + DELETE_WAL_BYTES;
 	if (execute()->status != PS_STATUS_OK)
 		die("fixture branch WAL-index progress commit failed");
+}
+
+/*
+ * posix-timeline-delete-holes only.  By this point in the extension phase,
+ * the daemon's own reopen (recovering the seed phase's on-disk state, whose
+ * flush watermark was never set because fixture_seed()'s clean stop left
+ * its memtable empty) has already replayed everything into the memtable
+ * and, since recover() flushes a nonempty memtable once at the end of its
+ * scan, durably published it -- the memtable is now empty again and the
+ * watermark sits at the end of everything seeded so far.  Nothing run in
+ * fixture_extend() above touches the memtable (forkmeta/WAL-index writes
+ * are separate formats).
+ *
+ * ps_core_close() unconditionally flushes a *nonempty* memtable on clean
+ * shutdown (flush_memtable() itself is the only thing that skips an empty
+ * one).  So the only way a hole can survive to the archived store above the
+ * watermark is for the memtable to hold nothing else in it at shutdown --
+ * this scenario therefore adds no other page write: it creates the target
+ * branch, writes exactly its two records (one plain, one zero-version,
+ * covering both tombstoned header shapes), deletes it, and waits for
+ * DELETED.  Deletion's own cleanup discards the target's two memtable
+ * entries (ps_memtable_discard_timeline()) once its records are tombstoned,
+ * so by the time the extension phase ends the memtable is empty again and
+ * the clean stop's flush is a no-op -- the tombstoned holes stay in the
+ * unflushed tail, above the watermark, in the archived store.  A downgraded
+ * (pre-fix) daemon's recover() therefore *does* reach them on reopen and
+ * fails closed on the unrecognized magic (verified against the pre-fix
+ * daemon binary; see RELEASE_VALIDATION.md's D5 note) -- unlike a hole left
+ * behind a watermark that already advanced past it, which a downgraded
+ * daemon never rescans at all.
+ */
+static void
+fixture_extend_holes(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	target_incarnation;
+	struct timespec pause_interval = {0, 20000000};
+	PsTimelineState state = (PsTimelineState) -1;
+
+	if (page == NULL)
+		die("out of memory");
+	target_incarnation = fixture_create_branch(FIXTURE_HOLES_TARGET_BRANCH);
+	/* target record 1: plain versioned (56-byte header) */
+	delete_write_block(page, FIXTURE_HOLES_TARGET_BRANCH, target_incarnation,
+					   0, FIXTURE_HOLES_LSN, 0xD1);
+	/* target record 2: zero-version, WAL-less (64-byte header) */
+	delete_write_block(page, FIXTURE_HOLES_TARGET_BRANCH, target_incarnation,
+					   1, 0, 0xD2);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_HOLES_TARGET_BRANCH, target_incarnation);
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->req_seq = target_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("holes fixture: BEGIN_DELETE failed");
+	for (int i = 0; i < 500; i++)
+	{
+		if (timeline_state(FIXTURE_HOLES_TARGET_BRANCH, NULL) == PS_TIMELINE_DELETED)
+		{
+			state = PS_TIMELINE_DELETED;
+			break;
+		}
+		nanosleep(&pause_interval, NULL);
+	}
+	if (state != PS_TIMELINE_DELETED)
+		die("holes fixture: target branch did not reach DELETED");
+	free(page);
 }
 
 /* The seed wrote each 64 KiB chunk full of a byte derived from its position,
@@ -1816,22 +1895,6 @@ fixture_verify(void)
 	if (!page_has_tag(page, 0x66))
 		die_page("fixture branch lost its WAL-less page version",
 				 FIXTURE_WALLESS_BLOCK, page);
-	/* Only a fixture captured since this write was added carries it; an
-	 * older (legacy) capture has no block 5 on this branch at all. */
-	if (!fixture_role_legacy())
-	{
-		set_relation(ch);
-		set_timeline(ch, FIXTURE_BRANCH, incarnation);
-		ch->opcode = PS_OP_READV;
-		ch->blocknum = 5;
-		ch->nblocks = 1;
-		if (execute()->status != PS_STATUS_OK)
-			die("fixture branch read of the deleted-branch-adjacent page failed");
-		memcpy(page, ch->data, page_size);
-		if (!page_has_tag(page, 0x88))
-			die_page("fixture branch lost the page written between the "
-					 "deleted branch's tombstoned records", 5, page);
-	}
 	set_relation(ch);
 	set_timeline(ch, FIXTURE_BRANCH, incarnation);
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
@@ -1867,6 +1930,33 @@ fixture_verify(void)
 	}
 	if (timeline_state(FIXTURE_DELETED_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
 		die("fixture deleted branch is not DELETED");
+	if (fixture_capture_holes())
+		fixture_verify_holes();
+	free(page);
+}
+
+/* posix-timeline-delete-holes only: the target branch reached DELETED and
+ * stays unreadable (its two records are tombstoned holes, verified
+ * directly against the archived store's bytes by the fixture's
+ * page_segment.hole_bad_len mutation, not by this oracle). */
+static void
+fixture_verify_holes(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	if (timeline_state(FIXTURE_HOLES_TARGET_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
+		die("holes fixture: target branch is not DELETED");
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_HOLES_TARGET_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status == PS_STATUS_OK)
+		die("holes fixture: a DELETED branch still serves reads");
 	free(page);
 }
 

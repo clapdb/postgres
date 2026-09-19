@@ -118,7 +118,6 @@ OPEN_REJECTED = "open_rejected"      # the daemon refuses to open the store
 USE_REJECTED = "use_rejected"        # it opens, but the oracle or inspection fails closed
 ACCEPTED = "accepted"                # it opens and the oracle passes
 CRASHED = "daemon_crashed"           # the daemon died of a signal or exited under use; never expected
-NOT_APPLICABLE = "not_applicable"    # this fixture's store carries no file the mutation targets
 
 
 class ForeignPayload(Exception):
@@ -218,6 +217,13 @@ def truncate_to(path: Path, size: int) -> None:
     path.write_bytes(data[:size])
 
 
+def first_match(store: Path, pattern: str) -> Path:
+    matches = sorted(store.glob(pattern))
+    if not matches:
+        raise FixtureError(f"fixture has no file matching {pattern!r}")
+    return matches[0]
+
+
 def forkmeta_record_offset(path: Path, rel: int, kind: int) -> int:
     """Where one fork-size event sits in the source log, found by the relation
     and the event it records rather than by its position."""
@@ -234,6 +240,44 @@ def forkmeta_record_offset(path: Path, rel: int, kind: int) -> int:
 
 def mutation(name: str, pattern: str, apply: Callable[[Path], None], expect: str) -> dict[str, Any]:
     return {"name": name, "pattern": pattern, "apply": apply, "expect": expect}
+
+
+SEG_HOLE_MAGICS = {0x53454830, 0x53454831, 0x53454832}
+
+
+def locate_first_hole(store: Path) -> tuple[Path, int]:
+    """The (file, byte offset) of the first timeline-delete tombstone hole
+    record among every seg_* file in the store (posix-timeline-delete-holes
+    only), walking each at its records' own header sizes.  The hole's
+    segment is not necessarily the fixture's first one (other history fills
+    earlier segments), so every seg_* file is searched, in name order."""
+    for candidate in sorted(store.glob("seg_*")):
+        data = candidate.read_bytes()
+        offset = 0
+        while offset + 48 <= len(data):
+            magic = struct.unpack_from("=I", data, offset)[0]
+            header = SEG_HEADER_BYTES.get(magic)
+            if header is None:
+                break
+            if magic in SEG_HOLE_MAGICS:
+                return candidate, offset
+            length = struct.unpack_from("=I", data, offset + 40)[0]
+            offset += header + length
+    raise FixtureError(f"{store} carries no tombstone hole record in any seg_* file")
+
+
+def corrupt_hole_len(path: Path) -> None:
+    """A hole whose len no longer matches page_size: not a legitimate torn
+    write (a hole's magic is written only after its body is fully zeroed, so
+    a torn hole write always leaves the pre-tombstone magic in place, never
+    a hole magic with a wrong len), so recover() must fail closed instead of
+    skipping a guessed byte count."""
+    candidate, offset = locate_first_hole(path.parent)
+    data = bytearray(candidate.read_bytes())
+    length = struct.unpack_from("=I", data, offset + 40)[0]
+    struct.pack_into("=I", data, offset + 40,
+                     length - 8 if length >= 8 else length + 8)
+    candidate.write_bytes(data)
 
 
 # Every persisted family with a startup or read-time validation contract.
@@ -356,6 +400,11 @@ MUTATIONS = [
              lambda p: flip_byte(p, 100), OPEN_REJECTED),
     mutation("image_layer.truncated", "layer_0_*",
              lambda p: truncate_to(p, -8), OPEN_REJECTED),
+    # timeline-delete tombstone hole (page_cleanup_tombstone_segment()):
+    # posix-timeline-delete-holes only, the one fixture whose store carries
+    # a hole above its flush watermark.
+    mutation("page_segment.hole_bad_len", "seg_*",
+             corrupt_hole_len, OPEN_REJECTED),
 ]
 
 
@@ -628,20 +677,24 @@ class Daemon:
 def run_client(client: Path, shm: str, mode: str, log: Path,
                payload_identity: dict[str, Any] | None = None,
                role: str = "current",
-               workload: str = "fixture") -> subprocess.CompletedProcess[str]:
-    """Run the named client workload (``fixture`` by default);
-    ``payload_identity`` (the capturing build's on capture, the fixture's own
-    on check) tells it which WAL page magic and block size the shipped WAL
-    carries, and ``role`` which objects the oracle may find missing: only a
-    legacy fixture may predate the backend's own object payloads."""
+               holes: bool = False) -> subprocess.CompletedProcess[str]:
+    """Run the fixture workload; ``payload_identity`` (the capturing build's
+    on capture, the fixture's own on check) tells it which WAL page magic
+    and block size the shipped WAL carries, ``role`` which objects the
+    oracle may find missing (only a legacy fixture may predate the backend's
+    own object payloads), and ``holes`` (posix-timeline-delete-holes only)
+    tells the extension phase to also seed and verify its deleted-branch
+    scenario (see pagestore_gc_crash_client.c's fixture_extend_holes())."""
     env = harness.private_environment()
     if payload_identity is not None:
         env["PAGESTORE_FIXTURE_XLOG_MAGIC"] = str(int(payload_identity["xlog_page_magic"]))
         env["PAGESTORE_FIXTURE_XLOG_BLCKSZ"] = str(int(payload_identity["xlog_blcksz"]))
     env["PAGESTORE_FIXTURE_ROLE"] = role
+    if holes:
+        env["PAGESTORE_FIXTURE_DELETE_HOLES"] = "1"
     with log.open("a", encoding="utf-8") as output:
         return subprocess.run(
-            [str(client), "--shm", shm, "--mode", mode, "--workload", workload],
+            [str(client), "--shm", shm, "--mode", mode, "--workload", "fixture"],
             stdout=output, stderr=subprocess.STDOUT, text=True,
             env=env, check=False,
         )
@@ -649,10 +702,10 @@ def run_client(client: Path, shm: str, mode: str, log: Path,
 
 def verify_until(client: Path, shm: str, log: Path, timeout: float, expect_tail: bool = True,
                  payload_identity: dict[str, Any] | None = None,
-                 workload: str = "fixture") -> None:
+                 holes: bool = False) -> None:
     deadline = time.monotonic() + timeout
     while True:
-        result = run_client(client, shm, "verify", log, payload_identity, workload=workload)
+        result = run_client(client, shm, "verify", log, payload_identity, holes=holes)
         if result.returncode == 0:
             return
         if not expect_tail:
@@ -683,7 +736,11 @@ def wait_for_forkmeta_cutover(store: Path, timeout: float) -> None:
 
 def capture(args: argparse.Namespace) -> int:
     fixture = args.capture
-    workload = args.workload
+    # posix-timeline-delete-holes seeds an extra deleted-branch scenario in
+    # the extension phase (fixture_extend_holes() in
+    # pagestore_gc_crash_client.c), so its target records stay above the
+    # flush watermark in the archived store (invariant I3's D5 note).
+    holes = fixture.name == "posix-timeline-delete-holes"
     fixture.mkdir(parents=True, exist_ok=True)
     # the shipped WAL is stamped with the capturing build's page magic and
     # block size, so the fixture is one that build loads; without a build
@@ -698,18 +755,11 @@ def capture(args: argparse.Namespace) -> int:
         store.mkdir()
         log = root / "daemon.log"
         shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}"
-        # Only the "fixture" workload exercises the WAL-index snapshot
-        # cutover itself (hence its low seed-phase trigger, raised for the
-        # extend phase below); another single-phase workload wants its
-        # WAL-index bytes to stay in the live epoch log throughout.
-        seed_daemon_args = SEED_ARGS if workload == "fixture" else DAEMON_ARGS
-        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log,
-                        seed_daemon_args)
+        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log, SEED_ARGS)
         try:
             if daemon.start() != "ready":
                 raise FixtureError(f"daemon refused a fresh store; see {log}")
-            seed = run_client(args.client_binary, shm, "seed", root / "client.log", stamp,
-                              workload=workload)
+            seed = run_client(args.client_binary, shm, "seed", root / "client.log", stamp)
             if seed.returncode != 0:
                 tail = (root / "client.log").read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
                 daemon_tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
@@ -720,35 +770,32 @@ def capture(args: argparse.Namespace) -> int:
             # asynchronously; the seed oracle passes only once every family
             # settled, and the extension then lands in the settled source tail
             verify_until(args.client_binary, shm, root / "client.log", 60.0, expect_tail=False,
-                         payload_identity=stamp, workload=workload)
-            if workload == "fixture":
-                wait_for_forkmeta_cutover(store, 60.0)
+                         payload_identity=stamp)
+            wait_for_forkmeta_cutover(store, 60.0)
         finally:
             code = daemon.stop()
         if code != 0:
             raise FixtureError(f"seeding daemon did not stop cleanly: status {code}")
-        # The extension phase is specific to the "fixture" workload (fork-size
-        # events appended after the snapshot cutover, in the settled source
-        # tail); a workload with no "extend" mode of its own is done once its
-        # seed oracle settles.
-        if workload == "fixture":
-            # the extension phase runs under the configuration the fixture records
-            shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_x"
-            daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log)
-            try:
-                if daemon.start() != "ready":
-                    raise FixtureError(f"daemon refused the seeded store; see {log}")
-                extend = run_client(args.client_binary, shm, "extend", root / "client.log", stamp)
-                if extend.returncode != 0:
-                    tail = (root / "client.log").read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
-                    raise FixtureError(f"fixture extension failed: {tail!r}")
-                verify_until(args.client_binary, shm, root / "client.log", 30.0, payload_identity=stamp)
-                time.sleep(1.0)
-                verify_until(args.client_binary, shm, root / "client.log", 10.0, payload_identity=stamp)
-            finally:
-                code = daemon.stop()
-            if code != 0:
-                raise FixtureError(f"daemon did not stop cleanly: status {code}")
+        # the extension phase runs under the configuration the fixture records
+        shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_x"
+        daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log)
+        try:
+            if daemon.start() != "ready":
+                raise FixtureError(f"daemon refused the seeded store; see {log}")
+            extend = run_client(args.client_binary, shm, "extend", root / "client.log", stamp,
+                               holes=holes)
+            if extend.returncode != 0:
+                tail = (root / "client.log").read_text(encoding="utf-8", errors="replace").splitlines()[-3:]
+                raise FixtureError(f"fixture extension failed: {tail!r}")
+            verify_until(args.client_binary, shm, root / "client.log", 30.0, payload_identity=stamp,
+                        holes=holes)
+            time.sleep(1.0)
+            verify_until(args.client_binary, shm, root / "client.log", 10.0, payload_identity=stamp,
+                        holes=holes)
+        finally:
+            code = daemon.stop()
+        if code != 0:
+            raise FixtureError(f"daemon did not stop cleanly: status {code}")
         identities = format_identities(args.format_tool)
         check_segment_formats(store, identities)
         check_archived_identities(store, identities)
@@ -760,7 +807,7 @@ def capture(args: argparse.Namespace) -> int:
         "schema": 1,
         "name": fixture.name,
         "role": "current",
-        "workload": workload,
+        "workload": "fixture",
         "daemon_args": DAEMON_ARGS,
         "daemon_env": DAEMON_ENV,
         # the PostgreSQL identity of the payloads inside: a build with another
@@ -832,6 +879,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                  metadata: dict[str, Any],
                  identities: list[dict[str, Any]] | None) -> None:
     store = root / "reopen"
+    holes = fixture.name == "posix-timeline-delete-holes"
     extract(fixture, store)
     if identities is not None:
         check_segment_formats(store, identities)
@@ -848,8 +896,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                 tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-4:]
                 raise FixtureError(f"fixture reopen {generation} refused: {status}; daemon: {tail!r}")
             result = run_client(args.client_binary, shm, "verify", root / "reopen-client.log",
-                                metadata.get("payload_identity"), metadata["role"],
-                                workload=metadata.get("workload", "fixture"))
+                                metadata.get("payload_identity"), metadata["role"], holes=holes)
             if result.returncode != 0:
                 tail = (root / "reopen-client.log").read_text(
                     encoding="utf-8", errors="replace").splitlines()[-3:]
@@ -866,15 +913,9 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
 def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict[str, Any],
                  metadata: dict[str, Any]) -> str:
     store = root / "mutations" / case["name"]
+    holes = fixture.name == "posix-timeline-delete-holes"
     extract(fixture, store)
-    matches = sorted(store.glob(case["pattern"]))
-    if not matches:
-        # A narrowly-scoped fixture (a specific workload's own store, not
-        # every persisted family) carries no file some mutations target;
-        # that is not a fixture defect, only a mutation this fixture cannot
-        # exercise.
-        return NOT_APPLICABLE
-    case["apply"](matches[0])
+    case["apply"](first_match(store, case["pattern"]))
     log = root / "mutations" / f"{case['name']}.daemon.log"
     shm = f"/psfixture_{os.getpid()}_{time.monotonic_ns()}_m"
     daemon = Daemon(args.daemon_binary, args.inspect_binary, store, shm, log,
@@ -887,7 +928,7 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
             return OPEN_REJECTED
         client_log = root / "mutations" / f"{case['name']}.client.log"
         result = run_client(args.client_binary, shm, "verify", client_log,
-                            metadata.get("payload_identity"), metadata["role"])
+                            metadata.get("payload_identity"), metadata["role"], holes=holes)
         # A mutation the store repairs (a torn append-only tail) resumes the
         # transition it interrupted asynchronously, so the oracle is retried
         # while that can still land; a rejection stays a rejection.
@@ -895,7 +936,7 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
         while result.returncode != 0 and time.monotonic() < deadline and daemon.alive():
             time.sleep(0.5)
             result = run_client(args.client_binary, shm, "verify", client_log,
-                                metadata.get("payload_identity"), metadata["role"])
+                                metadata.get("payload_identity"), metadata["role"], holes=holes)
         if not daemon.alive():
             code = daemon.process.returncode if daemon.process else None
             return f"{CRASHED} (daemon exited {code} under use)"
@@ -979,10 +1020,7 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
                 outcome = run_mutation(args, root, fixture, case, metadata)
             except FixtureError as error:
                 outcome = f"error: {error}"
-            if outcome == NOT_APPLICABLE:
-                print(f"skip - {case['name']}: this fixture's store has no "
-                      f"file matching {case['pattern']!r}")
-            elif outcome == case["expect"]:
+            if outcome == case["expect"]:
                 print(f"ok   - {case['name']}: {outcome}")
             else:
                 failures += 1
@@ -1028,11 +1066,6 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--capture", type=Path, metavar="FIXTURE_DIR")
     group.add_argument("--check", type=Path, nargs="+", metavar="FIXTURE_DIR")
-    parser.add_argument("--workload", default="fixture",
-                        help="--capture only: the client workload to seed the fixture "
-                             "with (default: fixture, the comprehensive persisted-family "
-                             "workload). A --check reads the workload each fixture "
-                             "recorded at capture time instead.")
     parser.add_argument("--daemon-binary", type=Path, required=True)
     parser.add_argument("--client-binary", type=Path, required=True)
     parser.add_argument("--inspect-binary", type=Path, required=True)
