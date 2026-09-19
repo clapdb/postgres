@@ -10,7 +10,9 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_fault.h"
 #include "pagestore_forkmeta_snapshot.h"
+#include "pagestore_manifest.h"
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
 
@@ -33,6 +35,10 @@ static int failed;
 #define TEST_SEG_WALLESS_ORDERED_MAGIC 0x53454731U
 #define TEST_SEG_CLAMPED_ORDERED_MAGIC 0x53454733U
 #define TEST_SEG_WALLESS_BOUND_MAGIC 0x53454734U
+#define TEST_SEG_MAGIC 0x53454732U
+#define TEST_SEG_HOLE48_MAGIC 0x53454830U
+#define TEST_SEG_HOLE56_MAGIC 0x53454831U
+#define TEST_SEG_HOLE64_MAGIC 0x53454832U
 #define TEST_MAX_TIMELINES 1024
 
 typedef struct TestForkMetaRecV1
@@ -1137,20 +1143,16 @@ test_deletion_filtered_forkmeta_impl(int commit_shape)
 		check(count_occurrences(captured, "retiring tail at offset") == 0 &&
 			  count_occurrences(captured, "refusing unmatched ordered record") == 0,
 			  "commit-shape reopen logs no segment-tail retirement and no refusal");
-		/* F3 mitigation, not the fix: at least one orphan is adopted here.
-		 * The open follow-up (RELEASE_VALIDATION.md, invariant I3) must
-		 * tighten this to == 0 once page_cleanup_rewrite_segment() stops
-		 * dropping live identities out from under the durable watermark.
-		 * This still adopts under the segment path's stricter, torn-append-
-		 * safe rule (R2-F1) because the pruned survivor here is genuinely
-		 * followed by other complete, acknowledged records in the same
-		 * segment (the sibling's later same-block/@200 writes and the
-		 * survivor accounting below) -- exactly the proof
-		 * test_torn_commit_append_never_adopted() shows is missing for an
-		 * actually-torn record, which stays retired regardless of lifetime. */
-		check(count_occurrences(captured, "adopting orphaned ordered") >= 1,
-			  "F3 mitigation: reopen adopts at least one orphan instead of "
-			  "silently losing the rescanned records");
+		/* Invariant I3: page_cleanup_tombstone_segment() tombstones a target
+		 * record in place instead of relocating survivors, so it never
+		 * rebases the flush watermark and never creates a rescan region.  A
+		 * pruned survivor's segment record therefore stays below the
+		 * watermark, is never rescanned, and reopen needs no adoption at
+		 * all -- unlike the pre-fix rewrite, which moved bytes and forced
+		 * exactly this to be a mitigation rather than the fix. */
+		check(count_occurrences(captured, "adopting orphaned ordered") == 0,
+			  "invariant I3: reopen adopts no orphan; the pruned survivor's "
+			  "record is never rescanned");
 	}
 	else
 		check(ps_core_open(store) == 0,
@@ -1164,15 +1166,19 @@ test_deletion_filtered_forkmeta_impl(int commit_shape)
 	check(meta_request_timeline(2, PS_OP_NBLOCKS, &sibling_key, 0, 0, 0, 0,
 								 &reply) && reply.result == 1,
 		  "live sibling metadata resolves after restart");
-	/* F3 (RELEASE_VALIDATION.md, open): fork_meta_snapshot_build() can
-	 * degrade or drop a marker whose page version was pruned from memory
-	 * while its segment record survives; a later timeline-delete rewrite
-	 * (page_cleanup_rewrite_segment(), driven by the target-timeline drops
-	 * above) rebases the flush watermark to (seg, 0), so the next open
-	 * rescans the whole segment and meets that now-orphaned record.  On the
-	 * unmodified core this silently loses the pinned sibling version at LSN
-	 * 200 (read_resolve_version returns rc 0); the generalized adoption rule
-	 * (F2) mitigates it into a logged pruning reversal instead. */
+	/* F3/Q1 (RELEASE_VALIDATION.md, resolved): fork_meta_snapshot_build()
+	 * can degrade or drop a marker whose page version was pruned from
+	 * memory while its segment record survives.  Before the fix, a later
+	 * timeline-delete rewrite (page_cleanup_rewrite_segment()) relocated
+	 * survivors and rebased the flush watermark to (seg, 0), so the next
+	 * open rescanned the whole segment and met that now-orphaned record
+	 * (silently losing it -- read_resolve_version returned rc 0) or,
+	 * incidentally, the generalized adoption rule turned it into a logged
+	 * pruning reversal.  Invariant I3 (page_cleanup_tombstone_segment()):
+	 * segment bytes never move and the watermark never retreats, so this
+	 * pruned survivor's record stays below the watermark and is never
+	 * rescanned at all -- it is simply still there, unreplayed, exactly as
+	 * before the deletion. */
 	{
 		unsigned char verpage[8192];
 		uint64_t	ver = 0,
@@ -1180,8 +1186,8 @@ test_deletion_filtered_forkmeta_impl(int commit_shape)
 
 		check(read_resolve_version(2, &sibling_key, 0, UINT64_MAX, 0, verpage,
 								   &ver, &rseq) == 1 && ver == 200,
-			  "F3 mitigation: the pinned sibling version at LSN 200 survives "
-			  "the timeline-delete rewrite and watermark rebase");
+			  "invariant I3: the pinned sibling version at LSN 200 survives "
+			  "the timeline-delete tombstone pass untouched");
 	}
 	close_runtime();
 	remove_tree(store);
@@ -3415,6 +3421,662 @@ test_artifact_write_unfenced_after_pin_drop(void)
 	remove_tree(store);
 }
 
+/*
+ * ---- T1: the hole record format and its readers ----
+ *
+ * A hole is written only by page_cleanup_tombstone_segment(); these tests
+ * hand-craft one directly with the low-level storage ops (as
+ * test_v1_bound_marker_snapshot() does for legacy bodies above) to test the
+ * reader in isolation from the writer: recover() must skip a well-formed
+ * hole between two live records without observing anything in it, and must
+ * fail closed on one whose len does not match page_size.
+ */
+static void
+test_hole_record_skipped_on_reopen(void)
+{
+	char		store[] = "/tmp/psforkmetaholeXXXXXX";
+	PsKey		before_key = {9, 9, 101, 0, PS_KLASS_RELATION};
+	PsKey		hole_key = {9, 9, 102, 0, PS_KLASS_RELATION};
+	PsKey		after_key = {9, 9, 103, 0, PS_KLASS_RELATION};
+	TestSegRecHdr before_hdr;
+	TestSegRecHdr hole_hdr;
+	TestSegRecHdr after_hdr;
+	unsigned char page[8192];
+	unsigned char pages[3][8192];
+	char		captured[16384];
+	int64_t		seg_off;
+	uint64_t	offsets[3];
+	int			rc = -1;
+
+	check(mkdtemp(store) != NULL, "create hole-record store");
+	check(ps_core_open(store) == 0, "bootstrap hole-record store");
+	close_runtime();
+	memset(&before_hdr, 0, sizeof(before_hdr));
+	before_hdr.magic = TEST_SEG_MAGIC;
+	before_hdr.timeline = 0;
+	before_hdr.key = before_key;
+	before_hdr.len = sizeof(page);
+	before_hdr.lsn = 500;
+	memset(&hole_hdr, 0, sizeof(hole_hdr));
+	hole_hdr.magic = TEST_SEG_HOLE48_MAGIC;
+	hole_hdr.timeline = 0;
+	hole_hdr.key = hole_key;
+	hole_hdr.len = sizeof(page);	/* well-formed: matches page_size */
+	hole_hdr.lsn = 999;
+	memset(&after_hdr, 0, sizeof(after_hdr));
+	after_hdr.magic = TEST_SEG_MAGIC;
+	after_hdr.timeline = 0;
+	after_hdr.key = after_key;
+	after_hdr.len = sizeof(page);
+	after_hdr.lsn = 600;
+	memset(pages, 0, sizeof(pages));
+	pages[0][128] = 0xa1;
+	/* pages[1] (the hole's body) stays zero -- a hole's body is never read */
+	pages[2][128] = 0xb2;
+	check(PsStoragePosix.open(store, segment_size) == 0,
+		  "open low-level storage for hand-crafted hole store");
+	seg_off = PsStoragePosix.seg_size(0, 0);
+	offsets[0] = seg_off >= 0 ? (uint64_t) seg_off : 0;
+	check((offsets[1] = offsets[0] + sizeof(before_hdr) + sizeof(page), 1) &&
+		  (offsets[2] = offsets[1] + sizeof(hole_hdr) + sizeof(page), 1) &&
+		  PsStoragePosix.seg_write(0, 0, offsets[0], &before_hdr,
+								 sizeof(before_hdr)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[0] + sizeof(before_hdr),
+								 pages[0], sizeof(page)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[1], &hole_hdr,
+								 sizeof(hole_hdr)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[1] + sizeof(hole_hdr),
+								 pages[1], sizeof(page)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[2], &after_hdr,
+								 sizeof(after_hdr)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[2] + sizeof(after_hdr),
+								 pages[2], sizeof(page)) == 0 &&
+		  PsStoragePosix.sync() == 0,
+		  "install a well-formed hole by hand between two live records");
+	PsStoragePosix.close();
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) &&
+		  rc == 0, "reopen with a hand-crafted hole between two live records");
+	check(count_occurrences(captured, "retiring tail at offset") == 0 &&
+		  count_occurrences(captured, "refusing unmatched ordered record") == 0 &&
+		  count_occurrences(captured, "adopting orphaned ordered") == 0 &&
+		  count_occurrences(captured, "incompatible record magic") == 0,
+		  "the hole logs no diagnostic and does not interrupt the scan");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &before_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0xa1,
+		  "the record before the hole is served");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &after_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0xb2,
+		  "the record after the hole is served");
+	check(read_resolve(0, &hole_key, 0, UINT64_MAX, 0, page, NULL) == 0,
+		  "the hole itself contributes no version");
+	close_runtime();
+	remove_tree(store);
+}
+
+static void
+test_hole_record_bad_len_rejected(void)
+{
+	char		store[] = "/tmp/psforkmetaholebadlenXXXXXX";
+	PsKey		before_key = {9, 9, 111, 0, PS_KLASS_RELATION};
+	PsKey		hole_key = {9, 9, 112, 0, PS_KLASS_RELATION};
+	TestSegRecHdr before_hdr;
+	TestSegRecHdr hole_hdr;
+	unsigned char page[8192];
+	unsigned char pages[2][8192];
+	int64_t		seg_off;
+	uint64_t	offsets[2];
+
+	check(mkdtemp(store) != NULL, "create bad-len hole store");
+	check(ps_core_open(store) == 0, "bootstrap bad-len hole store");
+	close_runtime();
+	memset(&before_hdr, 0, sizeof(before_hdr));
+	before_hdr.magic = TEST_SEG_MAGIC;
+	before_hdr.timeline = 0;
+	before_hdr.key = before_key;
+	before_hdr.len = sizeof(page);
+	before_hdr.lsn = 700;
+	memset(&hole_hdr, 0, sizeof(hole_hdr));
+	hole_hdr.magic = TEST_SEG_HOLE48_MAGIC;
+	hole_hdr.timeline = 0;
+	hole_hdr.key = hole_key;
+	hole_hdr.len = sizeof(page) - 8;	/* corrupt: must equal page_size */
+	hole_hdr.lsn = 999;
+	memset(pages, 0, sizeof(pages));
+	pages[0][128] = 0xc3;
+	check(PsStoragePosix.open(store, segment_size) == 0,
+		  "open low-level storage for bad-len hole store");
+	seg_off = PsStoragePosix.seg_size(0, 0);
+	offsets[0] = seg_off >= 0 ? (uint64_t) seg_off : 0;
+	check((offsets[1] = offsets[0] + sizeof(before_hdr) + sizeof(page), 1) &&
+		  PsStoragePosix.seg_write(0, 0, offsets[0], &before_hdr,
+								 sizeof(before_hdr)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[0] + sizeof(before_hdr),
+								 pages[0], sizeof(page)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[1], &hole_hdr,
+								 sizeof(hole_hdr)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[1] + sizeof(hole_hdr),
+								 pages[1], sizeof(page)) == 0 &&
+		  PsStoragePosix.sync() == 0,
+		  "install a hole with a wrong len by hand");
+	PsStoragePosix.close();
+	check(expect_open_failure(store),
+		  "a hole whose len does not match page_size fails startup closed");
+	remove_tree(store);
+}
+
+/*
+ * ---- T2: page_cleanup_tombstone_segment() keeps every survivor's offset ----
+ *
+ * Folds $SP/f3/q1_test.c's three variants (crash right after the tombstone
+ * pass, crash after one more flush, and a clean close after one more flush)
+ * into one test.  On the pre-fix rewrite path this reproduces Q1: a survivor
+ * flushed before the deletion and appended again afterward becomes
+ * unreadable (variants 1 and 2), because the rewrite relocates it and
+ * rebases the flush watermark past both its old and new offsets.  Under
+ * tombstoning no offset ever moves, so every variant serves every survivor.
+ */
+static void
+test_timeline_delete_keeps_offsets_variant(int variant)
+{
+	char		store[] = "/tmp/psq1XXXXXX";
+	char		seg0[1200];
+	char		size_marker[1200];
+	char		snapshots[1024];
+	char		manifest[1200];
+	char		captured[16384];
+	PsKey		target_key = {12, 12, 1, 0, PS_KLASS_RELATION};
+	PsKey		sibling_key = {12, 12, 2, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t	seq = 0;
+	off_t		size_before, size_after_tombstone;
+	PsFlushWatermark watermark_before = {0};
+	PsFlushWatermark watermark_after = {0};
+	int			have_watermark_before;
+	pid_t		pid;
+	int			status;
+	int			rc = -1;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create Q1 offsets-kept store");
+	n = snprintf(seg0, sizeof(seg0), "%s/seg_00000000", store);
+	check(n > 0 && (size_t) n < sizeof(seg0), "build Q1 seg0 path");
+	n = snprintf(size_marker, sizeof(size_marker),
+				 "%s/.test_size_after_tombstone", store);
+	check(n > 0 && (size_t) n < sizeof(size_marker),
+		  "build Q1 size-marker path");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots), "build Q1 snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "build Q1 manifest path");
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "open Q1 offsets-kept store");
+	check(create_branch_request(1, 0, 1) && create_branch_request(2, 0, 1),
+		  "create Q1 target and sibling timelines");
+	check(meta_request_timeline(1, PS_OP_CREATE, &target_key, 100, 0, 0, 0, NULL) &&
+		  meta_request_timeline(2, PS_OP_CREATE, &sibling_key, 100, 0, 0, 0, NULL),
+		  "create Q1 target and sibling fork metadata");
+	for (uint32_t b = 0; b < 6; b++)
+		check(append_relation_timeline(1, &target_key, b, 100 + b, page, &seq) == 0,
+			  "write target page into the shared segment");
+	/* survivors after the target bytes in the same segment: a plain
+	 * versioned page and a WAL-less (ordered) page. */
+	check(append_relation_timeline(2, &sibling_key, 0, 200, page, &seq) == 0,
+		  "write plain survivor page after the target bytes");
+	check(append_relation_timeline(2, &sibling_key, 1, 0, page, &seq) == 0,
+		  "write ordered survivor page after the target bytes");
+	have_watermark_before =
+		ps_manifest_get_flush_watermark(0, &watermark_before);
+	size_before = file_size(seg0);
+	check(size_before > 0, "shared segment has bytes before deletion");
+	close_runtime();
+
+	pid = fork();
+	if (pid == 0)
+	{
+		PsTimelineState state = (PsTimelineState) -1;
+		int			deleted = 0;
+
+		flush_pages = 1;
+		if (ps_core_open(store) != 0)
+			_exit(10);
+		if (!begin_delete_timeline(1))
+			_exit(11);
+		for (int i = 0; i < 400; i++)
+		{
+			(void) ps_core_maintenance();
+			if (ps_timeline_state(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+			{
+				deleted = 1;
+				break;
+			}
+			usleep(50000);
+		}
+		if (!deleted)
+			_exit(12);
+		/* Measure the segment right after the tombstone pass, before any
+		 * further legitimate append can legitimately grow it, and hand the
+		 * value to the parent (a fork does not share stdout state). */
+		{
+			off_t		sz = file_size(seg0);
+			FILE	   *marker = sz >= 0 ? fopen(size_marker, "w") : NULL;
+
+			if (marker == NULL || fprintf(marker, "%lld", (long long) sz) < 0 ||
+				fclose(marker) != 0)
+				_exit(14);
+		}
+		if (variant >= 1)
+		{
+			/* one more append: with the pre-fix rewrite this is the flush that
+			 * moves the watermark past the survivors' new offsets but below
+			 * their stale ones -- the Q1 loss window. */
+			uint64_t	extra_seq = 0;
+
+			if (append_relation_timeline(2, &sibling_key, 2, 300, page,
+										 &extra_seq) != 0)
+				_exit(13);
+		}
+		if (variant == 2)
+		{
+			close_runtime();
+			_exit(0);
+		}
+		_exit(0);
+	}
+	check(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		  WEXITSTATUS(status) == 0,
+		  "Q1 child scenario ran to completion");
+
+	flush_pages = 1;
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) &&
+		  rc == 0, "Q1 crash-restart opens");
+	check(count_occurrences(captured, "retiring tail") == 0 &&
+		  count_occurrences(captured, "refusing unmatched") == 0 &&
+		  count_occurrences(captured, "adopting orphaned") == 0,
+		  "Q1 reopen needs no retire/refuse/adopt");
+	{
+		FILE	   *marker = fopen(size_marker, "r");
+		long long	value = -1;
+
+		check(marker != NULL && fscanf(marker, "%lld", &value) == 1,
+			  "Q1 child reported the post-tombstone segment size");
+		if (marker != NULL)
+			fclose(marker);
+		size_after_tombstone = (off_t) value;
+	}
+	check(size_before == size_after_tombstone,
+		  "the shared segment's byte size right after the tombstone pass is "
+		  "unchanged from before the deletion (holes keep bytes, nothing "
+		  "was rewritten)");
+	check(ps_manifest_get_flush_watermark(0, &watermark_after) ==
+			  have_watermark_before &&
+		  (!have_watermark_before ||
+		   watermark_after.seg_id > watermark_before.seg_id ||
+		   (watermark_after.seg_id == watermark_before.seg_id &&
+			watermark_after.seg_off >= watermark_before.seg_off)),
+		  "the shard flush watermark never retreats");
+	{
+		uint64_t	ver = 0,
+					rseq = 0;
+
+		memset(page, 0, sizeof(page));
+		rc = read_resolve_version(2, &sibling_key, 0, UINT64_MAX, 0, page,
+								  &ver, &rseq);
+		check(rc == 1 && ver == 200,
+			  "plain survivor block 0 serves LSN 200 after crash-restart");
+		rc = read_resolve_version(2, &sibling_key, 1, UINT64_MAX, 0, page,
+								  &ver, &rseq);
+		check(rc == 1,
+			  "ordered (WAL-less) survivor block 1 readable after crash-restart");
+	}
+	{
+		PsChannel	reply;
+
+		check(meta_request_timeline(2, PS_OP_NBLOCKS, &sibling_key, 0, 0, 0, 0,
+									 &reply) &&
+			  reply.result == (uint64_t) (variant >= 1 ? 3 : 2),
+			  "NBLOCKS intact");
+	}
+	check(append_growth_batch(3100, 900) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "Q1 cutover after crash-restart");
+	check(snapshot_ordered_marker_count(snapshots, &sibling_key, 0, 0) == 1,
+		  "ordered survivor's marker count is 1 after a forced cutover");
+	close_runtime();
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  read_resolve_version(2, &sibling_key, 1, UINT64_MAX, 0, page, NULL,
+							   NULL) == 1,
+		  "clean reopen still serves the ordered survivor");
+	close_runtime();
+	remove_tree(store);
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+}
+
+static void
+test_timeline_delete_keeps_offsets(void)
+{
+	test_timeline_delete_keeps_offsets_variant(0);
+	test_timeline_delete_keeps_offsets_variant(1);
+	test_timeline_delete_keeps_offsets_variant(2);
+}
+
+/*
+ * After the survivors are flushed and the target is fully tombstoned, the
+ * segment holding only holes plus covered survivors is reclaimed the same
+ * way any other fully-covered segment is: by segment GC once the watermark
+ * moves past it.
+ */
+static void
+test_timeline_delete_reclaims_by_segment_gc(void)
+{
+	char		store[] = "/tmp/psq1gcXXXXXX";
+	char		seg0[1200];
+	PsKey		target_key = {13, 13, 1, 0, PS_KLASS_RELATION};
+	PsKey		sibling_key = {13, 13, 2, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t	seq = 0;
+	PsTimelineState state = (PsTimelineState) -1;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create segment-GC reclaim store");
+	n = snprintf(seg0, sizeof(seg0), "%s/seg_00000000", store);
+	check(n > 0 && (size_t) n < sizeof(seg0), "build segment-GC seg0 path");
+	segment_size = 65536;
+	flush_pages = 1;
+	segment_gc_enabled = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "open segment-GC reclaim store");
+	check(create_branch_request(1, 0, 1) && create_branch_request(2, 0, 1),
+		  "create target and sibling timelines for segment-GC test");
+	check(meta_request_timeline(1, PS_OP_CREATE, &target_key, 100, 0, 0, 0,
+								 NULL) &&
+		  meta_request_timeline(2, PS_OP_CREATE, &sibling_key, 100, 0, 0, 0,
+								 NULL),
+		  "create target and sibling fork metadata for segment-GC test");
+	for (uint32_t b = 0; b < 3; b++)
+		check(append_relation_timeline(1, &target_key, b, 100 + b, page,
+									   &seq) == 0,
+			  "write target page into segment 0");
+	check(append_relation_timeline(2, &sibling_key, 0, 200, page, &seq) == 0,
+		  "write surviving sibling page into segment 0");
+	check(access(seg0, F_OK) == 0, "segment 0 exists before deletion");
+	check(begin_delete_timeline(1), "begin target deletion for segment-GC test");
+	for (int i = 0; i < 400; i++)
+	{
+		(void) ps_core_maintenance();
+		if (ps_timeline_state(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+			break;
+		usleep(50000);
+	}
+	check(state == PS_TIMELINE_DELETED, "target deletion completes");
+	/* Push the append cursor, and the flush watermark behind it, into a
+	 * later segment: only once segment 0 is fully below the watermark can
+	 * segment GC reclaim it (it never reclaims the boundary segment). */
+	for (uint32_t b = 2; b < 40; b++)
+		check(append_relation_timeline(2, &sibling_key, b, 400 + b, page,
+									   &seq) == 0,
+			  "grow the surviving sibling past segment 0");
+	check(run_maintenance_until(seg0, 0),
+		  "segment 0 (holes and covered survivors alike) is reclaimed by "
+		  "segment GC");
+	check(read_resolve_version(2, &sibling_key, 0, UINT64_MAX, 0, page, NULL,
+							   NULL) == 1,
+		  "the covered survivor is still served from its image layer "
+		  "after its segment is gone");
+	close_runtime();
+	remove_tree(store);
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+	segment_size = 8 * 1024 * 1024;
+}
+
+/*
+ * ---- T3: a compaction publish never removes a version above the watermark ----
+ *
+ * page_remove_compacted_versions() runs only for versions a compaction
+ * publish actually dropped, which is exactly the covered (already-flushed)
+ * prefix -- a memtable-resident (unflushed) version can never be one of
+ * them.  This drives a real compaction (compact_layers = 1: two flushed
+ * layers of the same block trigger a merge that prunes the older,
+ * now-superseded version) and then leaves one more revision unflushed in
+ * the memtable, asserting it still resolves -- a cassert build additionally
+ * trips the invariant check in page_remove_compacted_versions() itself
+ * (~4820) if a pruned version's segment record were ever at or after the
+ * watermark, which every other test in this binary already exercises on
+ * every compaction they trigger.
+ */
+static void
+test_compaction_never_prunes_above_watermark(void)
+{
+	char		store[] = "/tmp/psforkmetawatermarkXXXXXX";
+	PsKey		key = {22, 22, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t	seq = 0;
+
+	check(mkdtemp(store) != NULL, "create I3 watermark-prune store");
+	compact_layers = 1;
+	flush_pages = 1;
+	check(ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
+		  "open I3 watermark-prune store and create fork");
+	/* Two flushed, same-LSN revisions: compact_layers = 1 makes the second
+	 * flush's publish merge past the first, superseded layer and drop its
+	 * now-covered version from memory (page_remove_compacted_versions()). */
+	check(append_relation_tag(&key, 0, 50, page, 0x01, &seq) == 0 &&
+		  append_relation_tag(&key, 0, 50, page, 0x02, &seq) == 0,
+		  "flush two revisions so compaction prunes the superseded one");
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x02,
+		  "compaction publish leaves the newest flushed revision readable");
+	/* Now leave a third revision unflushed in the memtable: raise the
+	 * threshold so append_page's own "memtable full" flush never fires. */
+	flush_pages = 1000000;
+	check(append_relation_tag(&key, 0, 50, page, 0x03, &seq) == 0,
+		  "write a revision that stays memtable-resident, unflushed");
+	/* Give maintenance a few turns: if anything ever tried to treat the
+	 * memtable-resident version as compaction's business, it would either
+	 * assert (cassert build) or silently vanish here. */
+	for (int i = 0; i < 5; i++)
+		(void) ps_core_maintenance();
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x03,
+		  "invariant I3: the unflushed memtable-resident revision survives "
+		  "in memory, untouched by compaction pruning");
+	close_runtime();
+	remove_tree(store);
+	compact_layers = 0;
+	flush_pages = 1;
+}
+
+/*
+ * ---- T5: crash matrix around the tombstone probes ----
+ *
+ * A segment laid out as [survivor A, pruned from memory by a prior
+ * compaction] [target records] [survivor B, live] [one more target record],
+ * crashed at PS_FAULT_POINT_TIMELINE_DELETE_MID_SEGMENT_TOMBSTONE (after the
+ * first hole of the segment, before the rest) and at
+ * PS_FAULT_POINT_TIMELINE_DELETE_AFTER_SEGMENT_TOMBSTONE (after the whole
+ * segment's holes are synced, before the DELETED transition).  Both must
+ * reopen with zero adoption/retire/refuse lines, deletion must resume and
+ * reach DELETED, and both survivors must still resolve -- survivor A because
+ * its record was always below the watermark and is never rescanned
+ * (invariant I3), survivor B because its bytes never moved.
+ */
+static int
+crash_matrix_configure_fault(const char *store, const char *fault_dir,
+							 const char *name)
+{
+	return setenv("PAGESTORE_TEST_FAULT_NAME", name, 1) == 0 &&
+		setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) == 0 &&
+		setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) == 0 &&
+		setenv("PAGESTORE_TEST_FAULT_DIR", fault_dir, 1) == 0 &&
+		ps_fault_init(store) == 0;
+}
+
+static int
+crash_matrix_arm_fault(const char *fault_dir)
+{
+	char		path[1600];
+	int			fd;
+
+	if (snprintf(path, sizeof(path), "%s/arm", fault_dir) < 0)
+		return 0;
+	fd = open(path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return 0;
+	return close(fd) == 0;
+}
+
+static void
+test_timeline_delete_crash_matrix_case(const char *fault_name)
+{
+	char		store[] = "/tmp/psforkmetacrashXXXXXX";
+	char		fault_dir[] = "/tmp/psforkmetacrashctlXXXXXX";
+	char		snapshots[1024];
+	char		frontier[1200];
+	char		captured[16384];
+	PsKey		survivor_a_key = {21, 21, 1, 0, PS_KLASS_RELATION};
+	PsKey		survivor_b_key = {21, 21, 2, 0, PS_KLASS_RELATION};
+	PsKey		target_key = {21, 21, 3, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t	seq = 0;
+	PsRetentionPin pin;
+	pid_t		pid;
+	int			status;
+	int			rc = -1;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create crash-matrix store");
+	check(mkdtemp(fault_dir) != NULL, "create crash-matrix fault control dir");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build crash-matrix snapshot path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build crash-matrix frontier path");
+	flush_pages = 1;
+	compact_layers = 2;
+	segment_gc_enabled = 0;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "open crash-matrix store");
+	check(create_branch_request(1, 0, 1) && create_branch_request(2, 0, 1),
+		  "create crash-matrix target and sibling timelines");
+	/* survivor A: several same-LSN ordered revisions of one block, so the
+	 * earlier ones become prunable once compaction publishes past them --
+	 * the exact shape test_reclaimed_ordered_markers_pruned() uses. */
+	for (int i = 0; i < 6; i++)
+		check(append_relation_timeline(2, &survivor_a_key, 0, 50, page,
+									   &seq) == 0,
+			  "write survivor A's prunable ordered revisions");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 2;
+	pin.owner_kind = 1;
+	pin.owner_id = 210;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.lsn = 200;
+	pin.admission_seq = seq;
+	check(seq != 0 && ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "compact and prune survivor A's earlier revisions from memory");
+	/* target records, then survivor B (live, ordered), then one more target
+	 * record -- all appended after survivor A in the same segment. */
+	for (uint32_t b = 0; b < 4; b++)
+		check(append_relation_timeline(1, &target_key, b, 100 + b, page,
+									   &seq) == 0,
+			  "write target records after the pruned survivor");
+	check(append_relation_timeline(2, &survivor_b_key, 0, 0, page, &seq) == 0,
+		  "write live survivor B between target records");
+	check(append_relation_timeline(1, &target_key, 4, 104, page, &seq) == 0,
+		  "write the trailing target record after survivor B");
+	close_runtime();
+
+	pid = fork();
+	if (pid == 0)
+	{
+		int			i;
+
+		flush_pages = 1;
+		compact_layers = 2;
+		segment_gc_enabled = 0;
+		if (!crash_matrix_configure_fault(store, fault_dir, fault_name))
+			_exit(20);
+		if (ps_core_open(store) != 0)
+			_exit(21);
+		if (!begin_delete_timeline(1))
+			_exit(22);
+		if (!crash_matrix_arm_fault(fault_dir))
+			_exit(23);
+		for (i = 0; i < 400; i++)
+		{
+			(void) ps_core_maintenance();
+			usleep(20000);
+		}
+		/* The fault should have fired (_exit(PS_FAULT_CRASH_EXIT)) well
+		 * before this loop exhausts; reaching here means it never did. */
+		_exit(24);
+	}
+	check(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		  WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT,
+		  "crash-matrix child crashed exactly at the armed tombstone probe");
+
+	flush_pages = 1;
+	compact_layers = 2;
+	segment_gc_enabled = 0;
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) &&
+		  rc == 0, "crash-matrix reopen after the armed probe");
+	check(count_occurrences(captured, "retiring tail") == 0 &&
+		  count_occurrences(captured, "refusing unmatched") == 0 &&
+		  count_occurrences(captured, "adopting orphaned") == 0,
+		  "crash-matrix reopen needs no retire/refuse/adopt");
+	{
+		PsTimelineState state = (PsTimelineState) -1;
+		int			deleted = 0;
+
+		for (int i = 0; i < 400 && !deleted; i++)
+		{
+			(void) ps_core_maintenance();
+			if (ps_timeline_state(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+				deleted = 1;
+			else
+				usleep(20000);
+		}
+		check(deleted, "deletion resumes and reaches DELETED after the crash");
+	}
+	{
+		uint64_t	ver = 0;
+
+		memset(page, 0, sizeof(page));
+		check(read_resolve_version(2, &survivor_a_key, 0, UINT64_MAX, 0, page,
+								   &ver, NULL) == 1 && ver == 50,
+			  "the pruned survivor A resolves after the crash (never rescanned)");
+		memset(page, 0, sizeof(page));
+		check(read_resolve_version(2, &survivor_b_key, 0, UINT64_MAX, 0, page,
+								   &ver, NULL) == 1,
+			  "the live survivor B resolves after the crash");
+	}
+	close_runtime();
+	remove_tree(store);
+	rmdir(fault_dir);
+	unsetenv("PAGESTORE_TEST_FAULT_NAME");
+	unsetenv("PAGESTORE_TEST_FAULT_ACTION");
+	unsetenv("PAGESTORE_TEST_FAULT_HIT");
+	unsetenv("PAGESTORE_TEST_FAULT_DIR");
+	ps_fault_reset();
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+	compact_layers = 0;
+}
+
+static void
+test_timeline_delete_crash_matrix(void)
+{
+	test_timeline_delete_crash_matrix_case("timeline_delete.mid_segment_tombstone");
+	test_timeline_delete_crash_matrix_case("timeline_delete.after_segment_tombstone");
+}
+
 int
 main(void)
 {
@@ -3998,6 +4660,12 @@ main(void)
 	test_artifact_generation_vs_cutoff();
 	test_artifact_forkmeta_cutoff_reason();
 	test_artifact_write_unfenced_after_pin_drop();
+	test_hole_record_skipped_on_reopen();
+	test_hole_record_bad_len_rejected();
+	test_timeline_delete_keeps_offsets();
+	test_timeline_delete_reclaims_by_segment_gc();
+	test_compaction_never_prunes_above_watermark();
+	test_timeline_delete_crash_matrix();
 	if (!failed)
 		remove_tree(store);
 	else
