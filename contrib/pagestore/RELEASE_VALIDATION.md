@@ -381,22 +381,23 @@ covers the block AND (residency on the image-layer path, or a following
 complete record in the same segment on the segment-suffix path) (commit
 class); every other unmatched ordered record is refused (layer prefix) or
 retires the segment tail (segment suffix), with a logged tuple either way.**
-A store written entirely by the fixed live path exercises this rule only
-through the F3 path below, never through its own writes -- it does not
-"never need the adoption rule": it needs it if and only if F3 fires. See
-"Open: pruned ordered marker rescanned after a timeline-delete rewrite (F3)"
-below.
+A store written entirely by the fixed timeline-delete path (invariant I3:
+segment bytes are immutable once written, so a rescan region is never
+created) needs the adoption rule only for a store that deleted a timeline
+before that fix -- see "Resolved: pruned ordered marker rescanned after a
+timeline-delete rewrite (F3)" below.
 
 `integration_test.sh` now stops every cluster and daemon it started, then
 starts a fresh daemon against the same retained store and asserts it reopens
 independently, with `ok - retained store reopens independently after clean
-shutdown`, `ok - no orphaned ordered records were adopted on reopen` (the F3
-detector: nonzero means F3 fired during this run and needs investigation, not
-a retry), `ok - no segment tail was retired on reopen`, and `ok - no ordered
-record was refused on reopen` (both unconditionally fatal: the adoption rule
-is supposed to turn every reachable case of either into a logged adoption
-instead). Independent reopen of the full integration store is now part of the
-script's PASS, not a separate manual step.
+shutdown`, `ok - no orphaned ordered records were adopted on reopen` (invariant
+I3: a fixed daemon's store never needs adoption, so nonzero here means either
+a pre-fix deletion or a regression and needs investigation, not a retry),
+`ok - no segment tail was retired on reopen`, and `ok - no ordered record was
+refused on reopen` (both unconditionally fatal: the adoption rule is supposed
+to turn every reachable case of either into a logged adoption instead).
+Independent reopen of the full integration store is now part of the script's
+PASS, not a separate manual step.
 
 Reproduce with `KEEPTMP=1 contrib/pagestore/integration_test.sh <build>`, then
 start `<build>/contrib/pagestore/pagestore_daemon` on the reported retained
@@ -604,9 +605,11 @@ and are now resolved.
   admission gate -- specifically to exercise the theoretical gap) in
   `pagestore_forkmeta_cutover_test.c`.
 
-## Open: pruned ordered marker rescanned after a timeline-delete rewrite (F3)
+## Resolved: pruned ordered marker rescanned after a timeline-delete rewrite (F3)
 
-**Release blocking.** Found during independent review of the fix above.
+**Root cause.** The deletion rewrite moved bytes and retreated (rebased) the
+watermark; everything below followed from that. Found during independent
+review of the fix above.
 Mechanism, confirmed from the code (not yet from a synthetic worst-case
 reproduction beyond the regression tests below):
 
@@ -633,11 +636,32 @@ reproduction beyond the regression tests below):
   strictly better than discarding every record after it in the segment, but
   it is still stale data resurfacing, not the invariant holding.
 
-**Invariant I3** (the one a follow-up must restore): a page version is removed
-from memory only while its segment record is, and remains, below the durable
-flush watermark; equivalently, every record a recovery rescan can encounter
-has a live in-memory identity, and therefore a retained marker. The deletion
-rewrite's watermark rebase-to-zero violates the "remains" half.
+**Q1 -- silent loss of acknowledged data, no crash required.** The same
+rewrite has a second, worse consequence than F3's rescanned marker. Image
+index entries of layers published *before* the rewrite still carry
+survivors' old, higher offsets. Once any later flush moves the watermark
+past the survivors' new (relocated, lower) offsets but not their stale
+(pre-rewrite) ones, a survivor is covered by neither: its stale layer offset
+is above the new watermark ("not covered", so `recover_layer_prefix()` skips
+it), and its true offset is below the watermark (so `recover()`'s rescan
+never reaches it either). `read_resolve_version()` finds nothing --
+`$SP/f3/q1_test.c` reproduced this on the unmodified core (six target pages
+then two survivors in one segment, delete the target timeline, append one
+more survivor page after the rewrite, reopen: both survivors return `rc ==
+0`), now folded into `test_timeline_delete_keeps_offsets()`
+(`pagestore_forkmeta_cutover_test.c`). This is "drop a branch, write a page,
+restart" silently losing already-acknowledged, already-flushed data -- worse
+than F3, and the same root cause (moved bytes, rebased watermark).
+
+**Invariant I3** (the one this PR restores): segment bytes are immutable once
+written, a record's `(seg_id, seg_off)` never changes, and the flush
+watermark never retreats; consequently a page version is removed from memory
+only while its segment record is, and remains, below the durable flush
+watermark -- equivalently, every record a recovery rescan can encounter has a
+live in-memory identity, and therefore a retained marker. The deletion
+rewrite's relocation and watermark rebase-to-zero violated both the
+immutability premise and the "remains" half of the consequence; this PR
+removes the rewrite (2c below) instead of compensating for what it moves.
 
 **Retirement is logical, not physical** (a known property, not itself part of
 this finding, but relevant to how it manifests): `recover()`'s retirement of
@@ -666,67 +690,62 @@ data a root fix is meant to recover, and today they are only *logically*
 discarded (unreachable through the index, but the bytes are still there for
 that fix to find); truncating them would foreclose that.
 
-**Evidence in this PR** (regression tests, `pagestore_forkmeta_cutover_test.c`):
-`test_deletion_filtered_forkmeta` asserts, after its final reopen, that the
-pinned sibling timeline's page version at LSN 200 is still resolvable
-(`read_resolve_version(...) == 1 && ver == 200`); on the unmodified baseline
-this returns `rc == 0` -- the version is silently gone. A commit-shape variant,
+**Evidence before the fix** (regression tests, `pagestore_forkmeta_cutover_test.c`,
+against the unmodified `page_cleanup_rewrite_segment()`): `test_deletion_filtered_forkmeta`
+asserted, after its final reopen, that the pinned sibling timeline's page
+version at LSN 200 is still resolvable (`read_resolve_version(...) == 1 &&
+ver == 200`); on the unmodified baseline this returned `rc == 0` -- the
+version was silently gone. A commit-shape variant,
 `test_deletion_filtered_forkmeta_commit_shape` (one extra WAL-less rewrite of
 the same block before the pinned write, producing a commit-class orphan for
-the rescan to meet), asserts the reopen logs no `retiring tail` and no
-`refusing unmatched` line, at least one adoption line, and the newest served
-version is still LSN 200; on the unmodified baseline these also fail.
-`test_torn_commit_append_never_adopted` (folding in the reviewer's standalone
-`torn_test.c` reproduction, R2-F1) proves the freeze proof alone is not a
-torn-append exclusion: it crashes a commit-class write after its segment body
-but before its marker, reopens a third time (with an intervening cutover in
-between so the torn sequence is frozen-covered), and asserts the tail is
-retired again -- with `... no complete record follows in this segment` --
-and the block still serves the last acknowledged tag; on the branch as it
-stood after F2 alone (segment-path commit adoption gated only by the freeze
-proof, no look-ahead) this instead adopts the torn body and serves the
-never-acknowledged tag. `test_torn_growth_append_never_adopted` proves the
-growth rule has no equivalent exposure on either lifetime.
+the rescan to meet), used to assert at least one adoption line (F2's
+mitigation); it now asserts zero, since I3 means there is nothing left to
+adopt. `test_torn_commit_append_never_adopted` (folding in the reviewer's
+standalone `torn_test.c` reproduction, R2-F1) still proves the freeze proof
+alone is not a torn-append exclusion, independent of I3: it crashes a
+commit-class write after its segment body but before its marker, reopens a
+third time (with an intervening cutover in between so the torn sequence is
+frozen-covered), and asserts the tail is retired again -- with `... no
+complete record follows in this segment` -- and the block still serves the
+last acknowledged tag. `test_torn_growth_append_never_adopted` proves the
+growth rule has no equivalent exposure on either lifetime. `$SP/f3/q1_test.c`
+(Q1 above) is now `test_timeline_delete_keeps_offsets()`.
 
-**Why a follow-up PR, and what it must do.** This is a distinct, pre-existing
-defect in the timeline-delete rewrite / watermark design (not introduced by
-F1's fix or by F2's generalization), it needs its own crash-matrix coverage,
-and there is an adjacent open question (Q1 below) that may widen it. Keeping
-it out of this PR keeps the blocker fix reviewable; this PR's mitigation (F2's
-generalized adoption) is a logged pruning reversal, not a claim that I3 holds.
-The follow-up must:
+**How it was fixed.** `page_cleanup_rewrite_segment()` became
+`page_cleanup_tombstone_segment()`: every target-timeline record is
+overwritten in place with a hole record of identical size (body zeroed, only
+the magic changed to one of three new `SEG_HOLE48/56/64_MAGIC` values, one
+per header shape), instead of being dropped from a rebuilt replacement
+buffer that every survivor after it then had to be copied into at a new
+offset. No survivor is ever relocated, no image-index entry ever goes stale,
+and the flush watermark is never rebased -- I3 holds by construction, not by
+tracking which relocated versions are still live in memory. Space is
+reclaimed the way any other covered-prefix segment already is: by segment GC
+once the whole segment is below the watermark. This is a persisted-format
+change (D5): the three hole magics are registered in
+`pagestore_format_versions`, and `fixtures/posix-artifact-lifecycle` was
+recaptured with a deleted branch whose target records sit between two live
+sibling records in the same segment, so the fixture's own reopen and
+mutation checks exercise a tombstoned segment. Older fixtures keep reopening
+unchanged: no hole magics exist in a store written before this fix, and a
+rebased watermark left by a pre-fix deletion is simply a valid (low, never
+retreating further) watermark to the new daemon.
 
-1. In `page_cleanup_rewrite_segment()`, copy a survivor record only if its
-   identity `(timeline, key, block, lsn or 0 for WAL-less, admission_seq)` has
-   a live `PageVer` in memory (matched by identity, not by `seg`/`off`,
-   because versions rebuilt from layers carry `seg == -1`); an
-   `admission_seq == 0` (legacy) record is always kept. On a match, stamp the
-   version's `seg`/`off` with the new location so relocation is visible.
-   Locks: the rewrite already holds every shard write lock and the map write
-   lock, so memory is the complete live set. Result: after a rewrite the
-   rescan set equals memory, and every ordered record in it has a retained
-   marker.
-2. Close the post-rebase window: while a shard's watermark sits at a rebased
-   position, the prune path must not remove a version whose record is at or
-   after the watermark until a later flush moves the watermark past it;
-   verify the deferred removal is retried rather than leaked until restart.
-3. **Q1** (must be answered with a test): after a rewrite rebases the
-   watermark and a later flush advances it again, image-layer index entries
-   for that segment carry stale pre-rewrite offsets; `recover_layer_prefix()`'s
-   coverage test and `recover()`'s scan start both use physical offsets, so a
-   survivor whose stale index offset exceeds the new watermark while its true
-   offset is below it may be replayed from neither the layer nor the segment
-   rescan. Test: drop a timeline whose records precede live sibling records in
-   the same segment, flush a small memtable so the watermark moves past the
-   survivors, crash-restart, and assert every surviving version is indexed. If
-   a manifest record is needed to fix it, that is a D5 format change with a
-   fixture.
-4. Tighten this PR's two regression tests to assert zero adoption lines (the
-   mitigation must no longer be exercised once I3 holds), and add
-   crash-matrix cases around `PS_FAULT_POINT_TIMELINE_DELETE_AFTER_SEGMENT_REWRITE`
-   with a pruned ordered record before and after the removed target records.
-5. Keep the refuse/retire diagnostics and the integration guard's zero-retire
-   /zero-refuse assertions as fatal signals; they must stay green throughout.
+**What is not yet fixed (follow-up, not blocking).** A store that already
+underwent a timeline deletion before this fix may have lost survivors to Q1
+(entries whose stale, pre-rewrite offset sits above the now-rebased
+watermark): those versions are not recovered by this PR. Repairing them --
+rebuilding lost versions by identity from the pre-rewrite layer entries the
+manifest's rebase record still identifies, which needs identity-level dedup
+in `page_add_version()` and an "already activated identical identity"
+acceptance in `fork_event_activate_seg()` (Q1c) -- is task T7 in the
+implementation plan, tracked as a separate PR with its own tests, plus a
+`pagestore_inspect` report so operators can tell whether a store is
+affected. Until then, a pre-fix deletion's F3 orphans are still adopted by
+the rules above (unchanged, and documented as recovery for pre-fix stores in
+`fork_event_adopt_orphaned_seg()`/`_commit_seg()`'s header comments); do not
+remove that adoption code before a release that no longer supports opening
+a store written by a pre-fix daemon.
 
 ## Resolved: linear event scans over inert commit markers (F5)
 

@@ -2354,17 +2354,18 @@ assert "$(grep -c 'reason=storage failure' "$DATA/daemon.log" 2>/dev/null || tru
 # a plain GROW, so a retained store could fail "storage open: Invalid
 # argument" on its very next reopen (see RELEASE_VALIDATION.md).  Stop every
 # cluster this run started, shut the daemon down cleanly, and reopen it alone
-# against the same store: it must come back up.  Recovery now also adopts an
-# orphaned ordered record whose selected forkmeta snapshot proves its append
-# completed (see RELEASE_VALIDATION.md); a store built entirely by the fixed
-# live path exercises that rule only through the still-open F3 pruned-marker
-# rescan path (a timeline-delete rewrite that rebases the flush watermark),
-# never through its own live writes.  So an adoption count above zero here is
-# not itself a failure, but it is the F3 detector: a nonzero count means F3
-# fired during this run and must be investigated (its evidence preserved with
-# KEEPTMP=1), not silently retried.  A retired segment tail or a bare refusal
-# is unconditionally fatal: the adoption rule (F2) is supposed to turn every
-# reachable case of either into a logged adoption instead.
+# against the same store: it must come back up.  Recovery still carries an
+# adoption rule for an orphaned ordered record whose selected forkmeta
+# snapshot proves its append completed (see RELEASE_VALIDATION.md), but
+# invariant I3 (page_cleanup_tombstone_segment(): segment bytes are
+# immutable once written, so timeline deletion never rebases the flush
+# watermark and never creates a rescan region) makes that rule dead code for
+# any store this daemon has ever fully owned -- it is recovery for a store
+# that deleted a timeline before this fix.  So all three counts below are
+# hard invariants here, not merely expected-zero: any nonzero count is either
+# a pre-fix store (unexpected in this script's fresh stores) or a regression,
+# and must be investigated (its evidence preserved with KEEPTMP=1), not
+# silently retried.
 "$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 [ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 [ -n "${READERDATA:-}" ] && "$BIN/pg_ctl" -D "$READERDATA" -m immediate -w stop >/dev/null 2>&1 || true
@@ -2391,15 +2392,14 @@ retire_count=${retire_count:-0}
 refuse_count=$(grep -c "refusing unmatched ordered record" "$DATA/daemon.log" 2>/dev/null)
 refuse_count=${refuse_count:-0}
 assert "$adopt_count" "0" \
-	"no orphaned ordered records were adopted on reopen (F3 detector: a nonzero count here means F3 fired and needs investigation, not a retry) (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
+	"no orphaned ordered records were adopted on reopen (invariant I3: a fixed daemon's store never needs adoption) (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
 # A "retiring tail" on a clean-shutdown reopen is always a defect here, never
 # an expected torn-append signature: a torn record requires a crash, and this
 # reopen follows a clean kill+wait shutdown, so nothing in this store can be
-# torn.  The only OTHER way recover() retires a proven, size-covered record is
-# a last-in-segment pruned survivor with no complete record behind it (R2-F1);
-# that needs a deletion rewrite to have dropped records behind it, which this
-# script's branch drops could produce.  If this count is ever nonzero, it is
-# the F3 signal (see RELEASE_VALIDATION.md's open finding), not noise.
+# torn.  Before this fix, the only other way recover() could retire a proven,
+# size-covered record was a last-in-segment pruned survivor left behind by a
+# timeline-delete rewrite that rebased the flush watermark (R2-F1); invariant
+# I3 removes that rewrite entirely, so this count is now a hard invariant too.
 assert "$retire_count" "0" \
 	"no segment tail was retired on reopen (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
 assert "$refuse_count" "0" \

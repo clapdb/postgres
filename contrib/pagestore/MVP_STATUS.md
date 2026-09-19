@@ -806,26 +806,45 @@ path, that at least one complete record follows it in the same segment (a
 torn body is always the last complete record of its segment, so nothing
 can ever follow it there); a commit-class record that is last in its segment
 is retired instead, since it cannot be told apart from a torn append at scan
-time -- for a store written entirely by the fixed live path this is a
-genuine F3 pruned survivor, so nothing acknowledged is lost, but for a
-pre-fix store that crashed after two same-lifetime cutovers (no close-time
-flush) it can instead be that record's own last acknowledged commit-class
-write, torn-indistinguishable, so retiring it falls back to serving the
-previous version.  Either adoption logs one `adopting orphaned ordered ...`
-line and any other case stays refused or retired.  A store written entirely
-by the fixed live path
-exercises this rule only through a separate, still-open finding (a pruned
-marker's record rescanned after a timeline-delete rewrite rebases the flush
-watermark; see `RELEASE_VALIDATION.md`, "Open: pruned ordered marker
-rescanned after a timeline-delete rewrite"), never through its own writes.
+time -- for a pre-fix store that crashed after two same-lifetime cutovers (no
+close-time flush) it can instead be that record's own last acknowledged
+commit-class write, torn-indistinguishable, so retiring it falls back to
+serving the previous version.  Either adoption logs one `adopting orphaned
+ordered ...` line and any other case stays refused or retired.  **Resolved**:
+a pruned marker's record used to be rescanned after a timeline-delete rewrite
+rebased the flush watermark (F3; worse, Q1: the same rewrite silently lost
+already-flushed survivors whose stale layer offset sat above a later,
+rebased watermark, no crash required -- see `RELEASE_VALIDATION.md`,
+"Resolved: pruned ordered marker rescanned after a timeline-delete rewrite").
+The fix is invariant I3: `page_cleanup_tombstone_segment()` tombstones a
+target timeline's records in place (each overwritten with a hole record of
+identical size, magic changed to one of three new `SEG_HOLE48/56/64_MAGIC`
+values) instead of rewriting the segment into a relocated replacement, so no
+survivor moves, no image-index entry goes stale, and the watermark is never
+rebased -- segment bytes are immutable once written.  Space is reclaimed by
+segment GC once the whole segment is below the watermark, same as any other
+covered segment.  A store written entirely by the fixed daemon now exercises
+the adoption rule above **never**: no timeline deletion it performs can ever
+create a rescan region.  The rule stays, unchanged, purely as recovery for a
+store that deleted a timeline before this fix (see the T7 follow-up below).
 `integration_test.sh`
 now stops every cluster it started, reopens its own retained store against a
 fresh daemon, and asserts the reopen succeeds, that no segment tail was
-retired and no record was refused (both unconditionally fatal), and reports
-the adoption count as that open finding's detector (this run: zero) rather
-than asserting it can never fire, so this class of failure fails the script
-instead of requiring the separate manual check `RELEASE_VALIDATION.md` used to
-call out.  Resolved (F5, see `RELEASE_VALIDATION.md`'s "Resolved: linear
+retired and no record was refused (both unconditionally fatal), and asserts the adoption count is zero as a hard invariant (not merely this run's observation), so any nonzero count fails the script instead of requiring the separate manual check `RELEASE_VALIDATION.md` used to call out.  Follow-up
+(task T7, separate PR, not blocking): a store that already underwent a
+timeline deletion before this fix may have lost survivors to Q1, and
+plainly -- a store that deleted a timeline under the old daemon and was then
+flushed (ordinary operation, not a rare condition) has already lost those
+versions; nothing here recovers them.  Repairing them is not yet
+implemented, and cannot in general rely on the manifest: the old rewrite's
+`PS_MANIFEST_REBASE_FLUSH_WATERMARK` record never carried the pre-rebase
+watermark, only a differently-tagged copy of the same post-rebase value, and
+even that tag does not survive the next routine `ps_manifest_compact()`,
+which rewrites every shard's current watermark out as a plain
+`SET_FLUSH_WATERMARK` -- so a repair tool has no durable manifest evidence
+to work from once a pre-fix-affected store has compacted even once; see
+`RELEASE_VALIDATION.md`'s "What is not yet fixed" for the detail.  Resolved
+(F5, see `RELEASE_VALIDATION.md`'s "Resolved: linear
 event scans over inert commit markers (F5)"): the marker-matching/adoption
 scans and the lsn-only bisection's equal-LSN run walk were linear in a
 fork's event count, costing O(N) per replayed record on an FSM/VM fork of a
