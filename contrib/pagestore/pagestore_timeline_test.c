@@ -31,6 +31,17 @@
 #define TEST_FEV_SEG_GROW_BOUND 7
 #define TEST_FEV_SEG_COMMIT_BOUND 8
 #define TEST_SEG_CLAMPED_ADMISSION_MAGIC 0x53454738U
+#define TEST_SEG_MAGIC 0x53454732U
+#define TEST_SEG_WALLESS_MAGIC 0x53454730U
+#define TEST_SEG_WALLESS_ORDERED_MAGIC 0x53454731U
+#define TEST_SEG_CLAMPED_ORDERED_MAGIC 0x53454733U
+#define TEST_SEG_WALLESS_BOUND_MAGIC 0x53454734U
+#define TEST_SEG_CLAMPED_BOUND_MAGIC 0x53454735U
+#define TEST_SEG_ADMISSION_MAGIC 0x53454736U
+#define TEST_SEG_WALLESS_ADMISSION_MAGIC 0x53454737U
+#define TEST_SEG_HOLE48_MAGIC 0x53454830U
+#define TEST_SEG_HOLE56_MAGIC 0x53454831U
+#define TEST_SEG_HOLE64_MAGIC 0x53454832U
 
 typedef struct TestTimelineV2
 {
@@ -102,6 +113,73 @@ typedef struct TestSegRecHdr
 	uint64_t lsn;
 	uint32_t len;
 } TestSegRecHdr;
+
+/*
+ * Scan a segment end to end counting SEG_HOLE*-magic tombstone records (see
+ * invariant I3 in pagestore_core.c's page_cleanup_tombstone_segment()).
+ * Every record, live or hole, is self-describing from its magic alone: this
+ * walks the file the same way recover() does, reading the 48-byte base
+ * header, picking the header shape from the magic, and skipping
+ * header_size + hdr.len bytes to the next record.  Returns the hole count,
+ * or -1 if a record's magic is unrecognized (caller passes 'size' from
+ * ps_storage->seg_size()).
+ */
+static int64_t
+count_segment_holes(int shard, int seg, int64_t size)
+{
+	int64_t		off = 0;
+	int64_t		holes = 0;
+
+	while (off + (int64_t) sizeof(TestSegRecHdr) <= size)
+	{
+		TestSegRecHdr hdr;
+		uint64_t	header_size;
+		int			is_hole;
+		int			bound;
+		int			admission;
+
+		if (ps_storage->seg_read(shard, seg, (uint64_t) off, &hdr,
+								  sizeof(hdr)) != 0)
+			return -1;
+		is_hole = hdr.magic == TEST_SEG_HOLE48_MAGIC ||
+			hdr.magic == TEST_SEG_HOLE56_MAGIC ||
+			hdr.magic == TEST_SEG_HOLE64_MAGIC;
+		if (is_hole)
+		{
+			holes++;
+			header_size = hdr.magic == TEST_SEG_HOLE48_MAGIC ?
+				sizeof(TestSegRecHdr) :
+				hdr.magic == TEST_SEG_HOLE56_MAGIC ?
+					sizeof(TestSegRecHdr) + sizeof(uint64_t) :
+					sizeof(TestSegRecHdr) + 2 * sizeof(uint64_t);
+		}
+		else
+		{
+			bound = hdr.magic == TEST_SEG_WALLESS_BOUND_MAGIC ||
+				hdr.magic == TEST_SEG_CLAMPED_BOUND_MAGIC ||
+				hdr.magic == TEST_SEG_WALLESS_ADMISSION_MAGIC ||
+				hdr.magic == TEST_SEG_CLAMPED_ADMISSION_MAGIC;
+			admission = hdr.magic == TEST_SEG_ADMISSION_MAGIC ||
+				hdr.magic == TEST_SEG_WALLESS_ADMISSION_MAGIC ||
+				hdr.magic == TEST_SEG_CLAMPED_ADMISSION_MAGIC;
+			if (hdr.magic != TEST_SEG_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_ORDERED_MAGIC &&
+				hdr.magic != TEST_SEG_CLAMPED_ORDERED_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_BOUND_MAGIC &&
+				hdr.magic != TEST_SEG_CLAMPED_BOUND_MAGIC &&
+				hdr.magic != TEST_SEG_ADMISSION_MAGIC &&
+				hdr.magic != TEST_SEG_WALLESS_ADMISSION_MAGIC &&
+				hdr.magic != TEST_SEG_CLAMPED_ADMISSION_MAGIC)
+				return -1;
+			header_size = sizeof(TestSegRecHdr) +
+				(bound ? sizeof(uint64_t) : 0) +
+				(admission ? sizeof(uint64_t) : 0);
+		}
+		off += (int64_t) header_size + (int64_t) hdr.len;
+	}
+	return holes;
+}
 
 static int checks;
 static int failed;
@@ -3023,8 +3101,9 @@ test_deleting_timeline_page_cleanup(void)
 	check(read_test_page(1, 0, page) == 1 && page[100] == 0x5A,
 		  "populate target page cache before deletion");
 	before = ps_storage->seg_size(0, 0);
-	check(before > 0 && begin_delete(1, 1, NULL),
-		  "begin shared page-segment deletion");
+	check(before > 0 && count_segment_holes(0, 0, before) == 0 &&
+			begin_delete(1, 1, NULL),
+		  "begin shared page-segment deletion with no holes yet");
 	for (int i = 0; i < 32; i++)
 		(void) ps_core_maintenance();
 	after = ps_storage->seg_size(0, 0);
@@ -3034,6 +3113,8 @@ test_deleting_timeline_page_cleanup(void)
 	 * rewrite that shrank it. */
 	check(after > 0 && after == before,
 		  "mixed segment is tombstoned in place without changing its size");
+	check(count_segment_holes(0, 0, after) == 1,
+		  "successful cleanup leaves exactly one hole for the target record");
 	memset(page, 0, sizeof(page));
 	check(read_test_page(1, 0, page) == 0,
 		  "target page and cache reference are gone");
@@ -3069,12 +3150,15 @@ test_deleting_timeline_page_cleanup(void)
 			write_timeline_layer(2, 0, 100) == 0,
 		  "write pure-target segment");
 	before = ps_storage->seg_size(0, 0);
-	check(before > 0 && begin_delete(2, 1, NULL),
-		  "begin pure-target page-segment deletion");
+	check(before > 0 && count_segment_holes(0, 0, before) == 0 &&
+			begin_delete(2, 1, NULL),
+		  "begin pure-target page-segment deletion with no holes yet");
 	for (int i = 0; i < 32; i++)
 		(void) ps_core_maintenance();
 	check(ps_storage->seg_size(0, 0) == before,
 		  "pure-target segment keeps its size, tombstoned in place");
+	check(count_segment_holes(0, 0, before) == 1,
+		  "pure-target segment becomes exactly one hole record");
 	check(state_of(2, &state, NULL) && state == PS_TIMELINE_DELETED,
 		  "pure-target cleanup still publishes DELETED");
 	close_store();
@@ -3111,6 +3195,9 @@ test_deleting_timeline_page_cleanup_fail_closed(void)
 	memset(page, 0, sizeof(page));
 	check(read_test_page(1, 0, page) == 1,
 		  "failed cleanup retains the target until repair");
+	check(count_segment_holes(0, 0, valid_size) == 0,
+		  "the validate-only pass 1 rejection writes zero holes: pass 2 "
+		  "never runs on a malformed segment");
 	close_store();
 	remove_tree(store);
 }
@@ -3317,6 +3404,7 @@ test_deleting_timeline_page_cleanup_oversized(void)
 	unsigned char sparse_tail = 0;
 	PsTimelineState state;
 	int64_t oversized;
+	int64_t valid_size;
 
 	configure_timeline_core();
 	segment_size = 32768;
@@ -3328,6 +3416,9 @@ test_deleting_timeline_page_cleanup_oversized(void)
 			write_timeline_layer(1, 0, 100) == 0 &&
 			write_timeline_layer(10, 1, 200) == 0,
 			"write target and sibling before oversized sparse tail");
+	valid_size = ps_storage->seg_size(0, 0);
+	check(valid_size > 0 && count_segment_holes(0, 0, valid_size) == 0,
+			"target and sibling records carry no holes before deletion");
 	check(ps_storage->seg_write(0, 0, segment_size, &sparse_tail,
 								 sizeof(sparse_tail)) == 0 &&
 			ps_storage->sync() == 0 && begin_delete(1, 1, NULL),
@@ -3342,6 +3433,9 @@ test_deleting_timeline_page_cleanup_oversized(void)
 	memset(page, 0, sizeof(page));
 	check(read_test_page(1, 0, page) == 1 && page[100] == 0x5A,
 			"oversized cleanup failure retains target page");
+	check(count_segment_holes(0, 0, valid_size) == 0,
+			"the validate-only pass 1 rejection writes zero holes: pass 2 "
+			"never runs on an oversized segment");
 	memset(page, 0, sizeof(page));
 	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
 			"oversized cleanup failure leaves sibling undamaged");
@@ -3374,14 +3468,18 @@ test_deleting_timeline_page_cleanup_prefix_hole(void)
 			write_timeline_layer(10, 1, 200) == 0,
 			"write prefix filler and later target/sibling records");
 	before = ps_storage->seg_size(0, 1);
-	check(before > 0 && ps_storage->seg_remove(0, 0) == 0 &&
+	check(before > 0 && count_segment_holes(0, 1, before) == 0 &&
+			ps_storage->seg_remove(0, 0) == 0 &&
 			begin_delete(1, 1, NULL),
-			"remove prefix segment before deleting later target");
+			"remove prefix segment before deleting later target, no holes yet");
 	for (int i = 0; i < 32; i++)
 		(void) ps_core_maintenance();
 	check(ps_storage->seg_size(0, 1) == before,
 			"cleanup crosses the missing prefix segment and tombstones the "
 			"later mixed segment in place, keeping its size");
+	check(count_segment_holes(0, 1, before) == 1,
+			"cleanup across the missing prefix segment leaves exactly one "
+			"hole in the later mixed segment");
 	memset(page, 0, sizeof(page));
 	check(read_test_page(1, 0, page) == 0,
 			"prefix-hole cleanup removes target page");
@@ -3419,8 +3517,10 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 			"write target and sibling into one short segment");
 	before = ps_storage->seg_size(0, 0);
 	check(before > 0 && before < (int64_t) segment_size &&
+			count_segment_holes(0, 0, before) == 0 &&
 			begin_delete(1, 1, NULL) && ps_storage->sync() == 0,
-			"begin deletion before simulating a missing ordered marker");
+			"begin deletion before simulating a missing ordered marker, "
+			"no holes yet");
 	close_store();
 	check(strip_ordered_markers(store, 10) == 0,
 			"remove only the live sibling ordered forkmeta marker");
@@ -3433,6 +3533,9 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 	check(after > 0 && after == before,
 			"DELETING cleanup tombstones the retired short segment in "
 			"place, keeping its size");
+	check(count_segment_holes(0, 0, after) == 1,
+			"retired short-segment cleanup leaves exactly one hole for the "
+			"target record");
 	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
 			"retired-segment cleanup permits durable DELETED publication");
 	memset(page, 0, sizeof(page));
