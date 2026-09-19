@@ -1157,6 +1157,520 @@ test_deletion_filtered_forkmeta(void)
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
+/*
+ * ---- a live ordered write's in-memory history equals recovery's (PR #262 review finding) ----
+ *
+ * append_page_impl() durably persists an ordered write's bound marker via
+ * fork_meta_persist_segment() regardless of the bug this covers; what was
+ * wrong is the in-memory mirror fork_grow_apply() built (a plain GROW with
+ * marker_kind = order_id = 0).  A forkmeta snapshot is serialized from that
+ * memory, so after a cutover it is the only durable copy of the pre-cutover
+ * metadata; a *second* cutover in the same daemon lifetime then finds the
+ * marker in neither memory nor the (already rewritten) source log and
+ * publishes a plain GROW, after which the record can never activate again.
+ * These tests drive exactly that two-cutover sequence and assert the bound
+ * marker (not a plain GROW) survives both generations.
+ */
+
+static int
+generation_advances_past(const char *directory, uint64_t generation)
+{
+	TestSnapshotHeader after;
+
+	for (int i = 0; i < 40; i++)
+	{
+		(void) ps_core_maintenance();
+		if (read_selected_header(directory, &after) == 0 &&
+			after.generation > generation)
+			return 1;
+		usleep(100000);
+	}
+	return 0;
+}
+
+static void
+test_live_ordered_marker_survives_two_cutovers(void)
+{
+	char store[] = "/tmp/psforkmetalive2cutXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 6, 1, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 20, 0, PS_KLASS_RELATION};
+	uint64_t first_seq = 0,
+				second_seq = 0;
+	PsRetentionPin pin;
+	TestSnapshotHeader hdr;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create live-ordered two-cutover store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build live-ordered snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build live-ordered manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build live-ordered frontier path");
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "open store and write pinned page history");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 77;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a safe frontier");
+	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
+		  "create the ordered fork at LSN 300");
+	/* pd_lsn 250 < definitive floor 300 -> clamped ordered record with a bound marker */
+	check(append_relation_tag(&key, 0, 250, page, 0x40, &seq) == 0 && seq != 0,
+		  "live clamped ordered write below the fork floor");
+	check(append_growth_batch(2200, 500) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "first cutover after the live ordered write");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 1 header");
+	check(snapshot_ordered_marker_count(snapshots, &key, seq, 1) == 1 &&
+		  !snapshot_has_plain_grow(snapshots, &key),
+		  "generation 1 keeps the live bound marker with no duplicate plain GROW");
+	check(append_growth_batch(2300, 600) &&
+		  generation_advances_past(snapshots, hdr.generation),
+		  "second cutover in the same daemon lifetime");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 2 header");
+	check(snapshot_ordered_marker_count(snapshots, &key, seq, 1) == 1 &&
+		  !snapshot_has_plain_grow(snapshots, &key),
+		  "generation 2 still keeps the live bound marker (the bug lost it here)");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0,
+		  "store reopens after two cutovers following a live ordered write");
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40, "ordered page readable after reopen");
+	close_runtime();
+	remove_tree(store);
+}
+
+static void
+test_live_ordered_commit_marker_survives_two_cutovers(void)
+{
+	char store[] = "/tmp/psforkmetalive2cutcmtXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 6, 2, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 21, 0, PS_KLASS_RELATION};
+	uint64_t first_seq = 0,
+				second_seq = 0;
+	uint64_t grow_seq = 0,
+				commit_seq = 0;
+	PsRetentionPin pin;
+	TestSnapshotHeader hdr;
+	unsigned char page[8192];
+	int n;
+
+	check(mkdtemp(store) != NULL, "create live-ordered commit-marker store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build commit-marker snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build commit-marker manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build commit-marker frontier path");
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "open store and write pinned page history");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 78;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a safe frontier");
+	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
+		  "create the ordered fork at LSN 300");
+	/* First write grows the block (SEG_GROW_BOUND); the second, identically
+	 * clamped write to the same block does not grow it, so it durably
+	 * persists as a SEG_COMMIT_BOUND -- recovery never builds a plain GROW
+	 * for that kind, so the pre-fix live path's plain GROW was itself a
+	 * divergence for this shape, independent of the two-cutover bug. */
+	check(append_relation_tag(&key, 0, 250, page, 0x40, &grow_seq) == 0 &&
+		  grow_seq != 0,
+		  "live clamped ordered growth write below the fork floor");
+	check(append_relation_tag(&key, 0, 250, page, 0x41, &commit_seq) == 0 &&
+		  commit_seq != 0 && commit_seq != grow_seq,
+		  "live clamped ordered commit rewrite of the same block");
+	check(append_growth_batch(2400, 700) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "first cutover after the live ordered growth+commit writes");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 1 header");
+	check(snapshot_ordered_marker_count(snapshots, &key, 0, 0) == 2 &&
+		  !snapshot_has_plain_grow(snapshots, &key),
+		  "generation 1 keeps both bound markers with no duplicate plain GROW");
+	check(append_growth_batch(2500, 800) &&
+		  generation_advances_past(snapshots, hdr.generation),
+		  "second cutover in the same daemon lifetime");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 2 header");
+	check(snapshot_ordered_marker_count(snapshots, &key, 0, 0) == 2 &&
+		  !snapshot_has_plain_grow(snapshots, &key),
+		  "generation 2 still keeps both bound markers (the bug lost the growth one here)");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0,
+		  "store reopens after two cutovers following live ordered growth+commit writes");
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x41, "newest ordered commit tag readable after reopen");
+	close_runtime();
+	remove_tree(store);
+}
+
+static void
+test_live_ordered_marker_walless_survives_two_cutovers(void)
+{
+	char store[] = "/tmp/psforkmetalive2cutwlXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 6, 3, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 22, 0, PS_KLASS_RELATION};
+	uint64_t first_seq = 0,
+				second_seq = 0;
+	PsRetentionPin pin;
+	TestSnapshotHeader hdr;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create WAL-less live-ordered two-cutover store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build WAL-less live-ordered snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build WAL-less live-ordered manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build WAL-less live-ordered frontier path");
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "open store and write pinned page history");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 79;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a safe frontier");
+	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
+		  "create the ordered fork at LSN 300");
+	/* pd_lsn 0 -> SEG_WALLESS_ADMISSION_MAGIC, stamped at the growth floor;
+	 * ordered via zero_version rather than clamped, same in-memory hazard. */
+	check(append_relation_tag(&key, 0, 0, page, 0x50, &seq) == 0 && seq != 0,
+		  "live WAL-less ordered write");
+	check(append_growth_batch(2600, 900) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "first cutover after the live WAL-less ordered write");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 1 header");
+	check(snapshot_ordered_marker_count(snapshots, &key, seq, 1) == 1 &&
+		  !snapshot_has_plain_grow(snapshots, &key),
+		  "generation 1 keeps the live WAL-less bound marker with no duplicate plain GROW");
+	check(append_growth_batch(2700, 1000) &&
+		  generation_advances_past(snapshots, hdr.generation),
+		  "second cutover in the same daemon lifetime");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 2 header");
+	check(snapshot_ordered_marker_count(snapshots, &key, seq, 1) == 1 &&
+		  !snapshot_has_plain_grow(snapshots, &key),
+		  "generation 2 still keeps the live WAL-less bound marker (the bug lost it here)");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0,
+		  "store reopens after two cutovers following a live WAL-less ordered write");
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x50, "WAL-less ordered page readable after reopen");
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
+ * ---- recovery adopts an orphaned ordered record, with diagnostics ----
+ *
+ * A store written entirely by the fixed live path never needs this rule (Task
+ * 1 keeps memory and recovery in agreement), but a store that already carries
+ * a plain GROW degraded by the pre-fix bug must still open and self-heal.
+ * These tests construct that degraded shape directly on a store written by
+ * the (now fixed) live path: they patch the one durable record the live
+ * write produced from a bound marker into the exact plain-GROW shape the old
+ * bug's serializer would have published, then exercise open/adopt/reopen.
+ */
+
+/*
+ * Patch the sole forkmeta source record matching (key, admission_seq) and
+ * kind SEG_GROW_BOUND/SEG_COMMIT_BOUND into a plain GROW with order_id = 0,
+ * using new_admission_seq/new_nblocks for the degraded record's identity
+ * (equal to the original to model the bug faithfully; deliberately different
+ * to build a fail-closed mismatch case).  Sealed as a legacy FKM2 record
+ * (as_legacy_record()) so the loader accepts the hand-edited bytes without
+ * recomputing the daemon's CRC-24.  The store must be closed (close_runtime())
+ * before calling this, and reopened by the caller afterward.
+ */
+static int
+patch_source_ordered_record(const char *store, const PsKey *key,
+							uint64_t admission_seq, uint64_t new_admission_seq,
+							uint32_t new_nblocks)
+{
+	char path[1024];
+	off_t size;
+	size_t count,
+				i;
+	TestForkMetaRecV2 *recs;
+	int patched = 0;
+	int ok;
+
+	if (snprintf(path, sizeof(path), "%s/forkmeta", store) < 0)
+		return 0;
+	size = file_size(path);
+	if (size < 0 || size % (off_t) sizeof(TestForkMetaRecV2) != 0)
+		return 0;
+	count = (size_t) (size / (off_t) sizeof(TestForkMetaRecV2));
+	recs = malloc(count * sizeof(TestForkMetaRecV2));
+	if (recs == NULL)
+		return 0;
+	ok = PsStoragePosix.open(store, segment_size) == 0;
+	/* fork_meta_read() returns the byte count read (like read(2)), not a
+	 * 0-on-success status -- unlike fork_meta_rewrite() below. */
+	for (i = 0; ok && i < count; i++)
+		ok = PsStoragePosix.fork_meta_read(i * sizeof(TestForkMetaRecV2),
+										   &recs[i],
+										   sizeof(TestForkMetaRecV2)) ==
+			(int) sizeof(TestForkMetaRecV2);
+	if (ok)
+	{
+		for (i = 0; i < count; i++)
+			if ((recs[i].kind == TEST_FEV_SEG_GROW_BOUND ||
+				 recs[i].kind == TEST_FEV_SEG_COMMIT_BOUND) &&
+				recs[i].admission_seq == admission_seq &&
+				memcmp(&recs[i].key, key, sizeof(*key)) == 0)
+			{
+				as_legacy_record(&recs[i]);
+				recs[i].kind = TEST_FEV_GROW;
+				recs[i].order_id = 0;
+				recs[i].admission_seq = new_admission_seq;
+				recs[i].nblocks = new_nblocks;
+				patched = 1;
+				break;
+			}
+		ok = patched &&
+			PsStoragePosix.fork_meta_rewrite(recs,
+							(uint32_t) (count * sizeof(TestForkMetaRecV2))) == 0;
+	}
+	PsStoragePosix.close();
+	free(recs);
+	return ok;
+}
+
+/*
+ * Like expect_open_failure(), but also asserts the daemon's diagnostic for a
+ * refused ordered record appears on stderr, so the bare, stale-
+ * errno "storage open: Invalid argument" this used to surface as cannot come
+ * back silently.
+ */
+static int
+expect_open_failure_logs(const char *store, const char *needle)
+{
+	char logpath[] = "/tmp/psforkmetadiagXXXXXX";
+	int logfd = mkstemp(logpath);
+	pid_t pid;
+	int status;
+	int found = 0;
+
+	if (logfd < 0)
+		return 0;
+	pid = fork();
+	if (pid == 0)
+	{
+		int rc;
+
+		dup2(logfd, STDERR_FILENO);
+		rc = ps_core_open(store);
+		if (rc == 0)
+			close_runtime();
+		_exit(rc != 0 ? 0 : 1);
+	}
+	if (pid > 0 && waitpid(pid, &status, 0) == pid &&
+		WIFEXITED(status) && WEXITSTATUS(status) == 0)
+	{
+		char buf[8192];
+		ssize_t n;
+
+		if (lseek(logfd, 0, SEEK_SET) == 0 &&
+			(n = read(logfd, buf, sizeof(buf) - 1)) > 0)
+		{
+			buf[n] = 0;
+			found = strstr(buf, needle) != NULL;
+		}
+	}
+	close(logfd);
+	unlink(logpath);
+	return found;
+}
+
+static void
+test_orphaned_ordered_marker_adopted(void)
+{
+	char store[] = "/tmp/psforkmetaadoptokXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 6, 4, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 23, 0, PS_KLASS_RELATION};
+	uint64_t first_seq = 0,
+				second_seq = 0;
+	PsRetentionPin pin;
+	TestSnapshotHeader hdr;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create orphaned-marker adoption store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build adoption snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build adoption manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build adoption frontier path");
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "open store and write pinned page history");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 80;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a safe frontier");
+	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
+		  "create the ordered fork at LSN 300");
+	check(append_relation_tag(&key, 0, 250, page, 0x40, &seq) == 0 && seq != 0,
+		  "live clamped ordered write below the fork floor");
+	close_runtime();
+	check(patch_source_ordered_record(store, &key, seq, seq, 1),
+		  "degrade the durable marker to the pre-fix plain-GROW shape");
+	check(ps_core_open(store) == 0,
+		  "a store with an orphaned ordered record still opens via adoption");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40, "adopted ordered page readable after open");
+	check(append_growth_batch(2800, 1100) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "cutover after adoption");
+	check(read_selected_header(snapshots, &hdr) == 0, "read post-adoption header");
+	check(snapshot_ordered_marker_count(snapshots, &key, seq, 1) == 1 &&
+		  !snapshot_has_plain_grow(snapshots, &key),
+		  "post-adoption cutover re-emits the bound marker, self-healing the store");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40, "healed store reopens and serves the ordered page");
+	close_runtime();
+	remove_tree(store);
+}
+
+static void
+test_orphaned_ordered_marker_not_adopted_on_mismatch(void)
+{
+	char store[] = "/tmp/psforkmetaadoptbadXXXXXX";
+	char frontier[1200];
+	PsKey key = {6, 6, 6, 5, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 24, 0, PS_KLASS_RELATION};
+	uint64_t first_seq = 0,
+				second_seq = 0;
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create orphaned-marker mismatch store");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build mismatch frontier path");
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "open store and write pinned page history");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 81;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a safe frontier");
+	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
+		  "create the ordered fork at LSN 300");
+	check(append_relation_tag(&key, 0, 250, page, 0x40, &seq) == 0 && seq != 0,
+		  "live clamped ordered write below the fork floor");
+	close_runtime();
+	/* A different admission_seq: the tuple no longer identifies the same
+	 * append, so the rule must stay fail-closed and refuse the open. */
+	check(patch_source_ordered_record(store, &key, seq, seq + 1000, 1),
+		  "degrade the durable marker with a mismatched admission sequence");
+	check(expect_open_failure_logs(store, "refusing unmatched ordered record"),
+		  "a plain GROW at a different admission_seq is not adopted; open "
+		  "still fails and logs the refused record's tuple");
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -1720,6 +2234,11 @@ main(void)
 	test_reclaimed_ordered_markers_pruned();
 	test_v1_bound_marker_snapshot();
 	test_no_manifest_marker_only_rejected();
+	test_live_ordered_marker_survives_two_cutovers();
+	test_live_ordered_commit_marker_survives_two_cutovers();
+	test_live_ordered_marker_walless_survives_two_cutovers();
+	test_orphaned_ordered_marker_adopted();
+	test_orphaned_ordered_marker_not_adopted_on_mismatch();
 	if (!failed)
 		remove_tree(store);
 	else

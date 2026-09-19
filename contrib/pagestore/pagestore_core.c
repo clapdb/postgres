@@ -5448,6 +5448,49 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	return 0;
 }
 
+/*
+ * Recovery-only repair for a store written by a since-fixed bug in the live
+ * write path: a live ordered write's bound marker existed only in memory as
+ * a plain FEV_GROW (marker_kind = 0, order_id = 0) instead of the recovery
+ * representation fork_event_activate_seg() expects, so a snapshot cutover
+ * could publish that plain GROW and strand the record's identity.  The
+ * admission sequence is allocated once per append and shared only by a page
+ * record and its own fork event, so a plain GROW carrying the exact
+ * (lsn, admission_seq, nblocks) tuple of an otherwise-unmatched ordered
+ * record is that record's own marker, degraded.  Adopting it reproduces
+ * exactly the in-memory state the live path would have produced without the
+ * bug.  Fail-closed: called only after fork_event_activate_seg() has already
+ * failed, and any mismatch here (zero identity, wrong admission_seq, wrong
+ * nblocks, a non-GROW kind, or an event that already carries a marker) is
+ * left untouched, so the caller still refuses the record.
+ */
+static int
+fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+							  uint64_t order_id, uint64_t admission_seq)
+{
+	if (order_id == 0 || admission_seq == 0)
+		return 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		ForkEvent  *v = &e->ev[i];
+
+		if (v->kind == FEV_GROW && v->marker_kind == 0 && v->order_id == 0 &&
+			v->lsn == lsn && v->admission_seq == admission_seq &&
+			v->nblocks == nblocks)
+		{
+			fprintf(stderr, "pagestore: adopting orphaned ordered record as bound marker "
+					"(timeline=%u lsn=%llu seq=%llu order=%llu nblocks=%u)\n",
+					e->timeline, (unsigned long long) lsn,
+					(unsigned long long) admission_seq,
+					(unsigned long long) order_id, nblocks);
+			v->marker_kind = FEV_SEG_GROW_BOUND;
+			v->order_id = order_id;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int
 fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				   uint64_t lsn, uint64_t admission_seq)
@@ -14748,8 +14791,34 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * former one-shot fork_grow after a batch.)  The WAL-less format stores a
 	 * zero-version page/object's growth floor in the same record while its
 	 * version stays 0.
+	 *
+	 * An ordered record's durable marker (fork_meta_persist_segment() above)
+	 * carries order_id/admission_seq; the in-memory history must end up with
+	 * the identical representation, because the forkmeta snapshot is
+	 * serialized from memory and, after a cutover, is the only durable copy
+	 * of the pre-cutover metadata.  fork_grow_apply() -> fork_event_add()
+	 * always stamps order_id = 0 / marker_kind = 0, so a plain apply here
+	 * would silently drop the identity from memory while it still lives in
+	 * the segment and (until the next cutover) the source log; a later
+	 * cutover would then publish a plain GROW that recovery can no longer
+	 * match.  Insert exactly what recovery itself rebuilds instead: add the
+	 * bound marker and activate it against this page record.  The marker
+	 * kind must mirror the one just persisted above (same segment_grows
+	 * expression).
 	 */
-	fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn, admission_seq);
+	if (ordered_record)
+	{
+		ForkEnt    *ofe = fork_get_or_create(timeline, key);
+
+		fork_event_add_seg_marker(ofe, hdr_grow_lsn, block + 1,
+								  segment_grows ? FEV_SEG_GROW_BOUND :
+								  FEV_SEG_COMMIT_BOUND,
+								  order_id, admission_seq);
+		(void) fork_event_activate_seg(ofe, hdr_grow_lsn, block + 1,
+									   order_id, admission_seq);
+	}
+	else
+		fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn, admission_seq);
 	if (out_admission_seq)
 		*out_admission_seq = admission_seq;
 	return 0;
@@ -16875,7 +16944,12 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		ForkEnt    *fe = fork_find(timeline, key);
 
+		/* fork_event_adopt_orphaned_seg() repairs a store written by the
+		 * since-fixed live-path bug (see its header comment); it never runs
+		 * unless the normal marker match above already failed. */
 		if ((!fe || !fork_event_activate_seg(fe, growth_lsn, block + 1,
+												 order_id, admission_seq)) &&
+			(!fe || !fork_event_adopt_orphaned_seg(fe, growth_lsn, block + 1,
 												 order_id, admission_seq)) &&
 			!fork_meta_legacy)
 			return 0;
@@ -17041,7 +17115,26 @@ recover_layer_prefix(uint32_t shard)
 								e->admission_seq, e->growth_lsn, e->order_id,
 								e->flags,
 								shard, -1, 0))
+		{
+			/* An unmatched ordered record with no orphan-adoption match
+			 * (fork_event_adopt_orphaned_seg() already tried and failed) is
+			 * fatal -- there is no size event to trust for this page.  Leave
+			 * a diagnostic identifying the exact tuple instead of the bare,
+			 * stale-errno "storage open: Invalid argument" this used to
+			 * surface as. */
+			fprintf(stderr, "pagestore_daemon: shard %u layer %llu: refusing "
+					"unmatched ordered record timeline=%u key=(klass=%u spc=%u "
+					"db=%u rel=%u fork=%d) block=%u lsn=%llu admission_seq=%llu "
+					"growth_lsn=%llu order_id=%llu flags=%#x\n",
+					shard, (unsigned long long) recs[i].layer_id, recs[i].timeline,
+					e->key.klass, e->key.spcOid, e->key.dbOid, e->key.relNumber,
+					e->key.forkNum, e->block, (unsigned long long) e->lsn,
+					(unsigned long long) e->admission_seq,
+					(unsigned long long) e->growth_lsn,
+					(unsigned long long) e->order_id, e->flags);
+			errno = EINVAL;
 			goto fail;
+		}
 	}
 	free(recs);
 	return 0;
@@ -17162,6 +17255,21 @@ recover(uint32_t shard)
 								flags,
 								shard, id, data_off))
 			{
+				/* An unmatched ordered record here silently discards the
+				 * rest of this segment below instead of failing recovery
+				 * outright -- log the tuple so that discard is visible,
+				 * matching the diagnostic in recover_layer_prefix(). */
+				fprintf(stderr, "pagestore_daemon: shard %u segment %d: retiring "
+						"tail at offset %llu on unmatched ordered record "
+						"timeline=%u key=(klass=%u spc=%u db=%u rel=%u fork=%d) "
+						"block=%u lsn=%llu admission_seq=%llu order_id=%llu "
+						"flags=%#x\n",
+						shard, id, (unsigned long long) off, hdr.timeline,
+						hdr.key.klass, hdr.key.spcOid, hdr.key.dbOid,
+						hdr.key.relNumber, hdr.key.forkNum, hdr.block,
+						(unsigned long long) hdr.lsn,
+						(unsigned long long) admission_seq,
+						(unsigned long long) order_id, flags);
 				retire_segment = 1;
 				break;
 			}
