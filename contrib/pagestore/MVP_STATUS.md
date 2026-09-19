@@ -819,13 +819,18 @@ retired and no record was refused (both unconditionally fatal), and reports
 the adoption count as that open finding's detector (this run: zero) rather
 than asserting it can never fire, so this class of failure fails the script
 instead of requiring the separate manual check `RELEASE_VALIDATION.md` used to
-call out.  Known gap from the same review (not fixed in that PR): every
-commit-class rewrite leaves one inert marker event in a fork's in-memory
-history (bounded durably, since the snapshot builder drops a commit marker
-once its version is pruned, but unbounded live between prunes), and the
-marker-matching/adoption scans over a fork's event array are linear, so a
-fork with many inert markers -- an FSM/VM fork of a hot table -- costs O(N)
-per replayed record; a follow-up should index by `(lsn, admission_seq)`.  One
+call out.  Resolved (F5, see `RELEASE_VALIDATION.md`'s "Resolved: linear
+event scans over inert commit markers (F5)"): the marker-matching/adoption
+scans and the lsn-only bisection's equal-LSN run walk were linear in a
+fork's event count, costing O(N) per replayed record on an FSM/VM fork of a
+hot table (O(N^2) per fork at recovery and per cutover); a
+`(lsn, admission_seq)` position index, gated by a per-fork legacy-event
+counter with the old linear code kept as its fallback, now makes every one
+of those O(log N)/O(1).  Measured at K = 50,000 commit-class rewrites: live
+path 41.7 -> 11.9 us/write, cutover 0.536 s -> 0.143 s, reopen 1.052 s ->
+0.451 s; see `RELEASE_VALIDATION.md` for the full table and the still-open
+follow-up (bounding the in-memory array itself by compacting the markers a
+cutover already dropped durably).  One
 gap remains documented in the check: a
 page-segment record can never be the only copy of a page, because a cleanly
 stopped daemon flushes its memtable into a layer before it exits, so every

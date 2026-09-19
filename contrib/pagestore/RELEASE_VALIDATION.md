@@ -661,19 +661,72 @@ The follow-up must:
 5. Keep the refuse/retire diagnostics and the integration guard's zero-retire
    /zero-refuse assertions as fatal signals; they must stay green throughout.
 
-## Note: linear event scans over inert commit markers (F5)
+## Resolved: linear event scans over inert commit markers (F5)
 
-Found during the same review. Every commit-class rewrite of a fork leaves one
-inert `FEV_SEG_GROW_BOUND`/`FEV_SEG_COMMIT_BOUND`-derived event in memory
-(exactly the post-restart state already, since markers are loaded from the
-log/snapshot and never compacted within a lifetime); the snapshot builder
-drops a commit marker once its version is pruned, so the *durable* count is
-bounded by live versions. The cost is not memory (40 bytes/event) but
-algorithmic: `fork_event_activate_seg()`, both `fork_event_adopt_orphaned_*()`
-rules, and `fork_meta_snapshot_marker_present()` scan a fork's event array
-linearly, so a fork with N inert markers costs O(N) per replayed record --
-O(N^2) per fork at recovery and per cutover. FSM/VM forks of hot tables are
-exactly the forks that accumulate these. Not a correctness issue and not fixed
-in this PR; tracked in `MVP_STATUS.md`'s known gaps for a follow-up (binary
-search on the sorted `(lsn, admission_seq)` order, or a hash on
-`admission_seq`).
+Found during an earlier review. Every commit-class rewrite of a fork leaves
+one inert `FEV_SEG_GROW_BOUND`/`FEV_SEG_COMMIT_BOUND`-derived event in memory
+(still true after this fix: markers are loaded from the log/snapshot and, in
+this PR, still never compacted within a lifetime -- see the follow-up below);
+the snapshot builder drops a commit marker once its version is pruned, so the
+*durable* count is bounded by live versions. The cost was not memory (40
+bytes/event) but algorithmic: `fork_event_activate_seg()`, both
+`fork_event_adopt_orphaned_*()` rules, and
+`fork_meta_snapshot_marker_present()` scanned a fork's event array linearly,
+and the existing lsn-only bisection in `fork_asof_hop()`/
+`fork_inheritance_fenced()` still walked every event at the fork's growth
+floor LSN (every commit-class marker of a fork shares that one LSN) -- O(N)
+per write, O(N^2) per fork at recovery and per cutover. FSM/VM forks of hot
+tables are exactly the forks that accumulate these.
+
+Fixed by indexing the array both insertion routines already kept in
+`(lsn, admission_seq)` tuple order: `fork_event_lower_bound()`/
+`upper_bound()` bisect on the tuple instead of LSN alone, `identity_range()`
+narrows a lookup to its exact `(lsn, admission_seq)` group instead of the
+whole array, and `fork_event_insert_pos()` bisects the insertion slot instead
+of walking backward from the tail. A per-fork `nlegacy_seq` counter (events
+with `admission_seq == 0`, i.e. legacy V1 records) gates the index: a legacy
+event is pinned at the end of its LSN run at insertion time and later events
+never pass it, so a fork holding one is not tuple-ordered inside a run and
+keeps the exact old linear code as a fallback (proven equal to it by a
+randomized self-test, `ps_test_fork_event_index_selftest()`, cross-checking
+both paths including long equal-LSN runs, equal-tuple duplicates, activation,
+and zero-seq legacy events). A deterministic step-counter guard
+(`ps_test_fork_event_scan_steps()`) makes the regression reproducible without
+a wall clock: a K=5,000-rewrite case asserts fewer than K*128 scan steps for
+the writes, the cutover, and the reopen (reopening with a raised
+`flush_pages` first, so the case's own cost is dominated by the index, not
+by a memtable flush -- and one image layer's worth of fsyncs -- on every
+single rewrite), and fails deterministically on the unmodified algorithm
+(measured: 25,010,000 steps for the writes, 12,507,500 for the cutover,
+12,507,501 for the reopen -- all ~K^2 or ~K^2/2, versus the 640,000
+ceiling). The wall clock is logged, not asserted (0.25 s on tmpfs, 2.5 s on
+a disk-backed directory for the whole case); the step counts are the actual
+guard.
+
+Measured on the microbenchmark (one fork, K commit-class WAL-less rewrites of
+one block; `contrib/pagestore/fev_bench.c`, tmpfs, `cc -O2`):
+
+| K | live path (avg us/write) | cutover | reopen after cutover |
+|---|---|---|---|
+| 10,000 | 17.9 -> 13.9 | 0.046 s -> 0.028 s | 0.140 s -> 0.106 s |
+| 50,000 | 41.7 -> 11.9 | 0.536 s -> 0.143 s | 1.052 s -> 0.451 s |
+
+The live path is now flat in N (the residual per-write cost is the marker
+fsync, the segment write, and the periodic memtable flush); cutover and
+reopen now scale linearly in K, the remainder being the source-log read/CRC
+and image-layer CRC verification. Real workloads are far from the old knee:
+`integration_test.sh` peaks at 104 inert markers on one fork (pg_proc's main
+fork) and 1641 events on the busiest fork (a growing table, already
+O(log N) reads even before this fix); `mvp_golden_test.sh` peaks at 2
+markers on one fork.
+
+No persisted-format change; the array's *contents* and order are unchanged,
+only how they are searched. Remaining follow-ups, deliberately out of this
+PR: (1) bound the in-memory array itself by compacting the inert markers a
+successful cutover just dropped from the durable snapshot (design B, next
+PR) -- until then the array is still never compacted within a lifetime; (2)
+`fork_meta_snapshot_marker_page_retained()`'s version-chain walk (design C,
+optional, only if a later profile shows it dominating); (3) `def_idx` for
+the remaining newest-first SET/DEAD linear scans
+(`fork_block_death_through()`, the walidx planner loops, the snapshot
+builder's per-entry loop) if they are ever shown to matter.

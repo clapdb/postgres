@@ -3628,6 +3628,7 @@ typedef struct ForkEnt
 	ForkEvent  *ev;				/* lsn-ordered size history */
 	uint32_t	nev;
 	uint32_t	evcap;
+	uint32_t	nlegacy_seq;	/* events with admission_seq == 0 (legacy V1) */
 	uint32_t   *def_idx;		/* indexes of SET/DEAD events only */
 	uint32_t	ndef;
 	uint32_t	defcap;
@@ -5038,6 +5039,90 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 #define FORK_HOP_DEF	2		/* definitive size (SET, or DEAD then regrown) */
 #define FORK_HOP_DEAD	3		/* definitively unlinked at the cap */
 
+/*
+ * (lsn, admission_seq) position index.  fork_event_add() and
+ * fork_event_add_seg_marker() keep the array in (lsn, admission_seq) order
+ * for every event that carries a nonzero admission sequence (equal tuples
+ * adjacent, arrival order); a legacy sequence-zero event is pinned at the
+ * end of its LSN run at insertion time and later events never pass it, so a
+ * fork that holds one is not guaranteed to be tuple-ordered inside a run.
+ * The index is therefore usable only on forks with nlegacy_seq == 0 and
+ * only for nonzero query sequences; every consumer keeps its linear scan
+ * as the fallback, bit-for-bit the code that ran before.
+ */
+static inline int
+fork_event_index_usable(const ForkEnt *e, uint64_t admission_seq)
+{
+	return e->nlegacy_seq == 0 && admission_seq != 0;
+}
+
+/* Test-only: increments once per loop iteration of the bounded scans below,
+ * so a test can assert the fast paths stayed sublinear without a wall
+ * clock. */
+static _Thread_local uint64_t fork_event_scan_steps;
+
+/* First index whose (lsn, admission_seq) >= the argument tuple. */
+static uint32_t
+fork_event_lower_bound(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
+{
+	uint32_t	lo = 0;
+	uint32_t	hi = e->nev;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+		const ForkEvent *v = &e->ev[mid];
+
+		fork_event_scan_steps++;
+		if (v->lsn < lsn ||
+			(v->lsn == lsn && v->admission_seq < admission_seq))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* First index whose (lsn, admission_seq) >  the argument tuple. */
+static uint32_t
+fork_event_upper_bound(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
+{
+	uint32_t	lo = 0;
+	uint32_t	hi = e->nev;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+		const ForkEvent *v = &e->ev[mid];
+
+		fork_event_scan_steps++;
+		if (v->lsn < lsn ||
+			(v->lsn == lsn && v->admission_seq <= admission_seq))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* [start, end) that contains every event at exactly (lsn, admission_seq):
+ * the tuple group when the index is usable, the whole array otherwise. */
+static void
+fork_event_identity_range(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
+						  uint32_t *start, uint32_t *end)
+{
+	if (fork_event_index_usable(e, admission_seq))
+	{
+		*start = fork_event_lower_bound(e, lsn, admission_seq);
+		*end = fork_event_upper_bound(e, lsn, admission_seq);
+	}
+	else
+	{
+		*start = 0;
+		*end = e->nev;
+	}
+}
+
 static int
 fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 			  uint32_t *nb_out)
@@ -5062,6 +5147,23 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 		*nb_out = e->ev[lo - 1].cached_nblocks;
 		return e->ev[lo - 1].cached_state;
 	}
+	/*
+	 * Fast path: with every admission sequence nonzero the array is
+	 * strictly (lsn, admission_seq)-ordered, so the events visible at
+	 * (cap, seq_cap) are exactly the prefix ending at upper_bound(), and
+	 * the cached fold at its last element is that prefix's fold -- the
+	 * same value the run loop below would compute.  Legacy forks fall
+	 * through to that loop unchanged.
+	 */
+	if (fork_event_index_usable(e, seq_cap))
+	{
+		uint32_t	pos = fork_event_upper_bound(e, cap, seq_cap);
+
+		if (pos == 0)
+			return FORK_HOP_NONE;
+		*nb_out = e->ev[pos - 1].cached_nblocks;
+		return e->ev[pos - 1].cached_state;
+	}
 	{
 		uint32_t	first = 0;
 		uint32_t	end = e->nev;
@@ -5069,7 +5171,9 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 		uint32_t	nb;
 
 		/* Everything below cap is visible regardless of admission sequence.
-		 * Reuse its cached fold, then inspect only the equal-cap run. */
+		 * Reuse its cached fold, then inspect only the equal-cap run.  This
+		 * is the legacy-fork fallback: the fast path above handles every
+		 * fork with nlegacy_seq == 0. */
 		while (first < end)
 		{
 			uint32_t mid = first + (end - first) / 2;
@@ -5085,6 +5189,7 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 		{
 			const ForkEvent *v = &e->ev[i];
 
+			fork_event_scan_steps++;
 			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
 				continue;
 			if (v->kind == FEV_GROW)
@@ -5244,11 +5349,22 @@ fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
 		return lo != 0 && e->ev[lo - 1].cached_fence_nblocks != UINT32_MAX &&
 			block >= e->ev[lo - 1].cached_fence_nblocks;
 	}
+	/* Fast path: same reasoning as fork_asof_hop() above, over
+	 * cached_fence_nblocks instead of cached_nblocks/cached_state. */
+	if (fork_event_index_usable(e, seq_cap))
+	{
+		uint32_t	pos = fork_event_upper_bound(e, cap, seq_cap);
+
+		return pos != 0 && e->ev[pos - 1].cached_fence_nblocks != UINT32_MAX &&
+			block >= e->ev[pos - 1].cached_fence_nblocks;
+	}
 	{
 		uint32_t first = 0;
 		uint32_t end = e->nev;
 		uint32_t fence;
 
+		/* Legacy-fork fallback; the fast path above handles every fork with
+		 * nlegacy_seq == 0. */
 		while (first < end)
 		{
 			uint32_t mid = first + (end - first) / 2;
@@ -5264,6 +5380,7 @@ fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
 		{
 			const ForkEvent *v = &e->ev[i];
 
+			fork_event_scan_steps++;
 			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
 				continue;
 			if (v->kind == FEV_DEAD)
@@ -5305,11 +5422,79 @@ fork_has_create_at(const ForkEnt *e, uint64_t lsn)
 }
 
 /*
+ * Open the slot a new event occupies: the same order both insertion sites
+ * always maintained (LSN, then nonzero admission sequence among nonzero
+ * ones; a zero sequence never moves past anything and nothing moves past
+ * it), found by binary search when the fork has no legacy events and by
+ * the original backwards walk otherwise.  Existing events at/after the slot
+ * are shifted up (memmove for the indexed case, an equivalent element-wise
+ * copy for the fallback walk); the caller fills e->ev[slot] and bumps nev.
+ * evcap growth must already have happened (both call sites do it before
+ * calling this).
+ */
+static uint32_t
+fork_event_insert_pos(ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
+{
+	uint32_t	i;
+
+	if (fork_event_index_usable(e, admission_seq))
+	{
+		i = fork_event_upper_bound(e, lsn, admission_seq);
+		if (i < e->nev)
+			memmove(&e->ev[i + 1], &e->ev[i],
+					(size_t) (e->nev - i) * sizeof(ForkEvent));
+		return i;
+	}
+	i = e->nev;
+	while (i > 0 &&
+		   (e->ev[i - 1].lsn > lsn ||
+			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq > admission_seq)))
+	{
+		fork_event_scan_steps++;
+		e->ev[i] = e->ev[i - 1];
+		i--;
+	}
+	return i;
+}
+
+/* Debug-only (never called from a production path: it is O(N)): walk the
+ * array once and confirm the invariant fork_event_insert_pos() relies on --
+ * nondecreasing lsn; within equal lsn, nonzero admission sequences
+ * nondecreasing when nlegacy_seq == 0; nlegacy_seq equal to the count of
+ * zero-sequence events.  Returns 1 if the invariant holds, 0 otherwise. */
+static int
+fork_event_check_order(const ForkEnt *e)
+{
+	uint32_t	zero = 0;
+
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		if (e->ev[i].admission_seq == 0)
+			zero++;
+		if (i == 0)
+			continue;
+		if (e->ev[i - 1].lsn > e->ev[i].lsn)
+			return 0;
+		if (e->ev[i - 1].lsn == e->ev[i].lsn && e->nlegacy_seq == 0 &&
+			e->ev[i - 1].admission_seq != 0 && e->ev[i].admission_seq != 0 &&
+			e->ev[i - 1].admission_seq > e->ev[i].admission_seq)
+			return 0;
+	}
+	return zero == e->nlegacy_seq;
+}
+
+/*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
  * newest-first scan).  GROW events that do not raise the size visible at
  * their own LSN are dropped: steady-state rewrites of existing blocks at ever
- * newer pd_lsns add nothing, so the history stays O(distinct sizes).
+ * newer pd_lsns add nothing, so the history stays O(distinct sizes).  Ordered
+ * markers (fork_event_add_seg_marker(), below) are one event per ordered
+ * write; every lookup that needs to find or bound a specific (lsn,
+ * admission_seq) tuple goes through the position index above instead of
+ * scanning, except on the legacy forks the index does not cover.
 */
 static _Thread_local int fork_event_cache_defer = 0;
 
@@ -5329,16 +5514,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 		e->evcap = e->evcap ? e->evcap * 2 : 4;
 		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
 	}
-	i = e->nev;
-	while (i > 0 &&
-		   (e->ev[i - 1].lsn > lsn ||
-			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq > admission_seq)))
-	{
-		e->ev[i] = e->ev[i - 1];
-		i--;
-	}
+	i = fork_event_insert_pos(e, lsn, admission_seq);
 	e->ev[i].lsn = lsn;
 	e->ev[i].admission_seq = admission_seq;
 	e->ev[i].order_id = 0;
@@ -5346,6 +5522,8 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = 0;
 	e->nev++;
+	if (admission_seq == 0)
+		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
 	if (fork_event_cache_defer)
 		return;
@@ -5398,16 +5576,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 		e->evcap = e->evcap ? e->evcap * 2 : 4;
 		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
 	}
-	i = e->nev;
-	while (i > 0 &&
-		   (e->ev[i - 1].lsn > lsn ||
-			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq > admission_seq)))
-	{
-		e->ev[i] = e->ev[i - 1];
-		i--;
-	}
+	i = fork_event_insert_pos(e, lsn, admission_seq);
 	e->ev[i].lsn = lsn;
 	e->ev[i].admission_seq = admission_seq;
 	e->ev[i].order_id = order_id;
@@ -5415,6 +5584,8 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = kind;
 	e->nev++;
+	if (admission_seq == 0)
+		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, 0);
 	fork_event_cache_from(e, i);
 }
@@ -5423,10 +5594,15 @@ static int
 fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 						uint64_t order_id, uint64_t admission_seq)
 {
-	for (uint32_t i = 0; i < e->nev; i++)
+	uint32_t	start = 0;
+	uint32_t	end = e->nev;
+
+	fork_event_identity_range(e, lsn, admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
 	{
 		ForkEvent  *v = &e->ev[i];
 
+		fork_event_scan_steps++;
 		if ((v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_COMMIT ||
 			 v->kind == FEV_SEG_GROW_BOUND ||
 			 v->kind == FEV_SEG_COMMIT_BOUND) &&
@@ -5494,12 +5670,17 @@ static int
 fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 							  uint64_t order_id, uint64_t admission_seq)
 {
+	uint32_t	start = 0;
+	uint32_t	end = e->nev;
+
 	if (order_id == 0 || !fork_meta_orphan_proven(admission_seq))
 		return 0;
-	for (uint32_t i = 0; i < e->nev; i++)
+	fork_event_identity_range(e, lsn, admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
 	{
 		ForkEvent  *v = &e->ev[i];
 
+		fork_event_scan_steps++;
 		if (v->kind == FEV_GROW && v->marker_kind == 0 && v->order_id == 0 &&
 			v->lsn == lsn && v->admission_seq == admission_seq &&
 			v->nblocks == nblocks)
@@ -5531,15 +5712,21 @@ static int
 fork_event_commit_adoptable(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 							uint64_t order_id, uint64_t admission_seq)
 {
-	uint32_t	i;
+	uint32_t	start = 0;
+	uint32_t	end;
 
 	if (e == NULL || order_id == 0 || !fork_meta_orphan_proven(admission_seq))
 		return 0;
 	if (fork_size_asof_hop(e, lsn, admission_seq) < nblocks)
 		return 0;
-	for (i = 0; i < e->nev; i++)
+	end = e->nev;
+	fork_event_identity_range(e, lsn, admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
+	{
+		fork_event_scan_steps++;
 		if (e->ev[i].lsn == lsn && e->ev[i].admission_seq == admission_seq)
 			return 0;		/* already has an event at this identity */
+	}
 	return 1;
 }
 
@@ -5589,6 +5776,457 @@ fork_event_adopt_orphaned_commit_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 			(unsigned long long) order_id, nblocks);
 	fork_event_add_seg_marker(e, lsn, nblocks, FEV_SEG_COMMIT_BOUND, order_id,
 							  admission_seq);
+	return 1;
+}
+
+/*
+ * Test-only oracles: the pre-index algorithms, verbatim, so the self-test
+ * below can cross-check the fast paths in fork_asof_hop()/
+ * fork_inheritance_fenced() against them even on a fork where the fast path
+ * itself would run (nlegacy_seq == 0).  Kept only for that purpose; never
+ * called from a production path.
+ */
+static int
+fork_asof_hop_reference(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
+						uint32_t *nb_out)
+{
+	*nb_out = 0;
+	if (seq_cap == 0)
+	{
+		uint32_t lo = 0;
+		uint32_t hi = e->nev;
+
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (e->ev[mid].lsn <= cap)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo == 0)
+			return FORK_HOP_NONE;
+		*nb_out = e->ev[lo - 1].cached_nblocks;
+		return e->ev[lo - 1].cached_state;
+	}
+	{
+		uint32_t	first = 0;
+		uint32_t	end = e->nev;
+		uint8_t		state;
+		uint32_t	nb;
+
+		while (first < end)
+		{
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
+		}
+		state = first == 0 ? FORK_HOP_NONE : e->ev[first - 1].cached_state;
+		nb = first == 0 ? 0 : e->ev[first - 1].cached_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_GROW)
+			{
+				if (v->nblocks > nb)
+					nb = v->nblocks;
+				state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+					FORK_HOP_GROW : FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_SET)
+			{
+				nb = v->nblocks;
+				state = FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_DEAD)
+			{
+				nb = 0;
+				state = FORK_HOP_DEAD;
+			}
+		}
+		*nb_out = nb;
+		return state;
+	}
+}
+
+static int
+fork_inheritance_fenced_reference(const ForkEnt *e, uint32_t block,
+								  uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL)
+		return 0;
+	if (seq_cap == 0)
+	{
+		uint32_t lo = 0;
+		uint32_t hi = e->nev;
+
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (e->ev[mid].lsn <= cap)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		return lo != 0 && e->ev[lo - 1].cached_fence_nblocks != UINT32_MAX &&
+			block >= e->ev[lo - 1].cached_fence_nblocks;
+	}
+	{
+		uint32_t first = 0;
+		uint32_t end = e->nev;
+		uint32_t fence;
+
+		while (first < end)
+		{
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
+		}
+		fence = first == 0 ? UINT32_MAX :
+			e->ev[first - 1].cached_fence_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_DEAD)
+				fence = 0;
+			else if (v->kind == FEV_SET && v->nblocks < fence)
+				fence = v->nblocks;
+		}
+		return fence != UINT32_MAX && block >= fence;
+	}
+}
+
+/* Deterministic xorshift64* generator for the self-test below: no libc PRNG
+ * dependency, reproducible across platforms from the same seed. */
+static uint64_t
+fork_event_selftest_rand(uint64_t *state)
+{
+	uint64_t	x = *state;
+
+	x ^= x >> 12;
+	x ^= x << 25;
+	x ^= x >> 27;
+	*state = x;
+	return x * 0x2545F4914F6CDD1DULL;
+}
+
+typedef struct FevSelftestMarker
+{
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint64_t	order_id;
+	uint32_t	nblocks;
+	uint8_t		kind;
+} FevSelftestMarker;
+
+/*
+ * Randomized cross-check of the (lsn, admission_seq) position index against
+ * the linear scans it replaces.  See pagestore_core.h for the calling
+ * convention.  legacy != 0 seeds some sequence-zero events so the fallback
+ * path (nlegacy_seq != 0) is exercised instead of the index.
+ */
+int
+ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
+								  uint32_t nqueries, int legacy)
+{
+	ForkEnt		fe;
+	uint64_t	rngstate = seed ? seed : 1;
+	uint64_t   *seq_pool;
+	FevSelftestMarker *markers;
+	uint32_t	nmarkers = 0;
+	int			rc = 0;
+	int			checkno = 0;
+
+#define FEV_ST_CHECK(cond) \
+	do { \
+		checkno++; \
+		if (!(cond)) \
+		{ \
+			rc = checkno; \
+			goto done; \
+		} \
+	} while (0)
+
+	memset(&fe, 0, sizeof(fe));
+	seq_pool = malloc((size_t) nevents * sizeof(*seq_pool));
+	markers = malloc((size_t) nevents * sizeof(*markers));
+	if (seq_pool == NULL || markers == NULL)
+	{
+		rc = -1;
+		goto done;
+	}
+
+	/* A shuffled permutation of 1..nevents: unique, nonzero, random-ordered
+	 * admission sequences so inserts land at random positions, not just the
+	 * tail. */
+	for (uint32_t i = 0; i < nevents; i++)
+		seq_pool[i] = i + 1;
+	for (uint32_t i = nevents; i > 1; i--)
+	{
+		uint32_t	j = (uint32_t) (fork_event_selftest_rand(&rngstate) % i);
+		uint64_t	tmp = seq_pool[i - 1];
+
+		seq_pool[i - 1] = seq_pool[j];
+		seq_pool[j] = tmp;
+	}
+
+	for (uint32_t i = 0; i < nevents; i++)
+	{
+		uint64_t	lsn = 1 + fork_event_selftest_rand(&rngstate) % 6;
+		uint64_t	admission_seq = seq_pool[i];
+		uint32_t	old_nev = fe.nev;
+		uint32_t	expected_slot;
+
+		if (legacy && (i % 7) == 6)
+			admission_seq = 0;
+
+		/*
+		 * Pin the arrival-order promise this whole index rests on (see the
+		 * header comment above fork_event_index_usable(), ~line 5043): the
+		 * slot fork_event_insert_pos() picks -- the fast path's
+		 * upper_bound(), or the fallback's backward walk, replicated here
+		 * read-only -- must be exactly where the new event lands.  Computed
+		 * before the insertion call, since both are side-effect-free reads
+		 * over the pre-insert array.
+		 */
+		if (fork_event_index_usable(&fe, admission_seq))
+			expected_slot = fork_event_upper_bound(&fe, lsn, admission_seq);
+		else
+		{
+			uint32_t	w = fe.nev;
+
+			while (w > 0 &&
+				   (fe.ev[w - 1].lsn > lsn ||
+					(fe.ev[w - 1].lsn == lsn && admission_seq != 0 &&
+					 fe.ev[w - 1].admission_seq != 0 &&
+					 fe.ev[w - 1].admission_seq > admission_seq)))
+				w--;
+			expected_slot = w;
+		}
+
+		if ((i & 1) == 0)
+		{
+			uint8_t		kind;
+			uint32_t	roll = (uint32_t) (fork_event_selftest_rand(&rngstate) % 8);
+			uint32_t	nblocks = (uint32_t) (fork_event_selftest_rand(&rngstate) % 9);
+
+			kind = roll == 0 ? FEV_SET : roll == 1 ? FEV_DEAD : FEV_GROW;
+			fork_event_add(&fe, lsn, admission_seq, nblocks, kind);
+			/* A GROW that does not raise the size at (lsn, admission_seq) is
+			 * deduped (fork_event_add() returns early, nev unchanged); the
+			 * slot promise has nothing to check in that case. */
+			FEV_ST_CHECK(fe.nev == old_nev || fe.nev == old_nev + 1);
+			if (fe.nev == old_nev + 1)
+				FEV_ST_CHECK(fe.ev[expected_slot].lsn == lsn &&
+							 fe.ev[expected_slot].admission_seq == admission_seq &&
+							 fe.ev[expected_slot].nblocks == nblocks &&
+							 fe.ev[expected_slot].kind == kind);
+		}
+		else
+		{
+			uint8_t		kind = (fork_event_selftest_rand(&rngstate) & 1) ?
+				FEV_SEG_GROW_BOUND : FEV_SEG_COMMIT_BOUND;
+			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rngstate) % 8);
+			uint64_t	order_id = 1 + fork_event_selftest_rand(&rngstate) % UINT32_MAX;
+
+			fork_event_add_seg_marker(&fe, lsn, nblocks, kind, order_id,
+									  admission_seq);
+			FEV_ST_CHECK(fe.nev == old_nev + 1);
+			FEV_ST_CHECK(fe.ev[expected_slot].lsn == lsn &&
+						 fe.ev[expected_slot].admission_seq == admission_seq &&
+						 fe.ev[expected_slot].order_id == order_id &&
+						 fe.ev[expected_slot].nblocks == nblocks &&
+						 fe.ev[expected_slot].kind == kind);
+			if (admission_seq != 0)
+			{
+				markers[nmarkers].lsn = lsn;
+				markers[nmarkers].admission_seq = admission_seq;
+				markers[nmarkers].order_id = order_id;
+				markers[nmarkers].nblocks = nblocks;
+				markers[nmarkers].kind = kind;
+				nmarkers++;
+			}
+		}
+		FEV_ST_CHECK(fork_event_check_order(&fe));
+	}
+	FEV_ST_CHECK(fe.nlegacy_seq <= fe.nev);
+
+	/* Activate a subset of the growth markers; a second activation of the
+	 * same GROW_BOUND tuple must fail (its kind is no longer a SEG_* kind).
+	 * Also deliberately duplicate a subset of the commit markers' tuples
+	 * with a plain GROW (fork_restore_later_page_growth()'s real shape),
+	 * exercising identity lookups over a multi-element group. */
+	for (uint32_t i = 0; i < nmarkers; i++)
+	{
+		FevSelftestMarker *m = &markers[i];
+
+		if (i % 3 == 0)
+		{
+			FEV_ST_CHECK(fork_event_activate_seg(&fe, m->lsn, m->nblocks,
+												  m->order_id,
+												  m->admission_seq) == 1);
+			FEV_ST_CHECK(fork_event_check_order(&fe));
+			if (m->kind == FEV_SEG_GROW_BOUND)
+				FEV_ST_CHECK(fork_event_activate_seg(&fe, m->lsn, m->nblocks,
+													  m->order_id,
+													  m->admission_seq) == 0);
+		}
+		else if (i % 3 == 1 && m->kind == FEV_SEG_COMMIT_BOUND)
+		{
+			fork_event_add(&fe, m->lsn, m->admission_seq, 100, FEV_GROW);
+			FEV_ST_CHECK(fork_event_check_order(&fe));
+		}
+	}
+
+	/* Query cross-checks. */
+	for (uint32_t i = 0; i < nqueries; i++)
+	{
+		uint64_t	cap;
+		uint64_t	seq_cap;
+		uint32_t	roll = (uint32_t) (fork_event_selftest_rand(&rngstate) % 4);
+
+		if (fe.nev > 0 && roll == 0)
+		{
+			uint32_t	idx = (uint32_t) (fork_event_selftest_rand(&rngstate) % fe.nev);
+
+			cap = fe.ev[idx].lsn;
+			seq_cap = fe.ev[idx].admission_seq;
+		}
+		else
+		{
+			cap = 1 + fork_event_selftest_rand(&rngstate) % 8;
+			seq_cap = (roll == 1) ? 0 :
+				1 + fork_event_selftest_rand(&rngstate) % (nevents + 5);
+		}
+
+		{
+			uint32_t	nb_fast = 0,
+						nb_ref = 0;
+			int			s_fast = fork_asof_hop(&fe, cap, seq_cap, &nb_fast);
+			int			s_ref = fork_asof_hop_reference(&fe, cap, seq_cap, &nb_ref);
+
+			FEV_ST_CHECK(s_fast == s_ref && nb_fast == nb_ref);
+		}
+		{
+			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rngstate) % 12);
+			int			f_fast = fork_inheritance_fenced(&fe, block, cap, seq_cap);
+			int			f_ref = fork_inheritance_fenced_reference(&fe, block, cap,
+																	 seq_cap);
+
+			FEV_ST_CHECK((f_fast != 0) == (f_ref != 0));
+		}
+		{
+			uint32_t	start = 0,
+						end = 0;
+
+			fork_event_identity_range(&fe, cap, seq_cap, &start, &end);
+			if (fork_event_index_usable(&fe, seq_cap))
+			{
+				for (uint32_t j = 0; j < fe.nev; j++)
+				{
+					int			has = fe.ev[j].lsn == cap &&
+						fe.ev[j].admission_seq == seq_cap;
+					int			inrange = j >= start && j < end;
+
+					FEV_ST_CHECK(has == inrange);
+				}
+			}
+			else
+				FEV_ST_CHECK(start == 0 && end == fe.nev);
+		}
+		if (fork_event_index_usable(&fe, seq_cap))
+		{
+			uint32_t	walk = fe.nev;
+
+			while (walk > 0 &&
+				   (fe.ev[walk - 1].lsn > cap ||
+					(fe.ev[walk - 1].lsn == cap && seq_cap != 0 &&
+					 fe.ev[walk - 1].admission_seq != 0 &&
+					 fe.ev[walk - 1].admission_seq > seq_cap)))
+				walk--;
+			FEV_ST_CHECK(walk == fork_event_upper_bound(&fe, cap, seq_cap));
+		}
+	}
+
+	{
+		uint32_t	zero = 0;
+
+		for (uint32_t i = 0; i < fe.nev; i++)
+			if (fe.ev[i].admission_seq == 0)
+				zero++;
+		FEV_ST_CHECK(zero == fe.nlegacy_seq);
+	}
+
+#undef FEV_ST_CHECK
+done:
+	free(seq_pool);
+	free(markers);
+	free(fe.ev);
+	free(fe.def_idx);
+	return rc;
+}
+
+/* Test-only: total scan/bisection steps taken by the loops above since the
+ * process started (or since last read; the counter never resets itself),
+ * thread-local so the test's own driver thread sees only its own writes. */
+uint64_t
+ps_test_fork_event_scan_steps(void)
+{
+	return fork_event_scan_steps;
+}
+
+/* Test-only: current event counts for one fork, under the shard read lock
+ * like ps_test_page_version_count(). */
+int
+ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
+						 uint32_t *nevents, uint32_t *nmarkers,
+						 uint32_t *ninert)
+{
+	ForkEnt    *e;
+	uint32_t	shard = ps_shard_of(key);
+
+	ps_lock_shard_rd(shard);
+	e = fork_find(timeline, key);
+	if (e == NULL)
+	{
+		ps_unlock_shard(shard);
+		return 0;
+	}
+	if (nevents)
+		*nevents = e->nev;
+	if (nmarkers)
+	{
+		uint32_t	n = 0;
+
+		for (uint32_t i = 0; i < e->nev; i++)
+			if (e->ev[i].marker_kind != 0)
+				n++;
+		*nmarkers = n;
+	}
+	if (ninert)
+	{
+		uint32_t	n = 0;
+
+		for (uint32_t i = 0; i < e->nev; i++)
+			if (e->ev[i].kind > FEV_DEAD)
+				n++;
+		*ninert = n;
+	}
+	ps_unlock_shard(shard);
 	return 1;
 }
 
@@ -8247,16 +8885,23 @@ static int
 fork_meta_snapshot_marker_present(const ForkMetaRecV2 *rec)
 {
 	ForkEnt *e = fork_find(rec->timeline, &rec->key);
+	uint32_t start = 0;
+	uint32_t end;
 
 	if (e == NULL)
 		return 0;
-	for (uint32_t i = 0; i < e->nev; i++)
+	end = e->nev;
+	fork_event_identity_range(e, rec->lsn, rec->admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
+	{
+		fork_event_scan_steps++;
 		if (e->ev[i].lsn == rec->lsn &&
 			e->ev[i].admission_seq == rec->admission_seq &&
 			e->ev[i].order_id == rec->order_id &&
 			e->ev[i].nblocks == rec->nblocks &&
 			e->ev[i].marker_kind == rec->kind)
 			return 1;
+	}
 	return 0;
 }
 
@@ -8313,13 +8958,20 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			if (fork_meta_ordered_marker_valid(&rec, 0) &&
 				(!filter_deleting ||
 				 !fork_meta_timeline_is_deleting(rec.timeline)) &&
+				/*
+				 * O(log N)/O(1) with the position index, versus the version-
+				 * chain walk in marker_page_retained(): check this first so
+				 * a marker already in memory (the steady-state case: every
+				 * source-log marker was loaded at recovery) never pays for
+				 * that walk.
+				 */
+				!fork_meta_snapshot_marker_present(&rec) &&
 				(preserve_survivors ||
 				 (fork_meta_event_future(rec.lsn, rec.admission_seq,
 										 cutoff.lsn, cutoff.admission_seq) ||
 				  fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
 															  rec.lsn, rec.admission_seq,
-															  rec.nblocks))) &&
-				!fork_meta_snapshot_marker_present(&rec))
+															  rec.nblocks))))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
 					rec.lsn, rec.admission_seq, cutoff.lsn,
@@ -8379,12 +9031,14 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 				fork_meta_ordered_marker_valid(&rec, 1) &&
 				(!filter_deleting ||
 				 !fork_meta_timeline_is_deleting(rec.timeline)) &&
+				/* See the V2 branch above: check presence (index-backed)
+				 * before the page-retention version-chain walk. */
+				!fork_meta_snapshot_marker_present(&rec) &&
 				(preserve_survivors ||
 				 (fork_meta_event_future(rec.lsn, 0, cutoff.lsn,
 										 cutoff.admission_seq) ||
 				  fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
-															  rec.lsn, 0, rec.nblocks))) &&
-				!fork_meta_snapshot_marker_present(&rec))
+															  rec.lsn, 0, rec.nblocks))))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
 					rec.lsn, 0, cutoff.lsn, cutoff.admission_seq) ?

@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
@@ -1500,6 +1501,175 @@ test_live_ordered_marker_walless_survives_two_cutovers(void)
 }
 
 /*
+ * F5: randomized cross-check of the (lsn, admission_seq) position index
+ * (fork_event_lower_bound()/upper_bound()/identity_range()/insert_pos())
+ * against the linear scans it replaces, on a private in-core fork that
+ * needs no store.  See ps_test_fork_event_index_selftest()'s header comment
+ * in pagestore_core.h for what each run covers.
+ */
+static void
+test_fork_event_index_selftest(void)
+{
+	static const uint64_t seeds[] = {1, 2, 3};
+
+	for (int legacy = 0; legacy <= 1; legacy++)
+		for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++)
+		{
+			int			rc = ps_test_fork_event_index_selftest(seeds[i], 2000,
+																4000, legacy);
+			char		msg[128];
+
+			snprintf(msg, sizeof(msg),
+					 "fork-event index selftest seed=%llu legacy=%d (failed check %d)",
+					 (unsigned long long) seeds[i], legacy, rc);
+			check(rc == 0, msg);
+		}
+}
+
+/*
+ * F5: deterministic scaling guard.  K WAL-less rewrites of one block (the
+ * FSM/VM pattern: one growth-class write, then K-1 inert commit-class
+ * markers sharing its LSN) must cost O(log N) bisection steps per write,
+ * not the O(N) linear scan the position index replaces -- a thread-local
+ * step counter, not a wall clock, so the assertion is reproducible on a
+ * loaded CI runner.  Sanity-run with fork_event_index_usable() forced to
+ * return 0 (the counted fallback loops are the unmodified O(N) scans, so
+ * this reproduces the pre-index cost exactly) confirmed all three fail
+ * deterministically at K=5000: writes 25,010,000 steps (~K^2), cutover
+ * 12,507,500, reopen 12,507,501 (~K^2/2 each, one triangular pass per
+ * phase), all far past the K*128 ceiling (640,000).
+ *
+ * The K rewrites reopen with a raised flush_pages (see below) so the
+ * dominant cost is the index's own O(log N) work, not memtable-flush
+ * fsyncs; measured 0.25s on tmpfs and 2.5s on a disk-backed directory
+ * (XFS/NVMe) for the whole case.  The wall clock is logged, not
+ * asserted, below.
+ */
+static void
+test_fork_event_index_scaling(void)
+{
+	char		store[] = "/tmp/psforkmetaeventscaleXXXXXX";
+	char		snapshots[1024];
+	char		manifest[1200];
+	char		frontier[1200];
+	PsKey		key = {6, 6, 6, 3, PS_KLASS_RELATION};
+	PsKey		pin_key = {6, 6, 21, 1, PS_KLASS_RELATION};
+	const uint32_t K = 5000;
+	uint64_t	first_seq = 0,
+				second_seq = 0,
+				seq = 0;
+	uint64_t	steps_before,
+				steps_after;
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	uint32_t	nevents = 0,
+				nmarkers = 0,
+				ninert = 0;
+	struct timespec t0,
+				t1;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create fork-event scaling store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build scaling snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "build scaling manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "build scaling frontier path");
+	flush_pages = 1;
+	compact_layers = 0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "open scaling store and write pinned page history");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 79;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a safe frontier for the scaling store");
+	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
+		  "create the FSM-like fork at LSN 300");
+
+	/*
+	 * flush_pages is captured by ps_memtable_create() at ps_core_open(), so
+	 * flush_pages == 1 above (needed to get the frontier published from
+	 * just two writes, matching every other test in this file) stays in
+	 * effect for the rest of this open -- one memtable flush per K rewrite
+	 * below, each with its own fsyncs.  Cheap on tmpfs, 10s-100s of seconds
+	 * on a real disk (the standalone CI lane's store).  Close and reopen
+	 * with a flush threshold above K: the K rewrites below then flush at
+	 * most once (at close), and the fsync cost this test pays scales with
+	 * K, not with K times a per-write flush.
+	 */
+	close_runtime();
+	flush_pages = (int) K + 1000;
+	check(ps_core_open(store) == 0,
+		  "reopen with a flush threshold above K for the scaling rewrites");
+
+	/* K WAL-less rewrites of block 0: the first grows the fork (activated
+	 * SEG_GROW_BOUND), every later one is an inert SEG_COMMIT_BOUND at the
+	 * same floor LSN -- long equal-LSN runs, the shape the index exists
+	 * for. */
+	steps_before = ps_test_fork_event_scan_steps();
+	for (uint32_t i = 0; i < K; i++)
+		check(append_relation_tag(&key, 0, 0, page, (unsigned char) i, &seq) == 0,
+			  "WAL-less rewrite of block 0 for the scaling guard");
+	steps_after = ps_test_fork_event_scan_steps();
+	check(steps_after - steps_before < (uint64_t) K * 128,
+		  "K live writes stay sublinear in scan steps (index, not O(N) scan)");
+
+	check(ps_test_fork_event_count(0, &key, &nevents, &nmarkers, &ninert) &&
+		  nevents == K + 1 && nmarkers == K && ninert == K - 1,
+		  "event/marker/inert counts match the FSM growth+commit shape");
+
+	steps_before = ps_test_fork_event_scan_steps();
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "cutover publishes for the scaling store");
+	steps_after = ps_test_fork_event_scan_steps();
+	check(steps_after - steps_before < (uint64_t) K * 128,
+		  "cutover stays sublinear in scan steps");
+	check(snapshot_ordered_marker_count(snapshots, &key, 0, 0) == (int) K,
+		  "cutover retains every marker (page versions unreclaimed)");
+
+	close_runtime();
+	steps_before = ps_test_fork_event_scan_steps();
+	check(ps_core_open(store) == 0, "reopen after cutover for the scaling store");
+	steps_after = ps_test_fork_event_scan_steps();
+	check(steps_after - steps_before < (uint64_t) K * 128,
+		  "reopen replay stays sublinear in scan steps");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == (unsigned char) (K - 1),
+		  "newest tag readable after reopen");
+
+	/*
+	 * A wall-clock catastrophe check would be redundant with the step-count
+	 * assertions above (the real guard) and flaky across CI hardware/disk
+	 * speed (M1 review finding); log it instead of asserting it.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (t1.tv_sec - t0.tv_sec >= 60)
+		fprintf(stderr,
+				"WARN: test_fork_event_index_scaling took %lds (informational only; "
+				"the scan-step assertions above are the real guard)\n",
+				(long) (t1.tv_sec - t0.tv_sec));
+
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
  * ---- recovery adopts an orphaned ordered record, with diagnostics ----
  *
  * Recovery adopts an unmatched ordered record only when the selected
@@ -2831,6 +3001,9 @@ main(void)
 	off_t poison_source_size;
 	int n;
 
+	/* Needs no store; runs first. */
+	test_fork_event_index_selftest();
+
 	check(mkdtemp(store) != NULL, "create runtime cutover store");
 	page_size = sizeof(page);
 	segment_size = 1024 * 1024;
@@ -3363,6 +3536,7 @@ main(void)
 	test_live_ordered_marker_survives_two_cutovers();
 	test_live_ordered_commit_marker_survives_two_cutovers();
 	test_live_ordered_marker_walless_survives_two_cutovers();
+	test_fork_event_index_scaling();
 	test_orphaned_ordered_marker_adopted();
 	test_orphaned_ordered_marker_not_adopted_on_mismatch();
 	test_orphaned_commit_marker_adopted();
