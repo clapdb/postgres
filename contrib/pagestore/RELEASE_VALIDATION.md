@@ -218,7 +218,7 @@ The release record should distinguish:
 
 No production sign-off is implied by the current assessment.
 
-## Additional recovery finding during PR #262 review
+## Recovery finding during PR #262 review (resolved)
 
 A cassert integration run passed with the final artifact publication producers,
 but reopening its retained store after shutdown failed in
@@ -233,10 +233,57 @@ The failure was reproduced on the unmodified `pagestore` baseline
 `2b2349887c2` in an isolated cassert build: its integration script passed, then
 its own daemon failed reopening the retained store. Debugging found the same
 FSM key and block, LSN 318767144 and order ID 2; the recovered GROW events again
-had zero order IDs. This predates the artifact changes. Diagnosis and repair
-of the lost ordering marker remain separate release work. Treat independent
-reopen of the full integration store as a release blocker; do not generalize
-the script's PASS into a claim that this additional recovery check passed.
+had zero order IDs. This predates the artifact changes.
+
+**Diagnosis.** A live ordered page write (a WAL-less or below-floor "clamped"
+relation page) durably persists a bound marker (`FEV_SEG_GROW_BOUND` or
+`FEV_SEG_COMMIT_BOUND`, carrying its `order_id`) to the forkmeta source log,
+but the *in-memory* fork history recorded it as a plain `FEV_GROW` with
+`marker_kind = 0` and `order_id = 0` -- `append_page_impl()`'s live path called
+the same `fork_grow_apply()` used for ordinary writes instead of inserting the
+marker-plus-activation recovery itself would rebuild. The forkmeta snapshot
+serializer builds a new generation from memory and compensates only by
+rescuing markers still present in the *current* source log; the first cutover
+after the write keeps the marker (copied from the source log) and resets the
+source log to a bare epoch record, but a *second* cutover in the same daemon
+lifetime finds the marker in neither memory nor the (already-reset) source log
+and publishes a plain GROW. On the next open, the image-layer index still
+carries the record's `order_id`; `fork_event_activate_seg()` finds no matching
+marker, `recover_layer_prefix()` fails, and the daemon exits with a stale
+`storage open: Invalid argument` (or whatever `errno` a prior syscall left
+behind). Nothing in the persisted formats was wrong; the in-memory
+representation had diverged from the one recovery reconstructs.
+
+**Fix.** The live path now inserts exactly the representation recovery would
+rebuild: `fork_event_add_seg_marker()` followed by `fork_event_activate_seg()`,
+using the same growth/commit distinction as the durable
+`fork_meta_persist_segment()` call a few lines above. Recovery additionally
+gained an explicit, logged adoption rule (`fork_event_adopt_orphaned_seg()`,
+called from `replay_page_record()` only after the normal marker match fails):
+when an ordered record's admission identity (nonzero `order_id` and
+`admission_seq`) matches a plain `GROW` event with the identical `lsn`,
+`admission_seq`, and `nblocks`, that event is the degraded serialization of
+this record's own marker (the admission sequence is allocated once per
+append), so the event is promoted back to a bound marker and one
+`pagestore: adopting orphaned ordered record ...` line is logged. The rule is
+fail-closed on any mismatch. `recover_layer_prefix()` and `recover()` also now
+print the refused/retired record's full tuple (and `recover_layer_prefix()`
+sets `errno = EINVAL`) before failing, so a bare, stale-errno
+`storage open: Invalid argument` cannot come back unexplained. Stores already
+in the broken state (any store that took a live ordered write followed by two
+forkmeta cutovers in one daemon lifetime) self-heal: they open via the
+adoption rule and publish a proper marker at their next cutover. No persisted
+format changed; `pagestore_format_versions` output and all format fixtures are
+unaffected.
+
+`integration_test.sh` now stops every cluster and daemon it started, then
+starts a fresh daemon against the same retained store and asserts it reopens
+independently, with `ok - retained store reopens independently after clean
+shutdown` and `ok - no orphaned ordered records were adopted on reopen` (the
+latter proves the *live* path fix, not just the recovery-side repair, since a
+store built entirely by the fixed daemon must never need the adoption rule).
+Independent reopen of the full integration store is now part of the script's
+PASS, not a separate manual step.
 
 Reproduce with `KEEPTMP=1 contrib/pagestore/integration_test.sh <build>`, then
 start `<build>/contrib/pagestore/pagestore_daemon` on the reported retained

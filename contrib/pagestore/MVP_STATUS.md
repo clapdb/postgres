@@ -752,7 +752,7 @@ bytes, so a flipped byte inside a record is rejected at open; FKM2 records
 stay readable, and `fixtures/posix-mvp-baseline` (FKM2) is kept as the legacy
 fixture that must keep reopening while `fixtures/posix-forkmeta-crc` is the
 current one that pins the compiled identities and takes every mutation.  This
-was the first format change to go through the fixture process.  Five findings
+was the first format change to go through the fixture process.  Six findings
 were fixed on the way: a store reopened at a new path was refused because
 layer locations recorded their absolute parent directory (a missing parent now
 rebases onto the store's own leaf; a foreign existing parent is still
@@ -766,7 +766,21 @@ the same fork -- a below-floor copy followed by a higher-LSN write on the same
 relation published a snapshot the daemon then could not open, so each part is
 now sorted into per-fork order before it is written; and a torn legacy prefix
 stayed repairable only after the unknown-magic check learned to read a legacy
-record first.  One gap remains documented in the check: a
+record first; and, found during PR #262 review, a live ordered write's bound
+marker existed only in the forkmeta source log -- the in-memory fork history
+recorded a plain GROW instead -- so a second forkmeta cutover in the same
+daemon lifetime published that plain GROW and the store could not reopen
+(`storage open: Invalid argument`).  Live writes now insert the marker-plus-
+activation representation recovery itself rebuilds, and recovery adopts an
+orphaned record -- one whose plain GROW carries the exact nonzero admission
+identity (`order_id`, `admission_seq`, `lsn`, `nblocks`) of an otherwise-
+unmatched ordered record -- logging one `adopting orphaned ordered record`
+line per repair; any mismatch stays fail-closed.  `integration_test.sh` now
+stops every cluster it started, reopens its own retained store against a
+fresh daemon, and asserts both that the reopen succeeds and that zero
+adoptions were needed, so this class of failure fails the script instead of
+requiring the separate manual check `RELEASE_VALIDATION.md` used to call out.
+One gap remains documented in the check: a
 page-segment record can never be the only copy of a page, because a cleanly
 stopped daemon flushes its memtable into a layer before it exits, so every
 archived page is also in a layer and a read resolves there (`reads mem=0
