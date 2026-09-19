@@ -322,6 +322,33 @@ _Static_assert(MAX_TIMELINES == PS_INSPECTION_MAX_TIMELINES,
 			   "inspection timeline capacity must match core capacity");
 static unsigned char walidx_snapshot_force_due[MAX_TIMELINES];
 static unsigned char walidx_snapshot_gc_force_due[MAX_TIMELINES];
+/* Set by the WAL reclaimer (wal_segment_reclaim_one) when a complete segment
+ * is blocked only by the stale in-memory raw WAL-index dependency floor, so
+ * that a compacted publication is requested on its behalf instead of waiting
+ * for the WAL-index controller's own tail trigger or high water.  Honored by
+ * walidx_snapshot_publish_one exactly like force_due, but owned separately so
+ * the backpressure observer's periodic rewrite of force_due (16542) cannot
+ * silently drop a pending reclaim request. */
+static unsigned char walidx_snapshot_reclaim_due[MAX_TIMELINES];
+/* The raw floor, fence epoch, and snapshot generation as of the last served
+ * reclaim-due request (walidx_reclaim_request_generation != the current
+ * walidx_snapshot_generation[tl] means a publication has happened since;
+ * walidx_reclaim_request_raw[tl] == 0 means never requested -- not the
+ * generation, which is legitimately 0 before a timeline's first-ever
+ * publish).  A progress advance alone can never retire the oldest raw item
+ * (walidx_entry_prune_plan drops an item only when a durable base and no
+ * retained horizon needs it; a higher cutoff changes neither), so once a
+ * served request's raw floor is unchanged and no retention-registry fence
+ * has changed since (walidx_reclaim_fence_epoch, not
+ * retention_effective_floor's own numeric value, which a pin reserved above
+ * the existing floor need not move), a repeat request would only cause a
+ * full non-compacting index rewrite for as long as an unreplaceable
+ * dependency blocks the segment -- fruitless, and (since the backend
+ * materializer publishes WAL-index progress once per indexing batch)
+ * sustained. */
+static uint64_t walidx_reclaim_request_raw[MAX_TIMELINES];
+static uint64_t walidx_reclaim_request_fence_epoch[MAX_TIMELINES];
+static uint64_t walidx_reclaim_request_generation[MAX_TIMELINES];
 static uint64_t walidx_observation_next_ns;
 static uint64_t walidx_observation_count;
 #define WALIDX_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
@@ -367,6 +394,21 @@ static char wal_segment_root[4096];
 
 static uint64_t page_reclaim_lag_bytes(void);
 static uint64_t wal_reclaim_lag_bytes(void);
+/* Bumped on every event that can move a WAL-reclaim proof input (retention,
+ * WAL-index publish/GC, durable progress, timeline delete); cancels the
+ * reclaimer's no-progress backoff early.  Defined with the WAL-reclaim state
+ * below; forward-declared here because page_prune_mark_all_due precedes it. */
+static inline void wal_reclaim_proof_changed(void);
+/* Bumped only on retention-registry changes (pin reserve/drop, artifact
+ * fence release/open, a branch cap released) -- the subset of
+ * wal_reclaim_proof_changed's events that can make a previously
+ * unreplaceable raw WAL-index item replaceable, excluding durable
+ * WAL-index progress and WAL-index publish/GC.  Lets the reclaim-due
+ * request's fruitless check in wal_segment_reclaim_one tell "a pin changed"
+ * from "progress advanced" even when neither moves retention_effective_floor's own
+ * numeric value (e.g. a new pin reserved above the existing floor).
+ * Forward-declared with wal_reclaim_proof_changed for the same reason. */
+static inline void walidx_reclaim_fence_changed(void);
 static uint64_t walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
 									unsigned char *gc_candidates);
 static uint64_t forkmeta_reclaim_lag_bytes(void);
@@ -999,6 +1041,10 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 	{
 		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
 		__atomic_store_n(&walidx_snapshot_gc_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
+		walidx_reclaim_request_raw[tl] = 0;
+		walidx_reclaim_request_fence_epoch[tl] = 0;
+		walidx_reclaim_request_generation[tl] = 0;
 	}
 	__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&backpressure_shutdown_requested, 0, __ATOMIC_RELEASE);
@@ -1183,6 +1229,13 @@ ps_test_walidx_force_due(uint32_t timeline)
 {
 	return timeline < MAX_TIMELINES ?
 		__atomic_load_n(&walidx_snapshot_force_due[timeline], __ATOMIC_ACQUIRE) : 0;
+}
+
+int
+ps_test_walidx_reclaim_due(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES ?
+		__atomic_load_n(&walidx_snapshot_reclaim_due[timeline], __ATOMIC_ACQUIRE) : 0;
 }
 
 int
@@ -3687,6 +3740,14 @@ page_prune_mark_all_due_locked(void)
 static void
 page_prune_mark_all_due(void)
 {
+	/* Every caller (pin reserve/drop, artifact fence release/open) is a
+	 * retention-registry change, which can move the WAL reclaimer's
+	 * retention_effective_floor input: cancel its no-progress backoff early
+	 * rather than waiting out the fixed 1 s timer, and make a reclaim-due
+	 * request permitted again even when this specific change did not move
+	 * retention_effective_floor's own numeric value. */
+	wal_reclaim_proof_changed();
+	walidx_reclaim_fence_changed();
 	ps_lock_map_rd();
 	page_prune_mark_all_due_locked();
 	ps_unlock_map();
@@ -9205,6 +9266,71 @@ static uint64_t wal_log_bytes[MAX_TIMELINES];
 #define WAL_IMMUTABLE_SEGMENT_BYTES PS_WAL_SEGMENT_MIN_BYTES
 static struct timespec wal_reclaim_retry_at[MAX_TIMELINES];
 static uint32_t wal_reclaim_cursor;
+/* Proof-keyed cancellation of the no-progress backoff (R3b-3): the backoff
+ * exists to avoid repeating the global drain on every idle tick while the
+ * candidate is genuinely unchanged, not to make the reclaimer wait out a
+ * fixed timer after a proof input has actually moved.  Every timeline's
+ * armed retry records the epoch as of just before that attempt read any
+ * proof input (not a fresh read at arm time -- see wal_reclaim_backoff); a
+ * later global bump (retention change, WAL-index publish/GC, durable
+ * progress, timeline delete) makes the timeline due again, but not before
+ * WAL_RECLAIM_REARM_MIN_NS after the arm: every re-evaluation is a full
+ * drain (admission write lock, all shard write locks, the whole-index raw
+ * floor scan, the control-image floor read), and PS_OP_RETENTION_PIN_DROP is
+ * dispatched without the admission lock, so a drop-heavy client pinned on one
+ * stuck segment would otherwise turn every drop into a drain at up to one per
+ * maintenance-thread idle tick.  20 ms caps that at 50 drains/s per timeline
+ * -- the same order as the 100 ms WAL-index observer -- while still being
+ * invisible against the soak's reaction-latency allowance.  The 1 s timer
+ * remains as the fallback for fail-closed errors, which are not proof-input
+ * events, though an unrelated epoch bump can still cancel a fail-closed
+ * backoff early once the floor has passed; that is a harmless extra retry,
+ * not a correctness requirement. */
+static uint64_t wal_reclaim_proof_epoch;
+static uint64_t wal_reclaim_backoff_epoch[MAX_TIMELINES];
+static struct timespec wal_reclaim_armed_at[MAX_TIMELINES];
+#define WAL_RECLAIM_REARM_MIN_NS 20000000L
+/* See the forward declaration and walidx_reclaim_request_fence_epoch for the
+ * narrower "a fence, not just progress, changed" signal this drives. */
+static uint64_t walidx_reclaim_fence_epoch;
+
+static inline void
+wal_reclaim_proof_changed(void)
+{
+	__atomic_fetch_add(&wal_reclaim_proof_epoch, 1, __ATOMIC_ACQ_REL);
+}
+
+static inline void
+walidx_reclaim_fence_changed(void)
+{
+	__atomic_fetch_add(&walidx_reclaim_fence_epoch, 1, __ATOMIC_ACQ_REL);
+}
+
+static inline int
+wal_reclaim_retry_due(uint32_t tl, const struct timespec *now)
+{
+	struct timespec min_at = wal_reclaim_armed_at[tl];
+
+	/* The rate-limit floor comes first and is unconditional: an epoch change
+	 * inside the window still makes the timeline due once the window ends
+	 * (wal_reclaim_backoff_epoch was recorded before this attempt read any
+	 * proof input, so the mismatch persists), it just is not honored early. */
+	min_at.tv_nsec += WAL_RECLAIM_REARM_MIN_NS;
+	if (min_at.tv_nsec >= 1000000000L)
+	{
+		min_at.tv_sec += min_at.tv_nsec / 1000000000L;
+		min_at.tv_nsec %= 1000000000L;
+	}
+	if (now->tv_sec < min_at.tv_sec ||
+		(now->tv_sec == min_at.tv_sec && now->tv_nsec < min_at.tv_nsec))
+		return 0;
+	if (__atomic_load_n(&wal_reclaim_proof_epoch, __ATOMIC_ACQUIRE) !=
+		wal_reclaim_backoff_epoch[tl])
+		return 1;
+	return !(now->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
+			 (now->tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
+			  now->tv_nsec < wal_reclaim_retry_at[tl].tv_nsec));
+}
 
 static void walidx_progress_init(uint32_t tl, uint64_t first_lsn);
 static int wal_segment_sync(uint32_t tl);
@@ -11001,12 +11127,22 @@ wal_reclaim_walidx_state_valid(uint32_t timeline, uint64_t *progress_out)
 	return 1;
 }
 
+/* epoch must be the proof epoch the caller read before it read any of the
+ * proof inputs (retention_floor, progress, raw_floor) that led to this
+ * backoff, not a fresh read here: a fresh read at arm time can race with a
+ * concurrent proof-relevant mutation that lands between the caller's (now
+ * stale) input read and this call, recording an epoch that already
+ * "catches up" to a change this attempt never actually observed and losing
+ * the wakeup for it (see the call site's comment). */
 static void
-wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
+wal_reclaim_backoff(uint32_t timeline, const struct timespec *now,
+					uint64_t epoch)
 {
 	wal_reclaim_retry_at[timeline] = *now;
 	if (wal_reclaim_retry_at[timeline].tv_sec < LONG_MAX)
 		wal_reclaim_retry_at[timeline].tv_sec++;
+	wal_reclaim_armed_at[timeline] = *now;
+	wal_reclaim_backoff_epoch[timeline] = epoch;
 }
 
 /* Read only stable per-timeline state while the WAL lock excludes append,
@@ -11014,7 +11150,16 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
  * decision: the caller must repeat the complete validation after admission and
  * the WAL-index gates have drained.  Observation ignores retry_at so a failed
  * reclaim cannot make real physical debt disappear; maintenance passes
- * honor_retry_at to avoid repeatedly draining admission for the same failure. */
+ * honor_retry_at to avoid repeatedly draining admission for the same failure.
+ * The no-progress backoff itself is proof-keyed (wal_reclaim_retry_due), rate
+ * limited to at most once per WAL_RECLAIM_REARM_MIN_NS: after that floor, it
+ * ends at the earlier of one second or the next retention / WAL-index
+ * publish-or-GC / durable-progress / timeline-delete event.  A real floor
+ * advance is not delayed by the clock past the rate-limit floor; a failure
+ * that is not proof-relevant (residual/storage errors) usually does wait out
+ * the full second, but an unrelated epoch bump can still cancel it early once
+ * the rate-limit floor has passed -- a harmless extra retry, not something
+ * either path relies on. */
 static int
 wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
 						int *observation_error)
@@ -11031,10 +11176,7 @@ wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
 		int residual_status;
 		int eligible;
 
-		if ((honor_retry_at &&
-			 (now_out->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
-			  (now_out->tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
-			   now_out->tv_nsec < wal_reclaim_retry_at[tl].tv_nsec))) ||
+		if ((honor_retry_at && !wal_reclaim_retry_due(tl, now_out)) ||
 			!ps_timeline_live(tl))
 			continue;
 		wal_lock = wal_log_lock_for(tl);
@@ -11071,7 +11213,14 @@ wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
  * reclaim a complete segment.  Each selected timeline is then revalidated in
  * full under admission -> all shards -> walidx_prune -> walidx publish -> WAL;
  * all-shard locks cover only the in-memory WAL-index snapshot and are released
- * before retention/control I/O, layer I/O, or unlink.
+ * before retention/control I/O, layer I/O, or unlink.  The candidate is the
+ * aligned-down minimum of the effective WAL retention floor, durable
+ * WAL-index progress, the oldest surviving raw WAL-index dependency, and (for
+ * a child timeline) the branch cap.  A complete segment whose retention floor
+ * and durable progress have both passed the boundary but whose raw WAL-index
+ * dependency has not requests one compacted WAL-index publication
+ * (walidx_snapshot_reclaim_due); the request is re-issued only after durable
+ * progress advances again.
  */
 static int
 wal_segment_reclaim_one(void)
@@ -11098,6 +11247,9 @@ wal_segment_reclaim_one(void)
 		uint64_t candidate;
 		uint64_t target;
 		uint64_t residual_target = 0;
+		uint64_t proof_epoch = 0;
+		uint64_t fence_epoch = 0;
+		uint64_t snapshot_generation = 0;
 		int attempt = 0;
 		int rc;
 		int walidx_valid;
@@ -11105,9 +11257,7 @@ wal_segment_reclaim_one(void)
 		int residual_status;
 		int shards_locked = 0;
 
-		if (now.tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
-			(now.tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
-			 now.tv_nsec < wal_reclaim_retry_at[tl].tv_nsec))
+		if (!wal_reclaim_retry_due(tl, &now))
 			continue;
 		if (!ps_timeline_live(tl))
 			continue;
@@ -11131,6 +11281,22 @@ wal_segment_reclaim_one(void)
 			continue;
 		}
 		pthread_rwlock_unlock(wal_lock);
+
+		/* Snapshot the proof epoch before reading any proof input below
+		 * (retention_floor, progress, raw_floor), so a concurrent
+		 * proof-relevant mutation that lands after this point is guaranteed
+		 * to bump the epoch past what wal_reclaim_backoff records for this
+		 * attempt, even if the inputs this attempt reads are already stale
+		 * relative to that mutation.  Some mutations that bump the epoch
+		 * (e.g. PS_OP_RETENTION_PIN_DROP) are dispatched without the
+		 * admission lock and run under only page_prune_lock/walidx_prune_lock,
+		 * both of which this attempt releases and reacquires below for the
+		 * retention_effective_floor scan; reading the epoch fresh at arm time
+		 * instead of here can race with exactly that window and record an
+		 * epoch that already "catches up" to a change this attempt never
+		 * actually observed -- a lost wakeup. */
+		proof_epoch = __atomic_load_n(&wal_reclaim_proof_epoch, __ATOMIC_ACQUIRE);
+		fence_epoch = __atomic_load_n(&walidx_reclaim_fence_epoch, __ATOMIC_ACQUIRE);
 
 		/* WAL-index writers take shard-wr before the publish read gate. */
 		for (uint32_t shard = 0; shard < nshards; shard++)
@@ -11179,6 +11345,7 @@ wal_segment_reclaim_one(void)
 		}
 		pthread_mutex_lock(&walidx_meta_lock);
 		walidx_valid = wal_reclaim_walidx_state_valid(tl, &progress);
+		snapshot_generation = walidx_snapshot_generation[tl];
 		pthread_mutex_unlock(&walidx_meta_lock);
 		/* This is the only section that needs all shard locks.  It scans stable
 		 * in-memory entries while the publish/prune gates freeze index mutation.
@@ -11232,8 +11399,82 @@ wal_segment_reclaim_one(void)
 		{
 			/* A complete segment exists, but the proven floor is still in the
 			 * current boundary.  Avoid repeating the global drain every idle tick;
-			 * the cheap due-time preselection will retry after the bounded delay. */
-			wal_reclaim_backoff(tl, &now);
+			 * the cheap due-time preselection will retry after the bounded delay
+			 * (below), unless a proof input changes first (wal_reclaim_retry_due).
+			 *
+			 * The raw WAL-index dependency floor only moves at a compacted
+			 * WAL-index snapshot publication, which nothing else here requests:
+			 * the WAL-index controller only publishes on its own 1 MiB tail
+			 * trigger or high water.  When that stale floor is the only reason
+			 * the segment is not yet complete -- retention and durable progress
+			 * (and, for a child, the branch cap) have already cleared this
+			 * boundary -- ask for a compacted publication on the reclaimer's
+			 * behalf instead of waiting for the controller to notice on its own
+			 * schedule.  The request is re-issued only when the oldest raw
+			 * dependency has changed, or a retention-registry fence has
+			 * changed (walidx_reclaim_request_raw/_fence_epoch/_generation),
+			 * since the last served request: a progress advance alone can
+			 * never retire the blocking item (walidx_entry_prune_plan drops
+			 * an item only when a durable base and no retained horizon needs
+			 * it, and a higher cutoff changes neither), so re-requesting on
+			 * progress alone would be a sustained full-index rewrite for as
+			 * long as an unreplaceable dependency blocks the segment, given
+			 * how often durable progress itself advances.  The fence signal
+			 * is walidx_reclaim_fence_epoch (bumped on a pin reserve/drop,
+			 * artifact fence release/open, or a branch cap released), not
+			 * retention_effective_floor's own numeric value: a pin reserved
+			 * above the existing floor -- exactly what authorizes a stored
+			 * page as a new replacement base -- need not move that value, so
+			 * comparing it directly would miss the one fence change this
+			 * request exists to react to.  A base that becomes durable with
+			 * no fence change at all is not detected here; it is left to the
+			 * WAL-index controller's own trigger, as before this request
+			 * existed.  The request is not additionally gated on
+			 * walidx_snapshot_end[tl] < progress: a fence change can make the
+			 * plan drop more at the very same end_lsn a prior publication
+			 * already covered (walidx_snapshot_publish_one's write-section
+			 * guard admits end_lsn == previous_end when reclaim_due is set,
+			 * for exactly this case), so "already covers current progress"
+			 * is not evidence that nothing more can be dropped. */
+			{
+				uint64_t proven = retention_floor < progress ?
+					retention_floor : progress;
+				uint64_t proven_target;
+				int already_due;
+				int served;
+				int fruitless;
+
+				if (timeline_has_parent(tl) && timelines[tl].branch_lsn < proven)
+					proven = timelines[tl].branch_lsn;
+				if (proven > store->end_lsn)
+					proven = store->end_lsn;
+				proven_target = proven - proven % store->segment_size;
+				already_due = __atomic_load_n(&walidx_snapshot_reclaim_due[tl],
+											  __ATOMIC_ACQUIRE);
+				served = snapshot_generation !=
+					walidx_reclaim_request_generation[tl];
+				/* walidx_reclaim_request_raw[tl] != 0, not the generation, is
+				 * the "ever requested" sentinel: generation 0 is a real,
+				 * common value (every timeline's first-ever request happens
+				 * before its first publish, when walidx_snapshot_generation
+				 * is still 0), but a request is recorded only when raw_floor
+				 * was already confirmed nonzero below, so 0 there is
+				 * unambiguous. */
+				fruitless = served && walidx_reclaim_request_raw[tl] != 0 &&
+					raw_floor == walidx_reclaim_request_raw[tl] &&
+					fence_epoch == walidx_reclaim_request_fence_epoch[tl];
+				if (raw_floor != 0 && raw_floor < proven &&
+					proven_target > store->start_lsn &&
+					!fruitless && !already_due)
+				{
+					walidx_reclaim_request_raw[tl] = raw_floor;
+					walidx_reclaim_request_fence_epoch[tl] = fence_epoch;
+					walidx_reclaim_request_generation[tl] = snapshot_generation;
+					__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 1,
+									 __ATOMIC_RELEASE);
+				}
+			}
+			wal_reclaim_backoff(tl, &now, proof_epoch);
 			goto selected_done;
 		}
 		if (target > store->end_lsn)
@@ -11251,7 +11492,7 @@ wal_segment_reclaim_one(void)
 
 retry_timeline:
 		if (attempt)
-			wal_reclaim_backoff(tl, &now);
+			wal_reclaim_backoff(tl, &now, proof_epoch);
 
 		/* Advance after every selected candidate, including fail-closed or failed
 		 * attempts, so it cannot starve later timelines on subsequent ticks. */
@@ -11277,6 +11518,12 @@ int
 ps_test_wal_reclaim_maintenance(void)
 {
 	return wal_segment_reclaim_one();
+}
+
+void
+ps_test_wal_reclaim_proof_changed(void)
+{
+	wal_reclaim_proof_changed();
 }
 
 int
@@ -11374,6 +11621,10 @@ walidx_purge_timeline(uint32_t tl)
 	walidx_snapshot_gc_pending[tl] = 0;
 	__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&walidx_snapshot_gc_force_due[tl], 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
+	walidx_reclaim_request_raw[tl] = 0;
+	walidx_reclaim_request_fence_epoch[tl] = 0;
+	walidx_reclaim_request_generation[tl] = 0;
 	memset(&walidx_snapshot_gc_retry_at[tl], 0,
 		   sizeof(walidx_snapshot_gc_retry_at[tl]));
 	memset(&walidx_snapshot_cleanup[tl], 0,
@@ -13398,6 +13649,8 @@ walidx_snapshot_publish_one(void)
 		struct timespec retry_at = walidx_snapshot_retry_at[tl];
 		int force_due = __atomic_load_n(&walidx_snapshot_force_due[tl],
 											 __ATOMIC_ACQUIRE);
+		int reclaim_due = __atomic_load_n(&walidx_snapshot_reclaim_due[tl],
+											 __ATOMIC_ACQUIRE);
 
 		if (ps_timeline_live(tl) &&
 				(now.tv_sec > retry_at.tv_sec ||
@@ -13405,7 +13658,8 @@ walidx_snapshot_publish_one(void)
 			!__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
 							 __ATOMIC_ACQUIRE) &&
 				(walidx_snapshot_reshard_pending[tl] ||
-				 walidx_progress[tl] > walidx_snapshot_end[tl] || force_due))
+				 walidx_progress[tl] > walidx_snapshot_end[tl] || force_due ||
+				 reclaim_due))
 		{
 			uint64_t tail = 0;
 			uint64_t threshold =
@@ -13430,7 +13684,7 @@ walidx_snapshot_publish_one(void)
 			 * log, bounding retained generations and total rewrite I/O. */
 			if (!invalid && (walidx_snapshot_end[tl] < walidx_frontier_current(tl) ||
 						 walidx_snapshot_reshard_pending[tl] || force_due ||
-						 tail >= threshold))
+						 reclaim_due || tail >= threshold))
 			{
 				candidate = (int) tl;
 				walidx_snapshot_cursor = (tl + 1) % MAX_TIMELINES;
@@ -13481,6 +13735,8 @@ walidx_snapshot_publish_one(void)
 		int prepared_generation;
 		int force_due = __atomic_load_n(&walidx_snapshot_force_due[tl],
 											 __ATOMIC_ACQUIRE);
+		int reclaim_due = __atomic_load_n(&walidx_snapshot_reclaim_due[tl],
+											 __ATOMIC_ACQUIRE);
 
 		pthread_mutex_lock(&walidx_meta_lock);
 		start_lsn = walidx_snapshot_generation[tl] != 0 ?
@@ -13492,7 +13748,7 @@ walidx_snapshot_publish_one(void)
 		if (start_lsn == UINT64_MAX ||
 			(!walidx_snapshot_reshard_pending[tl] &&
 				 (end_lsn < previous_end ||
-				  (end_lsn == previous_end && !force_due))) ||
+				  (end_lsn == previous_end && !force_due && !reclaim_due))) ||
 			(walidx_snapshot_reshard_pending[tl] && end_lsn < previous_end))
 			goto publish_done;
 		if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0)
@@ -13643,11 +13899,16 @@ walidx_snapshot_publish_one(void)
 		}
 		walidx_snapshot_gc_pending[tl] = 1;
 		pthread_mutex_unlock(&walidx_meta_lock);
+		/* A publication retires in-memory WAL-index items: the raw-dependency
+		 * floor a WAL reclaim scans may now be able to move past the current
+		 * boundary without waiting out the no-progress backoff's clock. */
+		wal_reclaim_proof_changed();
 		/* A forced publication consumed the observed append-tail frontier.
 		 * Clear only after the durable metadata update succeeds; a failed
 		 * publication must remain eligible for retry.  Request an immediate
 		 * post-maintenance observation so the new physical debt is measured. */
 		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
 		__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 		rc = 1;
 	}
@@ -13716,6 +13977,10 @@ walidx_snapshot_gc_one(void)
 		walidx_snapshot_gc_pending[candidate] = 0;
 		__atomic_store_n(&walidx_snapshot_gc_force_due[candidate], 0,
 						  __ATOMIC_RELEASE);
+		/* GC retires WAL-index generations the raw-dependency scan may have
+		 * been unable to look past; a WAL reclaim waiting on that scan may
+		 * now be able to proceed without the clock. */
+		wal_reclaim_proof_changed();
 		/* GC changed the physical debt identity.  Re-evaluate it on the
 		 * maintenance return path even when the normal WAL-index observation
 		 * interval has not elapsed. */
@@ -14000,6 +14265,9 @@ out:
 	walidx_progress[tl] = rec.end_lsn;
 	walidx_progress_valid[tl] = 1;
 	walidx_progress_durable[tl] = 1;
+	/* Durable progress is one of the terms wal_segment_reclaim_one takes the
+	 * minimum over; advancing it can move the candidate past the boundary. */
+	wal_reclaim_proof_changed();
 	rc = 0;
 out_update:
 	pthread_mutex_unlock(&walidx_meta_lock);
@@ -17682,6 +17950,20 @@ ps_handle_meta(PsChannel *ch)
 							 (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 							  PS_RETENTION_RESOURCE_WAL)) != 0)
 							page_prune_mark_all_due();
+						/* A WAL_INDEX-only pin change (no PAGE_HISTORY/WAL
+						 * bit) does not go through page_prune_mark_all_due
+						 * above, but walidx_prune_fences still fences the
+						 * compaction plan on WAL_INDEX pins: without this,
+						 * setting or moving one leaves a fruitless reclaim
+						 * request stuck until the WAL-index controller's own
+						 * trigger notices. */
+						if ((((old_found == 1 ? old_pin.resources : 0) |
+							  pin.resources) &
+							 PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+						{
+							walidx_reclaim_fence_changed();
+							wal_reclaim_proof_changed();
+						}
 					}
 					pthread_rwlock_unlock(&walidx_prune_lock);
 					pthread_rwlock_unlock(&page_prune_lock);
@@ -17777,6 +18059,19 @@ ps_handle_meta(PsChannel *ch)
 						 (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 						  PS_RETENTION_RESOURCE_WAL)) != 0)
 						page_prune_mark_all_due();
+					/* A WAL_INDEX-only pin change (no PAGE_HISTORY/WAL bit)
+					 * does not go through page_prune_mark_all_due above, but
+					 * walidx_prune_fences still fences the compaction plan
+					 * on WAL_INDEX pins: without this, reserving or moving
+					 * one leaves a fruitless reclaim request stuck until the
+					 * WAL-index controller's own trigger notices. */
+					if ((((old_found == 1 ? old_pin.resources : 0) |
+						  pin.resources) &
+						 PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+					{
+						walidx_reclaim_fence_changed();
+						wal_reclaim_proof_changed();
+					}
 				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
@@ -17816,6 +18111,18 @@ ps_handle_meta(PsChannel *ch)
 					(old_pin.resources & (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 										  PS_RETENTION_RESOURCE_WAL)) != 0)
 					page_prune_mark_all_due();
+				/* A WAL_INDEX-only pin drop does not go through
+				 * page_prune_mark_all_due above, but walidx_prune_fences
+				 * still fences the compaction plan on WAL_INDEX pins:
+				 * without this, dropping one leaves a fruitless reclaim
+				 * request stuck until the WAL-index controller's own
+				 * trigger notices. */
+				if (ret == PS_RETENTION_OK && old_found == 1 &&
+					(old_pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+				{
+					walidx_reclaim_fence_changed();
+					wal_reclaim_proof_changed();
+				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
 				if (ret == PS_RETENTION_STALE)
@@ -19047,7 +19354,13 @@ ps_core_maintenance(void)
 	 * the maintenance body.  Retry readiness under the exclusive lifecycle
 	 * writer fence after all ordinary/background work has drained. */
 	if (timeline_delete_publish_one())
+	{
+		/* A DELETED timeline releases its branch cap and retention pins,
+		 * both WAL-reclaim proof inputs on its parent. */
+		wal_reclaim_proof_changed();
+		walidx_reclaim_fence_changed();
 		did = 1;
+	}
 	/* Disabled-by-default controllers must not perturb the maintenance hot
 	 * path (or its scheduling) merely to republish an unchanged zero snapshot. */
 	if (page_reclaim_high_water_bytes != 0 ||
@@ -19235,6 +19548,22 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		   sizeof(walidx_snapshot_reshard_pending));
 	memset(walidx_snapshot_retry_at, 0, sizeof(walidx_snapshot_retry_at));
 	walidx_snapshot_cursor = 0;
+	/* An in-process reopen (close then open again in the same process, as
+	 * the standalone tests do) must not carry a forced/reclaim-due request
+	 * from the previous open's timelines into the new one: these otherwise
+	 * survive ps_core_close() and are reset only per-timeline on delete
+	 * (walidx_purge_timeline) or by the daemon's post-open backpressure
+	 * configuration call, neither of which runs between a bare close/open
+	 * pair. */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_snapshot_gc_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_snapshot_reclaim_due[tl], 0, __ATOMIC_RELEASE);
+		walidx_reclaim_request_raw[tl] = 0;
+		walidx_reclaim_request_fence_epoch[tl] = 0;
+		walidx_reclaim_request_generation[tl] = 0;
+	}
 	memset(walidx_log_epoch, 0, sizeof(walidx_log_epoch));
 	memset(walidx_snapshot_gc_pending, 0,
 		   sizeof(walidx_snapshot_gc_pending));
@@ -19248,6 +19577,9 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		   sizeof(walidx_snapshot_cleanup_retry_at));
 	memset(wal_reclaim_retry_at, 0, sizeof(wal_reclaim_retry_at));
 	wal_reclaim_cursor = 0;
+	__atomic_store_n(&wal_reclaim_proof_epoch, 0, __ATOMIC_RELEASE);
+	memset(wal_reclaim_backoff_epoch, 0, sizeof(wal_reclaim_backoff_epoch));
+	memset(wal_reclaim_armed_at, 0, sizeof(wal_reclaim_armed_at));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 

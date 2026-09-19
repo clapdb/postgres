@@ -412,7 +412,7 @@ scan-error zero-unlink behavior, complete per-segment validation, corrupt
 catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
 read-versus-reclaim mutex barrier.
 R3b-3 is the conservative POSIX/core policy integration.  It admits at most
-one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment; a selected candidate drains ordinary admission before
+one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment.  The backoff is proof-keyed, not clock-only: after a 20 ms rate-limit floor (WAL_RECLAIM_REARM_MIN_NS -- every re-evaluation is a full drain, and a retention pin drop is dispatched without the admission lock, so an unrated cancellation would let drop-heavy churn turn every drop into a drain), it ends at the earlier of one second or the next event that can move a proof input (a WAL-index publication or GC, durable WAL-index progress, a retention-registry change, or a timeline reaching DELETED), so a floor advance past that 20 ms floor is not left waiting on the one-second clock.  When a complete segment's retention floor and durable progress have both passed the boundary but its raw WAL-index dependency has not, the reclaimer requests one compacted WAL-index publication on its own behalf instead of waiting for the WAL-index controller's own tail trigger or high water: one publication + GC + reclaim pass after the blocking condition clears, no earlier than the 20 ms floor after the last arm.  The request is fence-keyed, not progress-keyed: it is re-issued only when the oldest raw dependency or a retention-registry fence (a pin reserved/dropped -- including a WAL_INDEX-only pin, which the compaction plan fences exactly like a PAGE_HISTORY/WAL pin -- an artifact fence released/opened, a branch cap released) has changed since the last served request, because a durable WAL-index progress advance alone -- published once per indexing batch by the backend materializer -- can never retire the blocking item, and re-requesting on every advance would be a sustained non-compacting rewrite for as long as an unreplaceable dependency blocks the segment; a dependency that becomes replaceable through a later durable base with no fence change at all is left to the WAL-index controller's own trigger, as before this request existed.  A selected candidate drains ordinary admission before
 freezing the WAL index, snapshots raw WAL dependencies under short-lived
 shard/map protection, and releases all shard locks before control-image,
 layer, metadata, or unlink I/O.  Its deletion candidate is the aligned-down
@@ -592,6 +592,74 @@ metadata tombstones remain to prevent resurrection; this does not promise
 bounded metadata for infinitely many distinct keys. See
 [`ARTIFACT_LIFECYCLE.md`](ARTIFACT_LIFECYCLE.md) for retry, recovery, legacy
 migration and the minimum-reader store format.
+
+Two nightly dispatches (2026-09-13/14, runs 34747373574 and 34825221247) failed
+seed 20260909's `wal` bound by a few KiB at the same sample (4698112 against
+4685824), both times between rounds 6400 and 6500.  The failure is explained
+and closed.  Physical shipped WAL in this workload is not governed by the WAL
+controller's high-water -- its lag counts only proven-reclaimable bytes, so an
+unproven interval is deliberately not lag and the controller never throttles
+here -- but by how often the WAL reclaimer's raw WAL-index dependency floor
+moves, and that floor only retires an item at a compacted WAL-index snapshot
+publication.  Nothing requested one on the reclaimer's own behalf, so a fully
+proven segment waited on the WAL-index controller's own cadence (~1000 rounds
+here, driven by its 128 KiB high water and a 100 ms observation timer), and a
+fixed one-second no-progress backoff -- uncancelled by the publication that
+unblocked it -- added up to another 237 rounds on the hosted runner.  Both
+mechanisms are now fixed (R3b-3 paragraph above): an on-demand, fence-keyed
+WAL-index compaction request for a segment blocked only by the stale raw
+dependency, and a proof-epoch-keyed backoff, rate limited to a 20 ms floor,
+that ends as soon as a proof input actually moves.  Independent review found
+two follow-on gaps in the first version of this fix and both are closed
+before merge: the backoff's epoch must be the one read before this attempt's
+own proof inputs (retention floor, durable progress, raw dependency), not a
+fresh read at arm time, or a retention pin dropped without the admission
+lock in the window this attempt has released walidx_prune_lock/wal_lock for
+the retention floor scan can bump the epoch before the backoff records it, a
+lost wakeup; and the request must be re-issued on a fence change (a pin
+reserved/dropped, an artifact fence released/opened, a branch cap released),
+not on every durable WAL-index progress op, since the backend materializer
+publishes progress once per indexing batch and a progress advance alone can
+never retire the blocking item.  The soak's `wal` during-bound is restated
+from five declared terms instead of a formula that named a term (the
+controller high-water) which never engages here: `WAL_HIGH_WATER +
+WAL_SEGMENT_BYTES + FENCE_WAL_BYTES_MAX + RECLAIM_REACTION_WAL_BYTES +
+BRANCH_WAL_ALLOWANCE = 4667392`, 18 KiB tighter than the bound it replaces,
+where `FENCE_WAL_BYTES_MAX` is the workload's longest-lived fence (the fixed
+reader's `READER_LIFE + 37` rounds) and `RECLAIM_REACTION_WAL_BYTES` is two
+materializer intervals of reclaimer reaction latency -- one WAL-index
+publication + GC + reclaim pass after the blocking condition clears (a raw
+dependency moving, or a retention-registry fence removing what was blocking
+compaction at the same durable progress), no earlier than the 20 ms
+rate-limit floor after the last no-progress arm; the allowance is >= 330 ms
+on a hosted runner.  A per-sample check ties physical `wal` directly to the
+fences the soak itself holds (`model_floor`, the minimum of the materializer
+pin, durable progress, every held reader, and a live branch's cap) rather
+than to the WAL-index controller's cadence, and reports the observed margin
+as `wal_fence_slack_max` in the JSON report; its expected composition is up
+to 1 MiB of segment alignment, up to another 1 MiB for one fully proven
+segment caught between clearing its boundary and actually reclaiming
+(publication + GC + the 20 ms floor + the reclaim pass), and ~130-200 KiB of
+raw WAL-index items retained for a held reader or branch below its own
+horizon -- so values up to roughly 2.1 MiB are the expected range, not a
+regression signal.  A second review round found two more gaps, both closed
+before merge: a WAL_INDEX-only retention pin (no PAGE_HISTORY or WAL bit) is
+fenced by the compaction plan (`walidx_prune_fences`) exactly like a
+PAGE_HISTORY/WAL pin, but the three pin-mutation sites only bumped the
+reclaimer's proof and fence epochs when the changed resources included
+PAGE_HISTORY or WAL, so dropping or moving a WAL_INDEX-only pin left the
+reclaimer fruitless-suppressed until the WAL-index controller's own trigger
+happened to notice independently; and the reclaim-due request's
+`walidx_snapshot_end[tl] < progress` guard was removed, since a fence change
+can make the compaction plan drop more raw WAL-index items at the very same
+durable-progress-covered end_lsn a prior publication already reached --
+"already covers current progress" was never evidence that nothing more
+could be dropped, and the publish path itself already admits a same-end_lsn
+republish when reclaim_due is set.  With the fix, seed 20260909 at 8000
+rounds peaks at ~1.7-1.8 MiB (over a 2.5x margin under the new bound)
+instead of sitting at the old bound, stable across CPU regimes and repeated
+runs; the first post-fix nightly dispatch is run
+<PAGESTORE_NIGHTLY_POSTFIX_RUN_ID> (to be filled in after merge).
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):

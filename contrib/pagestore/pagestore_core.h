@@ -185,6 +185,7 @@ extern uint32_t ps_test_page_version_count(uint32_t timeline, const PsKey *key,
 										   uint32_t block);
 extern uint32_t ps_test_artifact_fence_count(uint32_t timeline);
 extern int ps_test_walidx_force_due(uint32_t timeline);
+extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
@@ -271,6 +272,10 @@ extern void ps_test_set_walidx_observation_error_hook(
 extern void ps_test_set_backpressure_slow_path_hook(
 	PsBackpressureSlowPathTestHook hook, void *arg);
 extern int ps_test_wal_reclaim_maintenance(void);
+/* Test-only: bump the WAL-reclaim proof epoch directly, without going
+ * through a real proof-relevant event, to exercise the reclaim backoff's
+ * epoch-cancellation and rate-limit interaction deterministically. */
+extern void ps_test_wal_reclaim_proof_changed(void);
 extern int ps_test_wal_retained_base(uint32_t timeline, uint64_t *base_out);
 extern int ps_test_walidx_frontier_exception_active(uint32_t timeline,
 	uint64_t lsn);
