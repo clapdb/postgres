@@ -31,7 +31,6 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -62,6 +61,21 @@
 #include "pagestore_fault.h"
 #include "pagestore_forkmeta_prune.h"
 #include "pagestore_forkmeta_snapshot.h"
+
+/*
+ * Debug-only invariant checks, matching the project's cassert convention:
+ * live only when meson.build's PAGESTORE_ASSERT_CHECKING is defined (its
+ * own cassert build option; not this project's -- and not this file's --
+ * standalone lane), so they cost nothing and prove nothing in a release
+ * daemon.  A failed check is a logic bug in this file, never a storage
+ * fault; production code must never rely on one to fail closed.
+ */
+#ifdef PAGESTORE_ASSERT_CHECKING
+#include <assert.h>
+#define PS_ASSERT(cond) assert(cond)
+#else
+#define PS_ASSERT(cond) ((void) 0)
+#endif
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -3590,7 +3604,7 @@ segment_hole_magic_for_header_size(uint64_t header_size)
 		return SEG_HOLE48_MAGIC;
 	if (header_size == sizeof(SegRecHdr) + sizeof(uint64_t))
 		return SEG_HOLE56_MAGIC;
-	assert(header_size == sizeof(SegRecHdr) + 2 * sizeof(uint64_t));
+	PS_ASSERT(header_size == sizeof(SegRecHdr) + 2 * sizeof(uint64_t));
 	return SEG_HOLE64_MAGIC;
 }
 
@@ -4840,16 +4854,16 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 				recs[lo].admission_seq == v->admission_seq)
 				remove = 1;
 			/*
-			 * Invariant I3: segment bytes are immutable once written, so a
-			 * version is dropped from memory only once it is below the
-			 * flush watermark -- otherwise a rescan on the next open would
-			 * meet it with no in-memory identity to retain its marker (the
-			 * F3/Q1 defect this invariant rules out; see
-			 * page_cleanup_tombstone_segment()).  A layer-origin version
-			 * (seg == -1, already retargeted by segment GC or never
-			 * segment-backed) is covered by definition.
+			 * Invariant I3 (debug build only, PS_ASSERT): segment bytes
+			 * are immutable once written, so a version is dropped from
+			 * memory only once it is below the flush watermark --
+			 * otherwise a rescan on the next open would meet it with no
+			 * in-memory identity to retain its marker (the F3/Q1 defect
+			 * this invariant rules out; see page_cleanup_tombstone_segment()).
+			 * A layer-origin version (seg == -1, already retargeted by
+			 * segment GC or never segment-backed) is covered by definition.
 			 */
-			assert(!remove || v->seg < 0 ||
+			PS_ASSERT(!remove || v->seg < 0 ||
 				(g_shards[v->shard].flush_watermark_valid &&
 				 ((uint32_t) v->seg < g_shards[v->shard].flush_watermark.seg_id ||
 				  ((uint32_t) v->seg == g_shards[v->shard].flush_watermark.seg_id &&

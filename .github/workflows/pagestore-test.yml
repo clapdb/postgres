@@ -118,7 +118,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture_identities.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle fixtures/pgdata-artifacts \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/pgdata-artifacts \
             --format-tool ./pagestore_format_versions
 
       - name: Run standalone test suite
@@ -182,6 +182,7 @@ jobs:
             wal_reclaim_before_dir_fsync \
             timeline_delete_after_deleting \
             timeline_delete_after_wal_cleanup \
+            timeline_delete_mid_segment_tombstone \
             timeline_delete_after_segment_tombstone \
             timeline_delete_after_deleted \
             timeline_delete_before_deleting \
@@ -204,7 +205,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes \
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \
@@ -430,6 +431,7 @@ jobs:
                     contrib/pagestore/fixtures/posix-wal-payload-identity \
                     contrib/pagestore/fixtures/posix-backend-objects \
                     contrib/pagestore/fixtures/posix-artifact-lifecycle \
+                    contrib/pagestore/fixtures/posix-timeline-delete-holes \
             --daemon-binary build/contrib/pagestore/pagestore_daemon \
             --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
             --inspect-binary build/contrib/pagestore/pagestore_inspect \
