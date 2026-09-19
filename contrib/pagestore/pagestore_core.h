@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <stdint.h>
 
+#include "pagestore_artifact_format.h"
 #include "pagestore_ipc.h"
 #include "pagestore_storage.h"
 
@@ -64,13 +65,23 @@ extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
  * fresh process instead of reopening or flushing inherited mutex/buffer state.
  * On success non-POSIX storage retains caller-owned close.  On failure core
  * closes only providers whose open completed; failed opens clean themselves. */
-/* Artifact operations require the data shard write lock and ordinary admission. */
-extern int ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token);
+/* Artifact operations require the data shard write lock and ordinary
+ * admission.  reason may be NULL; on a -1 return it is set to why (never
+ * touched on success). */
+extern int ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn,
+	uint64_t *token, PsArtifactRefuseReason *reason);
 extern int ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 	const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq);
 extern int ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
-	uint64_t token, uint64_t count);
-extern int ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn);
+	uint64_t token, uint64_t count, PsArtifactRefuseReason *reason);
+extern int ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,
+	PsArtifactRefuseReason *reason);
+/* Best-effort diagnostic snapshot of a key's artifact state (the data
+ * fork's newest page LSN, the meta fork's newest commit LSN; each 0 if
+ * absent), for a refusal's log line.  Caller must hold the key's shard
+ * lock; never load-bearing for correctness. */
+extern void ps_artifact_diag(uint32_t tl, const PsKey *key,
+	uint64_t *last_page_lsn, uint64_t *last_commit_lsn);
 
 extern int	ps_core_open(const char *store_dir);
 

@@ -362,6 +362,32 @@ shm_publish_ready(PsShmHeader *hdr)
 }
 
 /*
+ * A refused artifact BEGIN/COMMIT/DROP used to be silent: the daemon mapped
+ * it straight to PS_STATUS_ERROR and the client's op number was the only clue
+ * (see the reader-snapshot key-collision postmortem in RELEASE_VALIDATION.md).
+ * Log one line per refusal and hand the reason back to the client in
+ * ch->result, so a CI failure like that is diagnosable from the one run.
+ */
+static void
+log_artifact_refusal(const char *op, uint32_t tl, const PsKey *key,
+					 uint64_t lsn, PsArtifactRefuseReason reason)
+{
+	uint64_t	last_page_lsn = 0,
+				last_commit_lsn = 0;
+
+	ps_artifact_diag(tl, key, &last_page_lsn, &last_commit_lsn);
+	fprintf(stderr,
+		"pagestore_daemon: artifact %s refused: reason=%s timeline=%u "
+		"key=(klass=%u,spc=%u,db=%u,rel=%u,fork=%d) lsn=%llu "
+		"last_page_lsn=%llu last_commit=%llu\n",
+		op, pagestore_artifact_refuse_reason_name(reason), tl,
+		key->klass, key->spcOid, key->dbOid, key->relNumber, key->forkNum,
+		(unsigned long long) lsn,
+		(unsigned long long) last_page_lsn,
+		(unsigned long long) last_commit_lsn);
+}
+
+/*
  * Serve one request.  The metadata ops are handled by the shared brain; the
  * four byte-I/O ops are done here synchronously via the storage backend.
  */
@@ -393,16 +419,40 @@ handle_request(PsChannel *ch)
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_ARTIFACT_BEGIN:
-			if (ps_artifact_begin(tl, &ch->key, ch->req_lsn, &ch->req_seq) != 0)
-				ch->status = PS_STATUS_ERROR;
+			{
+				PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
+
+				if (ps_artifact_begin(tl, &ch->key, ch->req_lsn, &ch->req_seq, &reason) != 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					ch->result = (uint32_t) reason;
+					log_artifact_refusal("BEGIN", tl, &ch->key, ch->req_lsn, reason);
+				}
+			}
 			break;
 		case PS_OP_ARTIFACT_COMMIT:
-			if (ps_artifact_commit(tl, &ch->key, ch->req_lsn, ch->req_seq, ch->nblocks) != 0)
-				ch->status = PS_STATUS_ERROR;
+			{
+				PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
+
+				if (ps_artifact_commit(tl, &ch->key, ch->req_lsn, ch->req_seq, ch->nblocks, &reason) != 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					ch->result = (uint32_t) reason;
+					log_artifact_refusal("COMMIT", tl, &ch->key, ch->req_lsn, reason);
+				}
+			}
 			break;
 		case PS_OP_ARTIFACT_DROP:
-			if (ps_artifact_drop(tl, &ch->key, ch->req_lsn) != 0)
-				ch->status = PS_STATUS_ERROR;
+			{
+				PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
+
+				if (ps_artifact_drop(tl, &ch->key, ch->req_lsn, &reason) != 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					ch->result = (uint32_t) reason;
+					log_artifact_refusal("DROP", tl, &ch->key, ch->req_lsn, reason);
+				}
+			}
 			break;
 		case PS_OP_EXTEND:
 			/* append_page grows the fork with the page's exact LSN */

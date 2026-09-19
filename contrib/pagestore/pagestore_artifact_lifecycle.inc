@@ -451,29 +451,71 @@ artifact_mutation_horizon(uint32_t tl, const PsKey *key, uint64_t lsn)
 	return allowed && (!data || lsn >= data->last_page_lsn);
 }
 
+/* Record why a caller sees this generation refused (reason may be NULL: the
+ * begin/commit/drop callers a fixed-arity test wrapper doesn't care about
+ * pass NULL) and return the -1 every existing caller already expects. */
+static int
+artifact_refuse(PsArtifactRefuseReason *reason, PsArtifactRefuseReason why)
+{
+	if (reason)
+		*reason = why;
+	return -1;
+}
+
+/* Best-effort diagnostic snapshot for a refused key: the data fork's newest
+ * page LSN and the meta fork's newest commit LSN, each 0 if absent.  Callers
+ * hold the key's shard lock already (the same lock ps_artifact_begin/commit/
+ * drop require); this never mutates anything and is never load-bearing. */
+void
+ps_artifact_diag(uint32_t tl, const PsKey *key, uint64_t *last_page_lsn,
+				 uint64_t *last_commit_lsn)
+{
+	ForkEnt    *data = tl < MAX_TIMELINES ? fork_find(tl, key) : NULL;
+	PsKey		meta = artifact_meta_key(key);
+	PageEnt    *e = tl < MAX_TIMELINES ? page_find(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK) : NULL;
+	PageVer    *v = e ? page_visible(e, UINT64_MAX, 0) : NULL;
+
+	*last_page_lsn = data ? data->last_page_lsn : 0;
+	*last_commit_lsn = v ? v->lsn : 0;
+}
+
 int
-ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token)
+ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
+				  PsArtifactRefuseReason *reason)
 {
 	PsKey		meta;
 	PageEnt    *e;
 	PageVer    *last;
 	PsArtifactLifecycle record = {0};
 
-	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE) ||
-		!core_process_valid() || tl >= MAX_TIMELINES || ps_storage->sync_needs_write_lock || !artifact_data_key(key) || lsn == 0 ||
-		!artifact_mutation_horizon(tl, key, lsn))
-		return -1;
+	if (reason)
+		*reason = PS_ARTIFACT_REFUSE_NONE;
+	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE))
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_POISONED);
+	if (!core_process_valid() || tl >= MAX_TIMELINES)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_INVALID);
+	if (ps_storage->sync_needs_write_lock)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_WRITE_LOCK);
+	if (!artifact_data_key(key) || lsn == 0)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_INVALID);
+	if (!artifact_mutation_horizon(tl, key, lsn))
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_HORIZON);
 	meta = artifact_meta_key(key);
 	e = page_find(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
 	last = e ? page_visible(e, UINT64_MAX, 0) : NULL;
-	if (last && (lsn < last->lsn ||
-				 artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK, last, &record, 0) != 0 ||
-				 (lsn == last->lsn && record.state == PS_ARTIFACT_DROPPED)))
-		return -1;
+	if (last)
+	{
+		if (lsn < last->lsn)
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_OLDER_GENERATION);
+		if (artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK, last, &record, 0) != 0)
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+		if (lsn == last->lsn && record.state == PS_ARTIFACT_DROPPED)
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_DROPPED);
+	}
 	e = page_find(tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
 	last = e ? page_visible(e, UINT64_MAX, 0) : NULL;
 	if (last && lsn < last->lsn)
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_BEGIN_NEWER);
 
 	/*
 	 * Completed generations are immutable even for zero-cap readers. A
@@ -487,7 +529,7 @@ ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token)
 	}
 	memset(&record, 0, sizeof(record));
 	if (artifact_store_record(tl, key, PS_ARTIFACT_BEGIN_BLOCK, lsn, &record, token) != 0)
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
 	{
 		ForkEnt    *fork = fork_get_or_create(tl, key);
 
@@ -614,7 +656,7 @@ ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 
 int
 ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
-				   uint64_t token, uint64_t count)
+				   uint64_t token, uint64_t count, PsArtifactRefuseReason *reason)
 {
 	ForkEnt    *fork;
 	PsArtifactLifecycle record = {.begin_seq = token, .page_count = count,
@@ -622,53 +664,81 @@ ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	PsArtifactLifecycle completed;
 	int			state;
 
-	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE) ||
-		!core_process_valid() || tl >= MAX_TIMELINES || ps_storage->sync_needs_write_lock || !artifact_data_key(key))
-		return -1;
+	if (reason)
+		*reason = PS_ARTIFACT_REFUSE_NONE;
+	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE))
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_POISONED);
+	if (!core_process_valid() || tl >= MAX_TIMELINES)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_INVALID);
+	if (ps_storage->sync_needs_write_lock)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_WRITE_LOCK);
+	if (!artifact_data_key(key))
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_INVALID);
 	state = artifact_completed_attempt(tl, key, lsn, token, &completed);
 	if (state != 0)
-		return state > 0 && count == completed.page_count ? 0 : -1;
+	{
+		if (state > 0 && count == completed.page_count)
+			return 0;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
+	}
 	if (!artifact_attempt(tl, key, lsn, token))
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
 	fork = fork_find(tl, key);
 	if (!fork || fork->artifact_attempt_seq != token ||
-		fork->artifact_page_count != count || ps_storage->sync() != 0)
-		return -1;
+		fork->artifact_page_count != count)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
+	if (ps_storage->sync() != 0)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
 	record.nblocks = fork->artifact_nblocks;
-	return artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL);
+	if (artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL) != 0)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+	return 0;
 }
 
 int
-ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn)
+ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,
+				 PsArtifactRefuseReason *reason)
 {
 	PsKey		meta;
 	PageEnt    *e;
 	PageVer    *last;
 	PsArtifactLifecycle record = {.state = PS_ARTIFACT_DROPPED};
 
-	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE) ||
-		!core_process_valid() || tl >= MAX_TIMELINES || ps_storage->sync_needs_write_lock || !artifact_data_key(key) || lsn == 0 ||
-		!artifact_mutation_horizon(tl, key, lsn))
-		return -1;
+	if (reason)
+		*reason = PS_ARTIFACT_REFUSE_NONE;
+	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE))
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_POISONED);
+	if (!core_process_valid() || tl >= MAX_TIMELINES)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_INVALID);
+	if (ps_storage->sync_needs_write_lock)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_WRITE_LOCK);
+	if (!artifact_data_key(key) || lsn == 0)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_INVALID);
+	if (!artifact_mutation_horizon(tl, key, lsn))
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_HORIZON);
 	meta = artifact_meta_key(key);
 	e = page_find(tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
 	last = e ? page_visible(e, UINT64_MAX, 0) : NULL;
 	if (last && lsn < last->lsn)
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_BEGIN_NEWER);
 	e = page_find(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
 	last = e ? page_visible(e, UINT64_MAX, 0) : NULL;
 	if (last && lsn < last->lsn)
-		return -1;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_OLDER_GENERATION);
 	if (last && lsn == last->lsn)
 	{
 		PsArtifactLifecycle prior;
 
 		if (artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK, last, &prior, 0) != 0)
-			return -1;
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
 		/* A same-LSN DROP cannot replace completed bytes seen by a branch. */
-		return prior.state == PS_ARTIFACT_DROPPED ? 0 : -1;
+		if (prior.state == PS_ARTIFACT_DROPPED)
+			return 0;
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_OLDER_GENERATION);
 	}
-	return artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL);
+	if (artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record, NULL) != 0)
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+	return 0;
 }
 
 static int

@@ -57,7 +57,7 @@ begin(uint64_t lsn)
 	uint64_t	token = 0;
 
 	ps_lock_shard_wr(ps_shard_of(&key));
-	int			rc = ps_artifact_begin(0, &key, lsn, &token);
+	int			rc = ps_artifact_begin(0, &key, lsn, &token, NULL);
 
 	ps_unlock_shard(ps_shard_of(&key));
 	check(rc == 0 && token != 0, "begin publication");
@@ -79,7 +79,7 @@ static int
 commit(uint64_t lsn, uint64_t token, uint64_t count)
 {
 	ps_lock_shard_wr(ps_shard_of(&key));
-	int			rc = ps_artifact_commit(0, &key, lsn, token, count);
+	int			rc = ps_artifact_commit(0, &key, lsn, token, count, NULL);
 
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc;
@@ -88,7 +88,7 @@ static int
 drop(uint64_t lsn)
 {
 	ps_lock_shard_wr(ps_shard_of(&key));
-	int			rc = ps_artifact_drop(0, &key, lsn);
+	int			rc = ps_artifact_drop(0, &key, lsn, NULL);
 
 	ps_unlock_shard(ps_shard_of(&key));
 	return rc;
@@ -147,6 +147,128 @@ maintain(void)
 		usleep(1000);
 	}
 }
+
+/*
+ * R5-1/R5-2 regression: the reader-snapshot DATA object (object number
+ * PS_READER_SNAPSHOT_DATA_OBJECT) used to be published under the same
+ * (klass PS_KLASS_READER_SNAPSHOT, dbOid InvalidOid) key by both the
+ * automatic checkpoint-driven snapshot and an explicit exact-R publish.  The
+ * artifact lifecycle allows only monotonic generations per key, so once the
+ * automatic side had a generation at a later checkpoint, an explicit
+ * publish at an earlier, controller-chosen R was silently refused (this is
+ * exactly what PRs #264/#265/#266 hit in CI: "daemon reported error for op
+ * 34").  The fix keys the explicit publish by the retention owner that
+ * pinned R, InvalidOid staying reserved for the automatic producer.
+ *
+ * This exercises that same mechanism (klass PS_KLASS_READER_SNAPSHOT,
+ * dbOid 0 vs. 8001) but at a dedicated relNumber (99, not
+ * PS_READER_SNAPSHOT_DATA_OBJECT's 1) and at LSNs (900000s) far past
+ * anything this file's other tests reach: PAGESTORE_ARTIFACT_TEST_READER=1
+ * runs this whole file with the shared `key` also at klass
+ * PS_KLASS_READER_SNAPSHOT, relNumber 1 -- reusing that relNumber or an
+ * LSN low enough to fall behind the page-prune frontier this file's
+ * maintenance/compaction calls have already advanced would collide with
+ * that shared state instead of testing the key split in isolation.
+ */
+static void
+test_reader_snapshot_owner_key_split(void)
+{
+	PsKey		automatic_key = {.klass = PS_KLASS_READER_SNAPSHOT,
+		.relNumber = 99, .dbOid = 0};
+	PsKey		explicit_key = {.klass = PS_KLASS_READER_SNAPSHOT,
+		.relNumber = 99, .dbOid = 8001};
+	unsigned char page[8192];
+	unsigned char readback[8192];
+	uint64_t	token;
+	uint64_t	resolved;
+	int			rc;
+	PsArtifactRefuseReason reason;
+
+	/* An automatic checkpoint snapshot completes a generation at LSN 900300. */
+	memset(page, 0xAA, sizeof(page));
+	token = 0;
+	ps_lock_shard_wr(ps_shard_of(&automatic_key));
+	rc = ps_artifact_begin(0, &automatic_key, 900300, &token, NULL);
+	ps_unlock_shard(ps_shard_of(&automatic_key));
+	check(rc == 0 && token != 0, "automatic generation begins at 900300");
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&automatic_key));
+	rc = ps_artifact_write(0, &automatic_key, 0, page, 900300, token, NULL);
+	ps_unlock_shard(ps_shard_of(&automatic_key));
+	ps_admission_read_unlock();
+	check(rc == 0, "automatic generation writes its page at 900300");
+	ps_lock_shard_wr(ps_shard_of(&automatic_key));
+	rc = ps_artifact_commit(0, &automatic_key, 900300, token, 1, NULL);
+	ps_unlock_shard(ps_shard_of(&automatic_key));
+	check(rc == 0, "automatic generation commits at 900300");
+
+	/*
+	 * BEGIN at 900200 on the *explicit* (owner-scoped) key succeeds despite the
+	 * completed 900300 on the automatic key: they are different keys.
+	 */
+	memset(page, 0xBB, sizeof(page));
+	token = 0;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	ps_lock_shard_wr(ps_shard_of(&explicit_key));
+	rc = ps_artifact_begin(0, &explicit_key, 900200, &token, &reason);
+	ps_unlock_shard(ps_shard_of(&explicit_key));
+	check(rc == 0 && token != 0 && reason == PS_ARTIFACT_REFUSE_NONE,
+		  "BEGIN at 900200 on the owner-scoped key succeeds despite the automatic 900300");
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&explicit_key));
+	rc = ps_artifact_write(0, &explicit_key, 0, page, 900200, token, NULL);
+	ps_unlock_shard(ps_shard_of(&explicit_key));
+	ps_admission_read_unlock();
+	check(rc == 0, "owner-scoped generation writes its page at 900200");
+	ps_lock_shard_wr(ps_shard_of(&explicit_key));
+	rc = ps_artifact_commit(0, &explicit_key, 900200, token, 1, NULL);
+	ps_unlock_shard(ps_shard_of(&explicit_key));
+	check(rc == 0, "owner-scoped generation commits at 900200");
+
+	/* Its pages read back at exact 900200. */
+	resolved = 0;
+	ps_lock_shard_rd(ps_shard_of(&explicit_key));
+	rc = read_resolve(0, &explicit_key, 0, 900200, 0, readback, &resolved);
+	ps_unlock_shard(ps_shard_of(&explicit_key));
+	check(rc == 1 && resolved == 900200 && memcmp(readback, page, sizeof(page)) == 0,
+		  "owner-scoped snapshot reads back at exact 900200");
+
+	/*
+	 * BEGIN at 900200 on the *automatic* key -- the base bug's exact shape -- is
+	 * refused, and the reason names an older/superseded generation instead
+	 * of a silent -1.
+	 */
+	token = 0;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	ps_lock_shard_wr(ps_shard_of(&automatic_key));
+	rc = ps_artifact_begin(0, &automatic_key, 900200, &token, &reason);
+	ps_unlock_shard(ps_shard_of(&automatic_key));
+	check(rc != 0,
+		  "BEGIN at 900200 on the automatic key after a completed 900300 is refused");
+	check(reason == PS_ARTIFACT_REFUSE_HORIZON ||
+		  reason == PS_ARTIFACT_REFUSE_OLDER_GENERATION,
+		  "the refusal reason identifies an older/superseded generation, not a silent -1");
+
+	/* A later automatic generation at 900400 still works: the owner-scoped side
+	 * channel did not disturb the automatic key's own monotonic sequence. */
+	memset(page, 0xCC, sizeof(page));
+	token = 0;
+	ps_lock_shard_wr(ps_shard_of(&automatic_key));
+	rc = ps_artifact_begin(0, &automatic_key, 900400, &token, NULL);
+	ps_unlock_shard(ps_shard_of(&automatic_key));
+	check(rc == 0, "a later automatic generation at 900400 still succeeds");
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&automatic_key));
+	rc = ps_artifact_write(0, &automatic_key, 0, page, 900400, token, NULL);
+	ps_unlock_shard(ps_shard_of(&automatic_key));
+	ps_admission_read_unlock();
+	check(rc == 0, "automatic generation at 900400 writes its page");
+	ps_lock_shard_wr(ps_shard_of(&automatic_key));
+	rc = ps_artifact_commit(0, &automatic_key, 900400, token, 1, NULL);
+	ps_unlock_shard(ps_shard_of(&automatic_key));
+	check(rc == 0, "automatic generation at 900400 commits");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -299,6 +421,7 @@ main(int argc, char **argv)
 	check(ps_test_artifact_fence_count(0) == 0, "retired data releases every artifact control-era fence");
 	token = begin(600);
 	check(write_page(600, token, 0, 0x66) == 0 && commit(600, token, 1) == 0 && read_value(0, 600, 0, 0x66), "recreate after drop");
+	test_reader_snapshot_owner_key_split();
 	ps_core_close();
 	for (int phase = 1; phase <= 2; phase++)
 	{

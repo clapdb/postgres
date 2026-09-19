@@ -1522,6 +1522,39 @@ inside them), because only the former can have a page-store support window.
    "payload needs PostgreSQL <version>" and is not treated as a broken
    envelope.
 
+D5 note (2026-09-19): the reader snapshot's DATA object gained a second
+`dbOid` partition -- a retention owner id instead of a real database Oid, for
+the artifact an explicit exact-R publish produces, distinct from the
+automatic checkpoint-driven snapshot's `dbOid = InvalidOid` -- after two
+producers sharing one key silently collided in CI (RELEASE_VALIDATION.md's
+"Integration-lane finding: a silent artifact key collision"). The manifest
+could not reuse the same partitioning trick on the existing MANIFEST object:
+that object's `dbOid` slot is already a namespace of real database OIDs (the
+automatic per-database manifest, tracked and retired by the reader database
+barrier), and an owner id equal to a live database's OID would alias it. The
+explicit publish's manifest instead got a new, dedicated object,
+`PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT`, keyed by the owner id. Both
+changes are store *address-space* partitions/additions, not envelope or
+payload changes: the bytes at any of these keys are unchanged, so neither
+bumped `PS_READER_SNAPSHOT_MANIFEST_FORMAT`/`PS_READER_SNAPSHOT_FORMAT` and
+neither needed fixture regeneration (`fixtures/pgdata-artifacts` and
+`fixtures/posix-artifact-lifecycle`, checked with `--require-build-match`,
+both still pass unchanged). Rule 4's "reader's published snapshot objects"
+now additionally means: one producer per key, with an owner id reserved for
+exact-R rather than an automatic key's `InvalidOid` or the automatic
+manifest's real-database-OID namespace.
+
+Open follow-ups from this fix (R5-5, tracked in RELEASE_VALIDATION.md's
+"Open follow-up work" section, not blocking): (a) an admission/storage
+refusal inside `artifact_store_record()` poisons the whole daemon's artifact
+path for the rest of its lifetime (`artifact_io_failed`), not just the one
+request -- now visible as `PS_ARTIFACT_REFUSE_STORE_RECORD`/`POISONED`
+instead of a bare -1, but the poisoning-on-one-refusal semantics need their
+own review; (b) `append_page_impl`'s page-prune-frontier fence can refuse a
+late-shipped SLRU/reader-snapshot artifact at or below the cutoff independent
+of key/generation ordering -- a separate hazard from the collision fixed
+here.
+
 ### D6. MVP deployment boundary
 
 Recommended: keep default-tablespace local POSIX as the MVP boundary.  Treat
@@ -1601,3 +1634,5 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
 | 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
 | 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |
+| 2026-09-19 | Fixed a silent artifact-key collision between the automatic checkpoint-driven reader snapshot and an explicit exact-R publish (PRs #264/#265/#266 all failed the integration lane identically at "daemon reported error for op 34"): the explicit publish now uses an owner-scoped `dbOid` key for its DATA object instead of sharing the automatic snapshot's `InvalidOid` key, publishes its manifest under a new dedicated `PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT` rather than aliasing the automatic per-database manifest's real-database-OID namespace at `MANIFEST_OBJECT`, and no longer publishes the automatic-only "global" manifest fallback; `ps_artifact_begin`/`commit`/`drop` report a refusal reason (`PsArtifactRefuseReason`, append-only) that the daemon logs and the client echoes instead of a bare op number, closing the diagnostic gap that made the original failures a one-line mystery for three PRs in a row (D5 note above; RELEASE_VALIDATION.md's "Integration-lane finding") | `pagestore_artifact_lifecycle_test.c`'s `test_reader_snapshot_owner_key_split` covers the refusal-reason plumbing and the per-`dbOid` producer independence the fix relies on (it cannot reach the base bug itself, which was `pagestore.c`'s key choice, not the lifecycle); `integration_test.sh`'s reader section is the actual regression test -- it forces the collision order deterministically (polls the automatic generation into existence before the explicit publish) instead of racing worker timing, fails with the key reverted ("artifact begin: newer generation exists"), and asserts no refusal line at the end of a passing run; full `meson test --suite pagestore` (74/74), all three fixture checks (store, pgdata, controller) unchanged with `--require-build-match`, `KEEPTMP=1 integration_test.sh`, `mvp_golden_test.sh`, and `branch_boot_test.sh` all green |
+| 2026-09-20 | Follow-up review of the above found and fixed a second, latent collision before it shipped: the explicit publish's manifest had reused MANIFEST_OBJECT's `dbOid` slot, which is the automatic per-database manifest's real-database-OID namespace (tracked/retired by the reader database barrier) -- an owner id equal to a live database's OID would have aliased that database's manifest and risked the barrier dropping it. Gave the explicit manifest its own object number instead (see D5 note); corrected two doc inaccuracies (the unit test does not reach the base bug; the owner id is range-checked, not truncated); mapped the "refused before ps_artifact_begin ran at all" case (`PS_ARTIFACT_REFUSE_NONE`, the daemon's klass/timeline gates) to an explicit message instead of a bare "none"; recorded the R4-2 poisoning and forkmeta-cutoff-vs-fenced-artifact follow-ups as open in RELEASE_VALIDATION.md | Full `meson test --suite pagestore` (74/74), all three fixture checks unchanged with `--require-build-match`, the unit test in both SLRU/reader-snapshot klass modes, `KEEPTMP=1 integration_test.sh`, `mvp_golden_test.sh`, and `branch_boot_test.sh` all green |
