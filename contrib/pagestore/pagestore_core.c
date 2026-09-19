@@ -660,7 +660,8 @@ static int prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t bl
 								uint32_t idx, uint64_t floor,
 								const PsPruneFence *fences, uint32_t nfences);
 static int retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
-											  uint64_t *floor_out, int map_locked);
+											  uint64_t *floor_out, int map_locked,
+											  uint64_t *pin_floor_out);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 							 uint32_t *nfences_out);
 
@@ -3476,6 +3477,19 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	 * the advertised bytes.  Recovery already derives the same index from the
 	 * surviving layer set. */
 	page_remove_compacted_versions(timeline, dropped, ndropped);
+	/* Residual 2: a control-class version this pass dropped can only be a
+	 * superseded control note or image -- the retirement that lets a stuck
+	 * WAL-retention-floor term (wal_retain_floor_level) advance.  Bump the
+	 * proof epoch once per such pass so the WAL reclaimer re-evaluates
+	 * promptly; an ordinary relation-page compaction (the common case) must
+	 * not bump it, or every compaction becomes a drain for any timeline with
+	 * a stuck segment (the v1 pathology this design avoids). */
+	for (uint32_t k = 0; k < ndropped; k++)
+		if (dropped[k].key.klass == PS_KLASS_CONTROL)
+		{
+			wal_reclaim_proof_changed();
+			break;
+		}
 	if (metrics_header != NULL)
 	{
 		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
@@ -3908,6 +3922,13 @@ timeline_meta_poison(void)
  * no new layer arrives.  Maintenance rewrites every marked nonempty shard and
  * clears its mark only after publishing at the new effective floor. */
 static unsigned char page_prune_due[MAX_TIMELINES][PS_MAX_CHANNELS];
+/* Set by the WAL reclaimer (wal_reclaim_request_control_flush) when the
+ * retention floor's control-note term alone holds a segment boundary and the
+ * note that sets it is superseded but still memtable-resident: compaction
+ * cannot prune it until it reaches an image layer, and the memtable flushes
+ * only on its own page-count threshold.  Serviced in ps_core_maintenance_impl
+ * before the compaction phase-1 scan, which then finds the note pruneable. */
+static unsigned char page_flush_requested[PS_MAX_CHANNELS];
 
 static void
 page_prune_mark_all_due_locked(void)
@@ -12362,6 +12383,89 @@ wal_reclaim_watch_fire_fpi(uint32_t tl, const WalIdxRec *records,
 	}
 }
 
+/* Caller holds none of the shard/map/publish locks: called from the WAL
+ * reclaimer's NOPROGRESS branch, which has released them for the retention
+ * floor scan.  Best-effort, like retention_effective_floor's own control-
+ * note reads (wal_retain_floor_level): a stale answer here costs at most one
+ * missed or one extra flush request, never an incorrect prune -- compaction
+ * revalidates every keep decision under its own locks and the exact-redo
+ * twin rule.  See "Residual 2" in the design doc for the predicate. */
+static void
+wal_reclaim_request_control_flush(uint32_t tl)
+{
+	PsKey		key;
+	PageEnt    *notes;
+	PsPruneFence *fences = NULL;
+	uint32_t	nfences = 0;
+	PsRetentionPin *pins = NULL;
+	uint32_t	npins = 0;
+	uint64_t	materializer_lsn = 0;
+	uint64_t	cutoff = 0;
+	uint32_t	control_shard;
+	int			rc;
+
+	memset(&key, 0, sizeof(key));
+	key.klass = PS_KLASS_CONTROL;
+	control_shard = ps_shard_of(&key);
+	if (control_shard >= PS_MAX_CHANNELS)
+		return;
+	ps_lock_map_rd();
+	rc = control_prune_fences(tl, &fences, &nfences);
+	ps_unlock_map();
+	if (rc != 0)
+		return;
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+	{
+		free(fences);
+		return;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+		if (pins[i].timeline == tl &&
+			pins[i].owner_kind == PS_RETENTION_OWNER_MATERIALIZER &&
+			(materializer_lsn == 0 || pins[i].lsn < materializer_lsn))
+			materializer_lsn = pins[i].lsn != 0 ? pins[i].lsn : 1;
+	free(pins);
+	if (control_checkpoint_cutoff(tl, materializer_lsn, &cutoff) != 0)
+	{
+		free(fences);
+		return;
+	}
+	notes = page_find(tl, &key, PS_CONTROL_NOTE_BLOCK);
+	if (notes != NULL)
+		for (int i = 0; i < notes->nver; i++)
+		{
+			const PageVer *v = &notes->vers[i];
+			int			required = 0;
+
+			if (v->lsn == 0 || (cutoff != 0 && v->lsn >= cutoff))
+				continue;
+			for (uint32_t f = 0; f < nfences && !required; f++)
+			{
+				if (fences[f].lsn < v->lsn)
+					continue;
+				required = 1;
+				for (int j = 0; j < notes->nver && required; j++)
+				{
+					const PageVer *v2 = &notes->vers[j];
+
+					if (j != i && v2->lsn > v->lsn && v2->lsn <= fences[f].lsn)
+						required = 0;
+				}
+			}
+			if (required)
+				continue;
+			/* v is superseded: not the newest note at or below any retained
+			 * fence, and below the operational floor. */
+			if (!walidx_base_version_durable(v))
+				__atomic_store_n(&page_flush_requested[control_shard], 1,
+								 __ATOMIC_RELEASE);
+			__atomic_store_n(&page_prune_due[tl][control_shard], 1,
+							 __ATOMIC_RELEASE);
+			break;
+		}
+	free(fences);
+}
+
 /* Caller holds walidx_meta_lock.  A progress value initialized from the first
  * append is not durable and is intentionally rejected here. */
 static int
@@ -12508,6 +12612,7 @@ wal_segment_reclaim_one(void)
 		PsWalStore *store;
 		pthread_rwlock_t *wal_lock;
 		uint64_t retention_floor = 0;
+		uint64_t pin_floor = 0;
 		uint64_t progress = 0;
 		uint64_t raw_floor = 0;
 		uint64_t candidate;
@@ -12644,9 +12749,9 @@ wal_segment_reclaim_one(void)
 		if (wal_reclaim_before_floor_test_hook != NULL)
 			wal_reclaim_before_floor_test_hook(tl,
 										 wal_reclaim_before_floor_test_hook_arg);
-		rc = rc != 0 ? rc : retention_effective_floor(tl,
+		rc = rc != 0 ? rc : retention_effective_floor_internal(tl,
 											 PS_RETENTION_RESOURCE_WAL,
-											 &retention_floor);
+											 &retention_floor, 0, &pin_floor);
 		pthread_rwlock_wrlock(&walidx_prune_lock);
 		walidx_publish_wrlock();
 		pthread_rwlock_wrlock(wal_lock);
@@ -12819,6 +12924,31 @@ wal_segment_reclaim_one(void)
 				}
 				else
 					wal_reclaim_watch_clear(tl);
+			}
+			/* Residual 2: when pins/branch caps/progress/the raw WAL-index
+			 * floor alone would already have cleared this boundary, the
+			 * control-note term folded into retention_floor
+			 * (wal_retain_floor_level) is the sole blocker.  If the note
+			 * that sets it is superseded but still memtable-resident,
+			 * request a flush of the control shard so the next compaction
+			 * pass can prune it.  pin_floor == 0 means pins impose no
+			 * constraint at all (the same sentinel retention_floor and
+			 * raw_floor use), not a floor at LSN 0, so it is excluded from
+			 * the minimum exactly like raw_floor is above. */
+			{
+				uint64_t pin_target = progress;
+
+				if (raw_floor != 0 && raw_floor < pin_target)
+					pin_target = raw_floor;
+				if (pin_floor != 0 && pin_floor < pin_target)
+					pin_target = pin_floor;
+				if (timeline_has_parent(tl) && timelines[tl].branch_lsn < pin_target)
+					pin_target = timelines[tl].branch_lsn;
+				if (pin_target > store->end_lsn)
+					pin_target = store->end_lsn;
+				pin_target -= pin_target % store->segment_size;
+				if (pin_target > store->start_lsn)
+					wal_reclaim_request_control_flush(tl);
 			}
 			wal_reclaim_backoff(tl, &now, proof_epoch);
 			goto selected_done;
@@ -14083,7 +14213,7 @@ walidx_plan_bases_build(uint32_t tl)
 	walidx_plan_bases_free();
 	if (retention_effective_floor_internal(tl,
 										   PS_RETENTION_RESOURCE_PAGE_HISTORY,
-										   &floor, 1) != 0 ||
+										   &floor, 1, NULL) != 0 ||
 		page_prune_fences(tl, &fences, &nfences) != 0)
 		return -1;
 	/* Protected horizons are exactly the page-history fences: owner pins
@@ -17696,7 +17826,8 @@ walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
  */
 static int
 retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
-							   uint64_t *floor_out, int map_locked)
+							   uint64_t *floor_out, int map_locked,
+							   uint64_t *pin_floor_out)
 {
 	typedef struct RetentionControlProjection
 	{
@@ -17815,6 +17946,12 @@ retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 	}
 	if (!map_locked)
 		ps_unlock_map();
+	/* The floor before the note-derived WAL term below: pins, branch caps,
+	 * and (for PAGE_HISTORY) the operational cutoff.  Lets a caller (the WAL
+	 * reclaimer) tell "the note term alone holds the boundary" apart from
+	 * "a pin or branch cap does" without a second scan. */
+	if (pin_floor_out != NULL)
+		*pin_floor_out = floor;
 
 	if (resource == PS_RETENTION_RESOURCE_WAL)
 	{
@@ -17846,7 +17983,8 @@ static int
 retention_effective_floor(uint32_t timeline, uint32_t resource,
 						  uint64_t *floor_out)
 {
-	return retention_effective_floor_internal(timeline, resource, floor_out, 0);
+	return retention_effective_floor_internal(timeline, resource, floor_out, 0,
+											  NULL);
 }
 
 /* Return only immutable WAL bytes which the existing R3b proof would permit
@@ -20879,6 +21017,37 @@ ps_core_maintenance_impl(void)
 			return 1;
 	}
 	/*
+	 * Residual 2 (a superseded control note stuck in the memtable): service
+	 * any control-shard flush the WAL reclaimer requested
+	 * (wal_reclaim_request_control_flush) before the compaction scan below,
+	 * so a note this flush makes durable is visible to the very next Phase 1
+	 * pass.  At most one shard's memtable is flushed per maintenance call,
+	 * matching the one-class-of-work-per-call convention here; a request
+	 * that turns out to have nothing to flush (already flushed by other
+	 * means) is simply cleared and the scan continues to the next shard.
+	 */
+	for (uint32_t sh = 0; sh < ns; sh++)
+	{
+		int			requested = __atomic_exchange_n(&page_flush_requested[sh],
+													0, __ATOMIC_ACQ_REL);
+
+		if (!requested)
+			continue;
+		ps_lock_shard_wr(sh);
+		ps_lock_map_wr();
+		if (g_shards[sh].memtable != NULL &&
+			ps_memtable_count(g_shards[sh].memtable) > 0)
+		{
+			(void) flush_memtable(&g_shards[sh], (uint32_t) g_shards[sh].cur_seg,
+								  g_shards[sh].cur_off);
+			ps_unlock_map();
+			ps_unlock_shard(sh);
+			return 1;
+		}
+		ps_unlock_map();
+		ps_unlock_shard(sh);
+	}
+	/*
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
 	 * layers are due for compaction.  A shared lock here lets reads proceed.
 	 */
@@ -20925,7 +21094,8 @@ ps_core_maintenance_impl(void)
 				 (__atomic_load_n(&page_prune_due[ftl][fsh], __ATOMIC_ACQUIRE) != 0 &&
 				  count_image_layers(ftl, fsh) > 0)) &&
 				retention_effective_floor_internal(ftl,
-					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1) == 0)
+					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1,
+					NULL) == 0)
 			{
 				int		was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh],
 													  0, __ATOMIC_ACQ_REL);

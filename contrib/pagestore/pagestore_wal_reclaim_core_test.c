@@ -1021,6 +1021,74 @@ test_late_fpi_requests_compaction(void)
 	remove_tree(store);
 }
 
+/*
+ * Residual 2: a superseded control note invisible to compaction while
+ * memtable-resident.  wal_retain_floor_level (part of retention_floor's WAL
+ * computation) counts every retained note, durable or not; compaction only
+ * reads image layers.  When retention_floor's note term alone holds a
+ * segment boundary and the note that sets it is superseded (not the newest
+ * note at or below any live fence) but still memtable-resident, the
+ * reclaimer requests a flush of the control shard so the very next
+ * compaction pass can prune it.  Also the twin-rule regression guard: a
+ * note that *is* required by a live fence must never be flushed or pruned
+ * on the reclaimer's behalf.  See plan-reclaim-residuals.md section 2.
+ */
+static void
+test_superseded_note_in_memtable_is_pruned(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-note-flush-XXXXXX";
+	char store2[] = "/tmp/pagestore-wal-policy-note-required-XXXXXX";
+	PsKey control_key;
+
+	memset(&control_key, 0, sizeof(control_key));
+	control_key.klass = PS_KLASS_CONTROL;
+
+	configure_core();
+	flush_pages = 64;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
+		  write_control(0, WAL_SEGMENT + 4096, WAL_SEGMENT + 4096) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 100, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_SEGMENT + 8192) &&
+		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
+		  wal_index_progress(0, 0, WAL_TOTAL),
+		  "note A (redo in segment 1), a fence between A and B, then note B");
+	check(maintenance_until_count(store, 0, 2),
+		  "segment 0 goes; segment 1 is held by the reader and by note A"
+		  " (the newest note at or below its fence)");
+	check(drop_wal_pin(0, 100, 1), "drop the reader pin: note A is now superseded");
+	check(maintenance_until_count(store, 0, 0),
+		  "the requested flush lands, compaction prunes A, and the floor"
+		  " becomes B's redo; before the fix, stuck at 2 for the whole 1 s"
+		  " window (A stays memtable-resident: flush_pages = 64 and only 4"
+		  " control pages were ever written)");
+	close_store();
+	remove_tree(store);
+
+	/* Twin-rule regression guard, same construction, reader pin left live:
+	 * note A is still required (the newest note at or below the reader's
+	 * fence) and must not be pruned or flushed on the reclaimer's behalf. */
+	configure_core();
+	flush_pages = 64;
+	check(mkdtemp(store2) != NULL && ps_core_open(store2) == 0 &&
+		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
+		  write_control(0, WAL_SEGMENT + 4096, WAL_SEGMENT + 4096) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 100, 1,
+					  PS_RETENTION_RESOURCE_ALL, WAL_SEGMENT + 8192) &&
+		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
+		  wal_index_progress(0, 0, WAL_TOTAL),
+		  "the same construction, reader pin left live this time");
+	check(maintenance_until_count(store2, 0, 2),
+		  "segment 0 goes; segment 1 is held by the reader and by note A");
+	check(!maintenance_until_count(store2, 0, 0) && segment_count(store2, 0) == 2,
+		  "note A is required by the live reader fence and must stay put");
+	check(ps_test_page_version_count(0, &control_key, PS_REDO_NOTE_BLOCK) == 2,
+		  "both notes survive: the reclaimer's request never touches a"
+		  " required note");
+	close_store();
+	remove_tree(store2);
+}
+
 /* A WAL_INDEX-only pin is not caught by page_prune_mark_all_due's
  * (PAGE_HISTORY|WAL) test, but walidx_prune_fences still fences the
  * compaction plan on every WAL_INDEX pin: dropping or moving a WAL_INDEX-only
@@ -2319,6 +2387,7 @@ main(void)
 	test_unreplaceable_dependency_requests_once();
 	test_late_durable_base_requests_compaction();
 	test_late_fpi_requests_compaction();
+	test_superseded_note_in_memtable_is_pruned();
 	test_walidx_only_pin_drop_requests_compaction();
 	test_dependency_cutoffs();
 	test_death_base_survives_prefix_prune();
