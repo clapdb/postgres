@@ -414,6 +414,7 @@ static uint64_t walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
 static uint64_t forkmeta_reclaim_lag_bytes(void);
 static int fork_meta_backpressure_throttled(void);
 static int admission_write_lock(void);
+static int fork_meta_orphan_proven(uint64_t admission_seq);
 static void backpressure_publish_locked(void);
 static void backpressure_update_locked(PsBackpressureController *controller,
 										 uint64_t lag, uint64_t high,
@@ -5449,26 +5450,40 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 }
 
 /*
- * Recovery-only repair for a store written by a since-fixed bug in the live
- * write path: a live ordered write's bound marker existed only in memory as
- * a plain FEV_GROW (marker_kind = 0, order_id = 0) instead of the recovery
- * representation fork_event_activate_seg() expects, so a snapshot cutover
- * could publish that plain GROW and strand the record's identity.  The
- * admission sequence is allocated once per append and shared only by a page
- * record and its own fork event, so a plain GROW carrying the exact
- * (lsn, admission_seq, nblocks) tuple of an otherwise-unmatched ordered
- * record is that record's own marker, degraded.  Adopting it reproduces
- * exactly the in-memory state the live path would have produced without the
- * bug.  Fail-closed: called only after fork_event_activate_seg() has already
- * failed, and any mismatch here (zero identity, wrong admission_seq, wrong
- * nblocks, a non-GROW kind, or an event that already carries a marker) is
+ * Recovery-only repair for an ordered record whose marker is missing from
+ * memory even though its admission identity (order_id, admission_seq) is
+ * nonzero and its segment/image-layer record survives.  Two distinct causes
+ * produce exactly this shape, both content-level: (1) the since-fixed
+ * live-path bug, where a live ordered write's marker existed only in memory
+ * as a plain FEV_GROW (marker_kind = 0, order_id = 0) instead of the
+ * recovery representation fork_event_activate_seg() expects, so a snapshot
+ * cutover could publish that plain GROW and strand the identity; (2) the
+ * snapshot builder degrading or dropping a marker whose page version had
+ * been pruned from memory, whose record is later rescanned after a timeline-
+ * delete rewrite rebases the flush watermark (tracked separately; see
+ * RELEASE_VALIDATION.md).  Both are fail-closed on fork_meta_orphan_proven():
+ * the selected forkmeta snapshot's freeze sequence proves the append that
+ * produced this admission_seq had already completed -- including its marker
+ * append, since a failed marker append poisons forkmeta -- by the time some
+ * later generation was frozen, so a marker genuinely absent from every
+ * durable source can only be an orphan, never a torn append still in flight
+ * (a torn append's sequence is always above every generation's freeze
+ * sequence; see fork_meta_orphan_proven()'s header comment).
+ *
+ * Growth rule: the admission sequence is allocated once per append and
+ * shared only by a page record and its own fork event, so a plain GROW
+ * carrying the exact (lsn, admission_seq, nblocks) tuple of an otherwise-
+ * unmatched ordered record is that record's own marker, degraded.  Adopting
+ * it reproduces the in-memory state the live path would have produced
+ * without bug (1).  Any mismatch (wrong admission_seq/nblocks, a non-GROW
+ * kind, an event that already carries a marker, or the proof failing) is
  * left untouched, so the caller still refuses the record.
  */
 static int
 fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 							  uint64_t order_id, uint64_t admission_seq)
 {
-	if (order_id == 0 || admission_seq == 0)
+	if (order_id == 0 || !fork_meta_orphan_proven(admission_seq))
 		return 0;
 	for (uint32_t i = 0; i < e->nev; i++)
 	{
@@ -5489,6 +5504,52 @@ fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 		}
 	}
 	return 0;
+}
+
+/*
+ * Commit-class companion to fork_event_adopt_orphaned_seg(), tried only
+ * after activation and the growth rule have both already failed: a second
+ * below-floor/WAL-less rewrite of an already-sized block (the FSM/VM
+ * pattern -- rewritten at every checkpoint) never left a plain GROW behind
+ * to begin with, even before the live-path fix, because fork_event_add()
+ * returns early for a GROW that does not raise fork_size_asof_hop() past
+ * its nblocks; there is no degraded identity to promote, only a missing
+ * one.  Insert the inert FEV_SEG_COMMIT_BOUND marker recovery itself would
+ * have loaded instead.  An inert marker never contributes to
+ * fork_size_asof_hop() (only GROW/SET/DEAD do), so the only effect of
+ * admitting it is to admit the page version; that is safe exactly when the
+ * fork's size already covered the block at this position -- the same
+ * decision the live write made (segment_grows == 0) -- which is why the
+ * size check below, not a plain-GROW match, is this rule's identity proof.
+ * Requires the same fork_meta_orphan_proven() precondition as the growth
+ * rule.  For the F3 pruned-marker case (a live version pruned from memory,
+ * then its record rescanned after a timeline-delete watermark rebase) this
+ * re-admits an already-pruned version -- a pruning reversal, not new data --
+ * which is strictly better than the alternative of retiring every record
+ * after it in the segment; see RELEASE_VALIDATION.md for the open follow-up
+ * that removes the need for this path to ever fire.
+ */
+static int
+fork_event_adopt_orphaned_commit_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+									 uint64_t order_id, uint64_t admission_seq)
+{
+	uint32_t	i;
+
+	if (order_id == 0 || !fork_meta_orphan_proven(admission_seq))
+		return 0;
+	if (fork_size_asof_hop(e, lsn, admission_seq) < nblocks)
+		return 0;
+	for (i = 0; i < e->nev; i++)
+		if (e->ev[i].lsn == lsn && e->ev[i].admission_seq == admission_seq)
+			return 0;		/* already has an event at this identity */
+	fprintf(stderr, "pagestore: adopting orphaned ordered commit record as inert "
+			"bound marker (timeline=%u lsn=%llu seq=%llu order=%llu nblocks=%u)\n",
+			e->timeline, (unsigned long long) lsn,
+			(unsigned long long) admission_seq,
+			(unsigned long long) order_id, nblocks);
+	fork_event_add_seg_marker(e, lsn, nblocks, FEV_SEG_COMMIT_BOUND, order_id,
+							  admission_seq);
+	return 1;
 }
 
 static int
@@ -6731,6 +6792,35 @@ static uint64_t fork_meta_snapshot_generation;
 static uint64_t fork_meta_snapshot_cutoff_lsn;
 static uint64_t fork_meta_snapshot_cutoff_seq;
 static uint64_t fork_meta_snapshot_freeze_seq;
+
+/*
+ * Proof that a marker missing from memory for this admission_seq was lost,
+ * not merely not yet appended (a torn append still in flight).
+ * fork_meta_snapshot_maintenance() computes freeze_seq = next_admission_seq
+ * - 1 (below) while holding admission_write_lock(), which blocks until
+ * every in-flight append has released the admission *read* lock
+ * (admission_active_readers == 0) -- and every append holds that read lock
+ * across its entire append_page_impl() call (pagestore_daemon.c run_request():
+ * ps_admission_read_lock() held across run_request_admitted(), which
+ * dispatches PS_OP_EXTEND/PS_OP_WRITEV through handle_request() ->
+ * ps_artifact_write() -> append_page_raw()/append_page_impl(), released
+ * only after that call returns).  So admission_seq <= freeze_seq implies the
+ * append that produced this admission_seq had already returned --
+ * including its marker append, since a failed fork_meta_persist_segment()
+ * poisons forkmeta -- by the time some selected generation's freeze was
+ * taken.  A marker genuinely absent from every durable source at that
+ * generation can therefore only be an orphan (lost by a builder decision),
+ * never a torn append: a torn append's sequence is always strictly above
+ * every generation's freeze sequence, so it can never satisfy this
+ * predicate and still hits the existing refuse/retire diagnostics.
+ */
+static int
+fork_meta_orphan_proven(uint64_t admission_seq)
+{
+	return fork_meta_snapshot_generation != 0 && admission_seq != 0 &&
+		admission_seq <= fork_meta_snapshot_freeze_seq;
+}
+
 /* The selected source is a compacted baseline, not controller debt.  Only
  * bytes appended after this baseline are charged.  The value is rebuilt after
  * recovery and advanced only after a durable source rewrite. */
@@ -16944,12 +17034,15 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		ForkEnt    *fe = fork_find(timeline, key);
 
-		/* fork_event_adopt_orphaned_seg() repairs a store written by the
-		 * since-fixed live-path bug (see its header comment); it never runs
-		 * unless the normal marker match above already failed. */
+		/* fork_event_adopt_orphaned_seg() and fork_event_adopt_orphaned_commit_seg()
+		 * repair a proven orphan's marker (see their header comments); neither
+		 * runs unless the normal marker match above already failed, and the
+		 * commit rule only after the growth rule has also failed. */
 		if ((!fe || !fork_event_activate_seg(fe, growth_lsn, block + 1,
 												 order_id, admission_seq)) &&
 			(!fe || !fork_event_adopt_orphaned_seg(fe, growth_lsn, block + 1,
+												 order_id, admission_seq)) &&
+			(!fe || !fork_event_adopt_orphaned_commit_seg(fe, growth_lsn, block + 1,
 												 order_id, admission_seq)) &&
 			!fork_meta_legacy)
 			return 0;
