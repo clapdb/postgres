@@ -50,6 +50,29 @@ bounded-history and recovery evidence, but neither a multi-day endurance test
 nor a large-data PostgreSQL test. The scheduled run also predates the reviewed
 revision; its result must not be attributed to the final release candidate.
 
+Two later scheduled runs, [34747373574](https://github.com/clapdb/postgres/actions/runs/34747373574)
+(2026-09-13) and [34825221247](https://github.com/clapdb/postgres/actions/runs/34825221247)
+(2026-09-14), failed seed `20260909`'s `wal` during-bound check by a few KiB
+(4698112 against the then-current bound of 4685824), both at the sample
+between rounds 6400 and 6500; the other two seeds passed in both runs. The
+failure is explained, not a new regression: physical shipped WAL in this
+workload was governed by how often the WAL reclaimer's raw WAL-index
+dependency floor moved rather than by the WAL controller's proven-lag
+high-water, and nothing requested a WAL-index compaction on the reclaimer's
+own behalf, so a fully proven segment waited on the WAL-index controller's own
+~1000-round cadence; a fixed one-second no-progress backoff, uncancelled by
+the publication that unblocked it, added up to another 237 rounds on the
+hosted runner.  The fix (`wal_segment_reclaim_one` requests an on-demand
+compacted WAL-index publication for a segment blocked only by the stale raw
+floor, and the no-progress backoff is cancelled by a proof-epoch bump on
+retention/WAL-index-publish/GC/progress/timeline-delete events, not only by
+the clock) closes it: the soak's `wal` bound is restated from five declared
+terms (18 KiB tighter, 4667392) with a per-sample check tying physical WAL to
+the soak's own fences, and seed 20260909 at 8000 rounds now peaks at ~1.75 MiB
+across repeated local runs, plain and CPU-contended.  The first post-fix
+nightly dispatch is run <PAGESTORE_NIGHTLY_POSTFIX_RUN_ID> (to be filled in
+after this change merges to `pagestore` and the nightly lane runs against it).
+
 ## Gaps in release evidence
 
 1. **Duration and scale.** Repeated short runs cannot establish multi-day
