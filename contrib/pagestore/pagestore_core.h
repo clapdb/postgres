@@ -185,6 +185,7 @@ extern uint32_t ps_test_page_version_count(uint32_t timeline, const PsKey *key,
 										   uint32_t block);
 extern uint32_t ps_test_artifact_fence_count(uint32_t timeline);
 extern int ps_test_walidx_force_due(uint32_t timeline);
+extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
