@@ -106,6 +106,21 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_fault_test pagestore_fault_test.c pagestore_fault.c -pthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_spdk_super_test pagestore_spdk_super_test.c pagestore_spdk_super.c
 
+      - name: Check fixture format identities against one pagestore_format_versions snapshot
+        # Cheap, single-step guard: every current fixture's format.json must
+        # agree with the same compiled-identity snapshot.  PR #262 bumped two
+        # identities and regenerated posix-artifact-lifecycle/format.json but
+        # not pgdata-artifacts/format.json; both are checked in separate,
+        # much slower steps below, so the mismatch was only caught on the
+        # base branch after merge (PR #263).  This runs first, so it fails
+        # before either of those steps' daemon work starts.
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_fixture_identities.py \
+            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
+                    fixtures/posix-artifact-lifecycle fixtures/pgdata-artifacts \
+            --format-tool ./pagestore_format_versions
+
       - name: Run standalone test suite
         working-directory: contrib/pagestore
         run: ./pagestore_test ./pagestore_daemon ./pagestore_inspect

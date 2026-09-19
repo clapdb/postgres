@@ -775,6 +775,27 @@ endforeach
 # read them in native order, so the fixture is skipped where the host byte
 # order differs; a big-endian baseline would be a second archive.
 if host_machine.endian() == 'little'
+# Cheap, single-step guard that must run before the two format-fixture tests
+# below: every current fixture's format.json must agree with the same
+# pagestore_format_versions snapshot.  PR #262 regenerated
+# posix-artifact-lifecycle/format.json but not pgdata-artifacts/format.json
+# after a persisted-format bump; each of those tests only compares its own
+# fixture against the compiled identities, so the two drifting apart was
+# only caught on the base branch after merge (PR #263).
+test('pagestore_fixture_identities',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_fixture_identities.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline',
+         meson.current_source_dir() / 'fixtures' / 'posix-forkmeta-crc',
+         meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
+         meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
+         meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
+         meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
+         '--format-tool', pagestore_format_versions],
+  depends: [pagestore_format_versions],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_persisted_format_fixture',
   pagestore_harness_python,
   args: [files('harness/pagestore_fixture.py'),
