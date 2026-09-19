@@ -98,10 +98,13 @@ reported and handled differently:
   per-key flag would have to reason about which other shards' records were
   appended between the last successful sync and the failure. Recovery
   rebuilds from disk on reopen, so the flag is cleared there. The one
-  exception: a `sync()` failure *before* any record is appended for that
-  operation (`ps_artifact_commit`'s pre-record data sync) is
-  `PS_ARTIFACT_REFUSE_SYNC` -- nothing durable is ambiguous yet, so it does
-  not poison and is retryable like an admission refusal.
+  exception: a `sync()` failure *before* the COMMIT record itself is
+  appended (`ps_artifact_commit`'s pre-record data sync, which proves the
+  attempt's already-written pages durable) is `PS_ARTIFACT_REFUSE_SYNC` --
+  nothing is indexed as complete yet, so there is no ambiguity about
+  completion state to poison over: a retry re-runs the same sync, which
+  must succeed before the COMMIT record can land, so it does not poison
+  and is retryable like an admission refusal.
 
 A process-crash test is not a power-loss guarantee.
 

@@ -554,7 +554,7 @@ ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
 		if (lsn < last->lsn)
 			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_OLDER_GENERATION);
 		if (artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK, last, &record, 0) != 0)
-			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_RECORD_UNREADABLE);
 		if (lsn == last->lsn && record.state == PS_ARTIFACT_DROPPED)
 			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_DROPPED);
 	}
@@ -679,18 +679,45 @@ ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 	if (reason)
 		*reason = PS_ARTIFACT_REFUSE_NONE;
 	if (!artifact_data_key(key))
-		return append_page_raw(tl, key, block, page, lsn, seq);
+	{
+		/* Not under the lifecycle protocol at all (or, for an SLRU/reader-
+		 * artifact klass, a nonzero forkNum the protocol never claims): a
+		 * plain append.  Classify and report its outcome's reason too --
+		 * daemon.c logs and returns it for a WRITE on an SLRU/READER_
+		 * SNAPSHOT klass regardless of forkNum, and discarding the outcome
+		 * here would otherwise leave *reason at NONE ("refused before
+		 * admission"), which is wrong for an admission refusal or I/O
+		 * failure that did run.  This never poisons here, matching the
+		 * pre-existing shape of every plain-append path in this function
+		 * (only an append under an open attempt, below, poisons on a real
+		 * I/O failure). */
+		PsAppendOutcome raw_outcome;
+		int			rc = append_page_raw_outcome(tl, key, block, page, lsn, seq,
+												 &raw_outcome);
+
+		if (rc != 0)
+			return artifact_refuse(reason, artifact_reason_for_outcome(raw_outcome));
+		return rc;
+	}
 	if (__atomic_load_n(&artifact_io_failed, __ATOMIC_ACQUIRE))
 		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_POISONED);
 	if (token == 0)
 	{
 		if (artifact_has_protocol(tl, key))
 			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_LEGACY_BYPASS);
-		return append_page_raw(tl, key, block, page, lsn, seq);
+		{
+			PsAppendOutcome raw_outcome;
+			int			rc = append_page_raw_outcome(tl, key, block, page, lsn, seq,
+													 &raw_outcome);
+
+			if (rc != 0)
+				return artifact_refuse(reason, artifact_reason_for_outcome(raw_outcome));
+			return rc;
+		}
 	}
 	state = artifact_completed_attempt(tl, key, lsn, token, &completed);
 	if (state < 0)
-		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_RECORD_UNREADABLE);
 	if (state > 0)
 	{
 		unsigned char *durable = malloc(page_size);
@@ -769,8 +796,12 @@ ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	if (!fork || fork->artifact_attempt_seq != token ||
 		fork->artifact_page_count != count)
 		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
-	/* Nothing appended yet: a failure here is retryable and must not poison
-	 * the store, unlike a failure recording the COMMIT record below. */
+	/* The attempt's pages are already appended, but no COMMIT record exists
+	 * yet, so nothing is indexed as complete: there is no ambiguity about
+	 * completion state for a failure here to poison over.  A retry re-runs
+	 * this same sync -- it must succeed before the COMMIT record below can
+	 * land -- so this is retryable and must not poison the store, unlike a
+	 * failure recording the COMMIT record itself. */
 	if (ps_storage->sync() != 0)
 		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_SYNC);
 	record.nblocks = fork->artifact_nblocks;
@@ -819,7 +850,7 @@ ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,
 		PsArtifactLifecycle prior;
 
 		if (artifact_record(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK, last, &prior, 0) != 0)
-			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_STORE_RECORD);
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_RECORD_UNREADABLE);
 		/* A same-LSN DROP cannot replace completed bytes seen by a branch. */
 		if (prior.state == PS_ARTIFACT_DROPPED)
 			return 0;

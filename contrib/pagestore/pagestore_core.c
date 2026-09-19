@@ -449,8 +449,6 @@ static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS]
 static int page_frontier_load(const char *store_dir);
 static void page_prune_mark_all_due_locked(void);
 static int key_eq(const PsKey *a, const PsKey *b);
-static int append_page_raw(uint32_t timeline, const PsKey *key, uint32_t block,
-	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq);
 
 /*
  * append_page_impl() returns -1 both when it refuses to admit a request
@@ -7527,8 +7525,8 @@ static uint64_t fork_meta_snapshot_freeze_seq;
  * call (pagestore_daemon.c run_request(): ps_admission_read_lock() held
  * across run_request_admitted(), which dispatches PS_OP_EXTEND/PS_OP_WRITEV
  * through handle_request() -> ps_artifact_write() ->
- * append_page_raw()/append_page_impl(), released only after that call
- * returns).  So admission_seq <= freeze_seq implies the append that
+ * append_page_raw_outcome()/append_page_impl(), released only after that
+ * call returns).  So admission_seq <= freeze_seq implies the append that
  * produced it had already returned by that freeze -- but "returned" does
  * NOT mean "wrote a marker": a crash between the segment body write and
  * fork_meta_persist_segment() (torn append) also returns via _exit(), and
@@ -15321,15 +15319,6 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq)
 {
 	return ps_artifact_write(timeline, key, block, page, version, 0, out_admission_seq, NULL);
-}
-
-static int
-append_page_raw(uint32_t timeline, const PsKey *key, uint32_t block,
-			const unsigned char *page, uint64_t version,
-			uint64_t *out_admission_seq)
-{
-	return append_page_raw_outcome(timeline, key, block, page, version,
-								   out_admission_seq, NULL);
 }
 
 static int

@@ -95,9 +95,19 @@ typedef enum PsArtifactRefuseReason
 	 */
 	PS_ARTIFACT_REFUSE_UNFENCED,			/* generation LSN below the page-reclaimed frontier and not fenced by an owner pin or branch point */
 	PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF,	/* growth ordered before the fork-metadata snapshot cutoff */
-	PS_ARTIFACT_REFUSE_SYNC,				/* data sync before the completion record failed; nothing recorded, retryable */
+	PS_ARTIFACT_REFUSE_SYNC,				/* data sync before the COMMIT record failed; nothing indexed as complete yet, retryable */
 	PS_ARTIFACT_REFUSE_LEGACY_BYPASS,		/* unversioned write to a key already under the lifecycle protocol */
 	PS_ARTIFACT_REFUSE_IMMUTABLE_MISMATCH,	/* same-LSN retry bytes differ from the completed generation */
+	/*
+	 * Appended in review of the two commits above, same append-only/no-
+	 * PS_SHM_VERSION-bump rule: distinguishes a failure reading back an
+	 * *existing* lifecycle record (corrupt, wrong identity, or a torn/
+	 * unrecognized layout -- artifact_record()) from STORE_RECORD's actual
+	 * meaning, a storage failure while durably recording a *new* one. Unlike
+	 * STORE_RECORD this never poisons: nothing was appended by the refused
+	 * request, so durable state cannot differ from in-memory state.
+	 */
+	PS_ARTIFACT_REFUSE_RECORD_UNREADABLE,	/* an existing lifecycle record failed validation on read; not poisoning */
 } PsArtifactRefuseReason;
 
 static inline const char *
@@ -141,6 +151,8 @@ pagestore_artifact_refuse_reason_name(PsArtifactRefuseReason reason)
 			return "legacy write refused: key is under the lifecycle protocol";
 		case PS_ARTIFACT_REFUSE_IMMUTABLE_MISMATCH:
 			return "immutable generation bytes differ";
+		case PS_ARTIFACT_REFUSE_RECORD_UNREADABLE:
+			return "an existing lifecycle record failed validation on read (not a storage failure; not poisoning)";
 	}
 	return "unknown";
 }
