@@ -61,6 +61,9 @@ fi
 if ! command -v md5sum >/dev/null 2>&1; then
 	md5sum() { if [ $# -eq 0 ]; then md5 -q; else md5 -q "$1"; fi; }
 fi
+if ! command -v sha256sum >/dev/null 2>&1; then
+	sha256sum() { shasum -a 256 "$@"; }
+fi
 file_size() { wc -c < "$1" | tr -d ' '; }
 sed_inplace() {
 	if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi

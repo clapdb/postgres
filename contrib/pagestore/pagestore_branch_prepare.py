@@ -61,12 +61,25 @@ def validate_authority_path(authority_dir: Path) -> os.stat_result:
         )
     component = authority_dir.parent
     immediate = True
+    followed_links = 0
     while True:
         component_stat = os.lstat(component)
         if stat.S_ISLNK(component_stat.st_mode) and component_stat.st_uid == 0:
             # A root-owned symlink (macOS /var, /tmp, /etc) cannot be replaced
-            # by an unprivileged user; continue the walk on its target.
-            component = Path(os.path.realpath(component))
+            # by an unprivileged user.  Follow exactly this one link and keep
+            # walking, so every component of its target -- including any
+            # further symlink -- is inspected by this same loop.
+            followed_links += 1
+            if followed_links > 8:
+                raise ConfigError(
+                    "retention_authority_dir ancestry follows too many symlinks"
+                )
+            target = Path(os.readlink(component))
+            if ".." in target.parts:
+                raise ConfigError(
+                    "retention_authority_dir ancestry symlink target must not contain '..'"
+                )
+            component = target if target.is_absolute() else component.parent / target
             continue
         if not stat.S_ISDIR(component_stat.st_mode):
             raise ConfigError(
