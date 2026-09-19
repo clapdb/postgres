@@ -96,6 +96,18 @@
     "version": 0
   },
   {
+    "family": "page_segment",
+    "artifact": "seg_* tombstone (56-byte-header hole)",
+    "magic": "0x53454831",
+    "version": 0
+  },
+  {
+    "family": "page_segment",
+    "artifact": "seg_* tombstone (64-byte-header hole)",
+    "magic": "0x53454832",
+    "version": 0
+  },
+  {
     "family": "pgdata",
     "artifact": ".pagestore-reader-map-pending (value at 0, identity trailer)",
     "magic": "0x504d5350",

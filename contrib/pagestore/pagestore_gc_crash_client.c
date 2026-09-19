@@ -1426,6 +1426,7 @@ fixture_seed(void)
 	unsigned char *page = malloc(page_size);
 	uint64_t	lsn = 0;
 	uint64_t	incarnation;
+	uint64_t	branch_incarnation;
 
 	if (page == NULL)
 		die("out of memory");
@@ -1482,6 +1483,7 @@ fixture_seed(void)
 	walidx_batch_and_commit(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
 	/* a live branch with its own page version, and a deleted branch */
 	incarnation = fixture_create_branch(FIXTURE_BRANCH);
+	branch_incarnation = incarnation;
 	delete_write_block(page, FIXTURE_BRANCH, incarnation, 0,
 					   FIXTURE_BRANCH_LSN, 0x77);
 	/* the branch's own shipped WAL; its WAL-index interval is added by the
@@ -1495,6 +1497,22 @@ fixture_seed(void)
 	delete_write_block(page, FIXTURE_BRANCH, incarnation, FIXTURE_WALLESS_BLOCK,
 					   0, 0x66);
 	incarnation = fixture_create_branch(FIXTURE_DELETED_BRANCH);
+	/* One record of each admission-era page-segment header shape (56-byte
+	 * plain, 64-byte ordered/zero-version) before the branch is deleted, so
+	 * timeline deletion's cleanup tombstones both shapes in place
+	 * (invariant I3, page_cleanup_tombstone_segment()) -- otherwise this
+	 * fixture would carry no instance of either SEG_HOLE56_MAGIC or
+	 * SEG_HOLE64_MAGIC, which check_segment_formats() requires of every
+	 * page-segment identity the compiled daemon advertises.  A live
+	 * sibling record sits between the two target records (T6, D5): the
+	 * shared segment then holds survivors both before and after a hole,
+	 * matching the layout task T2's own test exercises. */
+	delete_write_block(page, FIXTURE_DELETED_BRANCH, incarnation, 0,
+					   FIXTURE_FORK_LSN + 5000, 0x99);
+	delete_write_block(page, FIXTURE_BRANCH, branch_incarnation, 5,
+					   FIXTURE_FORK_LSN + 5500, 0x88);
+	delete_write_block(page, FIXTURE_DELETED_BRANCH, incarnation, 1,
+					   0, 0x9a);
 	set_relation(ch);
 	set_timeline(ch, FIXTURE_DELETED_BRANCH, incarnation);
 	ch->opcode = PS_OP_BEGIN_DELETE;
@@ -1798,6 +1816,22 @@ fixture_verify(void)
 	if (!page_has_tag(page, 0x66))
 		die_page("fixture branch lost its WAL-less page version",
 				 FIXTURE_WALLESS_BLOCK, page);
+	/* Only a fixture captured since this write was added carries it; an
+	 * older (legacy) capture has no block 5 on this branch at all. */
+	if (!fixture_role_legacy())
+	{
+		set_relation(ch);
+		set_timeline(ch, FIXTURE_BRANCH, incarnation);
+		ch->opcode = PS_OP_READV;
+		ch->blocknum = 5;
+		ch->nblocks = 1;
+		if (execute()->status != PS_STATUS_OK)
+			die("fixture branch read of the deleted-branch-adjacent page failed");
+		memcpy(page, ch->data, page_size);
+		if (!page_has_tag(page, 0x88))
+			die_page("fixture branch lost the page written between the "
+					 "deleted branch's tombstoned records", 5, page);
+	}
 	set_relation(ch);
 	set_timeline(ch, FIXTURE_BRANCH, incarnation);
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
