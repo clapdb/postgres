@@ -214,7 +214,7 @@ the lifecycle operations.
   both database artifacts exist before deletion, disappear from the newest
   view after the launcher cycle, and remain byte-identical at a retained old
   horizon; it also asserts a passing run's daemon log never contains
-  `reason=poisoned` or `reason=store record`.
+  `reason=poisoned` or `reason=storage failure`.
 - The golden and branch-boot scenarios exercise independent computes and
   portable SLRU bootstrap using the protocol.
 - Persisted-format checks cover legacy migration and the new fixture. Existing
@@ -256,7 +256,7 @@ both affected test binaries. Full `meson test --suite pagestore` passed
 (`posix-mvp-baseline`+`posix-artifact-lifecycle`, `pgdata-artifacts`) passed
 unchanged, including `--require-build-match`: no persisted-format or fixture
 change. `KEEPTMP=1 integration_test.sh` passed, including the two new
-assertions (no `reason=poisoned`, no `reason=store record` in a passing
+assertions (no `reason=poisoned`, no `reason=storage failure` in a passing
 run's daemon log); `mvp_golden_test.sh` and `branch_boot_test.sh` both
 passed. As with the entry above, this is local validation; the PR does not
 claim hosted CI ran.

@@ -561,7 +561,7 @@ and are now resolved.
   `test_artifact_generation_vs_cutoff` (T5) in
   `pagestore_forkmeta_cutover_test.c`, each fail on an unfixed tree and pass
   on this one; `integration_test.sh` now also asserts `reason=poisoned` and
-  `reason=store record` never appear in a passing run's daemon log.
+  `reason=storage failure` never appear in a passing run's daemon log.
 - **forkmeta-cutoff vs. fenced-artifact refusal.** This is *not* a separate
   hazard from the key collision fixed above -- the hazard was the poisoning
   above; once that no longer poisons, a refused generation here was already

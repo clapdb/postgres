@@ -2338,12 +2338,14 @@ assert "$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)"
 	"no artifact BEGIN/COMMIT/DROP was refused during the run"
 # Admission-refusal poisoning regression (this fix): a passing run must never
 # poison the artifact path (reason=poisoned) and must never hit a real
-# storage/sync failure recording a lifecycle page (reason=store record...).
-# Both grep substrings match regardless of the exact refuse-reason wording,
-# since a passing run never emits a refusal line of either kind at all.
+# storage/sync failure recording a lifecycle page
+# (pagestore_artifact_refuse_reason_name(PS_ARTIFACT_REFUSE_STORE_RECORD) ==
+# "storage failure recording the lifecycle page (artifact path poisoned
+# until reopen)"; grep the stable prefix, not the whole sentence, so a
+# reword of the trailing parenthetical does not silently break this check).
 assert "$(grep -c 'reason=poisoned' "$DATA/daemon.log" 2>/dev/null || true)" "0" \
 	"no artifact operation was refused as poisoned during the run"
-assert "$(grep -c 'reason=store record' "$DATA/daemon.log" 2>/dev/null || true)" "0" \
+assert "$(grep -c 'reason=storage failure' "$DATA/daemon.log" 2>/dev/null || true)" "0" \
 	"no artifact operation hit a storage failure recording a lifecycle page during the run"
 
 # --- 33. clean-shutdown reopen: the retained store opens without a live compute --
