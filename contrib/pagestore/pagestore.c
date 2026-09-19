@@ -7157,6 +7157,7 @@ typedef struct PagestoreReaderSnapshot
 #define PAGESTORE_READER_SNAPSHOT_READY_OBJECT PS_READER_SNAPSHOT_READY_OBJECT
 #define PAGESTORE_READER_RELMAP_OBJECT PS_READER_RELMAP_OBJECT
 #define PAGESTORE_READER_DATABASE_BARRIER_OBJECT PS_READER_DATABASE_BARRIER_OBJECT
+#define PAGESTORE_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
 
 #define PAGESTORE_READER_RELMAP_MAGIC PS_READER_RELMAP_MAGIC
@@ -9020,13 +9021,19 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 
 /*
  * owner is the retention owner id that pinned read_lsn (R); it must not be
- * InvalidOid, or this publish would alias the automatic checkpoint
- * snapshot's key (pagestore_artifact_format.h).  Unlike the automatic path,
- * this does not also publish the database-independent "global" manifest at
- * InvalidOid: nothing reads that fallback for an explicit snapshot (only
- * early-boot advancing-reader adoption does, before MyDatabaseId is known,
- * which never applies to a pinned reader), and publishing it here would
- * reopen the same collision against the automatic manifest one field over.
+ * InvalidOid, or this publish's DATA object would alias the automatic
+ * checkpoint snapshot's key (pagestore_artifact_format.h).  The manifest
+ * publishes under OWNER_MANIFEST, not MANIFEST: MANIFEST's dbOid slot is
+ * the automatic per-database manifest's namespace (real database OIDs,
+ * tracked and retired by the reader database barrier), and an owner id
+ * that happened to equal a database OID would alias that database's
+ * manifest and could be dropped by the barrier's per-database cleanup.
+ * Unlike the automatic path, this does not also publish the
+ * database-independent "global" manifest at InvalidOid: nothing reads that
+ * fallback for an explicit snapshot (only early-boot advancing-reader
+ * adoption does, before MyDatabaseId is known, which never applies to a
+ * pinned reader), and publishing it here would reopen the same DATA-object
+ * collision against the automatic manifest one field over.
  */
 static BlockNumber
 pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
@@ -9067,7 +9074,7 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
 	manifest_key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, owner);
+		PAGESTORE_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT, owner);
 	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
 		PS_KLASS_READER_SNAPSHOT, &manifest_key,
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
@@ -9085,12 +9092,14 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 
 /*
  * owner selects which producer's generation to load: InvalidOid resolves
- * the automatic checkpoint-driven manifest (per-database once attached,
- * else the database-independent fallback used only during early backend
- * init before MyDatabaseId is known -- see
+ * the automatic checkpoint-driven manifest at MANIFEST_OBJECT (per-database
+ * once attached, else the database-independent fallback used only during
+ * early backend init before MyDatabaseId is known -- see
  * pagestore_publish_reader_snapshot()'s comment on why an explicit publish
  * does not populate that fallback); a valid owner resolves the exact-R
- * snapshot that owner's retention pin published.
+ * snapshot that owner's retention pin published, at the separate
+ * OWNER_MANIFEST_OBJECT (never MANIFEST_OBJECT, whose dbOid slot is real
+ * database OIDs only -- pagestore_artifact_format.h).
  */
 static PagestoreReaderSnapshot *
 pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
@@ -9106,11 +9115,13 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 	uint64		resolved;
 	Size		xids_size;
 
-	key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT,
-		OidIsValid(owner) ? owner :
-		OidIsValid(MyDatabaseId) && DatabasePath != NULL ?
-		MyDatabaseId : InvalidOid);
+	key = OidIsValid(owner) ?
+		pagestore_reader_snapshot_key(
+			PAGESTORE_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT, owner) :
+		pagestore_reader_snapshot_key(
+			PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT,
+			OidIsValid(MyDatabaseId) && DatabasePath != NULL ?
+			MyDatabaseId : InvalidOid);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
 			&key, 0, (uint64) read_lsn, page, &resolved,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)

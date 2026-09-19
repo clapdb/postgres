@@ -403,7 +403,10 @@ typedef struct PsChannel
 
 	/* result */
 	uint32_t	status;
-	uint32_t	result;			/* NBLOCKS -> count; EXISTS -> 0/1 */
+	uint32_t	result;			/* NBLOCKS -> count; EXISTS -> 0/1;
+								 * ARTIFACT_BEGIN/COMMIT/DROP error -> the
+								 * refusal reason (PsArtifactRefuseReason,
+								 * pagestore_artifact_format.h; append-only) */
 	uint32_t	shard;			/* key-owner shard for this request */
 
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */

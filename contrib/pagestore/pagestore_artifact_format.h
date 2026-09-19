@@ -67,6 +67,11 @@ typedef struct PsArtifactLifecycle
  * reports one of these through an out-parameter; the daemon logs it and
  * returns it to the client in ch->result, and the client appends its name to
  * the ERROR it raises.
+ *
+ * Append-only: ch->result carries the numeric value across the daemon/client
+ * boundary for the lifetime of one running (daemon, backend) pair, so an
+ * existing member's number must never be reused or renumbered; add new
+ * reasons at the end.
  */
 typedef enum PsArtifactRefuseReason
 {
@@ -88,7 +93,13 @@ pagestore_artifact_refuse_reason_name(PsArtifactRefuseReason reason)
 	switch (reason)
 	{
 		case PS_ARTIFACT_REFUSE_NONE:
-			return "none";
+			/* Only ever reported for an actual refusal (a success never
+			 * reaches these two call sites): ps_artifact_begin/commit/drop
+			 * were refused before running far enough to set a specific
+			 * reason -- the daemon's klass/opcode gate (pagestore_daemon.c)
+			 * or the timeline-incarnation gate in ps_handle_meta
+			 * (pagestore_core.c) rejected the request first. */
+			return "refused before admission (timeline/klass gate)";
 		case PS_ARTIFACT_REFUSE_POISONED:
 			return "poisoned";
 		case PS_ARTIFACT_REFUSE_INVALID:
@@ -208,20 +219,36 @@ ps_slru_object_id(const char *dir)
 /*
  * ---- reader snapshot objects (PS_KLASS_READER_SNAPSHOT) ----------------
  *
- * The DATA and MANIFEST objects are keyed (object, dbOid); dbOid is
- * InvalidOid (0) for the automatic checkpoint-driven snapshot the reader
- * launcher publishes at every checkpoint redo, and the retention owner id
- * that pinned an exact-R snapshot's read LSN for an explicit publish
- * (pagestore_publish_reader_snapshot_artifact()).  Both go through the same
- * artifact-lifecycle admission (single producer, monotonic generations per
- * key), so two producers sharing a key is a real collision, not just an
- * odd read: an automatic generation at a later checkpoint silently refused
- * an explicit publish at an earlier, controller-chosen R (see
- * RELEASE_VALIDATION.md).  The owner id is truncated to fit dbOid's 32
- * bits -- readers pin with small controller-assigned ids, not the full
- * 64-bit retention-owner space -- and must not be zero, or it aliases the
- * automatic key.  READY has only one producer (automatic) and stays
- * InvalidOid-only.
+ * Every object here goes through the same artifact-lifecycle admission
+ * (single producer, monotonic generations per key), so two producers
+ * sharing a key is a real collision, not just an odd read: an automatic
+ * generation at a later checkpoint once silently refused an explicit
+ * publish at an earlier, controller-chosen R (see RELEASE_VALIDATION.md).
+ * Each object's dbOid partition, precisely:
+ *
+ *   DATA (object 1): dbOid InvalidOid (0) for the automatic
+ *     checkpoint-driven snapshot the reader launcher publishes at every
+ *     checkpoint redo; dbOid = the retention owner id that pinned an
+ *     exact-R snapshot's read LSN for an explicit publish
+ *     (pagestore_publish_reader_snapshot_artifact()).
+ *   MANIFEST (object 0): dbOid = a real database OID only -- the
+ *     automatic per-database manifest the reader-artifact database
+ *     workers publish at every checkpoint redo and the barrier
+ *     (DATABASE_BARRIER, object 4) tracks/retires per database.  An
+ *     explicit publish's manifest must NOT reuse this object: an owner id
+ *     equal to some database's OID would alias that database's manifest
+ *     slot and could be retired by the barrier's per-database cleanup.
+ *   OWNER_MANIFEST (object 5): dbOid = the retention owner id, used only
+ *     by an explicit exact-R publish's manifest -- the DATA object's
+ *     owner-scoped counterpart, kept out of the database-OID namespace
+ *     MANIFEST and the barrier both use.
+ *   READY (object 2): only one producer (automatic); InvalidOid-only.
+ *
+ * An owner id is range-checked to fit dbOid's 32 bits (readers pin with
+ * small controller-assigned ids, not the full 64-bit retention-owner
+ * space) and must not be zero, or DATA aliases the automatic key; a
+ * controller that assigns 64-bit ids with the high bit set cannot publish
+ * an exact-R snapshot for that owner.
  */
 
 #define PS_READER_SNAPSHOT_MANIFEST_OBJECT	0u
@@ -229,6 +256,7 @@ ps_slru_object_id(const char *dir)
 #define PS_READER_SNAPSHOT_READY_OBJECT		2u
 #define PS_READER_RELMAP_OBJECT				3u
 #define PS_READER_DATABASE_BARRIER_OBJECT	4u
+#define PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT	5u
 
 #define PS_READER_SNAPSHOT_MAGIC			0x50535253u	/* "PSRS" */
 #define PS_READER_SNAPSHOT_FORMAT			1u
