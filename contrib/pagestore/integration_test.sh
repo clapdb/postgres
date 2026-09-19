@@ -62,7 +62,12 @@ assert() {  # $1=actual $2=expected $3=message
 	fi
 }
 
-wait_daemon_ready() {
+# Poll for $DPID publishing a valid ready shared-memory header; return 0/1
+# without printing or exiting, so a caller can decide whether a failure to
+# come up is fatal to the whole script (wait_daemon_ready below) or just one
+# assertion (the reopen guard near the end, which must still print the
+# summary line on failure).
+daemon_shm_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
 	local expected_version="$IPC_VERSION"
@@ -75,9 +80,7 @@ wait_daemon_ready() {
 
 	for ((i = 0; i < 400; i++)); do
 		if ! kill -0 "$DPID" 2>/dev/null; then
-			echo "FAIL - pagestore daemon exited before publishing shared memory"
-			tail -100 "$DATA/daemon.log" 2>/dev/null || true
-			exit 1
+			return 1
 		fi
 		if [ -r "$shm_path" ]; then
 			read -r magic version page_size io_unit nchannels nshards < <(
@@ -92,8 +95,14 @@ wait_daemon_ready() {
 		fi
 		sleep 0.05
 	done
+	return 1
+}
 
-	echo "FAIL - pagestore daemon did not publish a ready shared-memory header"
+wait_daemon_ready() {
+	if daemon_shm_ready; then
+		return 0
+	fi
+	echo "FAIL - pagestore daemon did not publish a ready shared-memory header (or exited first)"
 	tail -100 "$DATA/daemon.log" 2>/dev/null || true
 	exit 1
 }
@@ -2327,6 +2336,35 @@ assert "$artifact_after" "$artifact_before" "retained database artifacts stay by
 # the owner-scoped key split instead of merely not hitting the race.
 assert "$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)" "0" \
 	"no artifact BEGIN/COMMIT/DROP was refused during the run"
+
+# --- 33. clean-shutdown reopen: the retained store opens without a live compute --
+# A live ordered write's durable bound marker used to exist only in memory
+# until a second forkmeta cutover in the same daemon lifetime degraded it to
+# a plain GROW, so a retained store could fail "storage open: Invalid
+# argument" on its very next reopen (see RELEASE_VALIDATION.md).  Stop every
+# cluster this run started, shut the daemon down cleanly, and reopen it alone
+# against the same store: it must come back up, and -- since this whole run
+# was written entirely by the fixed live path -- it must never have needed
+# the recovery-side adoption rule that heals stores written by the old bug.
+"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${READERDATA:-}" ] && "$BIN/pg_ctl" -D "$READERDATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${ADVANCINGDATA:-}" ] && "$BIN/pg_ctl" -D "$ADVANCINGDATA" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null	# clean shutdown: ps_core_close() runs
+rm -f "/dev/shm$SHM"
+"$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
+DPID=$!
+if daemon_shm_ready; then
+	reopen_ok=ok
+else
+	reopen_ok=FAIL
+fi
+assert "$reopen_ok" "ok" "retained store reopens independently after clean shutdown"
+adopt_count=$(grep -c "adopting orphaned ordered record" "$DATA/daemon.log" 2>/dev/null)
+assert "${adopt_count:-0}" "0" "no orphaned ordered records were adopted on reopen"
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 
 echo "----"
 if [ "$fail" = 0 ]; then
