@@ -791,10 +791,15 @@ staging happens only after that append returns), or, on the segment-suffix
 path, that at least one complete record follows it in the same segment (a
 torn body is always the last complete record of its segment, so nothing
 can ever follow it there); a commit-class record that is last in its segment
-is retired instead, even when it is a genuine pruned survivor rather than a
-torn append, since the two cannot be told apart at scan time.  Either
-adoption logs one `adopting orphaned ordered ...` line and any other case
-stays refused or retired.  A store written entirely by the fixed live path
+is retired instead, since it cannot be told apart from a torn append at scan
+time -- for a store written entirely by the fixed live path this is a
+genuine F3 pruned survivor, so nothing acknowledged is lost, but for a
+pre-fix store that crashed after two same-lifetime cutovers (no close-time
+flush) it can instead be that record's own last acknowledged commit-class
+write, torn-indistinguishable, so retiring it falls back to serving the
+previous version.  Either adoption logs one `adopting orphaned ordered ...`
+line and any other case stays refused or retired.  A store written entirely
+by the fixed live path
 exercises this rule only through a separate, still-open finding (a pruned
 marker's record rescanned after a timeline-delete rewrite rebases the flush
 watermark; see `RELEASE_VALIDATION.md`, "Open: pruned ordered marker

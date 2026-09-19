@@ -327,11 +327,18 @@ separately by each of the two adoption sites below:
     data) with the stash still unresolved, it is retired exactly as an
     unmatched, non-adoptable record would be, now saying so explicitly
     (`... no complete record follows in this segment`). A record that is
-    last in its segment is retired unconditionally on the segment path, even
-    when it is a genuine F3 survivor rather than a torn append (see the F3
-    section below) -- that loses only an already-pruned version, nothing
-    acknowledged, and it cannot be told apart from a torn append by any
-    proof available at scan time.
+    last in its segment is retired unconditionally on the segment path,
+    because it cannot be told apart from a torn append by any proof
+    available at scan time, and the two possible identities it can have
+    differ in what is lost: for a store written entirely by the fixed live
+    path this is a genuine F3 survivor (see the F3 section below), so
+    retiring it loses only an already-pruned version, nothing acknowledged;
+    for a store written by the pre-fix daemon that crashed (no close-time
+    flush) after two same-lifetime cutovers, it can instead be that record's
+    own last acknowledged commit-class write (the F2 shape --
+    `test_orphaned_commit_marker_segment_path_last_is_retired()` -- which is
+    exactly why that test calls it torn-indistinguishable), so retiring it
+    falls back to serving the previous version rather than losing data.
 
 Why `admission_seq_observe()`/`segment_order_id_observe()` are kept for a
 refused record, rather than removed to make the freeze proof itself
