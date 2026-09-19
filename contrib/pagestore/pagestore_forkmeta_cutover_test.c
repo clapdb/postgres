@@ -3101,8 +3101,8 @@ test_artifact_generation_vs_cutoff(void)
 		  run_maintenance_until(manifest, 1) &&
 		  read_selected_header(snapshots, &hdr) == 0,
 		  "T5: forkmeta cutover");
-	check(hdr.cutoff_lsn <= 150,
-		  "T5: the cutoff never passes an active same-timeline page-history pin");
+	check(hdr.cutoff_lsn == 150,
+		  "T5: the cutoff lands exactly at the frontier, which the pin@150 holds at 150");
 
 	/* A new key's generation at the pinned LSN publishes cleanly after the
 	 * cutover: it is never below the cutoff. */
@@ -3157,8 +3157,13 @@ test_artifact_generation_vs_cutoff(void)
 	check(artifact_commit_request(&keyD, hdr.cutoff_lsn, token, 1, &reason) == 0 &&
 		  reason == PS_ARTIFACT_REFUSE_NONE, "T5: keyD COMMIT at the cutoff LSN");
 
-	/* Drop pin 78; T1 (pagestore_artifact_lifecycle_test.c) is where the
-	 * frontier's post-drop position is asserted, not here. */
+	/* Drop pin 78 from the raw registry to close out this scenario's state.
+	 * This is the raw registry drop (ps_retention_drop()), not the daemon's
+	 * PS_OP_RETENTION_PIN_DROP meta op: it removes the pin but does not mark
+	 * page-prune due, so it does not itself move the frontier, and nothing
+	 * here asserts that it does.  T7 (test_artifact_write_unfenced_after_
+	 * pin_drop, below) is the test that drops a pin through the daemon op
+	 * specifically to observe the frontier advance past it. */
 	check(ps_retention_drop(0, PS_RETENTION_OWNER_READER, 78, 1) == PS_RETENTION_OK,
 		  "T5: drop pin 78");
 	close_runtime();
@@ -3249,6 +3254,162 @@ test_artifact_forkmeta_cutoff_reason(void)
 	check(artifact_begin_request(&keyF, 300, &token, &reason) == 0 && token != 0 &&
 		  reason == PS_ARTIFACT_REFUSE_NONE,
 		  "T6: BEGIN on another key at 300 still succeeds -- FORKMETA_CUTOFF did not poison");
+
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
+ * T7: the ps_artifact_write() poisoning boundary (pagestore_artifact_
+ * lifecycle.inc, append_page_raw_outcome() call in ps_artifact_write()).
+ * B2's BEGIN-time fence gate means an unfenced *new* generation is now
+ * refused at BEGIN, so T1 (pagestore_artifact_lifecycle_test.c) never
+ * reaches append_page_raw_outcome()'s UNFENCED outcome on the WRITE side at
+ * all -- it is dead in that file after B2.  The one remaining way to reach
+ * it is a genuine TOCTOU race B2 cannot close: BEGIN is admitted while an
+ * LSN is fenced (here, by an active page-history pin), and the fence is
+ * then legitimately withdrawn (the pin is dropped, and the frontier is
+ * free to advance past that LSN) before the attempt's data WRITE runs. That
+ * WRITE must still be refused UNFENCED and must NOT poison, exactly like a
+ * BEGIN-time refusal.  This mirrors the review's repro_c.c scenario
+ * (<scratchpad>/review-refusal/repro_c.c): restoring blanket poisoning in
+ * ps_artifact_write() (poisoning on any nonzero append_page_raw_outcome()
+ * rc, not just PS_APPEND_IO_FAILED) passes every other lifecycle/cutover
+ * test unchanged but fails this one.
+ */
+static void
+test_artifact_write_unfenced_after_pin_drop(void)
+{
+	char		store[] = "/tmp/psforkmetaartifactraceXXXXXX";
+	char		frontier[1200];
+	PsKey		pin_key = {6, 6, 920, 0, PS_KLASS_RELATION};
+	PsKey		keyG = {0, 0, 921, 0, PS_KLASS_READER_SNAPSHOT};
+	PsKey		keyH = {0, 0, 922, 0, PS_KLASS_READER_SNAPSHOT};
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	uint64_t	s100 = 0,
+				s150 = 0,
+				s200 = 0;
+	uint64_t	token = 0,
+				token2 = 0;
+	uint64_t	f = 0,
+				fs = 0;
+	uint32_t	fence_before;
+	PsArtifactRefuseReason reason;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "T7: create write-race store");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "T7: build frontier path");
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "T7: open store, no cutover in this scenario");
+	check(meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &s100) == 0 &&
+		  append_relation(&pin_key, 0, 150, page, &s150) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &s200) == 0,
+		  "T7: relation history at 100/150/200");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.owner_id = 78;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 150;
+	pin.admission_seq = s150;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK, "T7: pin@150 (owner 78)");
+	pin.owner_id = 77;
+	pin.lsn = 200;
+	pin.admission_seq = s200;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK, "T7: pin@200 (owner 77)");
+	check(run_maintenance_until(frontier, 1), "T7: durable frontier published");
+	check(ps_test_page_frontier(0, &f, &fs) != 0 && f == 150,
+		  "T7: pin@150 holds the frontier at 150");
+
+	/* BEGIN at the pinned LSN: admitted (the fence holds). */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token = 0;
+	check(artifact_begin_request(&keyG, 150, &token, &reason) == 0 && token != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T7: BEGIN at the pinned LSN 150 is admitted");
+
+	/* Drop the pin through the daemon meta op (PS_OP_RETENTION_PIN_DROP),
+	 * not the raw registry ps_retention_drop(): only the daemon op marks
+	 * page-prune due, which is what lets maintenance actually move the
+	 * frontier past 150 below. */
+	{
+		PsChannel	ch;
+
+		memset(&ch, 0, sizeof(ch));
+		ch.opcode = PS_OP_RETENTION_PIN_DROP;
+		ch.timeline = 0;
+		ch.key = pin_key;
+		ch.blocknum = PS_RETENTION_OWNER_READER;
+		ch.req_seq = 78;
+		ch.old_nblocks = 1;
+		ch.status = PS_STATUS_OK;
+		ps_lock_shard_rd(ps_shard_of(&pin_key));
+		(void) ps_handle_meta(&ch);
+		ps_unlock_shard(ps_shard_of(&pin_key));
+		check(ch.status == PS_STATUS_OK, "T7: drop pin 78 via the daemon meta op");
+	}
+	for (int i = 0; i < 40; i++)
+	{
+		(void) ps_core_maintenance();
+		(void) ps_test_page_frontier(0, &f, &fs);
+		if (f > 150)
+			break;
+		usleep(50000);
+	}
+	check(f > 150, "T7: the frontier moves past 150 once the pin is dropped");
+
+	/* The attempt's data WRITE now lands after the fence that admitted its
+	 * BEGIN has been legitimately withdrawn: refused UNFENCED, not poisoned,
+	 * and no fence leaked. */
+	fence_before = ps_test_artifact_fence_count(0);
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_write_request(&keyG, 0, 150, token, 0x70, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_UNFENCED,
+		  "T7: the WRITE, not the already-admitted BEGIN, is refused UNFENCED");
+	check(ps_test_artifact_fence_count(0) == fence_before,
+		  "T7: the refused WRITE leaked no artifact control-era fence");
+
+	/* Not poisoned: another key's BEGIN still succeeds, and keyG's own
+	 * earlier-completed sibling state is unaffected (nothing else was ever
+	 * published here, so check a fresh unrelated key instead). */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token2 = 0;
+	check(artifact_begin_request(&keyH, 400, &token2, &reason) == 0 && token2 != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T7: BEGIN on another key still succeeds -- the WRITE refusal did not poison");
+
+	/* The open attempt on keyG is recoverable: a fresh BEGIN at a newer,
+	 * fenced LSN supersedes it and completes normally. */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	token2 = 0;
+	check(artifact_begin_request(&keyG, 500, &token2, &reason) == 0 && token2 != 0 &&
+		  token2 != token && reason == PS_ARTIFACT_REFUSE_NONE,
+		  "T7: a fresh BEGIN at 500 supersedes the refused attempt");
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_write_request(&keyG, 0, 500, token2, 0x75, &reason) == 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE, "T7: its WRITE succeeds");
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_commit_request(&keyG, 500, token2, 1, &reason) == 0 &&
+		  reason == PS_ARTIFACT_REFUSE_NONE, "T7: its COMMIT succeeds");
+	check(artifact_read_at(&keyG, 500, 0, 0x75) == 1,
+		  "T7: the superseding generation reads back at 500");
+
+	/* The old, superseded token is simply dead -- not poisoned, not
+	 * ambiguous. */
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(artifact_write_request(&keyG, 0, 150, token, 0x70, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH,
+		  "T7: the old, superseded token is refused as ATTEMPT_MISMATCH");
+
+	/* Recovery is unaffected: reopen and the completed generation survives. */
+	close_runtime();
+	check(ps_core_open(store) == 0, "T7: reopen");
+	check(artifact_read_at(&keyG, 500, 0, 0x75) == 1,
+		  "T7: the completed generation at 500 survives reopen");
 
 	close_runtime();
 	remove_tree(store);
@@ -3836,6 +3997,7 @@ main(void)
 	test_torn_growth_append_never_adopted();
 	test_artifact_generation_vs_cutoff();
 	test_artifact_forkmeta_cutoff_reason();
+	test_artifact_write_unfenced_after_pin_drop();
 	if (!failed)
 		remove_tree(store);
 	else

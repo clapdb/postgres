@@ -378,16 +378,31 @@ test_admission_refusal_does_not_poison(void)
 	key.relNumber = saved_rel;
 }
 
+static int	fail_seg_write_at,
+			seg_write_calls;
+static int
+fault_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf, uint32_t len)
+{
+	if (++seg_write_calls == fail_seg_write_at)
+	{
+		errno = EIO;
+		return -1;
+	}
+	return PsStoragePosix.seg_write(shard, seg, off, buf, len);
+}
+
 /*
  * T2: guards the behaviour T1 must NOT change -- a real storage failure
  * (seg_write, or a sync that follows an appended lifecycle record) must
  * still poison the artifact path.  A sync failure that precedes any append
  * (nothing durable is now ambiguous) must not poison and must be reported
  * as SYNC, retryable.  Must run last before ps_core_close(): it leaves the
- * store poisoned.
+ * store poisoned.  Reopens the store internally once (between the seg_write
+ * and the post-record-sync scenarios), so each poisoning scenario starts
+ * from a clean, unpoisoned flag; take the store path so it can.
  */
 static void
-test_io_failure_still_poisons(void)
+test_io_failure_still_poisons(const char *store)
 {
 	uint64_t	f = 0,
 				fs = 0;
@@ -424,6 +439,38 @@ test_io_failure_still_poisons(void)
 		  "T2: a BEGIN on another key still succeeds -- the SYNC refusal above did not poison");
 	check(write_page(f + 210, token, 0, 0x72) == 0 && commit(f + 210, token, 1) == 0,
 		  "T2: its WRITE/COMMIT succeed");
+
+	/* A real seg_write() failure -- not merely a sync() failure -- is the
+	 * other IO_FAILED path through append_page_impl() (the header or page
+	 * body segment write, or fork_meta_persist_segment()), reached from
+	 * ps_artifact_write()'s append_page_raw_outcome() call.  It must poison
+	 * exactly like a post-record sync failure. */
+	key.relNumber = 64;
+	token = begin(f + 240);
+	fail_seg_write_at = 1;
+	seg_write_calls = 0;
+	fault.seg_write = fault_seg_write;
+	ps_storage = &fault;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(write_reason(f + 240, token, 0, 0x74, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_STORE_RECORD,
+		  "T2: a seg_write failure on the WRITE path is refused as STORE_RECORD");
+	ps_storage = &PsStoragePosix;
+	key.relNumber = 65;
+	token = 0;
+	reason = PS_ARTIFACT_REFUSE_NONE;
+	check(begin_reason(f + 310, &token, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_POISONED,
+		  "T2: the seg_write failure above poisoned too -- another key's BEGIN now fails as POISONED");
+
+	/* Reopen to clear the poison for the next scenario: each poisoning
+	 * scenario in this test needs to start from an unpoisoned store. */
+	ps_core_close();
+	check(ps_core_open(store) == 0, "T2: reopen clears the seg_write-failure poison");
+	ps_storage = &PsStoragePosix;
+	key.relNumber = saved_rel;
+	check(read_value(0, 600, 0, 0x66),
+		  "T2: the shared key's completed generation at 600 survives the reopen");
 
 	/* fail_sync_at = 2: the sync that follows the appended COMMIT record
 	 * fails.  The record is indexed in memory but not proven durable --
@@ -638,7 +685,7 @@ main(int argc, char **argv)
 	check(write_page(600, token, 0, 0x66) == 0 && commit(600, token, 1) == 0 && read_value(0, 600, 0, 0x66), "recreate after drop");
 	test_reader_snapshot_owner_key_split();
 	test_admission_refusal_does_not_poison();
-	test_io_failure_still_poisons();
+	test_io_failure_still_poisons(store);
 	ps_core_close();
 	for (int phase = 1; phase <= 2; phase++)
 	{
