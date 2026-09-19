@@ -3628,6 +3628,7 @@ typedef struct ForkEnt
 	ForkEvent  *ev;				/* lsn-ordered size history */
 	uint32_t	nev;
 	uint32_t	evcap;
+	uint32_t	nlegacy_seq;	/* events with admission_seq == 0 (legacy V1) */
 	uint32_t   *def_idx;		/* indexes of SET/DEAD events only */
 	uint32_t	ndef;
 	uint32_t	defcap;
@@ -5038,6 +5039,83 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 #define FORK_HOP_DEF	2		/* definitive size (SET, or DEAD then regrown) */
 #define FORK_HOP_DEAD	3		/* definitively unlinked at the cap */
 
+/*
+ * (lsn, admission_seq) position index.  fork_event_add() and
+ * fork_event_add_seg_marker() keep the array in (lsn, admission_seq) order
+ * for every event that carries a nonzero admission sequence (equal tuples
+ * adjacent, arrival order); a legacy sequence-zero event is pinned at the
+ * end of its LSN run at insertion time and later events never pass it, so a
+ * fork that holds one is not guaranteed to be tuple-ordered inside a run.
+ * The index is therefore usable only on forks with nlegacy_seq == 0 and
+ * only for nonzero query sequences; every consumer keeps its linear scan
+ * as the fallback, bit-for-bit the code that ran before.
+ */
+static inline int
+fork_event_index_usable(const ForkEnt *e, uint64_t admission_seq)
+{
+	return e->nlegacy_seq == 0 && admission_seq != 0;
+}
+
+/* First index whose (lsn, admission_seq) >= the argument tuple. */
+static uint32_t
+fork_event_lower_bound(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
+{
+	uint32_t	lo = 0;
+	uint32_t	hi = e->nev;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+		const ForkEvent *v = &e->ev[mid];
+
+		if (v->lsn < lsn ||
+			(v->lsn == lsn && v->admission_seq < admission_seq))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* First index whose (lsn, admission_seq) >  the argument tuple. */
+static uint32_t
+fork_event_upper_bound(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
+{
+	uint32_t	lo = 0;
+	uint32_t	hi = e->nev;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+		const ForkEvent *v = &e->ev[mid];
+
+		if (v->lsn < lsn ||
+			(v->lsn == lsn && v->admission_seq <= admission_seq))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* [start, end) that contains every event at exactly (lsn, admission_seq):
+ * the tuple group when the index is usable, the whole array otherwise. */
+static void
+fork_event_identity_range(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
+						  uint32_t *start, uint32_t *end)
+{
+	if (fork_event_index_usable(e, admission_seq))
+	{
+		*start = fork_event_lower_bound(e, lsn, admission_seq);
+		*end = fork_event_upper_bound(e, lsn, admission_seq);
+	}
+	else
+	{
+		*start = 0;
+		*end = e->nev;
+	}
+}
+
 static int
 fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 			  uint32_t *nb_out)
@@ -5062,6 +5140,23 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 		*nb_out = e->ev[lo - 1].cached_nblocks;
 		return e->ev[lo - 1].cached_state;
 	}
+	/*
+	 * Fast path: with every admission sequence nonzero the array is
+	 * strictly (lsn, admission_seq)-ordered, so the events visible at
+	 * (cap, seq_cap) are exactly the prefix ending at upper_bound(), and
+	 * the cached fold at its last element is that prefix's fold -- the
+	 * same value the run loop below would compute.  Legacy forks fall
+	 * through to that loop unchanged.
+	 */
+	if (fork_event_index_usable(e, seq_cap))
+	{
+		uint32_t	pos = fork_event_upper_bound(e, cap, seq_cap);
+
+		if (pos == 0)
+			return FORK_HOP_NONE;
+		*nb_out = e->ev[pos - 1].cached_nblocks;
+		return e->ev[pos - 1].cached_state;
+	}
 	{
 		uint32_t	first = 0;
 		uint32_t	end = e->nev;
@@ -5069,7 +5164,9 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 		uint32_t	nb;
 
 		/* Everything below cap is visible regardless of admission sequence.
-		 * Reuse its cached fold, then inspect only the equal-cap run. */
+		 * Reuse its cached fold, then inspect only the equal-cap run.  This
+		 * is the legacy-fork fallback: the fast path above handles every
+		 * fork with nlegacy_seq == 0. */
 		while (first < end)
 		{
 			uint32_t mid = first + (end - first) / 2;
@@ -5244,11 +5341,22 @@ fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
 		return lo != 0 && e->ev[lo - 1].cached_fence_nblocks != UINT32_MAX &&
 			block >= e->ev[lo - 1].cached_fence_nblocks;
 	}
+	/* Fast path: same reasoning as fork_asof_hop() above, over
+	 * cached_fence_nblocks instead of cached_nblocks/cached_state. */
+	if (fork_event_index_usable(e, seq_cap))
+	{
+		uint32_t	pos = fork_event_upper_bound(e, cap, seq_cap);
+
+		return pos != 0 && e->ev[pos - 1].cached_fence_nblocks != UINT32_MAX &&
+			block >= e->ev[pos - 1].cached_fence_nblocks;
+	}
 	{
 		uint32_t first = 0;
 		uint32_t end = e->nev;
 		uint32_t fence;
 
+		/* Legacy-fork fallback; the fast path above handles every fork with
+		 * nlegacy_seq == 0. */
 		while (first < end)
 		{
 			uint32_t mid = first + (end - first) / 2;
@@ -5305,11 +5413,52 @@ fork_has_create_at(const ForkEnt *e, uint64_t lsn)
 }
 
 /*
+ * Open the slot a new event occupies: the same order both insertion sites
+ * always maintained (LSN, then nonzero admission sequence among nonzero
+ * ones; a zero sequence never moves past anything and nothing moves past
+ * it), found by binary search when the fork has no legacy events and by
+ * the original backwards walk otherwise.  Existing events at/after the slot
+ * are shifted up (memmove for the indexed case, an equivalent element-wise
+ * copy for the fallback walk); the caller fills e->ev[slot] and bumps nev.
+ * evcap growth must already have happened (both call sites do it before
+ * calling this).
+ */
+static uint32_t
+fork_event_insert_pos(ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
+{
+	uint32_t	i;
+
+	if (fork_event_index_usable(e, admission_seq))
+	{
+		i = fork_event_upper_bound(e, lsn, admission_seq);
+		if (i < e->nev)
+			memmove(&e->ev[i + 1], &e->ev[i],
+					(size_t) (e->nev - i) * sizeof(ForkEvent));
+		return i;
+	}
+	i = e->nev;
+	while (i > 0 &&
+		   (e->ev[i - 1].lsn > lsn ||
+			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq > admission_seq)))
+	{
+		e->ev[i] = e->ev[i - 1];
+		i--;
+	}
+	return i;
+}
+
+/*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
  * newest-first scan).  GROW events that do not raise the size visible at
  * their own LSN are dropped: steady-state rewrites of existing blocks at ever
- * newer pd_lsns add nothing, so the history stays O(distinct sizes).
+ * newer pd_lsns add nothing, so the history stays O(distinct sizes).  Ordered
+ * markers (fork_event_add_seg_marker(), below) are one event per ordered
+ * write; every lookup that needs to find or bound a specific (lsn,
+ * admission_seq) tuple goes through the position index above instead of
+ * scanning, except on the legacy forks the index does not cover.
 */
 static _Thread_local int fork_event_cache_defer = 0;
 
@@ -5329,16 +5478,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 		e->evcap = e->evcap ? e->evcap * 2 : 4;
 		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
 	}
-	i = e->nev;
-	while (i > 0 &&
-		   (e->ev[i - 1].lsn > lsn ||
-			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq > admission_seq)))
-	{
-		e->ev[i] = e->ev[i - 1];
-		i--;
-	}
+	i = fork_event_insert_pos(e, lsn, admission_seq);
 	e->ev[i].lsn = lsn;
 	e->ev[i].admission_seq = admission_seq;
 	e->ev[i].order_id = 0;
@@ -5346,6 +5486,8 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = 0;
 	e->nev++;
+	if (admission_seq == 0)
+		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
 	if (fork_event_cache_defer)
 		return;
@@ -5398,16 +5540,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 		e->evcap = e->evcap ? e->evcap * 2 : 4;
 		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
 	}
-	i = e->nev;
-	while (i > 0 &&
-		   (e->ev[i - 1].lsn > lsn ||
-			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq != 0 &&
-			 e->ev[i - 1].admission_seq > admission_seq)))
-	{
-		e->ev[i] = e->ev[i - 1];
-		i--;
-	}
+	i = fork_event_insert_pos(e, lsn, admission_seq);
 	e->ev[i].lsn = lsn;
 	e->ev[i].admission_seq = admission_seq;
 	e->ev[i].order_id = order_id;
@@ -5415,6 +5548,8 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = kind;
 	e->nev++;
+	if (admission_seq == 0)
+		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, 0);
 	fork_event_cache_from(e, i);
 }
@@ -5423,7 +5558,11 @@ static int
 fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 						uint64_t order_id, uint64_t admission_seq)
 {
-	for (uint32_t i = 0; i < e->nev; i++)
+	uint32_t	start = 0;
+	uint32_t	end = e->nev;
+
+	fork_event_identity_range(e, lsn, admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
 	{
 		ForkEvent  *v = &e->ev[i];
 
@@ -5494,9 +5633,13 @@ static int
 fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 							  uint64_t order_id, uint64_t admission_seq)
 {
+	uint32_t	start = 0;
+	uint32_t	end = e->nev;
+
 	if (order_id == 0 || !fork_meta_orphan_proven(admission_seq))
 		return 0;
-	for (uint32_t i = 0; i < e->nev; i++)
+	fork_event_identity_range(e, lsn, admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
 	{
 		ForkEvent  *v = &e->ev[i];
 
@@ -5531,15 +5674,20 @@ static int
 fork_event_commit_adoptable(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 							uint64_t order_id, uint64_t admission_seq)
 {
-	uint32_t	i;
+	uint32_t	start = 0;
+	uint32_t	end;
 
 	if (e == NULL || order_id == 0 || !fork_meta_orphan_proven(admission_seq))
 		return 0;
 	if (fork_size_asof_hop(e, lsn, admission_seq) < nblocks)
 		return 0;
-	for (i = 0; i < e->nev; i++)
+	end = e->nev;
+	fork_event_identity_range(e, lsn, admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
+	{
 		if (e->ev[i].lsn == lsn && e->ev[i].admission_seq == admission_seq)
 			return 0;		/* already has an event at this identity */
+	}
 	return 1;
 }
 
@@ -8247,16 +8395,22 @@ static int
 fork_meta_snapshot_marker_present(const ForkMetaRecV2 *rec)
 {
 	ForkEnt *e = fork_find(rec->timeline, &rec->key);
+	uint32_t start = 0;
+	uint32_t end;
 
 	if (e == NULL)
 		return 0;
-	for (uint32_t i = 0; i < e->nev; i++)
+	end = e->nev;
+	fork_event_identity_range(e, rec->lsn, rec->admission_seq, &start, &end);
+	for (uint32_t i = start; i < end; i++)
+	{
 		if (e->ev[i].lsn == rec->lsn &&
 			e->ev[i].admission_seq == rec->admission_seq &&
 			e->ev[i].order_id == rec->order_id &&
 			e->ev[i].nblocks == rec->nblocks &&
 			e->ev[i].marker_kind == rec->kind)
 			return 1;
+	}
 	return 0;
 }
 
@@ -8313,13 +8467,20 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			if (fork_meta_ordered_marker_valid(&rec, 0) &&
 				(!filter_deleting ||
 				 !fork_meta_timeline_is_deleting(rec.timeline)) &&
+				/*
+				 * O(log N)/O(1) with the position index, versus the version-
+				 * chain walk in marker_page_retained(): check this first so
+				 * a marker already in memory (the steady-state case: every
+				 * source-log marker was loaded at recovery) never pays for
+				 * that walk.
+				 */
+				!fork_meta_snapshot_marker_present(&rec) &&
 				(preserve_survivors ||
 				 (fork_meta_event_future(rec.lsn, rec.admission_seq,
 										 cutoff.lsn, cutoff.admission_seq) ||
 				  fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
 															  rec.lsn, rec.admission_seq,
-															  rec.nblocks))) &&
-				!fork_meta_snapshot_marker_present(&rec))
+															  rec.nblocks))))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
 					rec.lsn, rec.admission_seq, cutoff.lsn,
@@ -8379,12 +8540,14 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 				fork_meta_ordered_marker_valid(&rec, 1) &&
 				(!filter_deleting ||
 				 !fork_meta_timeline_is_deleting(rec.timeline)) &&
+				/* See the V2 branch above: check presence (index-backed)
+				 * before the page-retention version-chain walk. */
+				!fork_meta_snapshot_marker_present(&rec) &&
 				(preserve_survivors ||
 				 (fork_meta_event_future(rec.lsn, 0, cutoff.lsn,
 										 cutoff.admission_seq) ||
 				  fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
-															  rec.lsn, 0, rec.nblocks))) &&
-				!fork_meta_snapshot_marker_present(&rec))
+															  rec.lsn, 0, rec.nblocks))))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
 					rec.lsn, 0, cutoff.lsn, cutoff.admission_seq) ?
