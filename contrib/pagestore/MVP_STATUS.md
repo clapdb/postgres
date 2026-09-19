@@ -772,19 +772,34 @@ recorded a plain GROW instead -- so a second forkmeta cutover in the same
 daemon lifetime published that plain GROW and the store could not reopen
 (`storage open: Invalid argument`).  Live writes now insert the marker-plus-
 activation representation recovery itself rebuilds, closing that path outright.
-Recovery separately gained a fail-closed adoption rule, reached only when the
-*selected forkmeta snapshot's freeze sequence* proves an unmatched ordered
-record's admission append had completed: a growth-class orphan (a plain GROW
-carrying the record's exact identity) is promoted back to a bound marker, and
-a commit-class orphan (a second below-floor/WAL-less rewrite of an
-already-sized block -- the FSM/VM pattern -- which never left a plain GROW
-behind even pre-fix) is proven safe by size instead and gets an inert marker;
-either logs one `adopting orphaned ordered ...` line and any other case stays
-refused.  A store written entirely by the fixed live path exercises this rule
-only through a separate, still-open finding (a pruned marker's record
-rescanned after a timeline-delete rewrite rebases the flush watermark; see
-`RELEASE_VALIDATION.md`, "Open: pruned ordered marker rescanned after a
-timeline-delete rewrite"), never through its own writes.  `integration_test.sh`
+Recovery separately gained a fail-closed adoption rule for an unmatched
+ordered record whose *selected forkmeta snapshot's freeze sequence* covers its
+admission sequence.  That freeze condition is only a NECESSARY filter, not
+proof against a torn append: a refused record's admission sequence is still
+observed to prevent identity reuse on retry, so a later cutover can freeze
+past a torn record's sequence too (review finding R2-F1, from independent
+re-review after F2/F3).  A growth-class orphan (a plain GROW carrying the
+record's exact identity) is promoted back to a bound marker -- sound
+unconditionally, since a torn growth append never leaves a durable marker or
+an in-memory event to begin with.  A commit-class orphan (a second
+below-floor/WAL-less rewrite of an already-sized block -- the FSM/VM pattern
+-- which never left a plain GROW behind even pre-fix) is proven safe by size
+instead and gets an inert marker, but only after an additional,
+path-specific torn-exclusion proof: residency on the image-layer path (a
+layer-resident record's marker append cannot still be in flight, since
+staging happens only after that append returns), or, on the segment-suffix
+path, that at least one complete record follows it in the same segment (a
+torn body is always the last complete record of its segment, so nothing
+can ever follow it there); a commit-class record that is last in its segment
+is retired instead, even when it is a genuine pruned survivor rather than a
+torn append, since the two cannot be told apart at scan time.  Either
+adoption logs one `adopting orphaned ordered ...` line and any other case
+stays refused or retired.  A store written entirely by the fixed live path
+exercises this rule only through a separate, still-open finding (a pruned
+marker's record rescanned after a timeline-delete rewrite rebases the flush
+watermark; see `RELEASE_VALIDATION.md`, "Open: pruned ordered marker
+rescanned after a timeline-delete rewrite"), never through its own writes.
+`integration_test.sh`
 now stops every cluster it started, reopens its own retained store against a
 fresh daemon, and asserts the reopen succeeds, that no segment tail was
 retired and no record was refused (both unconditionally fatal), and reports
