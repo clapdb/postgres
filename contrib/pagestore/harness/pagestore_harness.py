@@ -1617,6 +1617,14 @@ def cleanup_temporary_root(
 
 def remove_shm(shm: str) -> None:
     """Release a POSIX shm object without relying on Linux's /dev/shm view."""
+    if sys.platform == "darwin":
+        # pagestore_shm.h backs the segment with a regular file; no POSIX shm
+        # object exists, so this must run before the shm_unlink early returns.
+        try:
+            shm_backing_path(shm).unlink()
+        except FileNotFoundError:
+            pass
+        return
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         unlink = libc.shm_unlink
@@ -1634,12 +1642,6 @@ def remove_shm(shm: str) -> None:
         (Path("/dev/shm") / shm.removeprefix("/")).unlink()
     except FileNotFoundError:
         pass
-    # macOS: pagestore_shm.h backs the segment with a regular file.
-    if sys.platform == "darwin":
-        try:
-            shm_backing_path(shm).unlink()
-        except FileNotFoundError:
-            pass
 
 
 def shm_backing_path(shm: str) -> Path:
@@ -1915,6 +1917,11 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
         identity.status = "already_exited"
         return "pidfd-unavailable", "already_exited"
     if DARWIN_PROCESS_IDENTITY:
+        # macOS has no identity-bound signal handle (no pidfd).  The start
+        # time is verified immediately before kill(); the remaining window is
+        # one syscall wide and pids are allocated sequentially, so re-check
+        # afterwards and fail loudly if a replacement could have been hit
+        # rather than report a signal that may have gone elsewhere.
         try:
             os.kill(identity.pid, signal.SIGQUIT)
         except ProcessLookupError:
@@ -1923,6 +1930,12 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
             return "kill_starttime_verified", "already_exited"
         except PermissionError as error:
             raise PlanError(f"permission denied signalling pid {identity.pid}: {error}") from error
+        after = read_process_starttime(identity.pid)
+        if after is not None and after != identity.starttime:
+            raise PlanError(
+                f"pid {identity.pid} was reused while signalling: "
+                f"captured starttime={identity.starttime} current={after}"
+            )
         identity.status = "signaled"
         return "kill_starttime_verified", "signaled"
     raise PlanError(
