@@ -2343,9 +2343,17 @@ assert "$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)"
 # a plain GROW, so a retained store could fail "storage open: Invalid
 # argument" on its very next reopen (see RELEASE_VALIDATION.md).  Stop every
 # cluster this run started, shut the daemon down cleanly, and reopen it alone
-# against the same store: it must come back up, and -- since this whole run
-# was written entirely by the fixed live path -- it must never have needed
-# the recovery-side adoption rule that heals stores written by the old bug.
+# against the same store: it must come back up.  Recovery now also adopts an
+# orphaned ordered record whose selected forkmeta snapshot proves its append
+# completed (see RELEASE_VALIDATION.md); a store built entirely by the fixed
+# live path exercises that rule only through the still-open F3 pruned-marker
+# rescan path (a timeline-delete rewrite that rebases the flush watermark),
+# never through its own live writes.  So an adoption count above zero here is
+# not itself a failure, but it is the F3 detector: a nonzero count means F3
+# fired during this run and must be investigated (its evidence preserved with
+# KEEPTMP=1), not silently retried.  A retired segment tail or a bare refusal
+# is unconditionally fatal: the adoption rule (F2) is supposed to turn every
+# reachable case of either into a logged adoption instead.
 "$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 [ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 [ -n "${READERDATA:-}" ] && "$BIN/pg_ctl" -D "$READERDATA" -m immediate -w stop >/dev/null 2>&1 || true
@@ -2362,8 +2370,21 @@ else
 	reopen_ok=FAIL
 fi
 assert "$reopen_ok" "ok" "retained store reopens independently after clean shutdown"
-adopt_count=$(grep -c "adopting orphaned ordered record" "$DATA/daemon.log" 2>/dev/null)
-assert "${adopt_count:-0}" "0" "no orphaned ordered records were adopted on reopen"
+# Count both adoption line shapes: the growth-class rule ("...ordered record
+# as bound marker") and the commit-class rule ("...ordered commit record as
+# inert bound marker").
+adopt_count=$(grep -c "adopting orphaned ordered" "$DATA/daemon.log" 2>/dev/null)
+adopt_count=${adopt_count:-0}
+retire_count=$(grep -c "retiring tail at offset" "$DATA/daemon.log" 2>/dev/null)
+retire_count=${retire_count:-0}
+refuse_count=$(grep -c "refusing unmatched ordered record" "$DATA/daemon.log" 2>/dev/null)
+refuse_count=${refuse_count:-0}
+assert "$adopt_count" "0" \
+	"no orphaned ordered records were adopted on reopen (F3 detector: a nonzero count here means F3 fired and needs investigation, not a retry) (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
+assert "$retire_count" "0" \
+	"no segment tail was retired on reopen (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
+assert "$refuse_count" "0" \
+	"no ordered record was refused on reopen (adopted=$adopt_count retired=$retire_count refused=$refuse_count)"
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 
 echo "----"
