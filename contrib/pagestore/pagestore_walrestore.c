@@ -58,6 +58,7 @@
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 static void *shm;
 static volatile sig_atomic_t chan = -1;
@@ -114,7 +115,7 @@ is_wal_segment_name(const char *name)
 static void
 client_attach(const char *shm_name, uint32_t page_size_unused)
 {
-	int			fd = shm_open(shm_name, O_RDWR, 0600);
+	int			fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	PsShmHeader *hdr;
 	sigset_t	claimset,
 				oldset;

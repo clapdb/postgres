@@ -63,6 +63,7 @@
 
 #include "pagestore_artifact_format.h"
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 #define TEST_REL 4343u
 #define TEST_OWNER UINT64_C(23000)
@@ -262,7 +263,7 @@ attach(const char *name)
 {
 	PsShmHeader *header;
 
-	shm_fd = shm_open(name, O_RDWR, 0600);
+	shm_fd = ps_shm_open(name, O_RDWR, 0600);
 	if (shm_fd < 0)
 		die("cannot open shared memory");
 	shm_base = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,

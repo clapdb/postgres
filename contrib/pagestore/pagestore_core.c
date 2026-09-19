@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include "pagestore_artifact_format.h"
+#include "pagestore_compat.h"
 #include "pagestore_core.h"
 #include "pagestore_format.h"
 #include "pagestore_layer_store.h"
@@ -76,6 +77,102 @@
 #else
 #define PS_ASSERT(cond) ((void) 0)
 #endif
+
+#ifdef __APPLE__
+/*
+ * pthread_timedjoin_np() is a glibc extension.  Emulate it with a detached
+ * helper that performs the blocking join and signals completion; the caller
+ * waits on that signal until the deadline.  On timeout the helper (and its
+ * shared state) is abandoned to whichever side finishes last, which is safe
+ * because every caller terminates the process after a timed-out join.
+ */
+typedef struct PsTimedJoin
+{
+	pthread_t	thread;
+	pthread_mutex_t lock;
+	pthread_cond_t done_cv;
+	int			done;
+	int			rc;
+	int			refs;
+	void	   *result;
+} PsTimedJoin;
+
+static void
+ps_timedjoin_release(PsTimedJoin *join)
+{
+	int			last;
+
+	pthread_mutex_lock(&join->lock);
+	last = --join->refs == 0;
+	pthread_mutex_unlock(&join->lock);
+	if (last)
+	{
+		pthread_cond_destroy(&join->done_cv);
+		pthread_mutex_destroy(&join->lock);
+		free(join);
+	}
+}
+
+static void *
+ps_timedjoin_helper(void *arg)
+{
+	PsTimedJoin *join = arg;
+	void	   *result = NULL;
+	int			rc = pthread_join(join->thread, &result);
+
+	pthread_mutex_lock(&join->lock);
+	join->rc = rc;
+	join->result = result;
+	join->done = 1;
+	pthread_cond_broadcast(&join->done_cv);
+	pthread_mutex_unlock(&join->lock);
+	ps_timedjoin_release(join);
+	return NULL;
+}
+
+static int
+pthread_timedjoin_np(pthread_t thread, void **retval, const struct timespec *deadline)
+{
+	PsTimedJoin *join;
+	pthread_attr_t attr;
+	pthread_t	helper;
+	int			rc = 0;
+
+	join = calloc(1, sizeof(*join));
+	if (join == NULL)
+		return ENOMEM;
+	join->thread = thread;
+	join->refs = 2;
+	pthread_mutex_init(&join->lock, NULL);
+	pthread_cond_init(&join->done_cv, NULL);
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	rc = pthread_create(&helper, &attr, ps_timedjoin_helper, join);
+	pthread_attr_destroy(&attr);
+	if (rc != 0)
+	{
+		join->refs = 1;
+		ps_timedjoin_release(join);
+		return rc;
+	}
+	pthread_mutex_lock(&join->lock);
+	while (!join->done)
+	{
+		rc = pthread_cond_timedwait(&join->done_cv, &join->lock, deadline);
+		if (rc != 0 && !join->done)
+			break;
+	}
+	if (join->done)
+	{
+		rc = join->rc;
+		if (rc == 0 && retval != NULL)
+			*retval = join->result;
+	}
+	pthread_mutex_unlock(&join->lock);
+	ps_timedjoin_release(join);
+	return rc;
+}
+#endif							/* __APPLE__ */
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -11084,7 +11181,7 @@ wal_segment_discover_used(void)
 	root_fd = open(wal_segment_root,
 				   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (root_fd < 0 || (scan_fd = dup(root_fd)) < 0 ||
-		(dir = fdopendir(scan_fd)) == NULL)
+		(dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	errno = 0;

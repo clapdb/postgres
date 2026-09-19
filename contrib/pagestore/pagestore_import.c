@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 /* Physical tablespace OIDs (stable PostgreSQL constants). */
 #define DEFAULTTABLESPACE_OID	1663
@@ -54,7 +55,7 @@ static int	chan;
 static void
 client_attach(const char *shm_name)
 {
-	int			fd = shm_open(shm_name, O_RDWR, 0600);
+	int			fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	PsShmHeader *hdr;
 
 	if (fd < 0)

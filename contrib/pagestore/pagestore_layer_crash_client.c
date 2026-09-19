@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 #define TEST_REL 4242u
 #define TEST_LSN0 UINT64_C(0x1000)
@@ -40,7 +41,7 @@ attach(const char *name)
 {
 	PsShmHeader *header;
 
-	shm_fd = shm_open(name, O_RDWR, 0600);
+	shm_fd = ps_shm_open(name, O_RDWR, 0600);
 	if (shm_fd < 0)
 		die("cannot open shared memory");
 	shm_base = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,

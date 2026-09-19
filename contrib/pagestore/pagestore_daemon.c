@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
 #include "pagestore_fault.h"
@@ -1420,7 +1421,7 @@ main(int argc, char **argv)
 			fail_inspection_worker_startup = 1;
 	}
 
-	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
+	fd = ps_shm_open(shm_name, O_CREAT | O_RDWR, 0600);
 	if (fd < 0)
 	{
 		perror("shm_open");

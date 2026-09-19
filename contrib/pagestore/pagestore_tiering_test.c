@@ -177,6 +177,7 @@ static void
 test_legacy_local_uri_reopen(void)
 {
 	char root[] = "/tmp/ps-legacy-uri-XXXXXX";
+	char *canonical_root;
 	char store[PATH_MAX];
 	char previous_cwd[PATH_MAX];
 	const char *spellings[] = {"store", "alias", "store/../store"};
@@ -190,7 +191,17 @@ test_legacy_local_uri_reopen(void)
 		check(0, "prepare legacy URI fixture");
 		return;
 	}
-	snprintf(store, sizeof(store), "%s/store", root);
+	/* Canonical URIs are realpath() spellings; /tmp is a symlink on macOS. */
+	canonical_root = realpath(root, NULL);
+	if (canonical_root == NULL ||
+		snprintf(store, sizeof(store), "%s/store", canonical_root) >=
+		(int) sizeof(store))
+	{
+		free(canonical_root);
+		check(0, "resolve legacy URI fixture root");
+		return;
+	}
+	free(canonical_root);
 	if (chdir(root) != 0)
 	{
 		check(0, "enter legacy URI fixture directory");

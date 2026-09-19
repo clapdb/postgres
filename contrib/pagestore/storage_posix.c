@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "pagestore_storage.h"
+#include "pagestore_compat.h"
 #include "pagestore_format.h"
 #include "pagestore_ipc.h"
 #include "pagestore_store_owner.h"
@@ -1312,7 +1313,7 @@ posix_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
 	directory_fd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (directory_fd < 0 ||
 		(scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0)) < 0 ||
-		(dir = fdopendir(scan_fd)) == NULL)
+		(dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	errno = 0;
@@ -1425,7 +1426,7 @@ posix_walidx_reclaim_bytes(uint32_t tl, const uint64_t *keep_epochs,
 	directory_fd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (directory_fd < 0 ||
 		(scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0)) < 0 ||
-		(dir = fdopendir(scan_fd)) == NULL)
+		(dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	errno = 0;
@@ -1911,7 +1912,7 @@ posix_validate_private_dir(int root_fd, const char *name, uint32_t tl,
 	if (dir_fd < 0)
 		return errno == ENOENT ? 0 : -1;
 	scan_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
-	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+	if (scan_fd < 0 || (dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto done;
 	scan_fd = -1;
 	errno = 0;
@@ -1960,7 +1961,7 @@ posix_remove_private_dir(int root_fd, const char *name, uint32_t tl,
 	if (dir_fd < 0)
 		return errno == ENOENT ? 0 : -1;
 	scan_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
-	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+	if (scan_fd < 0 || (dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto done;
 	scan_fd = -1;
 	errno = 0;

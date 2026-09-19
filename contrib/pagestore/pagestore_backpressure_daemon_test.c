@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 #define SHUTDOWN_CANCEL_READY_BYTE 0x5a
 
@@ -146,7 +147,7 @@ wait_for_ready(const char *shm_name)
 {
 	for (int i = 0; i < 500; i++)
 	{
-		int fd = shm_open(shm_name, O_RDONLY, 0600);
+		int fd = ps_shm_open(shm_name, O_RDONLY, 0600);
 
 		if (fd >= 0)
 		{
@@ -206,7 +207,7 @@ test_unsupported_backend_cli_case(const char *daemon_path,
 	snprintf(shm_name, sizeof(shm_name), "/psbp_cli_%d", (int) getpid());
 	snprintf(store_dir, sizeof(store_dir), "/tmp/psbp_cli_store_%d",
 			 (int) getpid());
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 	if (pipe(pipefd) != 0)
 	{
 		check(0, "unsupported-backend CLI test creates stderr pipe");
@@ -243,7 +244,7 @@ test_unsupported_backend_cli_case(const char *daemon_path,
 		  case_name);
 	check(strstr(output, "backpressure requires the POSIX storage backend") != NULL,
 		  "unsupported-backend CLI reports the POSIX-only controller contract");
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 }
 
 static void
@@ -356,7 +357,7 @@ run_test(const char *daemon_path)
 	snprintf(shutdown_pause_file, sizeof(shutdown_pause_file),
 			 "/tmp/psbp_shutdown_pause_%d", (int) getpid());
 	snprintf(empty_segment, sizeof(empty_segment), "%s/seg_%08d", store_dir, 0);
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 	unlink(pause_file);
 	unlink(shutdown_pause_file);
 	/* Keep maintenance paused for both phases.  The first phase seeds the
@@ -386,7 +387,7 @@ run_test(const char *daemon_path)
 	if (!ready)
 		goto cleanup;
 
-	fd = shm_open(shm_name, O_RDWR, 0600);
+	fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	check(fd >= 0, "integration client opens daemon shared memory");
 	if (fd < 0)
 		goto cleanup;
@@ -444,7 +445,7 @@ run_test(const char *daemon_path)
 	check(ready, "throttle daemon publishes ready state");
 	if (!ready)
 		goto cleanup;
-	fd = shm_open(shm_name, O_RDWR, 0600);
+	fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	check(fd >= 0, "integration reopens daemon shared memory");
 	if (fd < 0)
 		goto cleanup;
@@ -588,7 +589,7 @@ run_test(const char *daemon_path)
 	check(ready, "cursor-restart daemon publishes ready state");
 	if (!ready)
 		goto cleanup;
-	fd = shm_open(shm_name, O_RDWR, 0600);
+	fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	check(fd >= 0, "cursor-restart client opens shared memory");
 	if (fd < 0)
 		goto cleanup;
@@ -678,7 +679,7 @@ run_test(const char *daemon_path)
 	check(ready, "shutdown-phase daemon publishes ready state");
 	if (!ready)
 		goto cleanup;
-	fd = shm_open(shm_name, O_RDWR, 0600);
+	fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	check(fd >= 0, "shutdown-phase client opens shared memory");
 	if (fd < 0)
 		goto cleanup;
@@ -787,7 +788,7 @@ cleanup:
 		munmap(shm, PS_SHM_SIZE);
 	if (fd >= 0)
 		close(fd);
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 	unlink(pause_file);
 	{
 		char command[256];
@@ -823,7 +824,7 @@ test_forkmeta_request_classification(const char *daemon_path)
 	snprintf(pause_file, sizeof(pause_file), "/tmp/psforkmeta_pause_%d", (int) getpid());
 	snprintf(frontier_file, sizeof(frontier_file), "%s/page-prune.frontiers",
 			 store_dir);
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 	unlink(pause_file);
 	{
 		char command[256];
@@ -844,7 +845,7 @@ test_forkmeta_request_classification(const char *daemon_path)
 	check(ready, "forkmeta classification daemon publishes ready state");
 	if (!ready)
 		goto cleanup;
-	fd = shm_open(shm_name, O_RDWR, 0600);
+	fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	check(fd >= 0, "forkmeta classification opens shared memory");
 	if (fd < 0)
 		goto cleanup;
@@ -954,7 +955,7 @@ cleanup:
 		munmap(shm, PS_SHM_SIZE);
 	if (fd >= 0)
 		close(fd);
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 	unlink(pause_file);
 	{
 		char command[256];

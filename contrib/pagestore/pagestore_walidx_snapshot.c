@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "pagestore_walidx_snapshot.h"
+#include "pagestore_compat.h"
 #include "pagestore_format.h"
 
 /*
@@ -528,7 +529,7 @@ gc_unselected_snapshot_entries(const char *directory, uint32_t timeline)
 	else if (errno != ENOENT)
 		goto cleanup;
 	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+	if (scan_fd < 0 || (dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	errno = 0;
@@ -1617,7 +1618,7 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 	else if (errno != ENOENT)
 		goto cleanup;
 	scan_fd = fcntl(current.directory_fd, F_DUPFD_CLOEXEC, 0);
-	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+	if (scan_fd < 0 || (dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	errno = 0;
@@ -1791,7 +1792,7 @@ ps_walidx_snapshot_reclaim_bytes(const char *directory, uint32_t timeline,
 	else if (errno != ENOENT)
 		goto cleanup;
 	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+	if (scan_fd < 0 || (dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	errno = 0;
