@@ -1139,7 +1139,14 @@ test_deletion_filtered_forkmeta_impl(int commit_shape)
 		/* F3 mitigation, not the fix: at least one orphan is adopted here.
 		 * The open follow-up (RELEASE_VALIDATION.md, invariant I3) must
 		 * tighten this to == 0 once page_cleanup_rewrite_segment() stops
-		 * dropping live identities out from under the durable watermark. */
+		 * dropping live identities out from under the durable watermark.
+		 * This still adopts under the segment path's stricter, torn-append-
+		 * safe rule (R2-F1) because the pruned survivor here is genuinely
+		 * followed by other complete, acknowledged records in the same
+		 * segment (the sibling's later same-block/@200 writes and the
+		 * survivor accounting below) -- exactly the proof
+		 * test_torn_commit_append_never_adopted() shows is missing for an
+		 * actually-torn record, which stays retired regardless of lifetime. */
 		check(count_occurrences(captured, "adopting orphaned ordered") >= 1,
 			  "F3 mitigation: reopen adopts at least one orphan instead of "
 			  "silently losing the rescanned records");
@@ -1495,21 +1502,32 @@ test_live_ordered_marker_walless_survives_two_cutovers(void)
 /*
  * ---- recovery adopts an orphaned ordered record, with diagnostics ----
  *
- * Recovery adopts an orphaned ordered record only when the selected forkmeta
- * snapshot proves the append completed (admission_seq <= its freeze_seq;
- * see fork_meta_orphan_proven()) and either a plain GROW with the identical
- * admission identity exists (growth class) or the fork's size at that
- * position already covered the block (commit class, inert marker); every
- * other unmatched ordered record is refused (layer prefix) or retires the
- * segment tail (segment suffix), with a logged tuple either way.  A store
- * written entirely by the fixed live path (Task 1 keeps memory and recovery
- * in agreement) exercises this rule only through the pruned-marker rescan
- * path (F3, RELEASE_VALIDATION.md; open follow-up), not through its own
- * live writes.  These tests construct the degraded shapes directly, through
- * the real forkmeta snapshot publication API (republish_degraded_snapshot(),
- * modeling what a pre-fix or F3-affected builder durably published) or, for
- * the fail-closed mismatch case, a raw source-log edit
- * (patch_source_ordered_record()), then exercise open/adopt/reopen.
+ * Recovery adopts an unmatched ordered record only when the selected
+ * forkmeta snapshot proves the append completed (admission_seq <= its
+ * freeze_seq; see fork_meta_orphan_proven()) -- a NECESSARY filter only, not
+ * proof against a torn append still in flight (review finding R2-F1: a
+ * refused record's admission_seq is still observed, so a later cutover can
+ * freeze past a torn sequence too) -- AND either a plain GROW with the
+ * identical admission identity exists (growth class, sound unconditionally
+ * on both paths, no further proof needed) or the fork's size at that
+ * position already covered the block (commit class, inert marker), PLUS,
+ * for the commit class only, a path-specific torn-exclusion proof: residency
+ * on the image-layer path (direct adoption, as here), or "at least one
+ * complete record follows it in the same segment" on the segment-suffix
+ * path (recover()'s deferred look-ahead; see test_torn_commit_append_never_adopted()
+ * and test_orphaned_commit_marker_segment_path_last_is_retired() below for
+ * that proof's positive and negative cases).  Every other unmatched ordered
+ * record is refused (layer prefix) or retires the segment tail (segment
+ * suffix), with a logged tuple either way.  A store written entirely by the
+ * fixed live path (Task 1 keeps memory and recovery in agreement) exercises
+ * this rule only through the pruned-marker rescan path (F3,
+ * RELEASE_VALIDATION.md; open follow-up) or an actual crash, not through an
+ * ordinary live write.  These tests construct the degraded shapes directly,
+ * through the real forkmeta snapshot publication API
+ * (republish_degraded_snapshot(), modeling what a pre-fix or F3-affected
+ * builder durably published) or, for the fail-closed mismatch case, a raw
+ * source-log edit (patch_source_ordered_record()), then exercise
+ * open/adopt/reopen.
  */
 
 /*
@@ -2109,6 +2127,118 @@ test_orphaned_commit_marker_adopted(void)
 	remove_tree(store);
 }
 
+/*
+ * Build the commit-orphan segment-path scenario without ever cleanly closing
+ * the store.  ps_core_close() (via close_runtime()) unconditionally flushes
+ * every shard's memtable into a layer on its way out (see MVP_STATUS.md's
+ * "page-segment record can never be the only copy" gap), so a store that is
+ * built and then closed normally can never leave an ordered record
+ * segment-resident for recover() to meet -- recover_layer_prefix() would see
+ * it instead, exercising the wrong path entirely.  A forked child builds the
+ * store and exits (_exit(), no close_runtime()) instead; the store-owner
+ * lock it holds releases with the process, the same property
+ * test_torn_commit_append_never_adopted() below relies on for its crash
+ * lifetime.  `with_follower` writes one more ordinary page, in the same
+ * shard's segment, after the commit-class write and before the cutover; the
+ * child hands the two ordered writes' admission sequences back over a pipe
+ * so the parent can drive republish_degraded_snapshot().
+ */
+static int
+build_segment_resident_commit_orphan(const char *store, const char *frontier,
+									 const char *manifest, const PsKey *pin_key,
+									 const PsKey *key, int with_follower,
+									 uint64_t *grow_seq_out,
+									 uint64_t *commit_seq_out)
+{
+	int			pipefd[2];
+	pid_t		pid;
+	int			status;
+	uint64_t	seqs[2] = {0, 0};
+
+	if (pipe(pipefd) != 0)
+		return 0;
+	pid = fork();
+	if (pid == 0)
+	{
+		unsigned char page[8192];
+		uint64_t	first_seq = 0,
+					second_seq = 0,
+					third_seq = 0;
+		uint64_t	grow_seq = 0,
+					commit_seq = 0;
+		PsRetentionPin pin;
+
+		close(pipefd[0]);
+		flush_pages = 1;
+		if (setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) != 0 ||
+			ps_core_open(store) != 0 ||
+			!meta_request(PS_OP_CREATE, pin_key, 100, 0, 0, 0, NULL) ||
+			append_relation(pin_key, 0, 100, page, &first_seq) != 0 ||
+			append_relation(pin_key, 0, 200, page, &second_seq) != 0)
+			_exit(1);
+		memset(&pin, 0, sizeof(pin));
+		pin.timeline = 0;
+		pin.owner_kind = 1;
+		pin.owner_id = 90;
+		pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+		pin.generation = 1;
+		pin.lsn = 200;
+		pin.admission_seq = second_seq;
+		if (ps_retention_set(&pin) != PS_RETENTION_OK ||
+			!run_maintenance_until(frontier, 1))
+			_exit(2);
+		/* flush_pages is read once, into the memtable's fixed threshold,
+		 * when ps_core_open() creates it, so reassigning the global
+		 * mid-session would not change an already-open memtable's flush
+		 * cadence.  Close (the pinned page history is meant to be flushed,
+		 * for the frontier above) and reopen with a threshold too high for
+		 * the few writes below, so they stay memtable/segment-resident;
+		 * this reopen is itself a clean close and is not the one this
+		 * scenario avoids. */
+		close_runtime();
+		flush_pages = 1000;
+		if (ps_core_open(store) != 0)
+			_exit(9);
+		if (!meta_request(PS_OP_CREATE, key, 300, 0, 0, 0, NULL))
+			_exit(3);
+		if (append_relation_tag(key, 0, 250, page, 0x40, &grow_seq) != 0 ||
+			grow_seq == 0)
+			_exit(4);
+		if (append_relation_tag(key, 0, 250, page, 0x41, &commit_seq) != 0 ||
+			commit_seq == 0 || commit_seq == grow_seq)
+			_exit(5);
+		if (with_follower &&
+			append_relation(pin_key, 0, 400, page, &third_seq) != 0)
+			_exit(6);
+		if (!append_growth_batch(3500, 2500) ||
+			setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) != 0 ||
+			!run_maintenance_until(manifest, 1))
+			_exit(7);
+		seqs[0] = grow_seq;
+		seqs[1] = commit_seq;
+		if (write(pipefd[1], seqs, sizeof(seqs)) != (ssize_t) sizeof(seqs))
+			_exit(8);
+		close(pipefd[1]);
+		/* Deliberately no close_runtime(): a clean close would flush every
+		 * record into a layer, which is exactly what this scenario must
+		 * avoid. */
+		_exit(0);
+	}
+	close(pipefd[1]);
+	if (pid < 0 ||
+		read(pipefd[0], seqs, sizeof(seqs)) != (ssize_t) sizeof(seqs) ||
+		waitpid(pid, &status, 0) != pid ||
+		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+	{
+		close(pipefd[0]);
+		return 0;
+	}
+	close(pipefd[0]);
+	*grow_seq_out = seqs[0];
+	*commit_seq_out = seqs[1];
+	return 1;
+}
+
 static void
 test_orphaned_commit_marker_segment_path(void)
 {
@@ -2118,12 +2248,8 @@ test_orphaned_commit_marker_segment_path(void)
 	char		frontier[1200];
 	PsKey		key = {6, 6, 6, 7, PS_KLASS_RELATION};
 	PsKey		pin_key = {6, 6, 26, 0, PS_KLASS_RELATION};
-	uint64_t	first_seq = 0,
-				second_seq = 0;
 	uint64_t	grow_seq = 0,
 				commit_seq = 0;
-	PsRetentionPin pin;
-	TestSnapshotHeader hdr;
 	PsChannel	reply;
 	unsigned char page[8192];
 	char		captured[16384];
@@ -2137,55 +2263,11 @@ test_orphaned_commit_marker_segment_path(void)
 	check(n > 0 && (size_t) n < sizeof(manifest), "build segment-path manifest path");
 	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
 	check(n > 0 && (size_t) n < sizeof(frontier), "build segment-path frontier path");
-	/* Page-history frontier publication scans image layers, so it needs at
-	 * least one real flush; keep the aggressive threshold for the pinned
-	 * setup writes and raise it only afterward, right before the ordered
-	 * writes this test needs to stay in the segment suffix (no image layer)
-	 * so reopen replays through recover() rather than recover_layer_prefix()
-	 * -- the path F3's data loss actually lives on. */
-	flush_pages = 1;
-	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
-		  ps_core_open(store) == 0 &&
-		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
-		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
-		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
-		  "open store and write pinned page history");
-	memset(&pin, 0, sizeof(pin));
-	pin.timeline = 0;
-	pin.owner_kind = 1;
-	pin.owner_id = 83;
-	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
-	pin.generation = 1;
-	pin.lsn = 200;
-	pin.admission_seq = second_seq;
-	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
-		  run_maintenance_until(frontier, 1),
-		  "publish a safe frontier");
-	/* flush_pages is read once, into the memtable's fixed threshold, when
-	 * ps_core_open() creates it -- reassigning the global mid-session would
-	 * not change an already-open memtable's flush cadence.  Reopen so the
-	 * higher threshold actually takes effect for the writes below. */
-	close_runtime();
-	flush_pages = 1000;
-	check(ps_core_open(store) == 0,
-		  "reopen with a flush threshold too high for this test's writes");
-	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
-		  "create the ordered fork at LSN 300");
-	check(append_relation_tag(&key, 0, 250, page, 0x40, &grow_seq) == 0 &&
-		  grow_seq != 0,
-		  "live clamped ordered growth write below the fork floor");
-	check(append_relation_tag(&key, 0, 250, page, 0x41, &commit_seq) == 0 &&
-		  commit_seq != 0 && commit_seq != grow_seq,
-		  "live clamped ordered commit rewrite of the same block");
-	check(append_growth_batch(3200, 1900) &&
-		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
-		  run_maintenance_until(manifest, 1),
-		  "first cutover publishes both real bound markers");
-	check(read_selected_header(snapshots, &hdr) == 0 &&
-		  snapshot_ordered_marker_count(snapshots, &key, 0, 0) == 2 &&
-		  !snapshot_has_plain_grow(snapshots, &key),
-		  "generation 1 carries both markers, no plain GROW");
-	close_runtime();
+	check(build_segment_resident_commit_orphan(store, frontier, manifest,
+											   &pin_key, &key, 1,
+											   &grow_seq, &commit_seq),
+		  "build a segment-resident growth+commit pair followed by another "
+		  "complete record, without a clean shutdown");
 	{
 		SnapshotOrphanEdit edits[2];
 
@@ -2205,8 +2287,10 @@ test_orphaned_commit_marker_segment_path(void)
 			  "adopting orphaned ordered record as bound marker") == 1 &&
 		  count_occurrences(captured,
 			  "adopting orphaned ordered commit record as inert bound marker") == 1 &&
+		  count_occurrences(captured, "followed by a complete record at offset") == 1 &&
 		  count_occurrences(captured, "retiring tail at offset") == 0,
-		  "both records adopt on the segment path; no segment tail is retired");
+		  "both records adopt on the segment path, the commit one logging "
+		  "which following complete record proved it; no segment tail is retired");
 	memset(page, 0, sizeof(page));
 	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 		  page[128] == 0x41, "newest (commit) tag readable after adoption");
@@ -2218,6 +2302,72 @@ test_orphaned_commit_marker_segment_path(void)
 		  meta_request(PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
 		  reply.result == 0,
 		  "a same-LSN truncate ordered after the inert marker still hides the block");
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
+ * Sibling of the above with nothing written after the commit-class record:
+ * this is exactly the shape a torn append below (no marker append, crash) is
+ * indistinguishable from at scan time, so it must stay fail-closed -- retired,
+ * not adopted -- even though fork_meta_orphan_proven() and the size check
+ * both hold.
+ */
+static void
+test_orphaned_commit_marker_segment_path_last_is_retired(void)
+{
+	char		store[] = "/tmp/psforkmetacmtseglastXXXXXX";
+	char		snapshots[1024];
+	char		manifest[1200];
+	char		frontier[1200];
+	PsKey		key = {6, 6, 6, 10, PS_KLASS_RELATION};
+	PsKey		pin_key = {6, 6, 29, 0, PS_KLASS_RELATION};
+	uint64_t	grow_seq = 0,
+				commit_seq = 0;
+	unsigned char page[8192];
+	char		captured[16384];
+	int			rc = -1;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create commit-orphan last-in-segment store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots), "build last-in-segment snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "build last-in-segment manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "build last-in-segment frontier path");
+	check(build_segment_resident_commit_orphan(store, frontier, manifest,
+											   &pin_key, &key, 0,
+											   &grow_seq, &commit_seq),
+		  "build a segment-resident growth+commit pair with nothing following, "
+		  "without a clean shutdown");
+	{
+		SnapshotOrphanEdit edits[2];
+
+		memset(edits, 0, sizeof(edits));
+		edits[0].key = key;
+		edits[0].admission_seq = grow_seq;
+		edits[0].degrade = 1;
+		edits[1].key = key;
+		edits[1].admission_seq = commit_seq;
+		edits[1].degrade = 0;
+		check(republish_degraded_snapshot(store, snapshots, edits, 2, 0),
+			  "republish the same degraded generation with no follower");
+	}
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) && rc == 0,
+		  "open still succeeds: the growth record adopts on its own");
+	check(count_occurrences(captured,
+			  "adopting orphaned ordered record as bound marker") == 1 &&
+		  count_occurrences(captured,
+			  "adopting orphaned ordered commit record") == 0 &&
+		  count_occurrences(captured,
+			  "no complete record follows in this segment") == 1,
+		  "the commit record, last in its segment, is retired instead of "
+		  "adopted -- torn-indistinguishable, so it must fail closed");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40,
+		  "the block still serves the older (growth) tag, not the retired one");
 	close_runtime();
 	remove_tree(store);
 }
@@ -2382,6 +2532,267 @@ test_orphaned_commit_marker_size_mismatch(void)
 	check(expect_open_failure_logs(store, "refusing unmatched ordered record"),
 		  "no size ever covered the block, so neither orphan rule adopts; "
 		  "open still fails and logs the refused record's tuple");
+	remove_tree(store);
+}
+
+/*
+ * ---- torn append vs. commit-class adoption (review finding R2-F1) ----
+ *
+ * A crash between a commit-class record's segment body write and its marker
+ * append (fork_meta_persist_segment()) leaves complete, well-formed bytes on
+ * disk with no marker -- exactly what an F3 pruned survivor also looks like
+ * to a rescan.  fork_meta_orphan_proven() alone cannot tell them apart: the
+ * torn record's admission_seq is observed (segment_order_id_observe()/
+ * admission_seq_observe()) on the very recovery pass that refuses it, and a
+ * later cutover in that same lifetime freezes past it, so the predicate
+ * alone would call it "proven" on any later rescan -- see its header
+ * comment.  The real, structural proof recover() uses instead: a torn body
+ * is always the last complete record of its segment (append_page_impl()
+ * advances the shard cursor only after the marker append succeeded), so it
+ * is retired again on every later rescan, not adopted, until a flush or a
+ * new segment moves past it.  `./torn_test 8` under `$SP/review-fsm/` is
+ * the reviewer's original standalone reproduction of this scenario against
+ * `PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES` (storage_posix.c); this is that
+ * scenario folded into the suite, plus a check that a later write still
+ * lands cleanly past the retired tail.
+ */
+static void
+test_torn_commit_append_never_adopted(void)
+{
+	char		store[] = "/tmp/psforkmetatorncommitXXXXXX";
+	char		snapshots[1024];
+	char		manifest[1200];
+	char		frontier[1200];
+	PsKey		key = {6, 6, 6, 11, PS_KLASS_RELATION};
+	PsKey		pin_key = {6, 6, 30, 0, PS_KLASS_RELATION};
+	TestSnapshotHeader hdr;
+	unsigned char page[8192];
+	char		captured[16384];
+	pid_t		pid;
+	int			status;
+	int			rc = -1;
+	uint64_t	new_seq = 0;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create torn-commit store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots), "build torn-commit snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "build torn-commit manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "build torn-commit frontier path");
+	flush_pages = 1;
+	/* lifetime 1 (child): CREATE@300, an acknowledged clamped write of block
+	 * 0 (tag 0x40), then a second clamped rewrite of the same block (tag
+	 * 0x41, commit-class) crashed after its 8th successful segment write --
+	 * its body, before fork_meta_persist_segment() ever runs. */
+	pid = fork();
+	if (pid == 0)
+	{
+		uint64_t	first_seq = 0,
+					second_seq = 0,
+					grow_seq = 0,
+					commit_seq = 0;
+		PsRetentionPin pin;
+
+		setenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES", "8", 1);
+		setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+		if (ps_core_open(store) != 0)
+			_exit(1);
+		if (!meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL))
+			_exit(2);
+		if (append_relation(&pin_key, 0, 100, page, &first_seq) != 0)
+			_exit(3);
+		if (append_relation(&pin_key, 0, 200, page, &second_seq) != 0)
+			_exit(4);
+		memset(&pin, 0, sizeof(pin));
+		pin.timeline = 0;
+		pin.owner_kind = 1;
+		pin.owner_id = 91;
+		pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+		pin.generation = 1;
+		pin.lsn = 200;
+		pin.admission_seq = second_seq;
+		if (ps_retention_set(&pin) != PS_RETENTION_OK ||
+			!run_maintenance_until(frontier, 1))
+			_exit(5);
+		if (!meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL))
+			_exit(6);
+		if (append_relation_tag(&key, 0, 250, page, 0x40, &grow_seq) != 0 ||
+			grow_seq == 0)
+			_exit(7);
+		(void) append_relation_tag(&key, 0, 250, page, 0x41, &commit_seq);
+		_exit(10);		/* not reached: the crash hook exits 86 first */
+	}
+	check(waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		  WEXITSTATUS(status) == 86,
+		  "child crashed after the torn commit-class body reached the segment");
+	unsetenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+
+	/* lifetime 2: no forkmeta generation is selected yet, so
+	 * fork_meta_orphan_proven() is trivially false and the torn record is
+	 * refused immediately -- not even stashed as a look-ahead candidate. */
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) && rc == 0,
+		  "lifetime 2 opens");
+	check(count_occurrences(captured, "retiring tail at offset") == 1 &&
+		  count_occurrences(captured, "no complete record follows") == 0 &&
+		  count_occurrences(captured, "adopting orphaned ordered commit record") == 0,
+		  "lifetime 2 retires the torn tail once, adopting nothing");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40, "lifetime 2 serves the committed tag, not the torn one");
+	check(append_growth_batch(3600, 2700) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "lifetime 2 cutover (its freeze now covers the torn record's sequence)");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 1 header");
+	close_runtime();
+
+	/* lifetime 3: fork_meta_orphan_proven() now holds for the torn record --
+	 * this is the reviewer's finding -- but the segment path's own proof
+	 * does not: nothing follows the retired tail (the crash truncated the
+	 * segment exactly there), so it is retired again, not adopted. */
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) && rc == 0,
+		  "lifetime 3 opens");
+	check(count_occurrences(captured, "retiring tail at offset") == 1 &&
+		  count_occurrences(captured, "no complete record follows in this segment") == 1 &&
+		  count_occurrences(captured, "adopting orphaned ordered commit record") == 0,
+		  "lifetime 3 retires the torn tail again, with no complete record "
+		  "following it in the segment, and still adopts nothing");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40, "lifetime 3 still serves the committed tag");
+
+	/* A fresh write after the retired tail must still land and be readable:
+	 * the retired-segment sentinel (cur_off = segment_size) rolls it into a
+	 * new segment rather than reusing the poisoned tail. */
+	check(append_relation_tag(&key, 0, 250, page, 0x42, &new_seq) == 0 &&
+		  new_seq != 0,
+		  "a fresh write past the retired torn segment succeeds");
+	close_runtime();
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+	check(ps_core_open(store) == 0, "lifetime 4 opens");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x42, "lifetime 4 serves the fresh write in its new segment");
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
+ * Companion to the above: the torn record is a growth-class write instead
+ * (block 1, extending the fork past its acknowledged size 1).  The growth
+ * rule needs no look-ahead proof -- it is sound by construction on both
+ * paths (no durable source can ever hold a degraded GROW at a torn
+ * sequence) -- so this never reaches the pending mechanism at all: the
+ * commit-rule's own size check (fork_size_asof_hop() < block + 1, since
+ * block 1 was never truly grown) refuses it independently of proof state,
+ * on every lifetime, so neither retire message ever gains the "no complete
+ * record follows" suffix here.
+ */
+static void
+test_torn_growth_append_never_adopted(void)
+{
+	char		store[] = "/tmp/psforkmetatorngrowthXXXXXX";
+	char		snapshots[1024];
+	char		manifest[1200];
+	char		frontier[1200];
+	PsKey		key = {6, 6, 6, 12, PS_KLASS_RELATION};
+	PsKey		pin_key = {6, 6, 31, 0, PS_KLASS_RELATION};
+	TestSnapshotHeader hdr;
+	PsChannel	reply;
+	unsigned char page[8192];
+	char		captured[16384];
+	pid_t		pid;
+	int			status;
+	int			rc = -1;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create torn-growth store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots), "build torn-growth snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "build torn-growth manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "build torn-growth frontier path");
+	flush_pages = 1;
+	pid = fork();
+	if (pid == 0)
+	{
+		uint64_t	first_seq = 0,
+					second_seq = 0,
+					grow_seq = 0;
+		PsRetentionPin pin;
+
+		setenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES", "8", 1);
+		setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+		if (ps_core_open(store) != 0)
+			_exit(1);
+		if (!meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL))
+			_exit(2);
+		if (append_relation(&pin_key, 0, 100, page, &first_seq) != 0)
+			_exit(3);
+		if (append_relation(&pin_key, 0, 200, page, &second_seq) != 0)
+			_exit(4);
+		memset(&pin, 0, sizeof(pin));
+		pin.timeline = 0;
+		pin.owner_kind = 1;
+		pin.owner_id = 92;
+		pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+		pin.generation = 1;
+		pin.lsn = 200;
+		pin.admission_seq = second_seq;
+		if (ps_retention_set(&pin) != PS_RETENTION_OK ||
+			!run_maintenance_until(frontier, 1))
+			_exit(5);
+		if (!meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL))
+			_exit(6);
+		if (append_relation_tag(&key, 0, 250, page, 0x40, &grow_seq) != 0 ||
+			grow_seq == 0)
+			_exit(7);
+		/* Torn: extends the fork from 1 to 2 blocks; crashes after the
+		 * body of block 1's write, before its marker. */
+		(void) append_relation_tag(&key, 1, 250, page, 0x50, &grow_seq);
+		_exit(10);		/* not reached */
+	}
+	check(waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		  WEXITSTATUS(status) == 86,
+		  "child crashed after the torn growth-class body reached the segment");
+	unsetenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) && rc == 0,
+		  "lifetime 2 opens");
+	check(count_occurrences(captured, "retiring tail at offset") == 1 &&
+		  count_occurrences(captured, "no complete record follows") == 0 &&
+		  count_occurrences(captured, "adopting orphaned ordered") == 0,
+		  "lifetime 2 retires the torn growth tail, adopting nothing");
+	check(meta_request(PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1, "lifetime 2: NBLOCKS stays 1, the torn growth never counted");
+	check(append_growth_batch(3700, 2900) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "lifetime 2 cutover");
+	check(read_selected_header(snapshots, &hdr) == 0, "read generation 1 header");
+	close_runtime();
+
+	/* lifetime 3: fork_meta_orphan_proven() now holds, but the growth rule
+	 * still finds no plain GROW to promote and the commit rule's size check
+	 * still fails (the fork's size never covered block 1) -- the size proof,
+	 * not just the segment look-ahead, keeps this fail-closed regardless of
+	 * lifetime, so the message stays the plain, non-look-ahead form. */
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) && rc == 0,
+		  "lifetime 3 opens");
+	check(count_occurrences(captured, "retiring tail at offset") == 1 &&
+		  count_occurrences(captured, "no complete record follows") == 0 &&
+		  count_occurrences(captured, "adopting orphaned ordered") == 0,
+		  "lifetime 3 retires the torn growth tail again, still adopting nothing");
+	check(meta_request(PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1, "lifetime 3: NBLOCKS still 1");
+	close_runtime();
 	remove_tree(store);
 }
 
@@ -2888,7 +3299,7 @@ main(void)
 		  "read latest selected payload before corruption test");
 	{
 		char checkpoint[1400];
-		unsigned char byte;
+		unsigned char byte = 0;
 		int fd;
 
 		n = snprintf(checkpoint, sizeof(checkpoint),
@@ -2956,8 +3367,11 @@ main(void)
 	test_orphaned_ordered_marker_not_adopted_on_mismatch();
 	test_orphaned_commit_marker_adopted();
 	test_orphaned_commit_marker_segment_path();
+	test_orphaned_commit_marker_segment_path_last_is_retired();
 	test_orphaned_commit_marker_not_proven();
 	test_orphaned_commit_marker_size_mismatch();
+	test_torn_commit_append_never_adopted();
+	test_torn_growth_append_never_adopted();
 	if (!failed)
 		remove_tree(store);
 	else
