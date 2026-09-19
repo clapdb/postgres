@@ -658,8 +658,16 @@ could be dropped, and the publish path itself already admits a same-end_lsn
 republish when reclaim_due is set.  With the fix, seed 20260909 at 8000
 rounds peaks at ~1.7-1.8 MiB (over a 2.5x margin under the new bound)
 instead of sitting at the old bound, stable across CPU regimes and repeated
-runs; the first post-fix nightly dispatch is run
-<PAGESTORE_NIGHTLY_POSTFIX_RUN_ID> (to be filled in after merge).
+runs; the first post-fix nightly dispatch,
+[run 35458043758](https://github.com/clapdb/postgres/actions/runs/35458043758)
+(manually dispatched 2026-09-19 against `316401d8d4b`, the #264 merge
+commit on `pagestore`, with this fix -- #265 -- already merged in its
+ancestry), confirms it: seed 20260909 at 8000 rounds passed with 45024 checks,
+0 failures, and both bounds satisfied; physical WAL peaked at 1736704 bytes
+against the 4667392 bound, with `wal_fence_slack_max` at 1568768 bytes. That
+is one dispatched run, not yet a scheduled-run history; the three-seed
+scheduled nightlies must still accumulate green runs against this revision
+before the final MVP status update.
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):
@@ -860,9 +868,25 @@ deployment, with the artifact lifecycle described in gate 4;
 gate 5 has its crash coverage composed, its concurrency clause closed (the
 crash matrix's concurrent appender at every publication boundary, and the
 composed forkmeta workload's acknowledged-append ledger), and its format
-fixtures complete.  What remains before the MVP is declared complete is:
+fixtures complete.  The nightly lane's seed-20260909 `wal`-bound flake is
+explained and fixed (#265); the FSM reopen blocker its fix's PRs hit is
+fixed (#264); and the artifact-key collision that made #264/#265/#266 all
+fail the integration lane identically is fixed (#266) -- see
+`RELEASE_VALIDATION.md`'s "Integration-lane finding" for the root cause and
+"Open: pruned ordered marker rescanned after a timeline-delete rewrite (F3)"
+for the one item that review left open: it is explicitly release-blocking
+there, but not an MVP gate, since #264's F2 mitigation already keeps it a
+logged pruning reversal rather than silent loss and gate 5's format fixtures
+stay complete.  What remains before the MVP is declared complete is:
 
-1. Keep the nightly bounded-space soak green across its first scheduled runs.
+1. Accumulate a green scheduled-run history on the three-seed nightly lane
+   against `316401d8d4b` and later (the fixes above).  A manually dispatched
+   run against that revision,
+   [35458043758](https://github.com/clapdb/postgres/actions/runs/35458043758)
+   (seed 20260909, 8000 rounds, 2026-09-19), confirms the fix -- 45024
+   checks, 0 failures, `physical_max.wal` 1736704 bytes against the 4667392
+   bound, `wal_fence_slack_max` 1568768 bytes -- but it is one dispatched
+   run, not yet the scheduled-run history this gate asks for.
 
 Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit

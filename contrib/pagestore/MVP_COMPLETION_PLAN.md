@@ -1654,11 +1654,27 @@ The default sequence was:
 5. H0 fault/inspection primitives -- done;
 6. H1 composed crash scenarios -- done;
 7. H2 format fixtures and compatibility CI -- done;
-8. R6 bounded-space acceptance and final MVP status update -- soak and nightly lane done; the
-   final status update follows the first scheduled nightly runs.
+8. R6 bounded-space acceptance and final MVP status update -- soak and
+   nightly lane done; the seed-20260909 `wal`-bound flake is explained and
+   fixed (#265); the reader-snapshot FSM reopen blocker the fix's PRs hit is
+   fixed (#264), with its F3 root cause (a pruned ordered marker rescanned
+   after a timeline-delete rewrite) tracked as an open, explicitly
+   release-blocking follow-up in `RELEASE_VALIDATION.md` -- not an MVP gate,
+   since #264's F2 mitigation already turns it into a logged pruning
+   reversal rather than silent loss, and gate 5's format fixtures stay
+   complete; the artifact-key collision that made #264/#265/#266 all fail
+   the integration lane identically is fixed (#266); the final status update
+   follows a green scheduled-nightly run history against the post-fix
+   revision.
 
-What remains: the final MVP status update once the nightly lane has a run
-history.
+What remains: the three-seed scheduled nightly lane accumulating a green run
+history against `316401d8d4b` and later (the fixes above), then the final
+MVP status update.  A manually dispatched run against that revision,
+[35458043758](https://github.com/clapdb/postgres/actions/runs/35458043758)
+(seed 20260909, 8000 rounds, 2026-09-19), confirms the fix on one dispatched
+run -- 45024 checks, 0 failures, `physical_max.wal` 1736704 bytes against the
+4667392 bound, `wal_fence_slack_max` 1568768 bytes -- but it is not yet the
+scheduled-run history this gate asks for.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
@@ -1720,3 +1736,4 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |
 | 2026-09-19 | Fixed a silent artifact-key collision between the automatic checkpoint-driven reader snapshot and an explicit exact-R publish (PRs #264/#265/#266 all failed the integration lane identically at "daemon reported error for op 34"): the explicit publish now uses an owner-scoped `dbOid` key for its DATA object instead of sharing the automatic snapshot's `InvalidOid` key, publishes its manifest under a new dedicated `PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT` rather than aliasing the automatic per-database manifest's real-database-OID namespace at `MANIFEST_OBJECT`, and no longer publishes the automatic-only "global" manifest fallback; `ps_artifact_begin`/`commit`/`drop` report a refusal reason (`PsArtifactRefuseReason`, append-only) that the daemon logs and the client echoes instead of a bare op number, closing the diagnostic gap that made the original failures a one-line mystery for three PRs in a row (D5 note above; RELEASE_VALIDATION.md's "Integration-lane finding") | `pagestore_artifact_lifecycle_test.c`'s `test_reader_snapshot_owner_key_split` covers the refusal-reason plumbing and the per-`dbOid` producer independence the fix relies on (it cannot reach the base bug itself, which was `pagestore.c`'s key choice, not the lifecycle); `integration_test.sh`'s reader section is the actual regression test -- it forces the collision order deterministically (polls the automatic generation into existence before the explicit publish) instead of racing worker timing, fails with the key reverted ("artifact begin: newer generation exists"), and asserts no refusal line at the end of a passing run; full `meson test --suite pagestore` (74/74), all three fixture checks (store, pgdata, controller) unchanged with `--require-build-match`, `KEEPTMP=1 integration_test.sh`, `mvp_golden_test.sh`, and `branch_boot_test.sh` all green |
 | 2026-09-20 | Follow-up review of the above artifact-key fix found and fixed a second, latent collision before it shipped: the explicit publish's manifest had reused MANIFEST_OBJECT's `dbOid` slot, which is the automatic per-database manifest's real-database-OID namespace (tracked/retired by the reader database barrier) -- an owner id equal to a live database's OID would have aliased that database's manifest and risked the barrier dropping it. Gave the explicit manifest its own object number instead (see D5 note); corrected two doc inaccuracies (the unit test does not reach the base bug; the owner id is range-checked, not truncated); mapped the "refused before ps_artifact_begin ran at all" case (`PS_ARTIFACT_REFUSE_NONE`, the daemon's klass/timeline gates) to an explicit message instead of a bare "none"; recorded the R4-2 poisoning and forkmeta-cutoff-vs-fenced-artifact follow-ups as open in RELEASE_VALIDATION.md | Full `meson test --suite pagestore` (74/74), all three fixture checks unchanged with `--require-build-match`, the unit test in both SLRU/reader-snapshot klass modes, `KEEPTMP=1 integration_test.sh`, `mvp_golden_test.sh`, and `branch_boot_test.sh` all green |
+| 2026-09-20 | Filled in the first post-fix nightly soak dispatch: after #265 (the `wal`-bound flake fix) merged to `pagestore`, manually dispatched the `pagestore nightly soak` workflow at `316401d8d4b` (the #264 merge commit); recorded its numbers in `RELEASE_VALIDATION.md` and `MVP_STATUS.md` in place of the `<PAGESTORE_NIGHTLY_POSTFIX_RUN_ID>` placeholder, and updated this plan's item 8/"What remains" and `MVP_STATUS.md`'s "Recommended sequence" to reflect that the flake (#265), the FSM reopen blocker (#264), and the artifact-key collision (#266) are all fixed, while F3's root cause stays an open, explicitly release-blocking (not MVP-gating) follow-up per `RELEASE_VALIDATION.md` | Run [35458043758](https://github.com/clapdb/postgres/actions/runs/35458043758): seed 20260909, 8000 rounds, 45024 checks, 0 failures, both during-run and quiescent bounds satisfied, `physical_max.wal` 1736704 bytes against the 4667392 bound, `wal_fence_slack_max` 1568768 bytes; one dispatched run, not yet the three-seed scheduled-run history the gate asks for |
