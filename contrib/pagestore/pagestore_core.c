@@ -380,15 +380,34 @@ static uint64_t walidx_reclaim_request_generation[MAX_TIMELINES];
  * still caught by the fire site the write passes through; see the
  * evidence key below for the exact-safety-net half.
  *
+ * retain_chain (pagestore_walidx_prune.c) applies per horizon: an
+ * UNPROTECTED horizon (the durable-progress cutoff, unless a page-history
+ * fence sits exactly there) needs a newer FPI in its window; a PROTECTED
+ * horizon (a page-history fence) accepts a durable base OR a newer FPI.  A
+ * blocking item sits below both kinds of horizon in general -- a nearer
+ * protected fence P and a farther unprotected one U (most often progress
+ * itself) -- and retires only once BOTH windows are satisfied: a base or
+ * FPI in [lo,P], AND an FPI in [lo,U].  hi_base/hi_fpi below are P and U
+ * respectively (never a single shared bound: an FPI landing in (P,U] --
+ * the ordinary case once P's own base already exists -- satisfies U
+ * without being in [lo,P], and collapsing both to whichever horizon is
+ * nearest, as an earlier version of this watch did, means such an FPI
+ * matches no window and the segment waits for the controller's own
+ * trigger as if the watch did not exist).
+ *
  * WAL_RECLAIM_WATCH_BASE: a durable version of (key,block) appears in
- * [lo,hi] -- fired by flush_memtable, the only place a version becomes
- * durable on the live write path.
+ * [lo,hi_base] -- fired by flush_memtable, the only place a version
+ * becomes durable on the live write path.  Armed only while the evidence
+ * below has not already found one there: a base already present in that
+ * closed window cannot be improved on, so re-firing on every later flush
+ * of unrelated versions of the same page (or of other pages that happen
+ * to hash to the same shard) would be a pure cost with no effect on the
+ * answer -- if the item is still stuck, a base in [lo,P] was never the
+ * reason.
  * WAL_RECLAIM_WATCH_FPI: a new full-page-image WAL-index item for
- * (key,block) is added in [lo,hi] -- fired by walidx_add_batch_locked.
- * A protected horizon's chain can be shortened by either event
- * (ps_walidx_prune_plan_bases takes start = max(first record above the
- * base, newest FPI)), so its watch kind is BASE|FPI; an unprotected
- * horizon's chain has no base to speak of, so its kind is FPI only.
+ * (key,block) is added in [lo,hi_fpi] -- fired by walidx_add_batch_locked.
+ * Armed only while the evidence has not already found an FPI there, for
+ * the same reason.
  *
  * Entries are exact (a single specific page and LSN window); a timeline
  * whose blocking minimum LSN has more than WAL_RECLAIM_WATCH_MAX items (only
@@ -407,7 +426,9 @@ typedef struct WalReclaimWatchEntry
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lo;				/* inclusive: the blocking item's end_lsn */
-	uint64_t	hi;				/* inclusive: the nearest horizon (h_cap) */
+	uint64_t	hi_base;		/* inclusive: nearest protected horizon (P) */
+	uint64_t	hi_fpi;			/* inclusive: nearest unprotected horizon
+								 * (U), or hi_base when none exists */
 	unsigned char kind;			/* WAL_RECLAIM_WATCH_BASE and/or _FPI */
 } WalReclaimWatchEntry;
 
@@ -424,9 +445,13 @@ static uint32_t wal_reclaim_watch_timelines_active;
 /*
  * Per-timeline retirement evidence for the last served reclaim-due request:
  * for each recorded item (same order as the watch), the identity (lsn,
- * admission_seq) of the newest durable version in [lo, h_cap] -- meaningful
- * only when that item's horizon is protected -- and the LSN of the newest
- * FPI item in [lo, h_cap].  A served request is fruitless-suppressed only
+ * admission_seq) of the newest durable version in [lo, P] (P = the nearest
+ * protected horizon at or above lo; zero when none exists) and the LSN of
+ * the newest FPI item in [lo, U] (U = the nearest unprotected horizon at or
+ * above lo, or P when no unprotected horizon exists either).  These are two
+ * separate windows, not one shared bound: see wal_reclaim_watch's comment
+ * for why a single nearest-horizon window misses the ordinary case where an
+ * FPI lands between P and U.  A served request is fruitless-suppressed only
  * while raw floor, fence epoch, AND this evidence are all unchanged since
  * it was recorded: evidence changes exactly when a version or FPI item the
  * retirement rule would actually use has appeared, whether or not a fire
@@ -12224,7 +12249,8 @@ walidx_base_version_durable(const PageVer *v)
  * WAL_RECLAIM_WATCH_MAX items at the minimum LSN -- the same items that
  * define *floor_out -- for the WAL reclaimer's fruitless-request watch (see
  * wal_reclaim_watch's comment).  Only .key/.block/.lo are filled in; the
- * caller fills .hi/.kind once it knows the governing horizon. */
+ * caller fills .hi_base/.hi_fpi/.kind once it knows the governing
+ * horizons. */
 static int
 wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
 								 uint64_t *floor_out,
@@ -12499,7 +12525,7 @@ wal_reclaim_watch_fire_flush(uint32_t shard_id)
 					{
 						const PageVer *v = &pe->vers[vi];
 
-						if (v->lsn >= e->lo && v->lsn <= e->hi &&
+						if (v->lsn >= e->lo && v->lsn <= e->hi_base &&
 							walidx_base_version_durable(v))
 							match = 1;
 					}
@@ -12561,7 +12587,7 @@ wal_reclaim_watch_fire_fpi(uint32_t tl, const WalIdxRec *records,
 			for (uint32_t r = 0; r < nrecords && !match; r++)
 				if ((records[r].flags & PS_WAL_INDEX_FLAG_FPI) != 0 &&
 					records[r].block == e->block &&
-					records[r].lsn >= e->lo && records[r].lsn <= e->hi &&
+					records[r].lsn >= e->lo && records[r].lsn <= e->hi_fpi &&
 					key_eq(&records[r].key, &e->key))
 					match = 1;
 		if (match)
@@ -13081,68 +13107,124 @@ wal_segment_reclaim_one(void)
 					ps_unlock_map();
 					for (uint32_t wi = 0; wi < watch_n; wi++)
 					{
-						uint64_t h_cap = progress;
-						int protected_horizon;
+						uint64_t lo = watch_items[wi].lo;
+						uint64_t p_min = 0;
+						int have_p = 0;
+						uint64_t u_min = 0;
+						int have_u = 0;
+						uint64_t fpi_hi;
 						WalReclaimEvidence ev;
 
 						memset(&ev, 0, sizeof(ev));
-						for (uint32_t fi = 0; fi < n_idx_fences; fi++)
-							if (idx_fences[fi] >= watch_items[wi].lo &&
-								idx_fences[fi] < h_cap)
-								h_cap = idx_fences[fi];
-						protected_horizon = h_cap >= watch_items[wi].lo &&
-							walidx_horizon_in_set(protected_set, n_protected,
-												  h_cap);
-						if (h_cap >= watch_items[wi].lo)
+						/* Progress (the durable-progress cutoff) is itself a
+						 * candidate horizon -- unprotected unless a
+						 * page-history fence happens to sit exactly there --
+						 * and, unlike the other fences below, has no
+						 * separate entry in idx_fences. */
+						if (progress >= lo)
 						{
-							WalIdxEnt *e;
-
-							if (protected_horizon)
+							if (walidx_horizon_in_set(protected_set,
+													  n_protected, progress))
 							{
-								const PageEnt *pe = page_find(tl,
-															  &watch_items[wi].key,
-															  watch_items[wi].block);
-
-								if (pe != NULL)
-									for (int vi = 0; vi < pe->nver; vi++)
-									{
-										const PageVer *v = &pe->vers[vi];
-
-										if (v->lsn >= watch_items[wi].lo &&
-											v->lsn <= h_cap &&
-											walidx_base_version_durable(v) &&
-											(ev.base_lsn == 0 ||
-											 v->lsn > ev.base_lsn ||
-											 (v->lsn == ev.base_lsn &&
-											  v->admission_seq > ev.base_seq)))
-										{
-											ev.base_lsn = v->lsn;
-											ev.base_seq = v->admission_seq;
-										}
-									}
+								have_p = 1;
+								p_min = progress;
 							}
-							e = walidx_find(tl, &watch_items[wi].key,
-										   watch_items[wi].block);
+							else
+							{
+								have_u = 1;
+								u_min = progress;
+							}
+						}
+						for (uint32_t fi = 0; fi < n_idx_fences; fi++)
+						{
+							uint64_t h = idx_fences[fi];
+
+							if (h < lo || h >= progress)
+								continue;
+							if (walidx_horizon_in_set(protected_set,
+													  n_protected, h))
+							{
+								if (!have_p || h < p_min)
+								{
+									have_p = 1;
+									p_min = h;
+								}
+							}
+							else
+							{
+								if (!have_u || h < u_min)
+								{
+									have_u = 1;
+									u_min = h;
+								}
+							}
+						}
+						if (have_p)
+						{
+							const PageEnt *pe = page_find(tl,
+														  &watch_items[wi].key,
+														  watch_items[wi].block);
+
+							if (pe != NULL)
+								for (int vi = 0; vi < pe->nver; vi++)
+								{
+									const PageVer *v = &pe->vers[vi];
+
+									if (v->lsn >= lo && v->lsn <= p_min &&
+										walidx_base_version_durable(v) &&
+										(ev.base_lsn == 0 ||
+										 v->lsn > ev.base_lsn ||
+										 (v->lsn == ev.base_lsn &&
+										  v->admission_seq > ev.base_seq)))
+									{
+										ev.base_lsn = v->lsn;
+										ev.base_seq = v->admission_seq;
+									}
+								}
+						}
+						/* No unprotected horizon at or above lo (only
+						 * possible when progress itself is protected and no
+						 * unprotected fence sits below it): fall back to
+						 * P's own window, so the FPI side still has a valid
+						 * bound instead of none at all. */
+						fpi_hi = have_u ? u_min : p_min;
+						if ((have_u || have_p) && fpi_hi >= lo)
+						{
+							WalIdxEnt *e = walidx_find(tl, &watch_items[wi].key,
+													   watch_items[wi].block);
+
 							if (e != NULL)
 								for (int ii = 0; ii < e->n; ii++)
 								{
 									WalIdxItem *item = &e->items[ii];
 
 									if ((item->flags & PS_WAL_INDEX_FLAG_FPI) != 0 &&
-										item->lsn >= watch_items[wi].lo &&
-										item->lsn <= h_cap &&
+										item->lsn >= lo &&
+										item->lsn <= fpi_hi &&
 										item->lsn > ev.fpi_lsn)
 										ev.fpi_lsn = item->lsn;
 								}
 						}
 						current_evidence[ncomputed] = ev;
 						armed[ncomputed] = watch_items[wi];
-						armed[ncomputed].hi = h_cap;
+						armed[ncomputed].hi_base = p_min;
+						armed[ncomputed].hi_fpi = fpi_hi;
+						/* Arm a kind only while its evidence has not already
+						 * found what it is looking for: a base or FPI
+						 * already present in its closed window cannot be
+						 * improved by a later, unrelated flush or WAL-index
+						 * add landing in the same window, so re-firing on
+						 * every one would only be cost with no effect on
+						 * the answer (NEW-HIGH-B).  If the item is still
+						 * stuck with both already nonzero, something other
+						 * than this watch holds it and the 1 s idle
+						 * fallback, or a fence-epoch change, is what moves
+						 * it next. */
 						armed[ncomputed].kind = (unsigned char)
-							(h_cap < watch_items[wi].lo ? 0 :
-							 protected_horizon ?
-							 (WAL_RECLAIM_WATCH_BASE | WAL_RECLAIM_WATCH_FPI) :
-							 WAL_RECLAIM_WATCH_FPI);
+							((have_p && ev.base_lsn == 0 ?
+							  WAL_RECLAIM_WATCH_BASE : 0) |
+							 ((have_u || have_p) && ev.fpi_lsn == 0 ?
+							  WAL_RECLAIM_WATCH_FPI : 0));
 						ncomputed++;
 					}
 					free(idx_fences);
@@ -13151,7 +13233,17 @@ wal_segment_reclaim_one(void)
 				/* Evidence-unchanged test: overflow only tracks its own
 				 * sentinel (raw+fence alone gate a repeat, matching the
 				 * pre-evidence request); otherwise every recorded item's
-				 * evidence must match exactly, including the count. */
+				 * evidence must match exactly, including the count.  A
+				 * count mismatch alone (raw_floor unchanged, but fewer or
+				 * more items now share it -- e.g. a partial retirement
+				 * that dropped one of several items previously at the same
+				 * blocking LSN, or a new item arriving at that LSN) is
+				 * treated as changed rather than compared item-by-item
+				 * against a now-differently-shaped array: nit, this costs
+				 * at most one extra fruitless re-request (the next
+				 * evaluation records the new count and, if nothing else
+				 * moved, is fruitless-suppressed again from then on), not
+				 * a repeat. */
 				if (watch_overflow)
 					evidence_unchanged =
 						walidx_reclaim_request_evidence_overflow[tl] != 0;
