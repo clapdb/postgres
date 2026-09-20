@@ -1287,11 +1287,19 @@ test_control_flush_not_repeated(void)
 	uint64_t	compact_after;
 	uint64_t	stored_before;
 	uint64_t	stored_after;
+	uint64_t	wanted_before;
+	uint64_t	wanted_after;
+	PsKey		control_key;
+	uint32_t	control_shard;
 	struct timespec t0,
 				t1;
 	double		elapsed_ms;
 
+	memset(&control_key, 0, sizeof(control_key));
+	control_key.klass = PS_KLASS_CONTROL;
+
 	configure_core();
+	control_shard = ps_shard_of(&control_key);
 	flush_pages = 64;
 	compact_layers = 8;
 	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
@@ -1314,6 +1322,16 @@ test_control_flush_not_repeated(void)
 		  " a twin of A), a fence between A2 and B, checkpoint B (self-redo)");
 	compact_before = ps_test_compaction_count();
 	stored_before = ps_test_control_flush_stored();
+	wanted_before = ps_test_control_flush_wanted();
+	/* One explicit call: the first evaluation to see the twin-churn state
+	 * finds the note superseded-per-fence and not yet durable, stores the
+	 * request (a fresh key), and sets page_flush_requested together with
+	 * page_prune_due for the control shard -- before compaction, which
+	 * consumes page_prune_due, gets a separate later call of its own. */
+	(void) ps_core_maintenance();
+	check(ps_test_page_prune_due(0, control_shard) != 0,
+		  "the stored request marks the control shard's page-prune-due flag"
+		  " together with it, per the LOW that ties the two");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
 		  "segment 0 goes; segment 1 is held by the reader's fence, and the"
 		  " control-flush decision has had a full window to run at least once");
@@ -1327,6 +1345,11 @@ test_control_flush_not_repeated(void)
 	} while (elapsed_ms < 5000.0);
 	compact_after = ps_test_compaction_count();
 	stored_after = ps_test_control_flush_stored();
+	wanted_after = ps_test_control_flush_wanted();
+	check(wanted_after - wanted_before >= stored_after - stored_before &&
+		  stored_after - stored_before >= 1,
+		  "the predicate was found true (wanted) at least as often as it was"
+		  " actually stored, and stored at least once");
 	check(compact_after - compact_before == 1,
 		  "[bound] the control-flush request and the compaction it enables"
 		  " fire exactly once over 5 s of idle maintenance -- not zero (the"
@@ -1400,6 +1423,123 @@ test_late_fpi_requests_compaction_protected_horizon(void)
 		  "[design goal] a protected horizon's watch is BASE|FPI: the FPI"
 		  " arrival retired the superseded older record; before the fix,"
 		  " still 2 (a durable-base-only watch never matches an FPI arrival)");
+	close_store();
+	remove_tree(store);
+}
+
+/* Round-2 review, NEW-HIGH-A: a protected page-history/walidx fence F below
+ * the unprotected durable-progress horizon (the production shape -- most
+ * pins sit well below progress).  retain_chain applies per horizon: the
+ * item retires iff (base or FPI in [lo,F]) AND (FPI in [lo,progress]).  A
+ * durable base at write (flush_pages == 1) satisfies F immediately; the
+ * newer FPI that arrives strictly between F and progress satisfies
+ * progress.  An earlier version of the evidence/watch computed a single
+ * nearest-horizon window (h_cap = min(progress, nearest fence)) and used it
+ * for both base and FPI evidence: since F is nearer than progress, h_cap
+ * landed on F, and the FPI arriving above F matched no window at all --
+ * the item was in fact retirable (a control case with the same state but
+ * the FPI already present before the first evaluation proves the plan
+ * retires it), but the watch/evidence mechanism never saw it, leaving the
+ * segment to wait for the WAL-index controller's own unrelated trigger,
+ * exactly the pre-PR gap this residual was meant to close. */
+static void
+test_fpi_between_protected_and_progress_retires(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	const uint64_t F = limited + 8192;
+	char		store[] = "/tmp/pagestore-wal-policy-r2a-XXXXXX";
+
+	configure_core();			/* flush_pages == 1: a base is durable at write */
+	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 300, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, F) &&
+		  write_relation_page(0, 0, limited + 100),
+		  "a known WAL-index item at `limited`, a page-history+walidx pin at"
+		  " F (protected, below progress), a durable base below F");
+	check(!maintenance_until_count(store, 0, 1) && segment_count(store, 0) == 2,
+		  "stuck at 2: F is served by the durable base, but the unprotected"
+		  " progress horizon still needs an FPI, so segment 1 cannot go"
+		  " either (it holds the item this reader pin still needs)");
+	check(ps_test_walidx_reclaim_due(0) == 0, "served fruitless");
+	check(wal_index_add_record(0, 2 * WAL_SEGMENT + 4096, 0, /* fpi */ 1),
+		  "a newer FPI for the same block arrives strictly between F and"
+		  " progress -- not in [lo,F], but exactly in (F,progress]");
+	check(maintenance_until_count(store, 0, 1),
+		  "[design goal] both windows are now satisfied (base in [lo,F], FPI"
+		  " in [lo,progress]): segment 1 must reclaim within the window --"
+		  " before the fix, an FPI landing between the nearest protected"
+		  " fence and progress matched neither window, and the segment"
+		  " waited for the WAL-index controller's own unrelated trigger"
+		  " instead");
+	close_store();
+	remove_tree(store);
+}
+
+/* Round-2 review, NEW-HIGH-B: the arm is unconditional, but a fire site
+ * that matches ANY qualifying version/item in [lo,hi] -- including one
+ * already reflected in the evidence at arm time -- refires on every later,
+ * unrelated flush of the watched page's shard: the v1 per-flush-drain
+ * pathology this design was meant to avoid.  A base already durable in
+ * [lo,F] (as in the previous test, before the FPI arrives) cannot be
+ * improved by a later flush of some other page that happens to hash to the
+ * same shard, so a BASE-kind watch must not still match those flushes.
+ * Count full reclaimer evaluations (the before-floor hook fires once per
+ * timeline actually reached) across 30 unrelated same-shard flushes spread
+ * over ~750 ms: unbounded re-firing costs one evaluation per flush (30);
+ * with re-firing correctly suppressed once evidence is satisfied, only the
+ * ordinary rate-limited/idle-fallback schedule applies. */
+static void
+count_eval(uint32_t timeline, void *arg)
+{
+	(void) timeline;
+	(*(unsigned int *) arg)++;
+}
+
+static void
+test_watch_does_not_refire_on_satisfied_base_evidence(void)
+{
+	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
+	const uint64_t F = limited + 8192;
+	char		store[] = "/tmp/pagestore-wal-policy-r2b-XXXXXX";
+	unsigned int evals = 0;
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 300, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY |
+					  PS_RETENTION_RESOURCE_WAL_INDEX, F) &&
+		  write_relation_page(0, 0, limited + 100),
+		  "same construction as the previous test: base durable in [lo,F],"
+		  " item still stuck on progress's own FPI requirement");
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "stuck at 2, request served fruitless");
+	check(ps_test_wal_reclaim_watch_count(0) == 1, "watch armed (1 entry)");
+	ps_test_set_wal_reclaim_before_floor_hook(count_eval, &evals);
+	for (uint32_t i = 0; i < 30; i++)
+	{
+		struct timespec t0, t1;
+
+		check(write_page_key(0, 7, 100 + i, WAL_TOTAL + 8192 * (i + 1)),
+			  "unrelated write to a different key, own flush (flush_pages == 1)");
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		do
+		{
+			if (!ps_core_maintenance())
+				usleep(1000);
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+		} while ((double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
+				 (double) (t1.tv_nsec - t0.tv_nsec) / 1e6 < 25.0);
+	}
+	ps_test_set_wal_reclaim_before_floor_hook(NULL, NULL);
+	check(evals <= 2,
+		  "[bound] 30 unrelated same-shard flushes over ~750 ms must not"
+		  " drain the reclaimer once per flush -- a base already found in"
+		  " the watched window cannot be improved by an unrelated flush, so"
+		  " re-arming BASE for it is pure cost with no effect on the"
+		  " answer; before the fix, every flush fired the watch and"
+		  " cancelled the no-progress backoff, so evals tracked the flush"
+		  " count instead of the reclaimer's own rate limit");
 	close_store();
 	remove_tree(store);
 }
@@ -2708,6 +2848,8 @@ main(void)
 	test_watch_ignores_unrelated_shard_flush();
 	test_control_flush_not_repeated();
 	test_late_fpi_requests_compaction_protected_horizon();
+	test_fpi_between_protected_and_progress_retires();
+	test_watch_does_not_refire_on_satisfied_base_evidence();
 	test_walidx_only_pin_drop_requests_compaction();
 	test_dependency_cutoffs();
 	test_death_base_survives_prefix_prune();
