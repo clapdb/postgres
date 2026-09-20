@@ -1005,9 +1005,18 @@ hot table (O(N^2) per fork at recovery and per cutover); a
 counter with the old linear code kept as its fallback, now makes every one
 of those O(log N)/O(1).  Measured at K = 50,000 commit-class rewrites: live
 path 41.7 -> 11.9 us/write, cutover 0.536 s -> 0.143 s, reopen 1.052 s ->
-0.451 s; see `RELEASE_VALIDATION.md` for the full table and the still-open
-follow-up (bounding the in-memory array itself by compacting the markers a
-cutover already dropped durably).  One
+0.451 s.  The in-memory array is now also bounded per daemon lifetime
+(design B, same `RELEASE_VALIDATION.md` section): a successful cutover
+compacts each fork's array down to exactly the events the durable
+checkpoint/tail kept, dropping the inert markers it dropped, right after
+the publish succeeds instead of leaving that to the next restart.
+Recovery-equivalent by construction (the durable state no longer carries
+them either).  Measured with `fev_bench K periodic` (K = 50,000 WAL-less
+rewrites split into 10 reclaiming cutover rounds): the in-memory event
+count on that fork stays in the low teens after every round with this fix,
+versus growing to 50,001 without it.  See `RELEASE_VALIDATION.md` for the
+full detail and the two follow-ups left open (design C's version-chain
+lookup, `def_idx` for a few remaining newest-first linear scans).  One
 gap remains documented in the check: a
 page-segment record can never be the only copy of a page, because a cleanly
 stopped daemon flushes its memtable into a layer before it exits, so every

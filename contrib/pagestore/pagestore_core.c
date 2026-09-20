@@ -4026,7 +4026,17 @@ typedef struct ForkEvent
 	uint8_t		kind;
 	uint8_t		marker_kind;	/* durable ordered marker kind, even after activation */
 	uint8_t		cached_state;
+	uint8_t		snapshot_dropped;	/* set by the last fork_meta_snapshot_build()
+									 * pass over this fork's events (1 iff this
+									 * event did not make it into the new
+									 * checkpoint/tail); consumed once, right
+									 * after a successful publish, by
+									 * fork_event_compact_dropped_markers(). */
 } ForkEvent;
+
+/* In-memory only (never persisted); this just documents that the added
+ * uint8_t above still fits the padding byte the struct already carried. */
+_Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 
 #define FEV_GROW	0
 #define FEV_SET		1
@@ -5914,7 +5924,12 @@ fork_event_check_order(const ForkEnt *e)
  * markers (fork_event_add_seg_marker(), below) are one event per ordered
  * write; every lookup that needs to find or bound a specific (lsn,
  * admission_seq) tuple goes through the position index above instead of
- * scanning, except on the legacy forks the index does not cover.
+ * scanning, except on the legacy forks the index does not cover.  An inert
+ * ordered marker (kind > FEV_DEAD, never activated to a size event) is not
+ * bounded by distinct sizes the way a GROW is; it is instead bounded per
+ * daemon lifetime by fork_event_compact_dropped_markers(), which runs right
+ * after every successful fork_meta_snapshot_build() and drops exactly the
+ * inert markers it drops from the new checkpoint/tail.
 */
 static _Thread_local int fork_event_cache_defer = 0;
 
@@ -5941,6 +5956,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = 0;
+	e->ev[i].snapshot_dropped = 0;
 	e->nev++;
 	if (admission_seq == 0)
 		e->nlegacy_seq++;
@@ -6003,6 +6019,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = kind;
+	e->ev[i].snapshot_dropped = 0;
 	e->nev++;
 	if (admission_seq == 0)
 		e->nlegacy_seq++;
@@ -6356,6 +6373,10 @@ fork_event_selftest_rand(uint64_t *state)
 	return x * 0x2545F4914F6CDD1DULL;
 }
 
+/* Defined below, near fork_meta_snapshot_build(); forward-declared here so
+ * the self-test hook's compact phase can call it on its private ForkEnt. */
+static void fork_event_compact_entry(ForkEnt *e);
+
 typedef struct FevSelftestMarker
 {
 	uint64_t	lsn;
@@ -6601,6 +6622,121 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			if (fe.ev[i].admission_seq == 0)
 				zero++;
 		FEV_ST_CHECK(zero == fe.nlegacy_seq);
+	}
+
+	/*
+	 * Compact phase (design B): flag a random subset of the surviving inert
+	 * markers (kind > FEV_DEAD) as if the last snapshot build had dropped
+	 * them, run the same per-entry compaction fork_meta_snapshot_maintenance()
+	 * calls after every successful cutover, and check it keeps every promise
+	 * -- array order, nlegacy_seq, def_idx, and every surviving event's own
+	 * fields, including its cached_* triple (a no-op element removed from a
+	 * prefix fold changes nothing below it).
+	 */
+	{
+		ForkEvent  *pre;
+		uint8_t    *flagged;
+		uint32_t	npre = fe.nev;
+		uint32_t	nsurvive = 0;
+		uint32_t	j,
+					k,
+					zero;
+
+		pre = npre ? malloc((size_t) npre * sizeof(*pre)) : NULL;
+		flagged = calloc(npre ? npre : 1, 1);
+		FEV_ST_CHECK((npre == 0 || pre != NULL) && flagged != NULL);
+		if (npre > 0)
+			memcpy(pre, fe.ev, (size_t) npre * sizeof(*pre));
+
+		for (uint32_t i = 0; i < npre; i++)
+		{
+			if (fe.ev[i].kind > FEV_DEAD &&
+				(fork_event_selftest_rand(&rngstate) % 2) == 0)
+			{
+				fe.ev[i].snapshot_dropped = 1;
+				flagged[i] = 1;
+			}
+			else
+				nsurvive++;
+		}
+
+		fork_event_compact_entry(&fe);
+
+		FEV_ST_CHECK(fe.nev == nsurvive);
+		FEV_ST_CHECK(fork_event_check_order(&fe));
+
+		j = k = zero = 0;
+		for (uint32_t i = 0; i < npre; i++)
+		{
+			if (flagged[i])
+				continue;
+			FEV_ST_CHECK(j < fe.nev);
+			FEV_ST_CHECK(fe.ev[j].lsn == pre[i].lsn &&
+						 fe.ev[j].admission_seq == pre[i].admission_seq &&
+						 fe.ev[j].order_id == pre[i].order_id &&
+						 fe.ev[j].nblocks == pre[i].nblocks &&
+						 fe.ev[j].kind == pre[i].kind &&
+						 fe.ev[j].marker_kind == pre[i].marker_kind &&
+						 fe.ev[j].cached_nblocks == pre[i].cached_nblocks &&
+						 fe.ev[j].cached_fence_nblocks == pre[i].cached_fence_nblocks &&
+						 fe.ev[j].cached_state == pre[i].cached_state &&
+						 fe.ev[j].snapshot_dropped == 0);
+			if (fe.ev[j].kind == FEV_SET || fe.ev[j].kind == FEV_DEAD)
+			{
+				FEV_ST_CHECK(k < fe.ndef && fe.def_idx[k] == j);
+				k++;
+			}
+			if (fe.ev[j].admission_seq == 0)
+				zero++;
+			j++;
+		}
+		FEV_ST_CHECK(j == fe.nev && k == fe.ndef && zero == fe.nlegacy_seq);
+		free(pre);
+		free(flagged);
+	}
+
+	/*
+	 * Compact-to-index-usable case (Low-2 review finding): a fork whose
+	 * only legacy (admission_seq == 0) events are inert markers must
+	 * regain fork_event_index_usable() -- the (lsn, admission_seq) index,
+	 * disabled by nlegacy_seq != 0 -- once compaction removes every one of
+	 * them, and its array must stay in tuple order at that point.  Build a
+	 * small private fork mixing nonzero-seq inert markers with legacy
+	 * (seq 0) inert markers, flag every legacy one, compact, and check
+	 * nlegacy_seq reaches exactly 0, the array is still tuple-ordered, the
+	 * index is now usable, and no seq-0 event remains.
+	 */
+	{
+		ForkEnt		fe2;
+		uint64_t	rng2 = seed ? seed * 7 + 3 : 5;
+
+		memset(&fe2, 0, sizeof(fe2));
+		for (uint32_t i = 0; i < 40; i++)
+		{
+			uint64_t	lsn = 1 + fork_event_selftest_rand(&rng2) % 4;
+			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rng2) % 8);
+			uint64_t	order_id = 1 + fork_event_selftest_rand(&rng2) % UINT32_MAX;
+
+			if (i % 3 == 0)
+				fork_event_add_seg_marker(&fe2, lsn, nblocks,
+										  FEV_SEG_COMMIT_BOUND, order_id, 0);
+			else
+				fork_event_add_seg_marker(&fe2, lsn, nblocks,
+										  FEV_SEG_COMMIT_BOUND, order_id,
+										  100 + i);
+		}
+		FEV_ST_CHECK(fe2.nlegacy_seq > 0 && fork_event_check_order(&fe2));
+		FEV_ST_CHECK(!fork_event_index_usable(&fe2, 1));
+		for (uint32_t i = 0; i < fe2.nev; i++)
+			if (fe2.ev[i].admission_seq == 0)
+				fe2.ev[i].snapshot_dropped = 1;
+		fork_event_compact_entry(&fe2);
+		FEV_ST_CHECK(fe2.nlegacy_seq == 0 && fork_event_check_order(&fe2));
+		FEV_ST_CHECK(fork_event_index_usable(&fe2, 1));
+		for (uint32_t i = 0; i < fe2.nev; i++)
+			FEV_ST_CHECK(fe2.ev[i].admission_seq != 0);
+		free(fe2.ev);
+		free(fe2.def_idx);
 	}
 
 #undef FEV_ST_CHECK
@@ -9608,7 +9744,22 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				/* A deletion-filtered generation must not carry any lifecycle or
 				 * ordered record owned by an explicit DELETING timeline. */
 				if (deleting)
+				{
+					/* A fork can reach here with a stale snapshot_dropped == 1
+					 * from an EARLIER build that flagged it (as not-deleting)
+					 * and then failed after this point (fail_entry/prepare/
+					 * commit -> retry_done, so fork_event_compact_dropped_markers()
+					 * never ran on that flag): if this fork's timeline entered
+					 * DELETING before the NEXT successful build, that build
+					 * skips it right here and never re-flags it, so a stale 1
+					 * would survive into the compaction pass that follows this
+					 * build's own success and wrongly drop an inert marker
+					 * from a fork this generation is supposed to leave
+					 * untouched.  Clear it here instead. */
+					for (uint32_t i = 0; i < e->nev; i++)
+						e->ev[i].snapshot_dropped = 0;
 					continue;
+				}
 
 				for (uint32_t i = 0; i < e->nev; i++)
 					if (e->ev[i].kind <= FEV_DEAD)
@@ -9736,6 +9887,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						kind = event->marker_kind != 0 ? event->marker_kind :
 							event->kind;
 						order_id = event->marker_kind != 0 ? event->order_id : 0;
+						event->snapshot_dropped = 0;
 					}
 					else if (event->marker_kind != 0 &&
 						(future || fork_meta_snapshot_marker_page_retained(
@@ -9744,14 +9896,31 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					{
 						kind = event->marker_kind;
 						order_id = event->order_id;
+						event->snapshot_dropped = 0;
 					}
 					else if (event->kind <= FEV_DEAD && keep[i])
 					{
 						kind = event->kind;
 						order_id = 0;
+						event->snapshot_dropped = 0;
 					}
 					else
+					{
+						/* Not emitted into either part of this generation.  An
+						 * inert marker (kind > FEV_DEAD) that lands here is
+						 * gone from every durable source once this build
+						 * commits; fork_event_compact_dropped_markers() drops
+						 * it from memory too, right after that commit
+						 * succeeds, so memory keeps matching what the next
+						 * boot rebuilds.  A pruned GROW/SET/DEAD (kind <=
+						 * FEV_DEAD, !keep[i]) also lands here and gets the
+						 * flag, but the compaction pass ignores it (it only
+						 * acts on kind > FEV_DEAD): those stay bounded by
+						 * distinct sizes already, per the header comment
+						 * above fork_event_add(). */
+						event->snapshot_dropped = 1;
 						continue;
+					}
 
 					if (fork_meta_vec_record(future ? tail : checkpoint,
 							e->timeline, &e->key, event->lsn,
@@ -9823,6 +9992,101 @@ fail_entry:
 	if (source->len > UINT32_MAX)
 		return -1;
 	return 0;
+}
+
+/*
+ * Compact one fork's event array in place: drop every event the per-entry
+ * loop above just flagged (snapshot_dropped == 1) that is also an inert
+ * ordered marker (kind > FEV_DEAD, i.e. never activated to a size event --
+ * an activated GROW/SET/DEAD is never flagged, and a pruned GROW/SET/DEAD
+ * is flagged but left alone here; see the comment at the flag site).  The
+ * remaining events keep their relative order and every cached_* value
+ * unchanged: an inert marker never enters the cached prefix fold
+ * (fork_event_cache_from() only folds GROW/SET/DEAD) and never sits in
+ * def_idx, so removing it changes nothing about any surviving event except
+ * its own array slot.  def_idx is rebuilt from the compacted array (a
+ * single pass; its capacity only shrinks or stays the same, never grows).
+ * A removed event can carry admission_seq == 0 (a legacy V1 record), in
+ * which case nlegacy_seq is decremented to match; this can legitimately
+ * drive nlegacy_seq to 0 and re-enable the (lsn, admission_seq) position
+ * index for this fork (fork_event_index_usable()) for the rest of this
+ * daemon lifetime.  That transition is safe: every insertion still goes
+ * through fork_event_insert_pos(), which keeps the array in tuple order
+ * for every event with a nonzero admission_seq regardless of nlegacy_seq;
+ * live admission sequences are allocated monotonically under the shard
+ * write lock, so nothing already in the array can insert out of order
+ * later; loaded records replay V1 (legacy, seq 0) before V2 (nonzero seq,
+ * assigned in increasing order) and each snapshot part is sorted by
+ * ascending nonzero seq before append, so the array a legacy fork loads
+ * with is already exactly the order the index needs; and a seq-0 event
+ * that is a GROW/SET/DEAD (kind <= FEV_DEAD) is never a candidate for
+ * removal here (only kind > FEV_DEAD is), so nlegacy_seq only reaches 0
+ * once every seq-0 event still in the array is gone -- at that point no
+ * interior seq-0 event is left to violate the index's ordering guarantee.
+ * O(e->nev); called once per fork per successful cutover.
+ */
+static void
+fork_event_compact_entry(ForkEnt *e)
+{
+	uint32_t	w = 0;
+
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		if (e->ev[i].snapshot_dropped && e->ev[i].kind > FEV_DEAD)
+		{
+			if (e->ev[i].admission_seq == 0)
+				e->nlegacy_seq--;
+			continue;
+		}
+		if (w != i)
+			e->ev[w] = e->ev[i];
+		e->ev[w].snapshot_dropped = 0;
+		w++;
+	}
+	if (w == e->nev)
+		return;
+	e->nev = w;
+	e->ndef = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].kind == FEV_SET || e->ev[i].kind == FEV_DEAD)
+			e->def_idx[e->ndef++] = i;
+	PS_ASSERT(fork_event_check_order(e));
+}
+
+/*
+ * Drop from every fork's in-memory history the inert markers the snapshot
+ * builder just dropped from the durable checkpoint/tail (fork_event_compact_entry()
+ * above).  Called only after fork_meta_snapshot_build() and the publish that
+ * follows it both succeed (fork_meta_snapshot_maintenance(), at rc = 1),
+ * under the same admission/shard/prune/map lock set that serialized the
+ * build, so nothing could have inserted a new event with a stale flag in
+ * between.  A fork visited under preserve_survivors is never flagged (that
+ * branch sets every event's flag to 0).  A fork skipped by the build's own
+ * "if (deleting) continue;" has every flag explicitly cleared right there
+ * before the skip, not merely left alone: without that clear, a fork could
+ * reach here with a stale 1 from an EARLIER build that flagged it (while
+ * not yet deleting) and then failed after stamping it (fail_entry/prepare/
+ * commit -> retry_done never runs this pass), followed by its timeline
+ * entering DELETING before the next successful build -- which would skip
+ * it and, without the explicit clear, leave that stale 1 for this pass to
+ * wrongly act on.  Either way, a deleting-or-preserve_survivors fork's
+ * surviving events always carry snapshot_dropped == 0 here, so this pass
+ * is a correctness no-op for it, exactly the "deleting forks and
+ * preserve_survivors generations untouched" requirement.  A failed build's
+ * flags never reach this pass at all (the caller does not run it on the
+ * retry/retry_done paths); the next SUCCESSFUL build overwrites every flag
+ * of every non-deleting fork it visits (and clears every deleting fork's)
+ * before this next runs, so a failed build's stale flags are always
+ * harmless by the time this pass reads them.  O(total events across every
+ * fork); once per cutover.
+ */
+static void
+fork_event_compact_dropped_markers(void)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
+				fork_event_compact_entry(e);
 }
 
 static int
@@ -10194,9 +10458,12 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	}
 	if (filter_deleting)
 		fork_meta_mark_deletion_cutover_done_locked();
-	/* Keep the in-memory chain conservative until the next restart.  All
-	 * acknowledged events remain available to readers; the durable checkpoint
-	 * is the source of truth for the next boot. */
+	/* The durable checkpoint just published is now the source of truth for
+	 * the next boot: drop the inert markers it no longer carries (flagged by
+	 * the build above) from every fork's in-memory history, so memory keeps
+	 * matching what that boot rebuilds instead of staying conservative until
+	 * a restart happens to come along. */
+	fork_event_compact_dropped_markers();
 	rc = 1;
 
 done:
