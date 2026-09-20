@@ -206,6 +206,22 @@ extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
 extern int ps_test_page_frontier(uint32_t timeline, uint64_t *lsn, uint64_t *seq);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
+extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
+extern uint64_t ps_test_compaction_count(void);
+extern int ps_test_page_prune_due(uint32_t timeline, uint32_t shard);
+/* Test-only: when nonzero, both wal_reclaim_watch fire sites (flush_memtable
+ * and walidx_add_batch_locked) return without checking for a match --
+ * simulating a fire that never happened, so a test can isolate the
+ * NOPROGRESS evaluation's own retirement-evidence recomputation as the
+ * safety net, independent of any fire. */
+extern void ps_test_set_wal_reclaim_watch_fire_hook(int suppress);
+/* Test-only: the control-note flush decision's dedup key (residual 2).
+ * ps_test_control_flush_wanted counts evaluations where the predicate held;
+ * ps_test_control_flush_stored counts only the ones where the (note lsn,
+ * admission_seq, fence_epoch) key actually changed and a request was
+ * stored. */
+extern uint64_t ps_test_control_flush_wanted(void);
+extern uint64_t ps_test_control_flush_stored(void);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
