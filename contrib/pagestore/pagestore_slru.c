@@ -73,10 +73,17 @@
 #include "access/commit_ts.h"
 /*
  * access/multixact_internal.h was split out of access/multixact.h upstream
- * in 19 (commit bb3b1c4f646); before that, the GetMultiXactInfo() prototype
- * and the MultiXactOffset type this file needs are exposed directly by
- * access/multixact.h.  On 19+, multixact_internal.h pulls in multixact.h
- * itself, so a single guarded include covers both.
+ * in 19 (commit bb3b1c4f646): the MultiXactOffset-page macros/functions
+ * this file's #else branch below reimplements moved there.  Before 19,
+ * access/multixact.h alone declares the MultiXactOffset type and the rest
+ * of the multixact API this file uses -- except GetMultiXactInfo() itself,
+ * which is not one of those symbols: it does not exist on 18 at all (added
+ * by a977e419ee6, "Refactor ReadMultiXactCounts() into GetMultiXactInfo()",
+ * 2025-08-19, well after the 18 branch), so including access/multixact.h
+ * does not expose it there.  On 19+, multixact_internal.h pulls in
+ * multixact.h itself, so a single guarded include still covers both
+ * majors' header needs; GetMultiXactInfo()'s own 18 gap is a separate
+ * problem, covered by the next paragraph.
  *
  * This guard alone does NOT make pagestore_slru.c (or the rest of
  * contrib/pagestore) compile on 18: see

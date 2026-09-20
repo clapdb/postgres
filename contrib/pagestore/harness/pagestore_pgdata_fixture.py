@@ -362,6 +362,38 @@ def capture(args: argparse.Namespace) -> int:
     missing = [rel for _, rel in ARTIFACTS.values() if not (source / rel).is_file()]
     if missing:
         raise FixtureError(f"{source} lacks {', '.join(missing)}")
+
+    previous: dict[str, Any] = {}
+    if (fixture / FIXTURE_JSON).is_file():
+        previous = json.loads((fixture / FIXTURE_JSON).read_text(encoding="utf-8"))
+
+    # Resolve pg_identity -- including the stale-identity refusal -- before
+    # writing anything: raising here, ahead of the tar/format.json writes
+    # below, means a refused recapture leaves the fixture directory
+    # completely untouched instead of half-updated (new artifacts.tar.gz
+    # and format.json but a stale fixture.json, since the exception used to
+    # be raised only after both were already overwritten).
+    build_identity = build_payload_identity(args)
+    pg_identity: dict[str, Any] | None = None
+    if build_identity is not None:
+        pg_identity = {key: build_identity[key] for key in PG_IDENTITY_KEYS
+                       if key in build_identity}
+    elif "pg_identity" in previous:
+        # The artifacts are about to be recaptured -- possibly under a
+        # different PostgreSQL build than the one that stamped the
+        # previous pg_identity -- so silently carrying that old identity
+        # forward would let a recapture claim a build match it never
+        # proved. Refuse by default; --keep-pg-identity is an explicit
+        # acknowledgement that this recapture is known to be under the
+        # same build (e.g. a content-only refresh, no rebuild in between).
+        if not args.keep_pg_identity:
+            raise FixtureError(
+                f"{fixture} previously recorded pg_identity {previous['pg_identity']}, but this "
+                "capture was not given --postgres-payload-identity[-tool], so the new artifacts' "
+                "actual PostgreSQL identity was never checked; pass one of those, or pass "
+                "--keep-pg-identity to explicitly carry the old identity forward unchanged")
+        pg_identity = previous["pg_identity"]
+
     fixture.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pagestore-pgdata-capture-") as temp:
         staged = Path(temp) / "artifacts"
@@ -372,9 +404,6 @@ def capture(args: argparse.Namespace) -> int:
         names = deterministic_tar(staged, fixture / ARTIFACTS_TAR)
     identities = format_identities(args.format_tool)
     (fixture / FORMAT_JSON).write_text(json.dumps(identities, indent=2) + "\n", encoding="utf-8")
-    previous: dict[str, Any] = {}
-    if (fixture / FIXTURE_JSON).is_file():
-        previous = json.loads((fixture / FIXTURE_JSON).read_text(encoding="utf-8"))
     metadata = {
         "schema": 1,
         "name": fixture.name,
@@ -389,25 +418,8 @@ def capture(args: argparse.Namespace) -> int:
         "artifacts": {name: rel for name, (_, rel) in ARTIFACTS.items()},
         "files": names,
     }
-    build_identity = build_payload_identity(args)
-    if build_identity is not None:
-        metadata["pg_identity"] = {key: build_identity[key] for key in PG_IDENTITY_KEYS
-                                   if key in build_identity}
-    elif "pg_identity" in previous:
-        # The artifacts above were just recaptured -- possibly under a
-        # different PostgreSQL build than the one that stamped the
-        # previous pg_identity -- so silently carrying that old identity
-        # forward would let a recapture claim a build match it never
-        # proved. Refuse by default; --keep-pg-identity is an explicit
-        # acknowledgement that this recapture is known to be under the
-        # same build (e.g. a content-only refresh, no rebuild in between).
-        if not args.keep_pg_identity:
-            raise FixtureError(
-                f"{fixture} previously recorded pg_identity {previous['pg_identity']}, but this "
-                "capture was not given --postgres-payload-identity[-tool], so the new artifacts' "
-                "actual PostgreSQL identity was never checked; pass one of those, or pass "
-                "--keep-pg-identity to explicitly carry the old identity forward unchanged")
-        metadata["pg_identity"] = previous["pg_identity"]
+    if pg_identity is not None:
+        metadata["pg_identity"] = pg_identity
     (fixture / FIXTURE_JSON).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"captured {fixture} ({len(names)} entries)")
     return 0
