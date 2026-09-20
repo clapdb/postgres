@@ -62,6 +62,19 @@
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
 
+/*
+ * SLRU_PAGES_PER_SEGMENT lived in access/slru.h as a fixed compile-time
+ * constant before 19; 19 made SLRU segment size configurable per-cluster
+ * (ControlFileData.slru_pages_per_segment) and moved the same default value
+ * to pg_config_manual.h.  access/slru.h is not frontend-safe (it pulls in
+ * storage/lwlock.h/atomics.h, and this file -- like pg_resetwal -- is built
+ * with FRONTEND defined), so alias the constant locally rather than
+ * including it just for this one macro.
+ */
+#if PG_VERSION_NUM < 190000
+#define SLRU_PAGES_PER_SEGMENT 32
+#endif
+
 static void *shm = NULL;
 
 /*
@@ -570,7 +583,16 @@ main(int argc, char **argv)
 	if (control.blcksz != BLCKSZ ||
 		control.relseg_size != RELSEG_SIZE ||
 		control.xlog_blcksz != XLOG_BLCKSZ ||
+#if PG_VERSION_NUM >= 190000
 		control.slru_pages_per_segment != SLRU_PAGES_PER_SEGMENT ||
+#else
+		/*
+		 * ControlFileData has no slru_pages_per_segment field before 19
+		 * (configurable SLRU segment size is 19-only); the segment size is
+		 * a compile-time constant on this build, so there is nothing in the
+		 * on-disk image to compare it against.
+		 */
+#endif
 		control.nameDataLen != NAMEDATALEN ||
 		control.indexMaxKeys != INDEX_MAX_KEYS ||
 		control.toast_max_chunk_size != TOAST_MAX_CHUNK_SIZE ||

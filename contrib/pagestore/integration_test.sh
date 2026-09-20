@@ -1143,10 +1143,16 @@ mxRecon=$($P -c "SELECT pagestore_multixact_offset_asof('$mA'::xid, '$mxC', '$mx
 assert "$([ "${mxRecon:-x}" -gt 0 ] 2>/dev/null && echo ok || echo "bad:$mxRecon")" "ok" \
 	"multixact offsets: scalar offset_asof(mA) returns a valid (>0) member offset"
 # derive the SLRU page geometry from the server's block_size instead of hardcoding 8192:
-# MULTIXACT_OFFSETS_PER_PAGE = BLCKSZ/8 (MultiXactOffset is 64-bit), and
-# SLRU_PAGES_PER_SEGMENT = 32 (block-size independent)
+# MULTIXACT_OFFSETS_PER_PAGE = BLCKSZ / sizeof(MultiXactOffset), and SLRU_PAGES_PER_SEGMENT = 32
+# (block-size independent).  MultiXactOffset is 64-bit (8 bytes) on 19+ and 32-bit (4 bytes)
+# on 18 and earlier -- ask the server (server_version_num) rather than hardcoding either.
 bs=$($P -c "SELECT current_setting('block_size')::int;")
-opp=$(( bs / 8 ))
+pgVersionNum=$($P -c "SELECT current_setting('server_version_num')::int;")
+if [ "$pgVersionNum" -ge 190000 ]; then
+	opp=$(( bs / 8 ))
+else
+	opp=$(( bs / 4 ))
+fi
 # byte-for-byte: the reconstructed offsets page == the parent's live pg_multixact/offsets
 # file (endian-agnostic, unlike decoding the uint32; also checks the successor slot mA+1)
 mxPage=$(( mA / opp ))
@@ -1179,8 +1185,14 @@ mOff=$mxRecon                                          # mA's first member offse
 mpp=$(( (bs / 20) * 4 ))
 mPage=$(( mOff / mpp ))
 mbRecon=$($P -c "SELECT md5(pagestore_multixact_members_page_asof($mPage, '$mxC', '$mxL'));")
-# members is a long-segment-name SLRU (15 hex chars) since MultiXactOffset went 64-bit
-mbSeg=$(printf '%015X' $(( mPage / 32 )))
+# members is a long-segment-name SLRU (15 hex chars) once MultiXactOffset is 64-bit (19+);
+# before that (18 and earlier) MultiXactOffset is 32-bit and members keeps the short (4-hex)
+# name every other SLRU uses ($pgVersionNum was already read above for $opp).
+if [ "$pgVersionNum" -ge 190000 ]; then
+	mbSeg=$(printf '%015X' $(( mPage / 32 )))
+else
+	mbSeg=$(printf '%04X' $(( mPage / 32 )))
+fi
 mbLive=$($P -c "SELECT md5(pg_read_binary_file('pg_multixact/members/$mbSeg', $(( (mPage % 32) * bs )), $bs));")
 assert "$mbRecon" "$mbLive" "multixact members: reconstructed page as-of L == the parent's live members file"
 # End to end: the parent resolves mA's members from exactly these on-disk pages -- step 20

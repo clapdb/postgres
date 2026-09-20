@@ -32,6 +32,18 @@
 #include "pagestore_ipc.h"		/* PsWalRec */
 
 /*
+ * Upstream renamed the replication-origin-id typedef from RepOriginId to
+ * ReplOriginId sometime after 18 (access/xlogdefs.h); both spellings name
+ * the same uint16.  pagestore.c and pagestore_slru.c are byte-for-byte
+ * copies of pagestore's tracked-upstream (19+) source and spell it
+ * ReplOriginId throughout, so alias it here on pre-19 builds rather than
+ * editing every call site.
+ */
+#if PG_VERSION_NUM < 190000
+typedef RepOriginId ReplOriginId;
+#endif
+
+/*
  * Version-neutral physical identity of a relation fork.  Deliberately built
  * from plain OIDs / numbers rather than RelFileLocator so the on-the-wire
  * identity does not change when PostgreSQL reshuffles its internal structs

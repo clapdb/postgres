@@ -2208,9 +2208,23 @@ ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
 		case T_ReindexStmt:
 			deny = "REINDEX";
 			break;
+#if PG_VERSION_NUM >= 190000
 		case T_RepackStmt:		/* REPACK (and its CLUSTER/VACUUM FULL legacy forms) */
 			deny = "REPACK";
 			break;
+#else
+		/*
+		 * Before 19, CLUSTER is its own statement (T_ClusterStmt), not one
+		 * of RepackStmt's legacy forms -- deny it explicitly the same way
+		 * T_RepackStmt does on 19+.  VACUUM FULL needs no separate case
+		 * here: on 18 it is still a plain T_VacuumStmt (VACOPT_FULL is just
+		 * a flag on it), and the T_VacuumStmt case above already denies
+		 * VACUUM/ANALYZE unconditionally, FULL or not.
+		 */
+		case T_ClusterStmt:
+			deny = "CLUSTER";
+			break;
+#endif
 		case T_CopyStmt:
 			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
 				deny = "COPY FROM";
