@@ -1251,6 +1251,146 @@ test_inert_markers_kept_on_preserve_survivors(void)
 	remove_tree(store);
 }
 
+/*
+ * Review finding (Low-1): a fork can reach a later build's
+ * "if (deleting) continue;" skip with a STALE snapshot_dropped == 1 from an
+ * EARLIER build that flagged it (while its timeline was not yet deleting)
+ * and then failed after that per-entry loop ran but before
+ * fork_event_compact_dropped_markers() could act on the flags (prepare
+ * fails -> fork_meta_snapshot_maintenance() takes the retry_done path,
+ * rc stays 0, compaction never runs for that attempt).  If the timeline
+ * then enters DELETING before the next successful build, that build skips
+ * the fork wholesale and, without explicitly clearing the flag there too,
+ * would leave the stale 1 for the compaction pass that follows THIS
+ * build's own success to wrongly act on -- removing an inert marker from a
+ * fork this generation is supposed to leave untouched.  Reproduces exactly
+ * that sequence: write ordered markers on a branch timeline, reclaim some
+ * of them so a cutover would flag them, fail that cutover at the prepare
+ * stage (PAGESTORE_TEST_FAIL_FORKMETA_PREPARED_BEFORE_CREATE, which fails
+ * after fork_meta_snapshot_build()'s per-entry loop already ran but before
+ * any compaction), then delete the timeline and let the next cutover
+ * succeed; asserts the fork's in-memory counts are unchanged by that
+ * second, successful cutover.
+ */
+static void
+test_deleting_fork_flags_cleared_on_failed_build_skip(void)
+{
+	char store[] = "/tmp/psforkmetaflagclearXXXXXX";
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 12, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	uint32_t nevents_before = 0,
+				nmarkers_before = 0,
+				ninert_before = 0;
+	uint32_t nevents_after = 0,
+				nmarkers_after = 0,
+				ninert_after = 0;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create flag-clear-on-skip store");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_snapshots/forkmeta_manifest_v1",
+				 store);
+	check(n > 0 && (size_t) n < sizeof(manifest), "build flag-clear manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "build flag-clear frontier path");
+	flush_pages = 1;
+	compact_layers = 2;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  create_branch_request(1, 0, 1) &&
+		  meta_request_timeline(1, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
+		  "open store, branch timeline 1, create the fork under test on it");
+	for (int i = 0; i < 12; i++)
+		check(append_relation_timeline(1, &key, 0, 0, page, &seq) == 0,
+			  "write ordered growth then later ordered COMMITs on the branch fork");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 1;
+	pin.owner_kind = 1;
+	pin.owner_id = 91;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = seq;
+	check(seq != 0 && ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a frontier for the branch and reclaim old ordered versions");
+	check(ps_test_fork_event_count(1, &key, &nevents_before, &nmarkers_before,
+									&ninert_before) &&
+		  ninert_before == 11,
+		  "12 live writes leave 11 inert commit markers before any cutover");
+	/*
+	 * A cutover now would flag some of those 11 as dropped (their versions
+	 * were just reclaimed) but must fail before compaction ever sees the
+	 * flags: fork_meta_snapshot_build()'s per-entry loop still runs (it
+	 * happens before ps_forkmeta_snapshot_prepare()), so the flags get
+	 * stamped; the injected failure is in prepare, which does not poison
+	 * the store, so a later cutover in this same process can still succeed.
+	 *
+	 * The churn to cross the byte trigger is deliberately created on
+	 * timeline 1 (not root_timeline via append_growth_batch()): a new
+	 * owning fork on the ROOT timeline with no published frontier of its
+	 * own would make fork_meta_snapshot_cutoff() fail closed (root is
+	 * never exempt), blocking every cutover attempt below, not just this
+	 * one -- timeline 1 already has a published frontier from the reclaim
+	 * above, so churn there stays covered.
+	 */
+	check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_PREPARED_BEFORE_CREATE", "1", 1) == 0 &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
+		  "arm a low trigger for the cutover attempt below");
+	for (uint32_t i = 0; i < 20; i++)
+	{
+		PsKey churn_key = key;
+
+		churn_key.relNumber = 100 + i;
+		check(meta_request_timeline(1, PS_OP_CREATE, &churn_key, 100, 0, 0, 0, NULL),
+			  "churn on the branch timeline to cross the byte trigger");
+	}
+	for (int tick = 0; tick < 10; tick++)
+		(void) ps_core_maintenance();
+	check(access(manifest, F_OK) != 0,
+		  "the injected prepare failure blocks this cutover from publishing");
+	unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_PREPARED_BEFORE_CREATE");
+	/*
+	 * The still-live retention pin on timeline 1 is an "active owner"
+	 * (timeline_has_active_owner()) and blocks PS_OP_BEGIN_DELETE; drop it
+	 * through the daemon meta op first, the same way T7's
+	 * test_artifact_write_unfenced_after_pin_drop() does above.
+	 */
+	{
+		PsChannel	ch;
+
+		memset(&ch, 0, sizeof(ch));
+		ch.opcode = PS_OP_RETENTION_PIN_DROP;
+		ch.timeline = 1;
+		ch.key = key;
+		ch.blocknum = pin.owner_kind;
+		ch.req_seq = pin.owner_id;
+		ch.old_nblocks = pin.generation;
+		ch.status = PS_STATUS_OK;
+		ps_lock_shard_rd(ps_shard_of(&key));
+		(void) ps_handle_meta(&ch);
+		ps_unlock_shard(ps_shard_of(&key));
+		check(ch.status == PS_STATUS_OK,
+			  "drop the branch's retention pin so it is no longer an active owner");
+	}
+	check(begin_delete_timeline(1),
+		  "begin deleting the branch timeline whose fork was just flagged");
+	check(run_maintenance_until(manifest, 1),
+		  "a later cutover now publishes, filtering the deleting timeline");
+	check(ps_test_fork_event_count(1, &key, &nevents_after, &nmarkers_after,
+									&ninert_after) &&
+		  nevents_after == nevents_before && nmarkers_after == nmarkers_before &&
+		  ninert_after == ninert_before,
+		  "the deleting fork's in-memory counts are untouched by the "
+		  "successful cutover that skipped it, despite the stale flags "
+		  "from the earlier failed cutover's per-entry loop");
+	close_runtime();
+	remove_tree(store);
+}
+
 /* Defined below, near the other two-cutover tests it was written for; also
  * used by the periodic-cutover scaling test just above its definition. */
 static int generation_advances_past(const char *directory, uint64_t generation);
@@ -1351,19 +1491,30 @@ test_fork_event_index_periodic_cutover_bounded(void)
 			  "advance this round's retention pin past every write so far");
 		/*
 		 * The frontier FILE only needs to exist once (round 0 creates it);
-		 * from round 1 on, wait for content by giving the page-pruning
-		 * maintenance class many ticks so THIS round's reclaim actually
-		 * runs before the cutover below measures its effect.
+		 * from round 1 on, wait for content by polling the block's own
+		 * version count (page-prune's actual effect) down to stability
+		 * instead of a blind fixed tick budget, so a round that converges
+		 * in a couple of ticks does not pay for the worst case every time.
 		 */
 		if (round == 0)
 			check(run_maintenance_until(frontier, 1),
 				  "publish the first frontier and reclaim this round's versions");
 		else
-			for (int tick = 0; tick < 60; tick++)
+		{
+			uint32_t	prev = ps_test_page_version_count(0, &key, 0);
+			int			stable = 0;
+
+			for (int tick = 0; tick < 300 && stable < 3; tick++)
 			{
+				uint32_t	cur;
+
 				(void) ps_core_maintenance();
-				usleep(50000);
+				usleep(5000);
+				cur = ps_test_page_version_count(0, &key, 0);
+				stable = (cur == prev) ? stable + 1 : 0;
+				prev = cur;
 			}
+		}
 		/*
 		 * The snapshot trigger stays high while each round's writes land
 		 * and its reclaim runs (matching every other reclaim test in this
@@ -5241,6 +5392,7 @@ main(void)
 	test_inert_markers_compacted_after_cutover();
 	test_inert_markers_kept_when_retained();
 	test_inert_markers_kept_on_preserve_survivors();
+	test_deleting_fork_flags_cleared_on_failed_build_skip();
 	test_fork_event_index_periodic_cutover_bounded();
 	test_v1_bound_marker_snapshot();
 	test_no_manifest_marker_only_rejected();

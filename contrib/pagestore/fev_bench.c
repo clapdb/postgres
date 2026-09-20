@@ -4,6 +4,9 @@
  * before cutover (source-log + segment replay), (c) a cutover
  * (fork_meta_snapshot_build), (d) a reopen after cutover (snapshot load).
  *
+ * Developer tool: not built or run by CI or meson.build; build and run it
+ * by hand when re-measuring F5 (see RELEASE_VALIDATION.md).
+ *
  * Build (from contrib/pagestore):
  *   cc -O2 -g -Wall -Wextra -I. -o fev_bench fev_bench.c pagestore_core.c
  *      pagestore_fault.c storage_posix.c pagestore_layer.c

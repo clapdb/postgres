@@ -881,10 +881,15 @@ operation's in-memory state must match recovery's (see `MVP_STATUS.md`).
 No persisted-format change. Tests (`pagestore_forkmeta_cutover_test.c`):
 `test_inert_markers_compacted_after_cutover` (12 live writes leave 11 inert
 markers in memory; after a reclaiming cutover the in-memory count drops to
-match the durable snapshot's, and a reopen's in-memory event/marker/inert
-counts match the post-compaction in-memory counts exactly -- the recovery
-equivalence check; fails before this PR, since the in-memory count stayed at
-11 forever in that process), `test_inert_markers_kept_when_retained` (no
+match the durable snapshot's, and a reopen's in-memory event/inert counts
+match the post-compaction in-memory counts exactly -- the recovery
+equivalence check; marker count is deliberately excluded from that
+comparison, see the test's own comment: an activated growth marker's
+`marker_kind` stays set in memory for the rest of the daemon lifetime by
+design, but the durable checkpoint record for it is an ordinary plain-GROW
+record with no marker identity, a pre-existing asymmetry design B does not
+touch; fails before this PR, since the in-memory count stayed at 11 forever
+in that process), `test_inert_markers_kept_when_retained` (no
 version reclaimed -> compaction is a no-op), `test_inert_markers_kept_on_preserve_survivors`
 (a deletion-forced generation with no provable operational cutoff -> every
 record re-emitted, compaction is a no-op), a `compact` phase added to the

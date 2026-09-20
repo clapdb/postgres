@@ -6695,6 +6695,50 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		free(flagged);
 	}
 
+	/*
+	 * Compact-to-index-usable case (Low-2 review finding): a fork whose
+	 * only legacy (admission_seq == 0) events are inert markers must
+	 * regain fork_event_index_usable() -- the (lsn, admission_seq) index,
+	 * disabled by nlegacy_seq != 0 -- once compaction removes every one of
+	 * them, and its array must stay in tuple order at that point.  Build a
+	 * small private fork mixing nonzero-seq inert markers with legacy
+	 * (seq 0) inert markers, flag every legacy one, compact, and check
+	 * nlegacy_seq reaches exactly 0, the array is still tuple-ordered, the
+	 * index is now usable, and no seq-0 event remains.
+	 */
+	{
+		ForkEnt		fe2;
+		uint64_t	rng2 = seed ? seed * 7 + 3 : 5;
+
+		memset(&fe2, 0, sizeof(fe2));
+		for (uint32_t i = 0; i < 40; i++)
+		{
+			uint64_t	lsn = 1 + fork_event_selftest_rand(&rng2) % 4;
+			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rng2) % 8);
+			uint64_t	order_id = 1 + fork_event_selftest_rand(&rng2) % UINT32_MAX;
+
+			if (i % 3 == 0)
+				fork_event_add_seg_marker(&fe2, lsn, nblocks,
+										  FEV_SEG_COMMIT_BOUND, order_id, 0);
+			else
+				fork_event_add_seg_marker(&fe2, lsn, nblocks,
+										  FEV_SEG_COMMIT_BOUND, order_id,
+										  100 + i);
+		}
+		FEV_ST_CHECK(fe2.nlegacy_seq > 0 && fork_event_check_order(&fe2));
+		FEV_ST_CHECK(!fork_event_index_usable(&fe2, 1));
+		for (uint32_t i = 0; i < fe2.nev; i++)
+			if (fe2.ev[i].admission_seq == 0)
+				fe2.ev[i].snapshot_dropped = 1;
+		fork_event_compact_entry(&fe2);
+		FEV_ST_CHECK(fe2.nlegacy_seq == 0 && fork_event_check_order(&fe2));
+		FEV_ST_CHECK(fork_event_index_usable(&fe2, 1));
+		for (uint32_t i = 0; i < fe2.nev; i++)
+			FEV_ST_CHECK(fe2.ev[i].admission_seq != 0);
+		free(fe2.ev);
+		free(fe2.def_idx);
+	}
+
 #undef FEV_ST_CHECK
 done:
 	free(seq_pool);
@@ -9700,7 +9744,22 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				/* A deletion-filtered generation must not carry any lifecycle or
 				 * ordered record owned by an explicit DELETING timeline. */
 				if (deleting)
+				{
+					/* A fork can reach here with a stale snapshot_dropped == 1
+					 * from an EARLIER build that flagged it (as not-deleting)
+					 * and then failed after this point (fail_entry/prepare/
+					 * commit -> retry_done, so fork_event_compact_dropped_markers()
+					 * never ran on that flag): if this fork's timeline entered
+					 * DELETING before the NEXT successful build, that build
+					 * skips it right here and never re-flags it, so a stale 1
+					 * would survive into the compaction pass that follows this
+					 * build's own success and wrongly drop an inert marker
+					 * from a fork this generation is supposed to leave
+					 * untouched.  Clear it here instead. */
+					for (uint32_t i = 0; i < e->nev; i++)
+						e->ev[i].snapshot_dropped = 0;
 					continue;
+				}
 
 				for (uint32_t i = 0; i < e->nev; i++)
 					if (e->ev[i].kind <= FEV_DEAD)
@@ -9947,6 +10006,23 @@ fail_entry:
  * def_idx, so removing it changes nothing about any surviving event except
  * its own array slot.  def_idx is rebuilt from the compacted array (a
  * single pass; its capacity only shrinks or stays the same, never grows).
+ * A removed event can carry admission_seq == 0 (a legacy V1 record), in
+ * which case nlegacy_seq is decremented to match; this can legitimately
+ * drive nlegacy_seq to 0 and re-enable the (lsn, admission_seq) position
+ * index for this fork (fork_event_index_usable()) for the rest of this
+ * daemon lifetime.  That transition is safe: every insertion still goes
+ * through fork_event_insert_pos(), which keeps the array in tuple order
+ * for every event with a nonzero admission_seq regardless of nlegacy_seq;
+ * live admission sequences are allocated monotonically under the shard
+ * write lock, so nothing already in the array can insert out of order
+ * later; loaded records replay V1 (legacy, seq 0) before V2 (nonzero seq,
+ * assigned in increasing order) and each snapshot part is sorted by
+ * ascending nonzero seq before append, so the array a legacy fork loads
+ * with is already exactly the order the index needs; and a seq-0 event
+ * that is a GROW/SET/DEAD (kind <= FEV_DEAD) is never a candidate for
+ * removal here (only kind > FEV_DEAD is), so nlegacy_seq only reaches 0
+ * once every seq-0 event still in the array is gone -- at that point no
+ * interior seq-0 event is left to violate the index's ordering guarantee.
  * O(e->nev); called once per fork per successful cutover.
  */
 static void
@@ -9974,6 +10050,7 @@ fork_event_compact_entry(ForkEnt *e)
 	for (uint32_t i = 0; i < e->nev; i++)
 		if (e->ev[i].kind == FEV_SET || e->ev[i].kind == FEV_DEAD)
 			e->def_idx[e->ndef++] = i;
+	PS_ASSERT(fork_event_check_order(e));
 }
 
 /*
@@ -9983,18 +10060,25 @@ fork_event_compact_entry(ForkEnt *e)
  * follows it both succeed (fork_meta_snapshot_maintenance(), at rc = 1),
  * under the same admission/shard/prune/map lock set that serialized the
  * build, so nothing could have inserted a new event with a stale flag in
- * between.  A fork skipped by the build's own "if (deleting) continue;", or
- * visited under preserve_survivors, is never flagged (every branch that
- * reaches the flag site sets it to 0 there, or the fork is not visited at
- * all) -- by induction, since this pass immediately follows every build
- * that could have flagged it, such a fork's surviving events always carry
- * snapshot_dropped == 0 here, so this pass is a correctness no-op for it,
- * exactly the "deleting forks and preserve_survivors generations untouched"
- * requirement.  A failed build's flags never reach this pass at all (the
- * caller does not run it on the retry/retry_done paths); the next
- * SUCCESSFUL build overwrites every flag of every fork it visits before
- * this next runs, so a failed build's stale flags are harmless.  O(total
- * events across every fork); once per cutover.
+ * between.  A fork visited under preserve_survivors is never flagged (that
+ * branch sets every event's flag to 0).  A fork skipped by the build's own
+ * "if (deleting) continue;" has every flag explicitly cleared right there
+ * before the skip, not merely left alone: without that clear, a fork could
+ * reach here with a stale 1 from an EARLIER build that flagged it (while
+ * not yet deleting) and then failed after stamping it (fail_entry/prepare/
+ * commit -> retry_done never runs this pass), followed by its timeline
+ * entering DELETING before the next successful build -- which would skip
+ * it and, without the explicit clear, leave that stale 1 for this pass to
+ * wrongly act on.  Either way, a deleting-or-preserve_survivors fork's
+ * surviving events always carry snapshot_dropped == 0 here, so this pass
+ * is a correctness no-op for it, exactly the "deleting forks and
+ * preserve_survivors generations untouched" requirement.  A failed build's
+ * flags never reach this pass at all (the caller does not run it on the
+ * retry/retry_done paths); the next SUCCESSFUL build overwrites every flag
+ * of every non-deleting fork it visits (and clears every deleting fork's)
+ * before this next runs, so a failed build's stale flags are always
+ * harmless by the time this pass reads them.  O(total events across every
+ * fork); once per cutover.
  */
 static void
 fork_event_compact_dropped_markers(void)
