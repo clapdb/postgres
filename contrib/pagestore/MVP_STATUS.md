@@ -412,7 +412,7 @@ scan-error zero-unlink behavior, complete per-segment validation, corrupt
 catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
 read-versus-reclaim mutex barrier.
 R3b-3 is the conservative POSIX/core policy integration.  It admits at most
-one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment.  The backoff is proof-keyed, not clock-only: after a 20 ms rate-limit floor (WAL_RECLAIM_REARM_MIN_NS -- every re-evaluation is a full drain, and a retention pin drop is dispatched without the admission lock, so an unrated cancellation would let drop-heavy churn turn every drop into a drain), it ends at the earlier of one second or the next event that can move a proof input (a WAL-index publication or GC, durable WAL-index progress, a retention-registry change, or a timeline reaching DELETED), so a floor advance past that 20 ms floor is not left waiting on the one-second clock.  When a complete segment's retention floor and durable progress have both passed the boundary but its raw WAL-index dependency has not, the reclaimer requests one compacted WAL-index publication on its own behalf instead of waiting for the WAL-index controller's own tail trigger or high water: one publication + GC + reclaim pass after the blocking condition clears, no earlier than the 20 ms floor after the last arm.  The request is fence-keyed, not progress-keyed: it is re-issued only when the oldest raw dependency or a retention-registry fence (a pin reserved/dropped -- including a WAL_INDEX-only pin, which the compaction plan fences exactly like a PAGE_HISTORY/WAL pin -- an artifact fence released/opened, a branch cap released) has changed since the last served request, because a durable WAL-index progress advance alone -- published once per indexing batch by the backend materializer -- can never retire the blocking item, and re-requesting on every advance would be a sustained non-compacting rewrite for as long as an unreplaceable dependency blocks the segment; when the request would be fruitless, the reclaimer arms a watch on the blocking page's window at every fruitless evaluation and keys the request on retirement evidence (the newest durable version and newest full-page-image item inside that window); a flush or index add that changes the evidence wakes it within the 20 ms floor, and the next evaluation (<= 1 s idle) catches any change that arrived without a wake, so at most one publication is issued per distinct evidence.  Separately, when the retention floor alone holds the boundary and the note that sets it is superseded -- below the PAGE_HISTORY effective floor and not the newest note at or below any control-note prune fence -- but still memtable-resident, the reclaimer requests a flush of the control shard so the next compaction can prune it, keyed on (note lsn, admission_seq, fence_epoch) so an unchanged decision is never re-issued, and marks the shard's page-prune-due flag only together with that flush request; the newest note at or below a live fence is never touched, and a layer-resident superseded note is left to the due mark the fence change already set.  A selected candidate drains ordinary admission before
+one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment.  The backoff is proof-keyed, not clock-only: after a 20 ms rate-limit floor (WAL_RECLAIM_REARM_MIN_NS -- every re-evaluation is a full drain, and a retention pin drop is dispatched without the admission lock, so an unrated cancellation would let drop-heavy churn turn every drop into a drain), it ends at the earlier of one second or the next event that can move a proof input (a WAL-index publication or GC, durable WAL-index progress, a retention-registry change, or a timeline reaching DELETED), so a floor advance past that 20 ms floor is not left waiting on the one-second clock.  When a complete segment's retention floor and durable progress have both passed the boundary but its raw WAL-index dependency has not, the reclaimer requests one compacted WAL-index publication on its own behalf instead of waiting for the WAL-index controller's own tail trigger or high water: one publication + GC + reclaim pass after the blocking condition clears, no earlier than the 20 ms floor after the last arm.  The request is fence-keyed, not progress-keyed: it is re-issued only when the oldest raw dependency or a retention-registry fence (a pin reserved/dropped -- including a WAL_INDEX-only pin, which the compaction plan fences exactly like a PAGE_HISTORY/WAL pin -- an artifact fence released/opened, a branch cap released) has changed since the last served request, because a durable WAL-index progress advance alone -- published once per indexing batch by the backend materializer -- can never retire the blocking item, and re-requesting on every advance would be a sustained non-compacting rewrite for as long as an unreplaceable dependency blocks the segment; when the request would be fruitless, the reclaimer arms a watch on the blocking page at every fruitless evaluation and keys the request on retirement evidence computed over two separate windows, not one: retain_chain applies per horizon, so a nearer protected horizon P (a page-history/walidx fence) accepts a durable base or a newer FPI in [item end, P], while the farther unprotected durable-progress horizon U needs a newer FPI in [item end, U] specifically -- collapsing both to whichever horizon is nearest, as an earlier version of this watch did, misses the ordinary case where an FPI lands strictly between P and U and satisfies U without ever being in [item end, P].  A flush or index add that changes either window's evidence wakes the watch within the 20 ms floor (only while that window has not already found what it needs, so a base or FPI already present cannot trigger a further, useless wake from the same watch on every later unrelated flush of the same shard), and the next evaluation (<= 1 s idle) catches any change that arrived without a wake; a request is not re-issued while both windows' evidence and the raw floor and fence epoch are unchanged, though a count of watched items that changes without their content doing so (a partial retirement) costs one extra fruitless re-request as a bounded nit, not a repeat.  Separately, when the retention floor alone holds the boundary and the note that sets it is superseded -- below the PAGE_HISTORY effective floor and not the newest note at or below any control-note prune fence -- but still memtable-resident, the reclaimer requests a flush of the control shard so the next compaction can prune it, keyed on (note lsn, admission_seq, fence_epoch) so an unchanged decision is never re-issued, and marks the shard's page-prune-due flag only together with that flush request; the newest note at or below a live fence is never touched, and a layer-resident superseded note is left to the due mark the fence change already set.  A selected candidate drains ordinary admission before
 freezing the WAL index, snapshots raw WAL dependencies under short-lived
 shard/map protection, and releases all shard locks before control-image,
 layer, metadata, or unlink I/O.  Its deletion candidate is the aligned-down
@@ -781,6 +781,51 @@ that never happened).  Full section 5 verification (all standalone suites,
 soak seed 20260909 5/5 plain + 3/3 contended, seeds 7 and 4242, and the
 2400-round default) was re-run after this revision; see the PR for the
 suite and soak tables.  No persisted format change.
+
+A second review pass of the same PR (2026-09-20) found the branch's other
+findings closed but two further HIGH issues in the residual-1 mechanism
+specifically, both in the single-window (h_cap) approximation the watch
+and its evidence used.  NEW-HIGH-A: retain_chain applies per horizon, and
+a blocking item generally sits below two horizons of different kinds, not
+one -- a nearer protected fence P (page-history/walidx) and the farther
+unprotected durable-progress horizon U -- retiring only once a base or FPI
+exists in [item end, P] AND an FPI exists in [item end, U].  Collapsing
+both to h_cap = min(progress, nearest fence) and using that single window
+for both base and FPI evidence meant an FPI landing strictly between P and
+U (the ordinary production shape once P's own base already exists)
+satisfied neither window: it was not in [item end, P], and h_cap never
+reached U at all once a nearer P existed, so the item stayed stuck and the
+segment waited for the WAL-index controller's own unrelated trigger, the
+exact pre-PR gap this residual exists to close.  Fixed by computing P and
+U independently per item (P = the nearest protected horizon at or above
+the item's low end; U = the nearest unprotected one, including progress
+itself), evidence over [item end, P] for the base and [item end, U] (or P
+when U does not exist) for the FPI, and arming/matching each kind against
+its own window (`WalReclaimWatchEntry` now carries `hi_base`/`hi_fpi`
+instead of one shared `hi`).  NEW-HIGH-B: with the arm unconditional, a
+fire site that matches *any* qualifying version already reflected in the
+evidence -- not only a new one -- refired on every later, unrelated flush
+of the watched page's shard: the exact per-flush-drain cost this design
+was meant to avoid, just relocated from "no watch" to "a watch that never
+stops mattering."  Fixed by arming a kind only while its own window's
+evidence has not already found what it needs (a base or FPI already
+present there cannot be improved by a later, unrelated flush landing in
+the same closed window); if an item is still stuck with both already
+nonzero, something other than this watch holds it, and a fence-epoch
+change or the 1 s idle fallback is what moves it next.  Two new
+reclaim-core tests were added
+(`test_fpi_between_protected_and_progress_retires`,
+`test_watch_does_not_refire_on_satisfied_base_evidence`), each failing on
+the pre-this-revision commit and passing after; the review's r2mut2
+mutation (every flush unconditionally wakes the reclaimer, independent of
+the watch) is killed by the second test's evaluation-count bound.  A nit
+(a watched-item-count mismatch after a partial retirement forces one extra
+fruitless re-request rather than a like-for-like comparison) is now
+called out in a comment rather than fixed, since it is already bounded to
+one extra request, not a repeat.  `ps_test_page_prune_due` and
+`ps_test_control_flush_wanted`, exported but unused after the first
+review pass, are now exercised by `test_control_flush_not_repeated`.  No
+persisted format change; see the PR for the re-verification results.
 
 The long-run configuration the gate asks for is the
 `pagestore nightly soak` workflow (`.github/workflows/pagestore-nightly.yml`):

@@ -852,12 +852,21 @@ Resolved (2026-09-20): two residuals left after the fix above were closed --
 (1) a replacement base or full-page-image item that becomes durable/arrives
 with no retention-registry fence change at all was left to the WAL-index
 controller's own trigger; the reclaimer now arms a watch on the specific
-blocking page's window at every fruitless evaluation and keys the request
-on retirement evidence (the newest durable version and newest
-full-page-image item inside that window); a flush or index add that
-changes the evidence wakes it within the 20 ms floor, and the next
-evaluation (<= 1 s idle) catches any change that arrived without a wake,
-so at most one publication is issued per distinct evidence.  (2)
+blocking page at every fruitless evaluation and keys the request on
+retirement evidence computed over two separate windows: a nearer protected
+horizon P (page-history/walidx fence) accepts a durable base or a newer
+FPI in [item end, P], while the farther unprotected durable-progress
+horizon U needs a newer FPI in [item end, U] specifically, since
+retain_chain applies its base-or-FPI-vs-FPI-only rule per horizon, not
+once for whichever horizon happens to be nearest.  A flush or index add
+that changes either window's evidence wakes the watch within the 20 ms
+floor -- only while that window has not already found what it needs, so
+an already-satisfied window cannot be re-triggered by every later,
+unrelated flush of the same shard -- and the next evaluation (<= 1 s idle)
+catches any change that arrived without a wake; a request is not re-issued
+while both windows and the raw floor/fence epoch are unchanged (a
+watched-item count change from a partial retirement is a bounded
+exception: one extra fruitless re-request, not a repeat).  (2)
 control-image/note pruning is scheduled on every retention change but
 executes only at the next shard compaction, which reads image layers only:
 a superseded control note that is still memtable-resident is invisible to
@@ -875,8 +884,14 @@ the soak's own workload, so its acceptance bounds are unchanged; see the
 new reclaim-core test cases below.  A follow-up review (also 2026-09-20,
 see the 2026-09-20 progress-log row below) found each of these two fixes
 had a design gap and closed both, plus three lower-severity issues, on the
-same branch before it shipped.  Nothing remains before the gate closes
-beyond keeping the nightly soak green.
+same branch before it shipped.  A second review pass (also 2026-09-20, see
+MVP_STATUS.md's second 2026-09-20 progress note) found the residual-1 watch's
+single-window (h_cap) evidence approximation missed the ordinary
+production case of a protected fence nearer than progress -- described
+above, in the two-window language that replaces the exactness claim the
+single-window design could not actually meet -- and closed it too.
+Nothing remains before the gate closes beyond keeping the nightly soak
+green.
 
 The nightly long-run configuration is `.github/workflows/pagestore-nightly.yml`
 (three seeds, 8000 rounds each, scheduled daily and dispatchable with chosen
