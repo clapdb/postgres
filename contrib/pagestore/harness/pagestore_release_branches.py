@@ -6,26 +6,37 @@ The manifest is the single place that says which PostgreSQL majors
 ``branchdb_<N>`` supports (``supported``, each with a ``status`` of
 ``planned``, ``candidate``, ``released`` or ``released-preview``, and the
 ``base_tag``/``contrib_sha`` it was last synced at -- both ``null`` until a
-sync records them) and which are kept only for reference (``unsupported``,
-each with a human-readable ``reason``, e.g. an upstream EOL date).
+sync happens) and which are kept only for reference (``unsupported``, each
+with a human-readable ``reason``, e.g. an upstream EOL date).
+
+The manifest is **hand-maintained**: nothing writes ``base_tag``/
+``contrib_sha`` automatically. ``scripts/branchdb-sync.sh sync-contrib``
+and ``minor`` only *read* them (for ``status``'s "does contrib match the
+recorded SHA" report); a release-branch PR that performs a sync updates
+the manifest itself, on ``pagestore``, as part of that PR -- a branch's
+own byte-identical ``contrib/pagestore`` copy has no way to record its own
+commit SHA from inside itself.
 
 Consumers:
 
-* ``scripts/branchdb-sync.sh status`` shells out to this module (see
-  ``release_branches_field``) to look up a major's recorded ``contrib_sha``
-  without a JSON library dependency of its own.
+* ``scripts/branchdb-sync.sh status`` invokes this module directly (as a
+  subprocess, so the shell script stays dependency-free) to look up a
+  major's recorded ``contrib_sha``.
 * The nightly/release-acceptance workflows (V4 plan, P4) read
   ``candidate_branches()`` to fan their soak matrix out over every branch
   that currently has release evidence riding on it, instead of a hardcoded
   YAML list.
 
-Run this file directly for a self-test: it validates the manifest's own
-structure (schema, no duplicate or misnamed majors, every supported major has
-a status this reader recognises, 13 and 14 are exactly the unsupported set)
-and prints a one-line summary.
+Run this file directly (no arguments) for a self-test: it validates the
+manifest's own structure (schema, no duplicate or misnamed majors, every
+supported major has a status this reader recognises, 13 and 14 are exactly
+the unsupported set) and prints a one-line summary. Run it with
+``--major N --field FIELD`` to print one manifest field for major N (the
+lookup ``scripts/branchdb-sync.sh status`` uses).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -154,8 +165,36 @@ def _self_test() -> int:
     return 0
 
 
+def _print_field(major: int, field: str) -> int:
+    """`--major N --field FIELD`: print one field of major N's manifest
+    entry (supported or unsupported), or nothing if the field is absent or
+    null. Used by scripts/branchdb-sync.sh's `status` as a subprocess call,
+    so the shell script does not duplicate the manifest's parsing/lookup
+    logic -- this module is the one place that knows the schema."""
+    try:
+        entry = entry_for_major(major)
+    except ReleaseBranchesError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    if entry is None:
+        return 0
+    value = entry.get(field)
+    if value is not None:
+        print(value)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    del argv
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--major", type=int, metavar="N",
+                        help="print one manifest field for major N instead of self-testing")
+    parser.add_argument("--field", metavar="FIELD",
+                        help="the field to print (requires --major), e.g. contrib_sha, base_tag")
+    args = parser.parse_args(argv)
+    if args.major is not None or args.field is not None:
+        if args.major is None or args.field is None:
+            parser.error("--major and --field must be given together")
+        return _print_field(args.major, args.field)
     try:
         return _self_test()
     except (ReleaseBranchesError, AssertionError) as error:

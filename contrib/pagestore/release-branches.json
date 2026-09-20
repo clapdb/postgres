@@ -11,7 +11,7 @@
     {
       "major": 18,
       "branch": "branchdb_18",
-      "status": "candidate",
+      "status": "planned",
       "base_tag": null,
       "contrib_sha": null
     },

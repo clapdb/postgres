@@ -26,10 +26,14 @@
   `scripts/branchdb-sync.sh` (below) for every change to one.
   `contrib/pagestore/release-branches.json` is the source of truth for which
   majors are currently supported and each one's status, base tag and synced
-  `pagestore` SHA; `branchdb_13`/`branchdb_14` are kept for reference at
-  their June 2026 LSM-foundation state, receive no syncs, and carry no
-  release evidence (see the file's `unsupported` list for the upstream EOL
-  dates driving that call).
+  `pagestore` SHA. It is **hand-maintained** (a PR to `pagestore` updates
+  it after a sync; `scripts/branchdb-sync.sh` only *reads* `base_tag`/
+  `contrib_sha` for `status`, it never writes them — and a branch's own
+  byte-identical `contrib/pagestore` copy cannot record its own commit SHA
+  from inside itself anyway). `branchdb_13`/`branchdb_14` are kept for
+  reference at their June 2026 LSM-foundation state, receive no syncs, and
+  carry no release evidence (see the file's `unsupported` list for the
+  upstream EOL dates driving that call).
 
 So the flow is: develop on `pagestore` (tracking upstream `REL_19_STABLE` by
 merge) → port the core patch series and sync `contrib/pagestore` onto each

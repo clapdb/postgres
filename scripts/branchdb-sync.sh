@@ -50,16 +50,19 @@
 #       Refuses if the result is not byte-identical to <SHA>'s contrib tree.
 #
 #   scripts/branchdb-sync.sh [--dry-run] verify <branch> <SHA>
-#       The checks a release-branch PR must pass: the branch's base is an
-#       upstream tag (not a moving branch head), zero merge commits above
-#       that base, contrib/pagestore is byte-identical to <SHA>, and every
-#       non-contrib commit above the base either carries a
-#       "Branchdb-Series:" trailer or has a ci:/docs:/fixtures: subject
-#       prefix. Add --require-build-match and a build directory
-#       (--build DIR) to additionally require that DIR's compiled fixture
-#       identities match a fixture recorded for <branch>'s major (a thin
-#       wrapper around pagestore_fixture.py --check --require-build-match;
-#       skipped unless --build is given).
+#       The checks a release-branch PR must pass: the branch's base is a
+#       REL_<v>_* upstream tag matching <branch>'s own major (not a moving
+#       branch head, and not some other tag that happens to sit there),
+#       zero merge commits above that base, contrib/pagestore is
+#       byte-identical to <SHA>, and every non-contrib commit above the
+#       base either carries a "Branchdb-Series:" trailer or has a
+#       ci:/docs:/fixtures: subject prefix. Add --require-build-match and a
+#       build directory (--build DIR) to additionally require that DIR's
+#       compiled fixture identities match a fixture recorded for
+#       <branch>'s major (a thin wrapper around pagestore_fixture.py
+#       --check --require-build-match; DIR itself must be a configured
+#       meson build directory for <branch>'s own major, checked against
+#       DIR/src/include/pg_config.h; skipped unless --build is given).
 #
 # --dry-run (any command, before the subcommand or after) prints the git
 # commands a mutating subcommand would run instead of running them; fetch,
@@ -74,7 +77,8 @@ set -euo pipefail
 SELF="$(basename "$0")"
 UPSTREAM=upstream
 DRY_RUN=0
-RELEASE_BRANCHES_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/contrib/pagestore/release-branches.json"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_BRANCHES_READER="$REPO_ROOT/contrib/pagestore/harness/pagestore_release_branches.py"
 
 usage() {
   # Print everything from the header comment block (between the shebang and
@@ -157,25 +161,15 @@ cmd_fetch() {
 # ---- status ------------------------------------------------------------------
 
 release_branches_field() {
-  # release_branches_field MAJOR FIELD -- best-effort JSON field lookup
-  # without a JSON library dependency (stdlib git only); tolerant of the
-  # field being null/absent.
+  # release_branches_field MAJOR FIELD -- looks up one field of MAJOR's
+  # release-branches.json entry via the reader module (not a hand-rolled
+  # JSON parse here: pagestore_release_branches.py is the one place that
+  # knows the manifest's schema and validates it before answering).
+  # Tolerant of the field being null/absent, or the reader being missing
+  # (this script has no hard dependency on the harness tree existing).
   local major=$1 field=$2
-  python3 - "$RELEASE_BRANCHES_JSON" "$major" "$field" <<'PY' 2>/dev/null || true
-import json, sys
-path, major, field = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-try:
-    with open(path, encoding="utf-8") as handle:
-        data = json.load(handle)
-except (OSError, ValueError):
-    sys.exit(0)
-for entry in data.get("supported", []) + data.get("unsupported", []):
-    if entry.get("major") == major:
-        value = entry.get(field)
-        if value is not None:
-            print(value)
-        break
-PY
+  [[ -f "$RELEASE_BRANCHES_READER" ]] || return 0
+  python3 "$RELEASE_BRANCHES_READER" --major "$major" --field "$field" 2>/dev/null || true
 }
 
 cmd_status() {
@@ -251,6 +245,7 @@ cmd_minor() {
 cmd_forward() {
   local from=${1:-} to=${2:-} tag=${3:-}
   [[ -n "$from" && -n "$to" ]] || die "usage: $SELF forward <FROM> <TO> [TAG]"
+  local from_arg=$from to_arg=$to
   # TO names the target major: a bare number (18), a branch (branchdb_18) or
   # a staging branch (branchdb_18-rc) are all accepted.
   local to_major
@@ -294,18 +289,24 @@ cmd_forward() {
   fi
   git rev-parse --verify --quiet "$tag" >/dev/null || die "unknown ref '$tag' (run '$SELF fetch'?)"
 
+  # Select only commits with a well-formed series trailer (exactly
+  # "Branchdb-Series: C1".."C7"), the same pattern `verify` holds commits
+  # to -- not merely a line starting with "Branchdb-Series:", which would
+  # also match a malformed or placeholder trailer.
   local -a series_commits=()
   while IFS= read -r sha; do
-    [[ -n "$sha" ]] && series_commits+=("$sha")
+    [[ -n "$sha" ]] || continue
+    git show -s --format=%B "$sha" | grep -qE '^Branchdb-Series: C[1-7]$' && series_commits+=("$sha")
   done < <(git log --reverse --format=%H --grep='^Branchdb-Series:' -E "$from_base..$from")
 
   if [[ ${#series_commits[@]} -eq 0 ]]; then
     cat >&2 <<EOF
-ERROR: no commit in $from_base..$from carries a "Branchdb-Series: C<n>" trailer;
-refusing to build $rc_branch from an unmarked range (that would either
-cherry-pick nothing or, worse, the raw unmarked history). The C1-C7 core
-series gets its trailers when it is squashed onto the target branch (V4
-plan, P2); run 'forward' again after that lands.
+ERROR: no commit in $from_base..$from carries a well-formed
+"Branchdb-Series: C1".."C7" trailer; refusing to build $rc_branch from an
+unmarked range (that would either cherry-pick nothing or, worse, the raw
+unmarked history). The C1-C7 core series gets its trailers when it is
+squashed onto the target branch (V4 plan, P2); run 'forward' again after
+that lands.
 EOF
     return 1
   fi
@@ -314,15 +315,50 @@ EOF
   for sha in "${series_commits[@]}"; do
     local trailer subject
     subject=$(git log -1 --format=%s "$sha")
-    trailer=$(git show -s --format=%B "$sha" | grep -m1 '^Branchdb-Series:' || echo "Branchdb-Series: ?")
+    trailer=$(git show -s --format=%B "$sha" | grep -m1 -E '^Branchdb-Series: C[1-7]$')
     printf '   %s  %-10s %s\n' "${sha:0:12}" "$trailer" "$subject"
   done
 
-  echo ">> building $rc_branch at $tag and cherry-picking the series above"
-  run git branch -f "$rc_branch" "$tag"
-  run git checkout "$rc_branch"
-  run git cherry-pick -x "${series_commits[@]}"
-  echo ">> done (or, on conflict, resolve and 'git cherry-pick --continue'). Next: '$SELF sync-contrib $rc_branch <pagestore SHA>'"
+  if git rev-parse --verify --quiet "$rc_branch" >/dev/null; then
+    # Resume onto the existing staging branch instead of force-resetting it
+    # back to $tag, which would silently discard any conflict resolutions
+    # already made on it. Skip commits already applied there (identified by
+    # the "-x" cherry-pick provenance trailer `cherry-pick` stamps).
+    echo ">> $rc_branch already exists; resuming onto it (not resetting to $tag)"
+    run git checkout "$rc_branch"
+    local applied
+    applied=$(git log --format=%B "$rc_branch")
+    local -a pending=()
+    for sha in "${series_commits[@]}"; do
+      grep -qF "(cherry picked from commit ${sha}" <<<"$applied" || pending+=("$sha")
+    done
+    series_commits=("${pending[@]}")
+    if [[ ${#series_commits[@]} -eq 0 ]]; then
+      echo ">> every core-series commit is already applied on $rc_branch; nothing to cherry-pick"
+      return 0
+    fi
+    echo ">> ${#series_commits[@]} commit(s) still to apply"
+  else
+    echo ">> building $rc_branch at $tag"
+    run git switch -C "$rc_branch" "$tag"
+  fi
+
+  if run git cherry-pick -x "${series_commits[@]}"; then
+    echo ">> done. Next: '$SELF sync-contrib $rc_branch <pagestore SHA>'"
+  else
+    # set -e would otherwise exit before this ever printed, leaving the
+    # operator with only git's own conflict output and no pointer back to
+    # this tool -- print the resume instructions unconditionally instead.
+    cat >&2 <<EOF
+>> cherry-pick stopped on a conflict on $rc_branch. Resolve it, then:
+     git add <resolved paths> && git cherry-pick --continue
+   Re-running '$SELF forward $from_arg $to_arg $tag' afterward resumes
+   from here: $rc_branch is not reset back to $tag, and commits already
+   applied (found by their "cherry picked from commit" -x trailer) are
+   skipped.
+EOF
+    return 1
+  fi
 }
 
 # ---- sync-contrib --------------------------------------------------------------
@@ -416,10 +452,15 @@ cmd_verify() {
 
   local failures=0
 
-  if git describe --tags --exact-match "$base" >/dev/null 2>&1; then
-    echo "ok   - base $(git describe --tags --exact-match "$base") is an upstream tag"
+  local base_tag
+  if base_tag=$(git describe --tags --exact-match "$base" 2>/dev/null) && \
+      [[ "$base_tag" =~ ^REL_${v}_ ]]; then
+    echo "ok   - base $base_tag is an upstream REL_${v}_* tag"
+  elif [[ -n "${base_tag:-}" ]]; then
+    echo "FAIL - base ${base:0:12} is tagged '$base_tag', which is not a REL_${v}_* tag (wrong major, or a non-release tag such as a pagestore-candidate-* tag reused as a base)"
+    failures=$((failures + 1))
   else
-    echo "FAIL - base ${base:0:12} is not pinned to an upstream tag (merge-base with $upref)"
+    echo "FAIL - base ${base:0:12} is not pinned to any tag (merge-base with $upref)"
     failures=$((failures + 1))
   fi
 
@@ -465,8 +506,23 @@ cmd_verify() {
     failures=$((failures + untrailered))
   fi
 
+  local build_was_given=$build
   if [[ -n "$build" ]]; then
-    local fixture_check="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/contrib/pagestore/harness/pagestore_fixture.py"
+    local build_major_line build_major
+    build_major_line=$(grep -m1 '^#define PG_MAJORVERSION_NUM' "$build/src/include/pg_config.h" 2>/dev/null || true)
+    build_major=${build_major_line##* }
+    if [[ -z "$build_major" ]]; then
+      echo "FAIL - --build $build has no src/include/pg_config.h (not a configured meson build directory?)"
+      failures=$((failures + 1))
+      build=""
+    elif [[ "$build_major" != "$v" ]]; then
+      echo "FAIL - --build $build is a PostgreSQL $build_major build, but $branch is major $v"
+      failures=$((failures + 1))
+      build=""
+    fi
+  fi
+  if [[ -n "$build" ]]; then
+    local fixture_check="$REPO_ROOT/contrib/pagestore/harness/pagestore_fixture.py"
     local -a fixtures=()
     while IFS= read -r -d '' dir; do
       fixtures+=("$dir")
@@ -499,7 +555,11 @@ cmd_verify() {
       fi
     fi
   elif [[ "$require_build_match" == "1" ]]; then
-    echo "FAIL - --require-build-match given without --build DIR"
+    if [[ -n "$build_was_given" ]]; then
+      echo "FAIL - --require-build-match cannot run: the given --build did not pass the major check above"
+    else
+      echo "FAIL - --require-build-match given without --build DIR"
+    fi
     failures=$((failures + 1))
   fi
 
