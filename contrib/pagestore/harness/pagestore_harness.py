@@ -1617,6 +1617,30 @@ def cleanup_temporary_root(
 
 def remove_shm(shm: str) -> None:
     """Release a POSIX shm object without relying on Linux's /dev/shm view."""
+    if sys.platform == "darwin":
+        # pagestore_shm.h backs the segment with a regular file; no POSIX shm
+        # object exists, so this must run before the shm_unlink early returns.
+        path = shm_backing_path(shm)
+        try:
+            directory = os.open(
+                path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+        except FileNotFoundError:
+            return
+        try:
+            info = os.fstat(directory)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) & 0o077):
+                raise PermissionError("shared-memory backing directory must be private and uid-owned")
+            # Anchor unlink to the verified directory, matching ps_shm_unlink.
+            # unlink does not follow a symlink in the final name.
+            try:
+                os.unlink(path.name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(directory)
+        return
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         unlink = libc.shm_unlink
@@ -1636,6 +1660,14 @@ def remove_shm(shm: str) -> None:
         pass
 
 
+def shm_backing_path(shm: str) -> Path:
+    """The macOS backing file for a shm name (see pagestore_shm.h)."""
+    name = shm.removeprefix("/").replace("/", "_")
+    if not name or name in {".", ".."} or len(os.fsencode(name)) >= 256:
+        raise ValueError("invalid shared-memory name")
+    return Path(f"/tmp/pagestore-shm-{os.getuid()}") / name
+
+
 def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
     """Signal the daemon and every helper it started in its private session."""
     try:
@@ -1653,6 +1685,7 @@ class ProcessIdentity:
     pidfd: int | None = None
     already_exited: bool = False
     status: str = "captured"
+    darwin_pidversion: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1675,8 +1708,73 @@ def require_signaled_process_stop(result: ProcessStopResult, target: str) -> Non
         )
 
 
+DARWIN_PROCESS_IDENTITY = sys.platform == "darwin"
+
+
+def darwin_libproc_function(name: str):
+    """Fail closed when this host lacks the required libproc interface."""
+    try:
+        return getattr(ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True), name)
+    except (OSError, AttributeError) as error:
+        raise PlanError(f"Darwin process identity API unavailable: {name}") from error
+
+
+def darwin_process_identity(pid: int) -> tuple[int, int] | None:
+    """Read start time and pidversion together from one kernel process reference.
+
+    XNU's PROC_PIDT_BSDINFOWITHUNIQID (18) returns proc_bsdinfo (136 bytes)
+    followed by proc_uniqidentifierinfo (56 bytes). The latter's pidversion
+    distinguishes reused PIDs and exec generations. These libproc interfaces
+    are private: reject unsupported flavors or unexpected structure sizes.
+    """
+    proc_pidinfo = darwin_libproc_function("proc_pidinfo")
+    proc_pidinfo.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(192)
+    copied = proc_pidinfo(pid, 18, 0, buffer, len(buffer))
+    if copied == 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return None
+        raise PlanError(
+            f"cannot read process identity for pid {pid}: {os.strerror(error)}"
+        )
+    if copied != len(buffer):
+        raise PlanError(f"short process identity for pid {pid}: {copied} bytes")
+    tvsec, tvusec = struct.unpack_from("=QQ", buffer.raw, 120)
+    pidversion = struct.unpack_from("=I", buffer.raw, 136 + 32)[0]
+    return tvsec * 1_000_000 + tvusec, pidversion
+
+
+def darwin_process_starttime(pid: int) -> int | None:
+    identity = darwin_process_identity(pid)
+    return None if identity is None else identity[0]
+
+
+def darwin_signal_identity(identity: ProcessIdentity) -> int:
+    """Send SIGQUIT to the captured generation, never to a bare PID.
+
+    proc_signal_with_audittoken validates token words 5 (pid) and 7
+    (pidversion) in the kernel and holds a process reference while signaling.
+    It returns an errno value directly, rather than -1 with errno set.
+    """
+    if identity.darwin_pidversion is None:
+        raise PlanError("cannot signal Darwin process without a captured pidversion")
+    send = darwin_libproc_function("proc_signal_with_audittoken")
+    send.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    send.restype = ctypes.c_int
+    token = (ctypes.c_uint32 * 8)()
+    token[5] = identity.pid
+    token[7] = identity.darwin_pidversion
+    return send(token, signal.SIGQUIT)
+
+
 def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | None:
     """Read Linux proc stat field 22, parsing comm through its final ')' safely."""
+    if DARWIN_PROCESS_IDENTITY and proc_root == Path("/proc"):
+        return darwin_process_starttime(pid)
     stat_path = proc_root / str(pid) / "stat"
     try:
         text = stat_path.read_text(encoding="utf-8")
@@ -1702,6 +1800,9 @@ def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | N
 
 def procfs_available(proc_root: Path = Path("/proc")) -> bool:
     """Return whether this host exposes a usable procfs process view."""
+    if DARWIN_PROCESS_IDENTITY and proc_root == Path("/proc"):
+        # libproc stands in for procfs as the process identity source.
+        return True
     try:
         (proc_root / "self" / "stat").read_text(encoding="utf-8")
     except PermissionError as error:
@@ -1736,6 +1837,13 @@ def capture_process_identity(pid: int) -> ProcessIdentity:
     """Capture a stable identity without ever reacquiring a replacement PID."""
     if pid <= 0:
         raise PlanError(f"invalid process pid: {pid}")
+    if DARWIN_PROCESS_IDENTITY:
+        darwin_libproc_function("proc_signal_with_audittoken")
+        captured = darwin_process_identity(pid)
+        if captured is None:
+            return ProcessIdentity(pid, None, already_exited=True, status="already_exited")
+        starttime, pidversion = captured
+        return ProcessIdentity(pid, starttime, darwin_pidversion=pidversion)
     # Always take the first observation before pidfd_open.  If the process
     # disappears during pidfd_open, do not read the PID again: that read could
     # describe a supervisor replacement rather than the old postmaster.
@@ -1838,6 +1946,19 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
         except OSError as error:
             raise PlanError(f"cannot signal pidfd for pid {identity.pid}: {error}") from error
 
+    if DARWIN_PROCESS_IDENTITY and identity.darwin_pidversion is not None:
+        error = darwin_signal_identity(identity)
+        if error == errno.ESRCH:
+            identity.already_exited = True
+            identity.status = "already_exited"
+        elif error:
+            raise PlanError(
+                f"cannot signal Darwin identity for pid {identity.pid}: {os.strerror(error)}"
+            )
+        else:
+            identity.status = "signaled"
+        return "proc_signal_with_audittoken", identity.status
+
     if identity.starttime is None:
         if not process_exists(identity.pid):
             identity.already_exited = True
@@ -1848,7 +1969,9 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
         )
     before = read_process_starttime(identity.pid)
     if before is None:
-        if process_exists(identity.pid):
+        # libproc stops describing a process once it exits, even before it is
+        # reaped, while kill(pid, 0) still succeeds on the zombie.
+        if not DARWIN_PROCESS_IDENTITY and process_exists(identity.pid):
             raise PlanError(
                 f"cannot verify live pid {identity.pid} before SIGQUIT"
             )
@@ -1879,9 +2002,15 @@ def wait_process_exit(identity: ProcessIdentity, timeout: float) -> str:
         raise HarnessTimeout(f"timed out waiting for pidfd of pid {identity.pid}")
 
     while time.monotonic() < deadline:
+        if DARWIN_PROCESS_IDENTITY and identity.darwin_pidversion is not None:
+            current_identity = darwin_process_identity(identity.pid)
+            if current_identity is None or current_identity[1] != identity.darwin_pidversion:
+                return "darwin_pidversion"
+            time.sleep(.05)
+            continue
         current = read_process_starttime(identity.pid)
         if current is None:
-            if not process_exists(identity.pid):
+            if DARWIN_PROCESS_IDENTITY or not process_exists(identity.pid):
                 return "proc_starttime"
             raise PlanError(
                 f"cannot verify pid {identity.pid} while waiting: /proc identity unavailable"

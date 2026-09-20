@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,11 @@ MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+# pidfd/procfs process identity is Linux-only; macOS uses libproc start times.
+LINUX_PROCESS_IDENTITY = unittest.skipUnless(
+    hasattr(os, "pidfd_open"), "pidfd process identity is Linux-only"
+)
 
 
 CAPABILITIES = {
@@ -46,6 +52,128 @@ CAPABILITIES = {
 
 
 class PlanValidationTests(unittest.TestCase):
+    def test_darwin_capture_uses_one_identity_snapshot(self):
+        with (
+            mock.patch.object(MODULE, "DARWIN_PROCESS_IDENTITY", True),
+            mock.patch.object(MODULE, "darwin_libproc_function"),
+            mock.patch.object(MODULE, "darwin_process_identity", return_value=(77, 9)) as read,
+            mock.patch.object(MODULE, "read_process_starttime") as starttime,
+        ):
+            identity = MODULE.capture_process_identity(123)
+        self.assertEqual((identity.starttime, identity.darwin_pidversion), (77, 9))
+        read.assert_called_once_with(123)
+        starttime.assert_not_called()
+
+    def test_darwin_signal_binds_captured_version_and_never_calls_kill(self):
+        for error, expected in ((0, "signaled"), (MODULE.errno.ESRCH, "already_exited"),
+                                (MODULE.errno.EPERM, None), (MODULE.errno.ENOSYS, None)):
+            with self.subTest(error=error):
+                identity = MODULE.ProcessIdentity(123, 77, darwin_pidversion=9)
+                send = mock.Mock(return_value=error)
+                with (
+                    mock.patch.object(MODULE, "DARWIN_PROCESS_IDENTITY", True),
+                    mock.patch.object(MODULE, "darwin_libproc_function", return_value=send),
+                    mock.patch.object(MODULE.os, "kill") as kill,
+                    mock.patch.object(MODULE, "read_process_starttime") as read,
+                ):
+                    if expected is None:
+                        with self.assertRaises(MODULE.PlanError):
+                            MODULE.send_process_sigquit(identity)
+                    else:
+                        self.assertEqual(MODULE.send_process_sigquit(identity),
+                                         ("proc_signal_with_audittoken", expected))
+                token, sig = send.call_args.args
+                self.assertEqual((token[5], token[7], sig), (123, 9, MODULE.signal.SIGQUIT))
+                kill.assert_not_called()
+                read.assert_not_called()
+
+    def test_darwin_missing_api_and_short_identity_fail_closed(self):
+        with mock.patch.object(MODULE.ctypes, "CDLL", side_effect=OSError("missing")):
+            with self.assertRaisesRegex(MODULE.PlanError, "API unavailable"):
+                MODULE.darwin_libproc_function("proc_signal_with_audittoken")
+        with mock.patch.object(MODULE.ctypes, "CDLL", return_value=object()):
+            with self.assertRaisesRegex(MODULE.PlanError, "API unavailable"):
+                MODULE.darwin_libproc_function("proc_signal_with_audittoken")
+        with mock.patch.object(MODULE, "darwin_libproc_function", return_value=mock.Mock(return_value=136)):
+            with self.assertRaisesRegex(MODULE.PlanError, "short process identity"):
+                MODULE.darwin_process_identity(123)
+
+    def test_darwin_wait_does_not_follow_replacement_generation(self):
+        identity = MODULE.ProcessIdentity(123, 77, darwin_pidversion=9)
+        with (
+            mock.patch.object(MODULE, "DARWIN_PROCESS_IDENTITY", True),
+            mock.patch.object(MODULE, "darwin_process_identity", return_value=(77, 10)),
+        ):
+            self.assertEqual(MODULE.wait_process_exit(identity, 1), "darwin_pidversion")
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires native Darwin libproc")
+    def test_darwin_kernel_rejects_stale_version_and_signals_captured_child(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            identity = MODULE.capture_process_identity(process.pid)
+            stale = MODULE.ProcessIdentity(
+                identity.pid, identity.starttime, darwin_pidversion=identity.darwin_pidversion ^ 1
+            )
+            self.assertEqual(MODULE.send_process_sigquit(stale),
+                             ("proc_signal_with_audittoken", "already_exited"))
+            self.assertIsNone(process.poll())
+            self.assertEqual(MODULE.send_process_sigquit(identity),
+                             ("proc_signal_with_audittoken", "signaled"))
+            self.assertEqual(process.wait(timeout=5), -MODULE.signal.SIGQUIT)
+            self.assertEqual(MODULE.darwin_signal_identity(identity), MODULE.errno.ESRCH)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_darwin_shm_cleanup_rejects_replaced_or_public_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            victim = private / "segment"
+            victim.write_text("keep")
+            link = root / "link"
+            link.symlink_to(private, target_is_directory=True)
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(MODULE, "shm_backing_path", return_value=link / "segment"),
+            ):
+                with self.assertRaises(OSError):
+                    MODULE.remove_shm("/segment")
+            self.assertTrue(victim.exists())
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(MODULE, "shm_backing_path", return_value=victim),
+            ):
+                private.chmod(0o777)
+                with self.assertRaises(PermissionError):
+                    MODULE.remove_shm("/segment")
+                self.assertTrue(victim.exists())
+                private.chmod(0o700)
+                MODULE.remove_shm("/segment")
+                self.assertFalse(victim.exists())
+                MODULE.remove_shm("/segment")  # Missing objects are harmless.
+
+    def test_darwin_shm_cleanup_rejects_foreign_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "segment"
+            path.write_text("keep")
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(MODULE, "shm_backing_path", return_value=path),
+                mock.patch.object(MODULE.os, "getuid", return_value=os.getuid() + 1),
+            ):
+                with self.assertRaises(PermissionError):
+                    MODULE.remove_shm("/segment")
+            self.assertTrue(path.exists())
+
+    def test_darwin_shm_names_cannot_escape_directory(self):
+        for name in ("", "/", ".", "..", "/..", "a" * 256):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                MODULE.shm_backing_path(name)
+        self.assertEqual(MODULE.shm_backing_path("/a/b").name, "a_b")
+
     def write_plan(self, records):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -145,6 +273,7 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.read_process_starttime(123, Path(temporary)), 4242
             )
 
+    @LINUX_PROCESS_IDENTITY
     def test_pidfd_signal_and_poll_are_identity_bound_and_closed(self):
         identity = MODULE.ProcessIdentity(123, 77, 41)
         poller = mock.Mock()
@@ -159,6 +288,7 @@ class PlanValidationTests(unittest.TestCase):
         send.assert_called_once_with(41, MODULE.signal.SIGQUIT, None, 0)
         poller.register.assert_called_once()
 
+    @LINUX_PROCESS_IDENTITY
     def test_capture_pidfd_esrch_is_already_exited_without_reacquiring_pid(self):
         with mock.patch.object(MODULE, "read_process_starttime", return_value=77) as read, \
                 mock.patch.object(MODULE.os, "pidfd_open", side_effect=ProcessLookupError):
@@ -167,6 +297,7 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(identity.status, "already_exited")
         read.assert_called_once_with(123)
 
+    @LINUX_PROCESS_IDENTITY
     def test_capture_procfs_absent_before_pidfd_is_already_exited(self):
         with mock.patch.object(MODULE, "read_process_starttime", return_value=None), \
                 mock.patch.object(MODULE, "procfs_available", return_value=True), \
@@ -180,6 +311,7 @@ class PlanValidationTests(unittest.TestCase):
         pidfd_open.assert_not_called()
         send.assert_not_called()
 
+    @LINUX_PROCESS_IDENTITY
     def test_procfs_unavailable_live_unverifiable_fails_safe_without_signal(self):
         with mock.patch.object(MODULE, "procfs_available", return_value=False), \
                 mock.patch.object(MODULE, "read_process_starttime", return_value=None), \
@@ -191,6 +323,7 @@ class PlanValidationTests(unittest.TestCase):
         pidfd_open.assert_not_called()
         send.assert_not_called()
 
+    @LINUX_PROCESS_IDENTITY
     def test_process_starttime_io_error_is_not_treated_as_exit(self):
         with mock.patch.object(
             MODULE.Path, "read_text", side_effect=OSError("I/O error")
@@ -198,6 +331,7 @@ class PlanValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.PlanError, "cannot read process identity"):
                 MODULE.read_process_starttime(123)
 
+    @LINUX_PROCESS_IDENTITY
     def test_capture_pidfd_replacement_is_already_exited_and_not_signaled(self):
         with mock.patch.object(
             MODULE, "read_process_starttime", side_effect=[77, 78]
@@ -224,6 +358,7 @@ class PlanValidationTests(unittest.TestCase):
             )
         kill.assert_not_called()
 
+    @LINUX_PROCESS_IDENTITY
     def test_pidfd_unavailable_live_capture_and_stop_fail_closed(self):
         with mock.patch.object(MODULE, "procfs_available", return_value=True), \
                 mock.patch.object(MODULE, "read_process_starttime", return_value=77), \
@@ -254,8 +389,10 @@ class PlanValidationTests(unittest.TestCase):
         try:
             result = MODULE.stop_process_immediately(process.pid, timeout=5)
             self.assertEqual(result.pid, process.pid)
-            self.assertEqual(result.signal_method, "pidfd_send_signal")
-            self.assertIn(result.wait_method, {"pidfd_poll", "proc_starttime"})
+            self.assertIn(
+                result.signal_method, {"pidfd_send_signal", "proc_signal_with_audittoken"}
+            )
+            self.assertIn(result.wait_method, {"pidfd_poll", "proc_starttime", "darwin_pidversion"})
             self.assertEqual(result.status, "signaled")
             self.assertIsNotNone(process.wait(timeout=1))
         finally:
@@ -1184,7 +1321,7 @@ class PlanValidationTests(unittest.TestCase):
         plan = MODULE.read_plan(ROOT / "scenarios" / "daemon_fault_recovery.jsonl")
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        root = Path(directory.name) / "failure"
+        root = Path(directory.name).resolve() / "failure"
 
         class FakeProcess:
             pid = 701
@@ -1236,7 +1373,7 @@ class PlanValidationTests(unittest.TestCase):
         plan = MODULE.read_plan(ROOT / "scenarios" / "image_layer_after_create.jsonl")
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        root = Path(directory.name) / "failure"
+        root = Path(directory.name).resolve() / "failure"
         health = {
             "protocol_version": 47, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,

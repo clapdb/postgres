@@ -397,6 +397,18 @@ fault-name, hit-count, operation-id)`.
 
 ### Fault implementation and crash semantics
 
+Whole-process SIGQUIT injection binds to the captured process identity.
+Linux uses a pidfd. Darwin captures start time and pidversion together with
+libproc's `PROC_PIDT_BSDINFOWITHUNIQID`, then sends through
+`proc_signal_with_audittoken`. The kernel validates the saved PID/version
+and holds a process reference while signaling; a reused PID or exec generation
+is treated as the old identity having exited. Waiting also checks that saved
+generation. Evidence records `proc_signal_with_audittoken` and
+`darwin_pidversion` as the signal and wait methods.
+These Darwin interfaces are private and detected at runtime: missing symbols,
+unsupported queries, unexpected structure sizes, and permission failures stop
+the scenario with an error. There is no fallback to an unbound `kill(pid)`.
+
 Fault points belong on state transitions, not arbitrary source lines.  Each
 registration documents owner, precondition, durability before the transition,
 state being changed, and recovery expectation:
