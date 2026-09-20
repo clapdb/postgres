@@ -2212,19 +2212,19 @@ ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
 		case T_RepackStmt:		/* REPACK (and its CLUSTER/VACUUM FULL legacy forms) */
 			deny = "REPACK";
 			break;
-#endif
+#else
 		/*
-		 * Before 19, REPACK does not exist (T_RepackStmt is a later
-		 * upstream unification of CLUSTER and VACUUM FULL, absent from
-		 * this build's nodetags.h) -- there is no case here for its 18
-		 * predecessor, T_ClusterStmt.  This switch is only a friendly,
-		 * early ERROR: any write-WAL utility that slips past it still hits
-		 * the wal_insert_restricted backstop below (xlog.c, C5) and PANICs
-		 * rather than executing, so the pinned-reader read-only guarantee
-		 * holds either way -- CLUSTER on 18 just gets the worse (PANIC)
-		 * failure mode instead of a clean ERROR here.  Left as a known gap
-		 * rather than inventing new deny-list design in this compat pass.
+		 * Before 19, CLUSTER is its own statement (T_ClusterStmt), not one
+		 * of RepackStmt's legacy forms -- deny it explicitly the same way
+		 * T_RepackStmt does on 19+.  VACUUM FULL needs no separate case
+		 * here: on 18 it is still a plain T_VacuumStmt (VACOPT_FULL is just
+		 * a flag on it), and the T_VacuumStmt case above already denies
+		 * VACUUM/ANALYZE unconditionally, FULL or not.
 		 */
+		case T_ClusterStmt:
+			deny = "CLUSTER";
+			break;
+#endif
 		case T_CopyStmt:
 			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
 				deny = "COPY FROM";
