@@ -71,7 +71,18 @@
 
 #include "access/htup_details.h"
 #include "access/commit_ts.h"
+/*
+ * access/multixact_internal.h was split out of access/multixact.h upstream
+ * in 19 (commit bb3b1c4f646); before that, the GetMultiXactInfo() prototype
+ * and the MultiXactOffset type this file needs are exposed directly by
+ * access/multixact.h.  On 19+, multixact_internal.h pulls in multixact.h
+ * itself, so a single guarded include covers both.
+ */
+#if PG_VERSION_NUM >= 190000
 #include "access/multixact_internal.h"
+#else
+#include "access/multixact.h"
+#endif
 #include "access/slru.h"
 #include "catalog/pg_control.h"
 #include "pagestore_artifact_format.h"
