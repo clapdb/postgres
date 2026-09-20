@@ -617,7 +617,11 @@ def deterministic_tar(store: Path, output: Path) -> list[str]:
 def extract(fixture: Path, store: Path) -> None:
     store.mkdir(parents=True)
     with tarfile.open(fixture / STORE_TAR, "r:gz") as tar:
-        tar.extractall(store, filter="data")
+        try:
+            tar.extractall(store, filter="data")
+        except TypeError:
+            # Python < 3.12 (no "filter" keyword); the fixtures are trusted.
+            tar.extractall(store)
 
 
 class Daemon:

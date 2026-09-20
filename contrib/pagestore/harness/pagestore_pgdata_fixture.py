@@ -92,7 +92,11 @@ def deterministic_tar(root: Path, output: Path) -> list[str]:
 def extract(fixture: Path, target: Path) -> None:
     target.mkdir(parents=True)
     with tarfile.open(fixture / ARTIFACTS_TAR, "r:gz") as tar:
-        tar.extractall(target, filter="data")
+        try:
+            tar.extractall(target, filter="data")
+        except TypeError:
+            # Python < 3.12 (no "filter" keyword); the fixtures are trusted.
+            tar.extractall(target)
 
 
 # ---- the identity each loader binds an artifact to ---------------------------

@@ -33,6 +33,7 @@ fi
 BIN=$(dirname "$PGCTL")
 ROOT=$(dirname "$BIN")
 export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
+export DYLD_LIBRARY_PATH="$ROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 # A loaded CI runner can take longer than pg_ctl's one-minute default to
 # reach a ready postmaster; a slow start is not a failed one.
 export PGCTLTIMEOUT=${PGCTLTIMEOUT:-180}
@@ -49,6 +50,39 @@ STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo	# private throwaway cluster for the wal-redo helper
 MAIN_SOCK=$(new_sockdir main)
 SHM=/psint_$$
+# The daemon's IPC segment as a filesystem path: Linux exposes POSIX shm under
+# /dev/shm; on macOS pagestore_shm.h backs it with a regular file instead.
+if [ "$(uname -s)" = Darwin ]; then
+	SHM_PATH="/tmp/pagestore-shm-$(id -u)/${SHM#/}"
+else
+	SHM_PATH="/dev/shm$SHM"
+fi
+remove_test_shm() {
+    # Reuse the harness's fd-relative cleanup and private-directory validation.
+    python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from pagestore_harness import remove_shm
+remove_shm(sys.argv[2])
+' "$SCRIPT_DIR/harness" "$SHM"
+}
+# GNU/BSD userland shims.
+if ! command -v md5sum >/dev/null 2>&1; then
+	md5sum() { if [ $# -eq 0 ]; then md5 -q; else md5 -q "$1"; fi; }
+fi
+if ! command -v sha256sum >/dev/null 2>&1; then
+	sha256sum() { shasum -a 256 "$@"; }
+fi
+file_size() { wc -c < "$1" | tr -d ' '; }
+sed_inplace() {
+	if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi
+}
+# Insert the branch-parent fields after the "timeline": 1 line of a manifest.
+add_branch_parent_fields() {  # $1=manifest $2=fork_lsn
+	awk -v lsn="$2" '{ print }
+		/"timeline": 1,/ { printf "  \"parent_timeline\": 0,\n  \"parent_incarnation\": 1,\n  \"fork_lsn\": \"%s\",\n", lsn }' \
+		"$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
 PORT=5432
 P="$BIN/psql -h $MAIN_SOCK -p $PORT -U postgres -tA"
 fail=0
@@ -68,7 +102,7 @@ assert() {  # $1=actual $2=expected $3=message
 # assertion (the reopen guard near the end, which must still print the
 # summary line on failure).
 daemon_shm_ready() {
-	local shm_path="/dev/shm$SHM"
+	local shm_path="$SHM_PATH"
 	local expected_magic=$((0x50414753))
 	local expected_version="$IPC_VERSION"
 	local expected_page_size=8192
@@ -84,7 +118,7 @@ daemon_shm_ready() {
 		fi
 		if [ -r "$shm_path" ]; then
 			read -r magic version page_size io_unit nchannels nshards < <(
-				od -An -tu4 -N24 -w24 "$shm_path" 2>/dev/null
+				od -An -tu4 -N24 "$shm_path" 2>/dev/null | tr -s ' \n' ' '
 			)
 			[ "$magic" = "$expected_magic" ] &&
 				[ "$version" = "$expected_version" ] &&
@@ -161,14 +195,14 @@ cleanup() {
 		"${ADVANCINGDATA:+$(dirname "$ADVANCINGDATA")}" \
 		"${BADREADER:+$(dirname "$BADREADER")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}" "$SOCKROOT"
-	rm -f "/dev/shm$SHM"
+	remove_test_shm || exit 1
 }
 trap cleanup EXIT
 
 mkdir -p "$TS"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
 wait_daemon_ready
@@ -301,7 +335,7 @@ seg=$(basename "$(ls "$DATA"/pg_wal/archive_status/*.done 2>/dev/null | head -1)
 out=$(mktemp)
 if [ -n "$seg" ] && "$BUILD/contrib/pagestore/pagestore_walrestore" \
 		--shm "$SHM" --timeline 0 --incarnation 1 --segsize 16777216 "$seg" "$out"; then
-	assert "$(stat -c %s "$out")" "16777216" "restored WAL segment $seg is a full standard segment"
+	assert "$(file_size "$out")" "16777216" "restored WAL segment $seg is a full standard segment"
 	# The payload's own identity gates the hand-off to recovery: the build's
 	# WAL page magic passes, a foreign one and a different segment size exit
 	# with a status above 125, which RestoreArchivedFile() treats as fatal
@@ -389,7 +423,7 @@ rm -f "$history_out"
 # exhaust the daemon's shared-memory mailboxes.
 missing_out=$(mktemp)
 walrestore_reuse_ok=1
-for _ in $(seq 1 160); do
+for ((iteration = 0; iteration < 160; iteration++)); do
 	rm -f "$missing_out"
 	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
 		--timeline 0 --incarnation 1 --segsize 16777216 FFFFFFFFFFFFFFFFFFFFFFFF \
@@ -413,7 +447,7 @@ wait_walidx_visible() {
 	local rel=$1
 	local count=0
 
-	for i in $(seq 1 200); do
+	for ((i = 1; i <= 200; i++)); do
 		count=$($P -c "SELECT pagestore_walidx_count('$rel', 0, 0);")
 		[ "${count:-0}" -gt 0 ] && return 0
 		sleep 0.1
@@ -429,7 +463,7 @@ $P -c "SELECT pg_switch_wal();" >/dev/null
 widx=0
 # Earlier sections intentionally leave about 50 MB of shipped WAL ahead of
 # this table.  Batched index publication must consume that backlog promptly.
-for i in $(seq 1 200); do
+for ((i = 1; i <= 200; i++)); do
 	widx=$($P -c "SELECT pagestore_walidx_count('widx', 0, 0);")
 	[ "${widx:-0}" -gt 0 ] && break
 	sleep 0.1
@@ -448,7 +482,7 @@ $P -c "CREATE TABLE widx_resume(id int) TABLESPACE ts;
        INSERT INTO widx_resume SELECT generate_series(1,1000);
        SELECT pg_switch_wal();" >/dev/null
 widx_resume=0
-for i in $(seq 1 200); do
+for ((i = 1; i <= 200; i++)); do
 	widx_resume=$($P -c "SELECT pagestore_walidx_count('widx_resume', 0, 0);")
 	[ "${widx_resume:-0}" -gt 0 ] && break
 	sleep 0.1
@@ -579,7 +613,7 @@ assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's
 # unlike a shared-daemon test where prior writes could push these into a layer.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach the engine before restarting the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 # Never flush: the crash-recovery rows must remain segment-log-only.
 "$DAEMON" --shm "$SHM" --store "$STORE" --flush-pages 100000000 \
 	>>"$DATA/daemon.log" 2>&1 &
@@ -591,7 +625,7 @@ $P -c "CREATE TABLE crash(id int, v text) TABLESPACE ts;
 crash_ck=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach before crashing the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null      # crash: no ps_core_close() -> memtable lost
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 # Restart and rebuild the index from the segment log.
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
@@ -1088,7 +1122,7 @@ mxlocker=$!
 # wait until A actually holds the ROW lock -- its xid lands in the tuple's xmax -- rather
 # than a fixed sleep (or a relation-level RowShareLock that is taken before the tuple lock),
 # so a slow host can't let B lock and commit the row alone
-for _ in $(seq 1 100); do
+for ((iteration = 0; iteration < 100; iteration++)); do
 	[ "$($P -c "SELECT (xmax <> '0'::xid)::int FROM mx WHERE id=1;" 2>/dev/null)" = "1" ] && break
 	sleep 0.1
 done
@@ -1644,7 +1678,7 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
 READER_SUBXID_SQL=$(mktemp)
 {
 	printf 'BEGIN; INSERT INTO reader_running VALUES (1);\n'
-	for _ in $(seq 1 20000); do
+	for ((iteration = 0; iteration < 20000; iteration++)); do
 		printf 'SAVEPOINT s; INSERT INTO reader_subxid VALUES (1); RELEASE SAVEPOINT s;\n'
 	done
 	printf "PREPARE TRANSACTION 'reader_running_at_r';\n"
@@ -1740,9 +1774,8 @@ assert "$([ "${readerSnapshotBlocks:-0}" -gt 1 ] && echo ok || echo no)" "ok" \
 # rewritten manifest cannot reuse another timeline's running-XID snapshot.
 BRANCHREADERPREP=$(mktemp -d)
 cp -a "$READERPREP/." "$BRANCHREADERPREP"
-sed -i 's/"timeline": 0/"timeline": 1/' "$BRANCHREADERPREP/pagestore_reader.manifest"
-sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"parent_incarnation\": 1,\\n  \"fork_lsn\": \"$bL\"," \
-	"$BRANCHREADERPREP/pagestore_reader.manifest"
+sed_inplace 's/"timeline": 0/"timeline": 1/' "$BRANCHREADERPREP/pagestore_reader.manifest"
+add_branch_parent_fields "$BRANCHREADERPREP/pagestore_reader.manifest" "$bL"
 # Retag the copied snapshot to timeline 1 and recompute its PostgreSQL CRC32C.
 # This produces a structurally valid branch-reader fixture, so the install must
 # reach (and be rejected by) the target branch-manifest identity check below.
@@ -2055,9 +2088,8 @@ BADREADER=
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
 BADREADER_SOCK=$(new_sockdir badreader)
-sed -i 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
-sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"parent_incarnation\": 1,\\n  \"fork_lsn\": \"$readerR\"," \
-	"$BADREADER/pagestore_reader.manifest"
+sed_inplace 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
+add_branch_parent_fields "$BADREADER/pagestore_reader.manifest" "$readerR"
 cat >> "$BADREADER/postgresql.conf" <<EOF
 pagestore.timeline = 1
 unix_socket_directories = '$BADREADER_SOCK'
@@ -2165,7 +2197,7 @@ assert "$($PR -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned r
 assert "$($PR -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"
 "$BIN/pg_ctl" -D "$READERDATA" -m fast -w stop >/dev/null
-sed -i 's/pagestore.advance_read_lsn = off/pagestore.advance_read_lsn = on/' \
+sed_inplace 's/pagestore.advance_read_lsn = off/pagestore.advance_read_lsn = on/' \
 	"$ADVANCINGDATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null
 readerAutoPublished=no
@@ -2223,7 +2255,7 @@ advancingRestore=$("$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$
 # that would collide on the data directory lock.
 advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1) || {
 	advancingReady=0
-	for _ in $(seq 60); do
+	for ((iteration = 0; iteration < 60; iteration++)); do
 		if "$BIN/pg_ctl" -D "$ADVANCINGDATA" status >/dev/null 2>&1 &&
 			$PR -c "SELECT 1;" >/dev/null 2>&1; then
 			advancingReady=1
@@ -2317,7 +2349,7 @@ assert "$?" "0" "database artifacts exist before DROP DATABASE"
 $P -v ON_ERROR_STOP=1 -c "DROP DATABASE reader_aux;" >/dev/null
 $P -v ON_ERROR_STOP=1 -c "CHECKPOINT;" >/dev/null
 artifact_dropped=0
-for _ in $(seq 1 60); do
+for ((iteration = 0; iteration < 60; iteration++)); do
 	if "$artifact_probe" --reader-artifacts "$SHM" "$artifact_db_oid" latest absent >/dev/null; then
 		artifact_dropped=1
 		break
@@ -2373,7 +2405,7 @@ assert "$(grep -c 'reason=storage failure' "$DATA/daemon.log" 2>/dev/null || tru
 [ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 [ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null	# clean shutdown: ps_core_close() runs
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
 if daemon_shm_ready; then

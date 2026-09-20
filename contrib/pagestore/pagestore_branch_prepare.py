@@ -59,13 +59,38 @@ def validate_authority_path(authority_dir: Path) -> os.stat_result:
         raise ConfigError(
             "retention_authority_dir must be owned by this user and mode 0700"
         )
-    component = authority_dir.parent
-    immediate = True
-    while True:
+    pending = [(authority_dir.parent, True)]
+    followed_links = 0
+    while pending:
+        component, immediate = pending.pop()
         component_stat = os.lstat(component)
+        if stat.S_ISLNK(component_stat.st_mode) and component_stat.st_uid == 0:
+            # Link ownership is insufficient: its source parent must also
+            # prevent replacement. Check both lexical and target ancestry,
+            # following one hop at a time so no intermediate link is hidden.
+            followed_links += 1
+            if followed_links > 8:
+                raise ConfigError(
+                    "retention_authority_dir ancestry follows too many symlinks"
+                )
+            target = Path(os.readlink(component))
+            if ".." in target.parts:
+                raise ConfigError(
+                    "retention_authority_dir ancestry symlink target must not contain '..'"
+                )
+            target = target if target.is_absolute() else component.parent / target
+            pending.append((target, immediate))
+            pending.append((component.parent, False))
+            continue
         if not stat.S_ISDIR(component_stat.st_mode):
             raise ConfigError(
                 "retention_authority_dir ancestry must contain only directories"
+            )
+        # A directory owner can replace its entries or chmod it regardless
+        # of group/world mode bits, even when the entry is root-owned.
+        if component_stat.st_uid not in {0, effective_uid}:
+            raise ConfigError(
+                "retention_authority_dir ancestry must be owned by root or this user"
             )
         writable = component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         sticky = component_stat.st_mode & stat.S_ISVTX
@@ -79,10 +104,8 @@ def validate_authority_path(authority_dir: Path) -> os.stat_result:
             raise ConfigError(
                 "retention_authority_dir ancestry contains a replaceable writable directory"
             )
-        if component.parent == component:
-            break
-        component = component.parent
-        immediate = False
+        if component.parent != component:
+            pending.append((component.parent, False))
     return authority_stat
 
 

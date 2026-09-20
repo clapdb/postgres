@@ -2,9 +2,11 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -29,6 +31,47 @@ class SupervisorTests(unittest.TestCase):
         self.data = self.root / "data"
         self.data.mkdir()
         (self.data / "PG_VERSION").write_text("19\n", encoding="utf-8")
+
+    def test_authority_symlink_checks_source_and_target_ancestry(self):
+        root = self.root.resolve()
+        source = root / "source"
+        source.mkdir(mode=0o700)
+        target = root / "target"
+        target.mkdir(mode=0o700)
+        authority = target / "authority"
+        authority.mkdir(mode=0o700)
+        link = source / "link"
+        link.symlink_to(target, target_is_directory=True)
+        original_lstat = os.lstat
+        foreign_source_owner = False
+
+        def root_owned_link(path):
+            info = original_lstat(path)
+            if Path(path) == link:
+                fields = list(info)
+                fields[4] = 0
+                return os.stat_result(fields)
+            if Path(path) == source and foreign_source_owner:
+                fields = list(info)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return info
+
+        # Emulate a root-created link without needing root privileges.
+        with mock.patch.object(MODULE.os, "lstat", side_effect=root_owned_link):
+            MODULE.validate_authority_path(link / "authority")
+            source.chmod(0o777)
+            with self.assertRaisesRegex(MODULE.ConfigError, "replaceable writable"):
+                MODULE.validate_authority_path(link / "authority")
+            source.chmod(0o700)
+            target.chmod(0o777)
+            with self.assertRaisesRegex(MODULE.ConfigError, "parent must"):
+                MODULE.validate_authority_path(link / "authority")
+            target.chmod(0o700)
+            source.chmod(0o755)
+            foreign_source_owner = True
+            with self.assertRaisesRegex(MODULE.ConfigError, "owned by root or this user"):
+                MODULE.validate_authority_path(link / "authority")
 
     def config_value(self, **overrides):
         value = {
