@@ -14085,6 +14085,11 @@ timeline_reset_reuse_runtime(uint32_t timeline)
 	ps_pgcache_invalidate_timeline(timeline);
 	wal_runtime_purge(timeline);
 	memset(page_prune_due[timeline], 0, sizeof(page_prune_due[timeline]));
+	/* L2: the reused incarnation starts with a clean "deletion blocked"
+	 * dedup history -- otherwise a torn-tail stall logged for incarnation N
+	 * could suppress the first log line for the same stall recurring on
+	 * incarnation N+1 if the tuple happens to coincide. */
+	timeline_cleanup_blocked_last_valid[timeline] = 0;
 	__atomic_store_n(&timeline_used[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_wal_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_page_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
@@ -14200,6 +14205,10 @@ timeline_delete_page_cleanup_one(void)
 			ps_lock_shard_wr(sh);
 		ps_lock_map_wr();
 		had_entries = page_cleanup_has_index_entries_locked(tl);
+		/* L1: a stale failure from a *different* timeline's earlier scan
+		 * must never be attributed to this timeline below -- reset before
+		 * the call so cleanup_last_failure_valid only survives this scan. */
+		cleanup_last_failure_valid = 0;
 		rc = page_cleanup_scan_timeline_locked(tl);
 		if (rc == 0 && __atomic_load_n(&fork_meta_deletion_cutover_done[tl],
 											__ATOMIC_ACQUIRE))
@@ -14576,6 +14585,11 @@ timeline_delete_publish_one(void)
 			/* The deleted branch's cap no longer fences its ancestors' page
 			 * and control history; revisit their layers (map-wr is held). */
 			page_prune_mark_all_due_locked();
+			/* L2: DELETED is the durable proof this incarnation is fully
+			 * gone; a reuse of this slot must not have its own "deletion
+			 * blocked" diagnostic suppressed by a stale tuple left behind
+			 * by this incarnation's stall history. */
+			timeline_cleanup_blocked_last_valid[tl] = 0;
 			did = 1;
 		}
 		ps_unlock_map();
