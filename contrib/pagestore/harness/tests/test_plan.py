@@ -52,6 +52,80 @@ CAPABILITIES = {
 
 
 class PlanValidationTests(unittest.TestCase):
+    def test_darwin_capture_uses_one_identity_snapshot(self):
+        with (
+            mock.patch.object(MODULE, "DARWIN_PROCESS_IDENTITY", True),
+            mock.patch.object(MODULE, "darwin_libproc_function"),
+            mock.patch.object(MODULE, "darwin_process_identity", return_value=(77, 9)) as read,
+            mock.patch.object(MODULE, "read_process_starttime") as starttime,
+        ):
+            identity = MODULE.capture_process_identity(123)
+        self.assertEqual((identity.starttime, identity.darwin_pidversion), (77, 9))
+        read.assert_called_once_with(123)
+        starttime.assert_not_called()
+
+    def test_darwin_signal_binds_captured_version_and_never_calls_kill(self):
+        for error, expected in ((0, "signaled"), (MODULE.errno.ESRCH, "already_exited"),
+                                (MODULE.errno.EPERM, None), (MODULE.errno.ENOSYS, None)):
+            with self.subTest(error=error):
+                identity = MODULE.ProcessIdentity(123, 77, darwin_pidversion=9)
+                send = mock.Mock(return_value=error)
+                with (
+                    mock.patch.object(MODULE, "DARWIN_PROCESS_IDENTITY", True),
+                    mock.patch.object(MODULE, "darwin_libproc_function", return_value=send),
+                    mock.patch.object(MODULE.os, "kill") as kill,
+                    mock.patch.object(MODULE, "read_process_starttime") as read,
+                ):
+                    if expected is None:
+                        with self.assertRaises(MODULE.PlanError):
+                            MODULE.send_process_sigquit(identity)
+                    else:
+                        self.assertEqual(MODULE.send_process_sigquit(identity),
+                                         ("proc_signal_with_audittoken", expected))
+                token, sig = send.call_args.args
+                self.assertEqual((token[5], token[7], sig), (123, 9, MODULE.signal.SIGQUIT))
+                kill.assert_not_called()
+                read.assert_not_called()
+
+    def test_darwin_missing_api_and_short_identity_fail_closed(self):
+        with mock.patch.object(MODULE.ctypes, "CDLL", side_effect=OSError("missing")):
+            with self.assertRaisesRegex(MODULE.PlanError, "API unavailable"):
+                MODULE.darwin_libproc_function("proc_signal_with_audittoken")
+        with mock.patch.object(MODULE.ctypes, "CDLL", return_value=object()):
+            with self.assertRaisesRegex(MODULE.PlanError, "API unavailable"):
+                MODULE.darwin_libproc_function("proc_signal_with_audittoken")
+        with mock.patch.object(MODULE, "darwin_libproc_function", return_value=mock.Mock(return_value=136)):
+            with self.assertRaisesRegex(MODULE.PlanError, "short process identity"):
+                MODULE.darwin_process_identity(123)
+
+    def test_darwin_wait_does_not_follow_replacement_generation(self):
+        identity = MODULE.ProcessIdentity(123, 77, darwin_pidversion=9)
+        with (
+            mock.patch.object(MODULE, "DARWIN_PROCESS_IDENTITY", True),
+            mock.patch.object(MODULE, "darwin_process_identity", return_value=(77, 10)),
+        ):
+            self.assertEqual(MODULE.wait_process_exit(identity, 1), "darwin_pidversion")
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires native Darwin libproc")
+    def test_darwin_kernel_rejects_stale_version_and_signals_captured_child(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            identity = MODULE.capture_process_identity(process.pid)
+            stale = MODULE.ProcessIdentity(
+                identity.pid, identity.starttime, darwin_pidversion=identity.darwin_pidversion ^ 1
+            )
+            self.assertEqual(MODULE.send_process_sigquit(stale),
+                             ("proc_signal_with_audittoken", "already_exited"))
+            self.assertIsNone(process.poll())
+            self.assertEqual(MODULE.send_process_sigquit(identity),
+                             ("proc_signal_with_audittoken", "signaled"))
+            self.assertEqual(process.wait(timeout=5), -MODULE.signal.SIGQUIT)
+            self.assertEqual(MODULE.darwin_signal_identity(identity), MODULE.errno.ESRCH)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
     def test_darwin_shm_cleanup_rejects_replaced_or_public_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -316,9 +390,9 @@ class PlanValidationTests(unittest.TestCase):
             result = MODULE.stop_process_immediately(process.pid, timeout=5)
             self.assertEqual(result.pid, process.pid)
             self.assertIn(
-                result.signal_method, {"pidfd_send_signal", "kill_starttime_verified"}
+                result.signal_method, {"pidfd_send_signal", "proc_signal_with_audittoken"}
             )
-            self.assertIn(result.wait_method, {"pidfd_poll", "proc_starttime"})
+            self.assertIn(result.wait_method, {"pidfd_poll", "proc_starttime", "darwin_pidversion"})
             self.assertEqual(result.status, "signaled")
             self.assertIsNotNone(process.wait(timeout=1))
         finally:
