@@ -54,6 +54,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 /* ===================== configuration ================================== */
 
@@ -416,7 +417,7 @@ fatal(const char *fmt, ...)
 	va_end(ap);
 	fputc('\n', stderr);
 	kill_daemon();
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 	if (!keep_store)
 		remove_tree(store_dir);
 	exit(2);
@@ -471,7 +472,7 @@ wait_ready(void)
 {
 	for (int i = 0; i < 3000; i++)	/* up to ~30s: recovery scans segments */
 	{
-		int			fd = shm_open(shm_name, O_RDWR, 0600);
+		int			fd = ps_shm_open(shm_name, O_RDWR, 0600);
 		int			status;
 		struct stat st;
 
@@ -515,7 +516,7 @@ client_attach(void)
 {
 	PsShmHeader *hdr;
 
-	cl_shm_fd = shm_open(shm_name, O_RDWR, 0600);
+	cl_shm_fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	if (cl_shm_fd < 0)
 		fatal("client shm_open: %s", strerror(errno));
 	cl_shm = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
@@ -579,14 +580,14 @@ stop_daemon_clean(void)
 			check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
 				  "daemon exits cleanly on SIGTERM (status %d)", status);
 			daemon_pid = -1;
-			shm_unlink(shm_name);
+			ps_shm_unlink(shm_name);
 			return;
 		}
 		sleep_ms(10);
 	}
 	check(0, "daemon stopped within 60s of SIGTERM");
 	kill_daemon();
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 }
 
 static void
@@ -594,7 +595,7 @@ stop_daemon_crash(void)
 {
 	client_detach();
 	kill_daemon();
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 }
 
 /* ===================== metrics ======================================== */
@@ -1007,7 +1008,7 @@ cl_exec(void)
 }
 
 static void
-setkey(PsChannel *ch, uint32_t tl, uint64_t incarnation, uint32_t rel)
+set_channel_key(PsChannel *ch, uint32_t tl, uint64_t incarnation, uint32_t rel)
 {
 	memset((void *) &ch->key, 0, sizeof(ch->key));
 	ch->key.spcOid = 1;
@@ -1052,7 +1053,7 @@ op_create(uint32_t tl, uint64_t inc, uint32_t rel, uint64_t lsn)
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_CREATE;
 	ch->req_lsn = lsn;
 	return cl_exec()->status;
@@ -1063,7 +1064,7 @@ op_unlink(uint32_t tl, uint64_t inc, uint32_t rel, uint64_t lsn)
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_UNLINK;
 	ch->req_lsn = lsn;
 	return cl_exec()->status;
@@ -1075,7 +1076,7 @@ op_truncate(uint32_t tl, uint64_t inc, uint32_t rel, uint32_t nblocks,
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->nblocks = nblocks;
 	ch->req_lsn = lsn;
@@ -1088,7 +1089,7 @@ op_zeroextend(uint32_t tl, uint64_t inc, uint32_t rel, uint32_t block,
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_ZEROEXTEND;
 	ch->blocknum = block;
 	ch->nblocks = nblocks;
@@ -1102,7 +1103,7 @@ op_writev(uint32_t tl, uint64_t inc, uint32_t rel, uint32_t block,
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_WRITEV;
 	ch->blocknum = block;
 	ch->nblocks = n;
@@ -1116,7 +1117,7 @@ op_readv(uint32_t tl, uint64_t inc, uint32_t rel, uint32_t block,
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = n;
@@ -1132,7 +1133,7 @@ op_read_at(uint32_t tl, uint64_t inc, uint32_t rel, uint32_t block,
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
@@ -1150,7 +1151,7 @@ op_nblocks(uint32_t tl, uint64_t inc, uint32_t rel, uint64_t lsn,
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_NBLOCKS;
 	ch->req_lsn = lsn;
 	ch->req_seq = seq;
@@ -1164,7 +1165,7 @@ op_exists(uint32_t tl, uint64_t inc, uint32_t rel, uint64_t lsn, int *exists)
 {
 	PsChannel  *ch = chan();
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	ch->opcode = PS_OP_EXISTS;
 	ch->req_lsn = lsn;
 	cl_exec();
@@ -1194,7 +1195,7 @@ op_walidx_add_batch(uint32_t tl, uint64_t inc, uint32_t rel,
 	PsChannel  *ch = chan();
 	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
 
-	setkey(ch, tl, inc, rel);
+	set_channel_key(ch, tl, inc, rel);
 	for (uint32_t i = 0; i < n; i++)
 	{
 		entries[i].key = ch->key;
@@ -2121,7 +2122,7 @@ main(int argc, char **argv)
 	snprintf(shm_name, sizeof(shm_name), "/pssoak_%d", (int) getpid());
 	snprintf(store_dir, sizeof(store_dir), "%s/pagestore-soak-%d", base,
 			 (int) getpid());
-	shm_unlink(shm_name);
+	ps_shm_unlink(shm_name);
 	remove_tree(store_dir);
 	if (mkdir(store_dir, 0700) != 0)
 		fatal("mkdir %s: %s", store_dir, strerror(errno));

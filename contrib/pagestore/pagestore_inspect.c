@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 static void
 usage(const char *prog)
@@ -794,7 +795,7 @@ main(int argc, char **argv)
 		usage(argv[0]);
 		return 2;
 	}
-	fd = shm_open(shm_name, relation_operation ? O_RDWR : O_RDONLY, 0);
+	fd = ps_shm_open(shm_name, relation_operation ? O_RDWR : O_RDONLY, 0);
 	if (fd < 0)
 	{
 		perror("pagestore_inspect: shm_open");

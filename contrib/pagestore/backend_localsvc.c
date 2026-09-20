@@ -43,6 +43,7 @@
 #include "pagestore_backend.h"
 #include "tcop/utility.h"
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
@@ -179,7 +180,7 @@ ls_attach(void)
 	if (ls_shm != NULL)
 		return;
 
-	fd = shm_open(localsvc_shm_name, O_RDWR, 0600);
+	fd = ps_shm_open(localsvc_shm_name, O_RDWR, 0600);
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
