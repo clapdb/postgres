@@ -974,6 +974,449 @@ test_reclaimed_ordered_markers_pruned(void)
 	compact_layers = 0;
 }
 
+/*
+ * Design B: the in-memory event array is bounded per daemon lifetime, not
+ * just per restart.  Same fixture shape as test_reclaimed_ordered_markers_pruned()
+ * above (a growth marker that gets activated, 11 later inert commit markers
+ * on the same block, then a reclaiming cutover), but this test checks the
+ * IN-MEMORY counts (ps_test_fork_event_count()) instead of only the durable
+ * snapshot.  Before this PR's fork_event_compact_dropped_markers(), the
+ * in-memory ninert stays 11 forever in this process (the array only shrinks
+ * on the next restart, per the old "keep the in-memory chain conservative"
+ * comment) -- so the post-cutover assertion below is the fail-before/
+ * pass-after case for this task.
+ */
+static void
+test_inert_markers_compacted_after_cutover(void)
+{
+	char store[] = "/tmp/psforkmetamarkercompactXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 7, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	uint32_t nevents_before = 0,
+				nmarkers_before = 0,
+				ninert_before = 0;
+	uint32_t nevents_after = 0,
+				nmarkers_after = 0,
+				ninert_after = 0;
+	uint32_t nevents_reopen = 0,
+				nmarkers_reopen = 0,
+				ninert_reopen = 0;
+	int markers;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create inert-marker compaction store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build compaction snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build compaction manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build compaction frontier path");
+	flush_pages = 1;
+	compact_layers = 2;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
+		  "open compaction fixture and create fork");
+	check(append_relation_tag(&key, 0, 50, page, 0x40, &seq) == 0,
+		  "write initial ordered growth before compaction restart");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40,
+		  "restart with activated marker-growth as sole durable size event");
+	for (int i = 1; i < 12; i++)
+		check(append_relation_tag(&key, 0, 50, page,
+								  (unsigned char) (0x40 + i), &seq) == 0,
+			  "write later ordered COMMIT for the same block");
+	check(ps_test_fork_event_count(0, &key, &nevents_before, &nmarkers_before,
+									&ninert_before) &&
+		  nevents_before == 13 && nmarkers_before == 12 &&
+		  ninert_before == 11,
+		  "the CREATE's SET plus 12 live writes (1 activated GROW, 11 inert "
+		  "commit markers) sit in memory pre-cutover");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 88;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = seq;
+	check(seq != 0 && ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "compact and durably reclaim old ordered page identities");
+	check(append_growth_batch(2300, 600) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "snapshot after ordered page-version reclamation");
+	markers = snapshot_ordered_marker_count(snapshots, &key, 0, 0);
+	check(markers > 0 && markers < 11 && snapshot_has_plain_grow(snapshots, &key),
+		  "reclaimed growth marker becomes retained ordinary GROW while markers bound");
+	check(ps_test_fork_event_count(0, &key, &nevents_after, &nmarkers_after,
+									&ninert_after) &&
+		  ninert_after == (uint32_t) markers &&
+		  ninert_after < ninert_before &&
+		  nevents_after < nevents_before,
+		  "post-cutover compaction drops exactly the durable snapshot's dropped "
+		  "inert markers from memory (fail-before: ninert stayed 11 here)");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x4b,
+		  "bounded ordered-marker snapshot restarts with latest page intact");
+	/*
+	 * nmarkers is not compared here: it counts marker_kind != 0, which the
+	 * activated GROW keeps set (the durable ordered identity survives
+	 * activation, on purpose -- see the ForkEvent.marker_kind comment) for
+	 * as long as this daemon lifetime runs, but the checkpoint record for an
+	 * activated GROW is an ordinary plain-GROW record (snapshot_has_plain_grow()
+	 * above already established this), which the loader reconstructs with
+	 * marker_kind == 0.  That asymmetry is pre-existing snapshot-builder
+	 * behavior, not something design B's compaction touches; nevents and
+	 * ninert are the counts the F5 in-memory/recovery equivalence is about,
+	 * and both must match exactly.
+	 */
+	check(ps_test_fork_event_count(0, &key, &nevents_reopen, &nmarkers_reopen,
+									&ninert_reopen) &&
+		  nevents_reopen == nevents_after && ninert_reopen == ninert_after,
+		  "recovery equivalence: reopen's in-memory nevents/ninert match the "
+		  "compacted in-memory counts from before the restart");
+	close_runtime();
+	remove_tree(store);
+	compact_layers = 0;
+}
+
+/*
+ * Companion case: when no page version has been reclaimed, the builder
+ * retains every ordered marker (fork_meta_snapshot_marker_page_retained()
+ * is true for all of them), so fork_event_compact_dropped_markers() has
+ * nothing flagged to drop.  In-memory counts must be unchanged by the
+ * cutover.
+ */
+static void
+test_inert_markers_kept_when_retained(void)
+{
+	char store[] = "/tmp/psforkmetamarkerretainXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 8, 0, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 21, 1, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t first_seq = 0,
+				second_seq = 0,
+				seq = 0;
+	uint32_t nevents_before = 0,
+				nmarkers_before = 0,
+				ninert_before = 0;
+	uint32_t nevents_after = 0,
+				nmarkers_after = 0,
+				ninert_after = 0;
+	PsRetentionPin pin;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create inert-marker retention store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build retention snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build retention manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build retention frontier path");
+	flush_pages = 1;
+	compact_layers = 0;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "open retention fixture and write a pinned page to prove a cutoff");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 89;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "publish a provable frontier without compacting any layer "
+		  "(compact_layers == 0, so no page version is reclaimed)");
+	check(meta_request(PS_OP_CREATE, &key, 300, 0, 0, 0, NULL),
+		  "create the fork under test above the published frontier");
+	for (int i = 0; i < 12; i++)
+		check(append_relation_tag(&key, 0, 50, page, (unsigned char) i, &seq) == 0,
+			  "write ordered growth then later ordered COMMITs for the same block");
+	check(ps_test_fork_event_count(0, &key, &nevents_before, &nmarkers_before,
+									&ninert_before) &&
+		  ninert_before == 11,
+		  "12 live writes leave 11 inert commit markers before cutover");
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "cutover with page versions unreclaimed");
+	/*
+	 * All 12 markers are retained durably, including the activated growth
+	 * marker: fork_meta_snapshot_marker_page_retained() is true for its own
+	 * (lsn, admission_seq, nblocks) too, since no page version was
+	 * reclaimed, so the per-entry loop takes the marker_kind branch for it
+	 * as well instead of falling through to the plain-GROW branch (compare
+	 * test_inert_markers_compacted_after_cutover() above, where reclaiming
+	 * flips exactly that one event to a plain GROW).
+	 */
+	check(snapshot_ordered_marker_count(snapshots, &key, 0, 0) == 12,
+		  "every marker is retained durably (no version was reclaimed)");
+	check(ps_test_fork_event_count(0, &key, &nevents_after, &nmarkers_after,
+									&ninert_after) &&
+		  nevents_after == nevents_before && nmarkers_after == nmarkers_before &&
+		  ninert_after == ninert_before,
+		  "every marker is retained (page versions unreclaimed): compaction "
+		  "is a no-op");
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
+ * preserve_survivors == 1 (a deletion-forced generation with no operational
+ * cutoff it can prove): every record is emitted for every surviving fork, so
+ * nothing is ever flagged, and compaction must be a no-op even though a
+ * cutover happened.  The root timeline (0) fork below deliberately never
+ * gets a published page-prune frontier, so fork_meta_snapshot_cutoff()
+ * cannot prove an operational cutoff (fork_meta_entry_exempt() only exempts
+ * a non-root branch); deleting timeline 1 (with its own fork events) makes
+ * the cutover forced.
+ */
+static void
+test_inert_markers_kept_on_preserve_survivors(void)
+{
+	char store[] = "/tmp/psforkmetamarkerpreserveXXXXXX";
+	char manifest[1200];
+	PsKey key = {6, 6, 9, 0, PS_KLASS_RELATION};
+	PsKey del_key = {6, 6, 10, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t seq = 0,
+				del_seq = 0;
+	uint32_t nevents_before = 0,
+				nmarkers_before = 0,
+				ninert_before = 0;
+	uint32_t nevents_after = 0,
+				nmarkers_after = 0,
+				ninert_after = 0;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create preserve-survivors compaction store");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_snapshots/forkmeta_manifest_v1",
+				 store);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build preserve-survivors manifest path");
+	flush_pages = 1;
+	compact_layers = 0;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
+		  "open preserve-survivors fixture and create the root-timeline fork");
+	for (int i = 0; i < 6; i++)
+		check(append_relation_tag(&key, 0, 50, page, (unsigned char) i, &seq) == 0,
+			  "write ordered growth then later ordered COMMITs, no frontier published");
+	check(ps_test_fork_event_count(0, &key, &nevents_before, &nmarkers_before,
+									&ninert_before) &&
+		  ninert_before == 5,
+		  "6 live writes leave 5 inert commit markers before the forced cutover");
+	check(create_branch_request(1, 0, 1) &&
+		  meta_request_timeline(1, PS_OP_CREATE, &del_key, 100, 0, 0, 0, NULL) &&
+		  append_relation_timeline(1, &del_key, 0, 0, page, &del_seq) == 0,
+		  "create a second timeline with its own fork event to force deletion");
+	check(begin_delete_timeline(1),
+		  "begin deleting the second timeline");
+	check(run_maintenance_until(manifest, 1),
+		  "deletion-forced cutover publishes without a provable operational cutoff");
+	check(ps_test_fork_event_count(0, &key, &nevents_after, &nmarkers_after,
+									&ninert_after) &&
+		  nevents_after == nevents_before && nmarkers_after == nmarkers_before &&
+		  ninert_after == ninert_before,
+		  "preserve_survivors retains every record: compaction is a no-op");
+	close_runtime();
+	remove_tree(store);
+}
+
+/* Defined below, near the other two-cutover tests it was written for; also
+ * used by the periodic-cutover scaling test just above its definition. */
+static int generation_advances_past(const char *directory, uint64_t generation);
+
+/*
+ * Scaling assertion (design B): repeated rewrite/cutover PERIODS must keep
+ * the in-memory array bounded, not growing with the total number of writes
+ * across every period.
+ *
+ * The fork is created once, far above every round's retention pin (floor
+ * 100000 vs pin lsn 100000 itself -- see below), and never truncated: every
+ * round's PER_ROUND WAL-less rewrites of the same block therefore clamp to
+ * the SAME fixed floor for the whole test (test_reclaimed_ordered_markers_pruned()'s
+ * clamped-write shape above), so `existed_before` in the admission check
+ * stays false and every one of them keeps generating an inert commit
+ * marker, round after round -- not just in round 0.  (A floor that
+ * advances between rounds, e.g. via a same-size PS_OP_TRUNCATE, makes the
+ * block "already visible" as of the new floor for every write after the
+ * first in that round, which silences the ordered/marker path entirely --
+ * a dead end this test steered around, not a design B concern.)  Each
+ * round's retention pin targets that SAME floor lsn (where the versions
+ * actually are) with an advancing admission_seq (a higher generation
+ * supersedes its own earlier pin, test_inert_markers_compacted_after_cutover()'s
+ * reclaim recipe), so every earlier round's versions become reclaimable;
+ * the pin's lsn equals the fork's floor, so the operational cutoff it
+ * establishes never exceeds the floor and a fresh admission_seq is always
+ * future at equal lsn, so later rounds' writes are never refused
+ * (PS_APPEND_REFUSED_FORKMETA_CUTOFF).  Before
+ * fork_event_compact_dropped_markers() existed, nothing ever dropped the
+ * earlier rounds' now-durably-dropped inert markers from memory, so
+ * nevents would grow by roughly PER_ROUND on every round; this is the
+ * fail-before case for this task (see the PR description for the measured
+ * before/after numbers).
+ */
+static void
+test_fork_event_index_periodic_cutover_bounded(void)
+{
+	char store[] = "/tmp/psforkmetaperiodicboundXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 11, 0, PS_KLASS_RELATION};
+	const uint64_t FLOOR = 100000;
+	const uint32_t ROUNDS = 6;
+	const uint32_t PER_ROUND = 30;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	uint32_t max_nevents = 0;
+	uint32_t first_nevents = 0;
+	TestSnapshotHeader hdr;
+	int have_hdr = 0;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create periodic-cutover bound store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots), "build periodic snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest), "build periodic manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier), "build periodic frontier path");
+	flush_pages = 1;
+	compact_layers = 2;
+	/*
+	 * An earlier test in this binary (test_deletion_filtered_forkmeta_commit_shape())
+	 * leaves segment_gc_enabled/cache_pages/segment_size at non-default
+	 * values for the rest of the process; restore the defaults this test
+	 * was designed and repro'd against.
+	 */
+	segment_gc_enabled = 1;
+	cache_pages = 1024;
+	segment_size = 8 * 1024 * 1024;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, FLOOR, 0, 0, 0, NULL),
+		  "open periodic-cutover store and create fork at the fixed floor");
+
+	for (uint32_t round = 0; round < ROUNDS; round++)
+	{
+		PsRetentionPin pin;
+		uint32_t nevents = 0,
+					nmarkers = 0,
+					ninert = 0;
+
+		for (uint32_t i = 0; i < PER_ROUND; i++)
+			check(append_relation_tag(&key, 0, 50, page,
+									  (unsigned char) (round * PER_ROUND + i),
+									  &seq) == 0,
+				  "periodic-cutover round write");
+		memset(&pin, 0, sizeof(pin));
+		pin.timeline = 0;
+		pin.owner_kind = 1;
+		pin.owner_id = 90;
+		pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+		pin.generation = round + 1;
+		pin.lsn = FLOOR;
+		pin.admission_seq = seq;
+		check(seq != 0 && ps_retention_set(&pin) == PS_RETENTION_OK,
+			  "advance this round's retention pin past every write so far");
+		/*
+		 * The frontier FILE only needs to exist once (round 0 creates it);
+		 * from round 1 on, wait for content by giving the page-pruning
+		 * maintenance class many ticks so THIS round's reclaim actually
+		 * runs before the cutover below measures its effect.
+		 */
+		if (round == 0)
+			check(run_maintenance_until(frontier, 1),
+				  "publish the first frontier and reclaim this round's versions");
+		else
+			for (int tick = 0; tick < 60; tick++)
+			{
+				(void) ps_core_maintenance();
+				usleep(50000);
+			}
+		/*
+		 * The snapshot trigger stays high while each round's writes land
+		 * and its reclaim runs (matching every other reclaim test in this
+		 * file); only lowering it right before forcing the cutover avoids
+		 * a premature cutover racing the reclaim pass mid-round.  The
+		 * churn batch's own floor also stays above FLOOR, for the same
+		 * admission reason as the fork under test.
+		 */
+		check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+			  append_growth_batch(2500 + round * 20, FLOOR + 500 + round * 20),
+			  "periodic-cutover round churn to cross the byte trigger");
+		if (!have_hdr)
+		{
+			check(run_maintenance_until(manifest, 1),
+				  "first periodic cutover publishes");
+			have_hdr = read_selected_header(snapshots, &hdr) == 0;
+			check(have_hdr, "read first periodic cutover's header");
+		}
+		else
+		{
+			uint64_t before_generation = hdr.generation;
+
+			check(generation_advances_past(snapshots, before_generation),
+				  "later periodic cutover publishes a new generation");
+			check(read_selected_header(snapshots, &hdr) == 0,
+				  "read this round's cutover header");
+		}
+		check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0,
+			  "raise the trigger back before the next round's writes");
+		check(ps_test_fork_event_count(0, &key, &nevents, &nmarkers, &ninert),
+			  "read in-memory counts after this round's cutover");
+		if (round == 0)
+			first_nevents = nevents;
+		if (nevents > max_nevents)
+			max_nevents = nevents;
+	}
+
+	/*
+	 * Bounded by roughly what round 0 alone left behind, not by
+	 * ROUNDS * PER_ROUND: the fail-before number for this fixture is
+	 * reported in the PR description (measured against this same test with
+	 * fork_event_compact_dropped_markers() reverted).
+	 */
+	check(max_nevents <= first_nevents + PER_ROUND,
+		  "the in-memory array stays bounded across repeated cutovers, not "
+		  "growing with the total writes over every round (fail-before: it "
+		  "grew toward ROUNDS * PER_ROUND here)");
+
+	close_runtime();
+	remove_tree(store);
+	compact_layers = 0;
+}
+
 static void
 test_legacy_only_deletion_filtered_forkmeta(void)
 {
@@ -4795,6 +5238,10 @@ main(void)
 	test_deletion_filtered_forkmeta();
 	test_deletion_filtered_forkmeta_commit_shape();
 	test_reclaimed_ordered_markers_pruned();
+	test_inert_markers_compacted_after_cutover();
+	test_inert_markers_kept_when_retained();
+	test_inert_markers_kept_on_preserve_survivors();
+	test_fork_event_index_periodic_cutover_bounded();
 	test_v1_bound_marker_snapshot();
 	test_no_manifest_marker_only_rejected();
 	test_live_ordered_marker_survives_two_cutovers();
