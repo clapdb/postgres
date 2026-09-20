@@ -1,0 +1,348 @@
+/*-------------------------------------------------------------------------
+ *
+ * pagestore_backend.h
+ *	  Version-neutral storage backend interface ("the lib boundary").
+ *
+ * This header is the encapsulation boundary between the per-version smgr shim
+ * (pagestore.c) and the actual storage implementation.  The shim translates
+ * PostgreSQL's version-specific smgr calls into the version-neutral operations
+ * declared here; a backend implements them by talking to whatever actually
+ * stores the data -- a distributed page service, a local SPDK device, a local
+ * daemon, or (for now) the built-in magnetic disk manager.
+ *
+ * Everything a backend needs to identify a page is expressed in
+ * version-neutral terms (PageStoreRelKey + fork + block).  The only
+ * PG-coupled value that crosses the boundary is the opaque "localreln"
+ * cookie, which carries the SMgrRelation through for the passthrough backend
+ * only; real (remote/SPDK) backends must ignore it and rely on the key.
+ *
+ * src/../contrib/pagestore/pagestore_backend.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef PAGESTORE_BACKEND_H
+#define PAGESTORE_BACKEND_H
+
+#include "access/xlogdefs.h"
+#include "common/relpath.h"
+#include "storage/block.h"
+#include "storage/relfilelocator.h"
+#include "storage/smgr.h"
+
+#include "pagestore_ipc.h"		/* PsWalRec */
+
+/*
+ * Version-neutral physical identity of a relation fork.  Deliberately built
+ * from plain OIDs / numbers rather than RelFileLocator so the on-the-wire
+ * identity does not change when PostgreSQL reshuffles its internal structs
+ * between major versions.
+ */
+typedef struct PageStoreRelKey
+{
+	Oid			spcOid;			/* tablespace */
+	Oid			dbOid;			/* database */
+	RelFileNumber relNumber;	/* relation filenode */
+	int32		forkNum;		/* ForkNumber, widened for stability */
+} PageStoreRelKey;
+
+typedef struct PageStoreWalIndexEntry
+{
+	PageStoreRelKey key;
+	BlockNumber block;
+	uint32		flags;			/* PS_WAL_INDEX_FLAG_* */
+	uint64		lsn;
+	uint64		end_lsn;		/* decoded WAL record EndRecPtr */
+} PageStoreWalIndexEntry;
+
+/*
+ * A storage backend.  All ops are page-granular (BLCKSZ buffers) and keyed by
+ * version-neutral identity.  "localreln" is the originating SMgrRelation,
+ * passed opaquely for the passthrough backend; remote backends ignore it.
+ *
+ * For M0 the interface is synchronous; later milestones add async
+ * submit/complete variants (for SPDK polling and PG's AIO) alongside these.
+ */
+typedef struct PageStoreBackend
+{
+	const char *name;
+
+	/*
+	 * If true, this backend stores data in local files managed by md.c, so the
+	 * shim may delegate local-only concerns (prefetch, writeback,
+	 * registersync, fd, async startreadv) straight to md.  Remote backends set
+	 * this false; the shim then handles those itself.
+	 */
+	bool		uses_local_files;
+
+	/*
+	 * Upper bound (in pages) on how many blocks the buffer manager may combine
+	 * into a single readv/writev for this backend.  0 means "use md's default"
+	 * (segment-boundary based).  Remote backends use this to keep an I/O
+	 * within their transfer buffer.
+	 */
+	uint32		max_combine_pages;
+
+	/* one-time per-backend initialization (may be NULL) */
+	void		(*init) (void);
+
+	/* --- fork lifecycle / metadata --- */
+
+	/* create the fork (make it exist with zero blocks) */
+	void		(*create) (const PageStoreRelKey *key, void *localreln,
+						 bool isRedo, bool isRedoEnsure);
+	/* does the fork exist? */
+	bool		(*fork_exists) (const PageStoreRelKey *key, void *localreln);
+	/* remove the fork entirely */
+	void		(*unlink) (const PageStoreRelKey *key, bool isRedo);
+	/* current size of the fork, in blocks */
+	BlockNumber (*nblocks) (const PageStoreRelKey *key, void *localreln);
+	/* shrink the fork from old_blocks down to nblocks blocks */
+	void		(*truncate) (const PageStoreRelKey *key, void *localreln,
+							 BlockNumber old_blocks, BlockNumber nblocks);
+
+	/* --- data plane (vectored: nblocks contiguous BLCKSZ buffers) --- */
+
+	/* read nblocks pages starting at blocknum into buffers[] */
+	void		(*readv) (const PageStoreRelKey *key, void *localreln,
+						  BlockNumber blocknum, void **buffers, BlockNumber nblocks);
+	/* overwrite nblocks existing pages starting at blocknum from buffers[] */
+	void		(*writev) (const PageStoreRelKey *key, void *localreln,
+						   BlockNumber blocknum, const void **buffers,
+						   BlockNumber nblocks, bool skipFsync);
+	/* grow the fork by one block at blocknum, written from buffer */
+	void		(*extend) (const PageStoreRelKey *key, void *localreln,
+						   BlockNumber blocknum, const void *buffer, bool skipFsync);
+	/*
+	 * Grow the fork by nblocks *zero-filled* blocks starting at blocknum,
+	 * without supplying page contents.  This is the bulk pre-allocation
+	 * counterpart to extend(): the engine uses it to add many empty pages in
+	 * one call (e.g. when extending a relation under concurrent insertion).
+	 * The new pages read back as zeros until later written.
+	 */
+	void		(*zeroextend) (const PageStoreRelKey *key, void *localreln,
+							   BlockNumber blocknum, int nblocks, bool skipFsync);
+
+	/* --- durability --- */
+
+	/* flush the fork's data durably to storage (immediate fsync equivalent) */
+	void		(*immedsync) (const PageStoreRelKey *key, void *localreln);
+
+	/*
+	 * Asynchronous-read support for the AIO (smgr_startreadv) path.  Fetch
+	 * nblocks pages starting at blocknum into a region the caller can read
+	 * with preadv, and return that region as (fd, offset).  The shim then
+	 * issues a normal AIO readv from (fd, offset) into the buffer pool, so all
+	 * of PostgreSQL's read-completion machinery (checksum verify, marking
+	 * BM_VALID) runs unchanged.  NULL for backends without an async path (the
+	 * shim falls back to md for startreadv).
+	 */
+	bool		(*fetch_to_fd) (const PageStoreRelKey *key, BlockNumber blocknum,
+								BlockNumber nblocks, int *out_fd, uint64 *out_offset);
+} PageStoreBackend;
+
+/*
+ * Backend registry.  Backends register themselves (typically from this
+ * module's _PG_init); the GUC pagestore.backend selects the active one.
+ */
+extern void pagestore_register_backend(const PageStoreBackend *backend);
+extern const PageStoreBackend *pagestore_lookup_backend(const char *name);
+
+/* The passthrough backend, defined in backend_passthrough.c. */
+extern const PageStoreBackend PageStoreBackendPassthrough;
+
+/* The localsvc backend (talks to the daemon), in backend_localsvc.c. */
+extern const PageStoreBackend PageStoreBackendLocalSvc;
+extern void pagestore_localsvc_init(void);
+/* Bind the postmaster's immutable compute identity before any normal I/O. */
+extern void pagestore_localsvc_bind_incarnation(uint32 timeline,
+													 uint64 incarnation);
+extern uint64 pagestore_localsvc_expected_incarnation(void);
+extern void pagestore_localsvc_read_at(const PageStoreRelKey *key,
+									   BlockNumber blocknum, uint64 lsn, void *out);
+/* 1 = found (out, version, sequence filled), 0 = no version at or below
+ * lsn, -1 = the daemon could not read the version: never treat as absent. */
+extern int	pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
+											 BlockNumber blocknum, uint64 lsn,
+											 void *out, uint64 *version_out,
+											 uint64 *version_seq_out);
+extern void pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
+										   uint64 branch_lsn,
+										   uint64 target_incarnation,
+										   uint64 parent_incarnation);
+extern void pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
+											 uint64 branch_lsn,
+											 uint64 target_incarnation,
+											 uint64 parent_incarnation);
+extern void pagestore_localsvc_require_branch_timeout(uint32 new_tl,
+														 uint32 parent_tl,
+														 uint64 branch_lsn,
+														 uint64 target_incarnation,
+														 uint64 parent_incarnation,
+														 int timeout_ms);
+extern void pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
+												 uint64 branch_lsn,
+												 uint64 target_incarnation,
+												 uint64 parent_incarnation);
+extern void pagestore_localsvc_detach(void);
+extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
+										  uint32 len);
+extern void pagestore_localsvc_walidx_add(const PageStoreRelKey *key,
+										  BlockNumber block, uint64 lsn);
+extern void pagestore_localsvc_walidx_add_batch(
+	const PageStoreWalIndexEntry *entries, int nentries);
+extern uint64 pagestore_localsvc_wal_end(void);
+extern uint64 pagestore_localsvc_wal_end_timeout(int timeout_ms);
+extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
+											BlockNumber block);
+extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
+										  BlockNumber block, uint64 lsn_max,
+										  PsWalRec **out);
+extern uint64 pagestore_localsvc_walidx_progress(void);
+extern void pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn);
+extern bool pagestore_localsvc_timeline_parent(uint32 timeline,
+											 uint32 *parent_timeline,
+											 uint64 *branch_lsn);
+extern bool pagestore_localsvc_timeline_parent_timeout(
+	uint32 timeline, uint32 *parent_timeline, uint64 *branch_lsn,
+	int timeout_ms);
+/* Exact-token ancestry lookup.  The request is stamped with the immutable
+ * token bound for timeline; parent_incarnation is returned by the daemon. */
+extern bool pagestore_localsvc_timeline_info(uint32 timeline,
+	uint32 *parent_timeline, uint64 *branch_lsn,
+	uint64 *parent_incarnation, int timeout_ms);
+extern uint8 pagestore_localsvc_begin_delete(uint32 timeline,
+	uint64 expected_incarnation);
+extern bool pagestore_localsvc_timeline_state(uint32 timeline,
+	uint32 *state, uint64 *incarnation);
+extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
+										uint32 len, void *out);
+extern uint32 pagestore_localsvc_timeline(void);
+extern uint64 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key,
+											  uint64 lsn);
+extern bool pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,
+												BlockNumber blocknum, uint64 lsn,
+												uint64 *death_out,
+												uint64 *seq_out);
+extern bool pagestore_localsvc_nblocks_asof_checked(const PageStoreRelKey *key,
+													uint64 lsn,
+													uint64 *nblocks_out);
+extern int	pagestore_localsvc_exists_asof(const PageStoreRelKey *key,
+										   uint64 lsn);
+extern uint64 pagestore_localsvc_read_lsn(void);
+extern uint32 pagestore_localsvc_read_epoch(void);
+extern void pagestore_localsvc_adopt_read_view(uint64 read_lsn,
+										   uint64 read_seq, uint32 read_epoch);
+extern bool pagestore_localsvc_read_fence_timeout(uint64 read_lsn,
+										  uint64 *read_seq, int timeout_ms);
+extern bool pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
+													   uint64 read_lsn,
+													   uint64 *read_seq, int timeout_ms);
+extern void pagestore_localsvc_pinned_init(bool localsvc_active);
+
+/* pagestore_control.c: mirror pg_control to the store (write/flush hooks) */
+extern void pagestore_control_mirror_init(bool localsvc_active);
+extern XLogRecPtr pagestore_control_writer_checkpoint_lsn_timeout(int timeout_ms);
+
+/* pagestore_slru.c: live SLRU page mirror (write-side capture + ship) */
+extern void pagestore_slru_mirror_init(bool localsvc_active);
+extern void pagestore_slru_mirror_drain(void);
+extern void pagestore_slru_note_checkpoint_redo(XLogRecPtr redo);
+struct ControlFileData;
+extern void pagestore_publish_checkpoint_reader_snapshot(
+	const struct ControlFileData *control);
+extern uint32 pagestore_slru_klass_id(const char *name);
+
+/* the SLRU mirror's primed (continuity) marker, as a data directory holds it */
+typedef enum PagestoreSlruPrimedMarker
+{
+	PAGESTORE_SLRU_PRIMED_ABSENT,	/* never primed */
+	PAGESTORE_SLRU_PRIMED_STAMPLESS,	/* the original empty marker: always debt */
+	PAGESTORE_SLRU_PRIMED_LEGACY,	/* the stamp alone, no identity */
+	PAGESTORE_SLRU_PRIMED_STAMPED,	/* the stamp and this build's identity */
+	PAGESTORE_SLRU_PRIMED_INVALID	/* unreadable, or another build's identity */
+} PagestoreSlruPrimedMarker;
+
+extern PagestoreSlruPrimedMarker pagestore_slru_primed_marker_read(const char *dir,
+																   uint64 *stamp);
+extern bool pagestore_slru_primed_marker_write(const char *dir, uint64 stamp);
+extern uint64 pagestore_localsvc_wal_retain_floor(void);
+/* Returns PS_STATUS_OK, PS_STATUS_STALE, or PS_STATUS_ERROR.  A controller
+ * must not treat either non-OK result as a successful ownership change. */
+extern uint8 pagestore_localsvc_retention_set(uint32 timeline,
+											 uint32 owner_kind, uint64 owner_id,
+											 uint32 generation, uint32 resources,
+											 uint64 lsn, uint64 admission_seq);
+extern uint8 pagestore_localsvc_retention_set_timeout(uint32 timeline,
+										 uint32 owner_kind, uint64 owner_id,
+										 uint32 generation, uint32 resources,
+										 uint64 lsn, uint64 admission_seq,
+										 int timeout_ms);
+extern uint8 pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
+									 uint32 owner_kind, uint64 owner_id,
+									 uint32 generation, uint32 resources,
+									 uint64 lsn, uint64 *admission_seq,
+									 int timeout_ms);
+extern uint8 pagestore_localsvc_retention_drop(uint32 timeline,
+											  uint32 owner_kind, uint64 owner_id,
+											  uint32 generation);
+/* Enumerate durable owners by index.  Start with *epoch = 0 and reuse the
+ * returned epoch; PS_STATUS_STALE requires restarting at index zero. */
+extern uint8 pagestore_localsvc_retention_get(uint32 index,
+											 PsRetentionPin *pin, uint32 *count,
+											 uint64 *epoch, bool *found);
+extern uint8 pagestore_localsvc_retention_drop_timeout(uint32 timeline,
+												  uint32 owner_kind, uint64 owner_id,
+												  uint32 generation, int timeout_ms);
+extern uint8 pagestore_localsvc_retention_drop_with_incarnation(
+	uint32 timeline, uint32 owner_kind, uint64 owner_id, uint32 generation,
+	uint64 incarnation);
+extern uint8 pagestore_localsvc_retention_lookup(uint32 timeline,
+											uint32 owner_kind, uint64 owner_id,
+											PsRetentionPin *pin, bool *found,
+											int timeout_ms);
+extern void pagestore_localsvc_store_sync(void);
+extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
+extern bool pagestore_localsvc_admission_fence_begin(uint64 redo_lsn,
+													  uint64 *token);
+extern bool pagestore_localsvc_admission_fence_active(uint64 token);
+extern uint64 pagestore_localsvc_admission_barrier_timeout(int timeout_ms);
+extern void pagestore_localsvc_admission_fence_end(uint64 token);
+extern BlockNumber pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
+																 const PageStoreRelKey *key,
+																 int timeout_ms);
+extern uint64 pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, int timeout_ms);
+extern void pagestore_localsvc_artifact_commit(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, uint64 token, uint32 count, int timeout_ms);
+extern void pagestore_localsvc_artifact_drop(uint32 klass, const PageStoreRelKey *key,
+	uint64 version, int timeout_ms);
+extern uint64 pagestore_localsvc_artifact_write(uint32 klass, const PageStoreRelKey *key,
+	BlockNumber block, const void *page, uint64 version, uint64 token, int timeout_ms);
+extern uint64 pagestore_localsvc_obj_write_post_timeout(uint32 klass,
+												  const PageStoreRelKey *key,
+													   BlockNumber block,
+													   const void *page,
+													   uint64 version,
+													   BlockNumber nb,
+													   int timeout_ms);
+extern void pagestore_localsvc_obj_write_timeout(uint32 klass,
+												 const PageStoreRelKey *key,
+												 BlockNumber block,
+												 const void *page,
+												 uint64 version, int timeout_ms);
+extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
+										 BlockNumber block, const void *page,
+										 uint64 version);
+extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
+										BlockNumber block, void *page);
+extern bool pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
+										   BlockNumber block, uint64 version,
+										   void *page, uint64 *resolved);
+extern bool pagestore_localsvc_obj_read_at_timeout(uint32 klass,
+												   const PageStoreRelKey *key,
+												   BlockNumber block,
+												   uint64 version, void *page,
+												   uint64 *resolved,
+												   int timeout_ms);
+
+#endif							/* PAGESTORE_BACKEND_H */

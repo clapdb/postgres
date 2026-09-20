@@ -1,0 +1,2 @@
+{"schema":1,"scenario":"daemon-fault-recovery","seed":1432778632,"contracts":["fault_reachability","restart_idempotence"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
+{"op":"crash","id":"daemon-after-ready","target":"store","model":"process_abort","fault":"daemon.after_ready","action":"crash","hit":1}

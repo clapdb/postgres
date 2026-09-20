@@ -1,0 +1,1874 @@
+# Pagestore MVP completion plan
+
+This document is the execution plan for closing the remaining pagestore MVP
+gates.  [`MVP_STATUS.md`](MVP_STATUS.md) remains the source of truth for current
+status and MVP scope; this document records the ordered work packages,
+dependencies, acceptance criteria, and decisions that still need agreement.
+
+Update this plan when a decision is made, a pull request lands, or evidence
+changes an acceptance criterion.  Do not mark a work package complete merely
+because its implementation PR merged: its listed evidence must pass on the
+`pagestore` branch.
+
+## Baseline
+
+Baseline as of 2026-08-14:
+
+- PRs #174-#191 have completed their stacked review flow.  The reclamation
+  roll-up lands their aggregate on `pagestore`; this includes retention-owner
+  lifecycle, page-version pruning, bounded page-history churn, and immutable
+  WAL segment/store primitives.
+- The local POSIX golden path is green: WAL-only writer -> continuous
+  materializer -> durable fork -> independent branch -> process restarts.
+- Managed materializer lifecycle and serialized portable branch bootstrap are
+  implemented for the default-tablespace local POSIX topology.
+- The durable retention registry is consumed by reader and materializer
+  controllers.  Image compaction consumes its exact page-history fences and
+  publishes a durable reclamation frontier before retiring sources.
+- Repeated update/compact cycles bound retained page history.  The live WAL
+  path seals validated 1 MiB immutable segments while retaining its flat log
+  as the migration/tail authority.  Shipped WAL, WAL-index history, fork
+  metadata, and deleted timelines remain unbounded.
+- Focused crash tests exist, but the composed fault and persisted-format
+  compatibility gates remain open.
+
+Three of the five MVP gates are therefore complete.  The two remaining gates
+are:
+
+1. retention-driven, bounded space reclamation;
+2. composed crash recovery and persisted-format compatibility.
+
+## Completion definition
+
+The MVP is complete when all of the following are true on `pagestore`:
+
+- the existing composed golden scenario remains green;
+- every running fixed/advancing reader and materializer protects the exact
+  resources and LSNs it may still consume;
+- page history, shipped WAL, and WAL-index history are reclaimed without
+  crossing the effective retention floor;
+- a deleted timeline is durably and idempotently removed with all of its local
+  data, subject to ancestry and owner checks;
+- a bounded long-running workload reaches a bounded steady-state disk size;
+- process crashes at declared materializer, branch, manifest/layer, and GC
+  transitions recover to a valid old or new state, never a torn state;
+- persisted-format fixtures prove supported reopen/upgrade paths and fail
+  closed on unsupported or corrupt formats;
+- the complete pagestore CI suite and the new bounded-space/crash/compatibility
+  lanes are green.
+
+S3/Lambda, SPDK layer recovery, multi-writer timelines, user-tablespace portable
+bootstrap, and production performance targets remain outside this MVP.
+
+## Dependency order
+
+```text
+R0 retention localsvc API
+  -> R1 controller owner lifecycle
+       -> R2 page-version pruning
+       -> R3a segmented-WAL format
+       -> R4 WAL-index reclamation/replacement bases
+            -> R3b shipped-WAL reclamation acceptance
+       -> R4b fork-metadata compaction
+       -> R5 timeline deletion
+            -> R6 bounded-space acceptance
+
+H0 harness fault/inspection primitives
+  -> H1 composed crash scenarios
+  -> H2 persisted-format compatibility lane
+
+R2-R5, including R4b, feed GC scenarios in H1.  R6 and H2 close the two MVP
+gates.
+
+```
+
+### H1 branch-controller prepared-receipt crash slice
+
+Status: **implemented for the prepared-receipt/service-restore slice**.
+
+`pagestore_branch_prepare` publishes a CRC-protected, configuration-bound
+operation journal before changing service state. Recovery only continues a
+fully recorded branch boundary and converges the temporary retention pin,
+materializer pause, and writer ownership through idempotent/read-only checks.
+The four process-abort points cover receipt publication and service-restore
+edges. Bootstrap installation, page-store layer recovery, and GC are outside
+this slice.
+
+R0 and H0 may proceed independently.  Reclaimers must not be enabled before R1
+has made every in-scope runtime owner visible to the retention authority.
+R3a may land before R4, but R3b and its bounded-WAL acceptance gate require
+R4's replacement bases to have removed the oldest raw-WAL dependencies.
+
+## Retention and reclamation work
+
+### R0. Land the localsvc retention-owner API
+
+Status: **implemented for durable owners and page-history admission; the WAL,
+WAL-index, and forkmeta resource frontiers remain coupled to R3/R4/R4b**.
+
+Deliverables:
+
+- `pagestore_localsvc_retention_set()` and owner lookup/enumeration with the
+  exact `(LSN, admission_sequence)` fence plus explicit owner generation;
+- `pagestore_localsvc_retention_drop()` with explicit owner generation;
+- backend declarations and protocol-field documentation;
+- tests for successful set/drop, idempotent drop, invalid owner/resource input,
+  daemon rejection, and reconnect/restart behavior;
+- durable, non-enumerable owner tombstones that retain the maximum accepted
+  generation after DROP, including across log compaction and restart.
+- persisted per-resource reclamation cutoffs plus exact retained-base
+  exceptions.  SET admission and reclaimer
+  cutoff selection share one synchronization protocol: a SET below any
+  requested `(LSN, admission_sequence)` resource frontier is rejected, while
+  an accepted SET is visible before a reclaimer can select a conflicting
+  cutoff.  The record/recovery format and lifecycle tests preserve the
+  sequence through append, enumeration, compaction, and restart.
+- fork metadata shares the page-history reclamation frontier: its compactor
+  advances that same full tuple atomically before retiring events, and every
+  page-history SET is checked against the maximum of page-image and forkmeta
+  progress.  Retention owners declare whether each resource is a point-in-time
+  base consumer or a range/replay consumer.  A point-in-time owner may retain
+  a sparse fixed-reader base `F` while its
+  operational cutoff advances to `C > F`: admission accepts `F` and tuples at
+  or above `C`, but rejects reclaimed tuples in `(F, C)`.  The durable cutoff
+  and exact exception set are updated crash-atomically and consulted by page,
+  WAL, WAL-index, and forkmeta admission; tests cover restart and exception
+  removal after the owning reader drains.  Materializers and other range
+  consumers must instead declare their full required interval; admission
+  rejects them unless that interval is continuously retained and never treats
+  equality with a discrete reader base as sufficient proof.
+- the R0 wire/API and durable owner record carry a controller allocation-domain
+  token distinct from the per-owner generation, plus durable live-token
+  reservation.  R1 clients must reserve and transmit it from their first
+  deployment; older records are upgraded to explicit live exceptions before
+  any R5 allocation-domain frontier may advance.
+- recovery resumes the global admission-sequence allocator strictly above the
+  maximum sequence in every durable pin, reclamation frontier, branch fence,
+  page/forkmeta record, and other sequence-bearing state before admitting a
+  mutation; alternatively, allocation advances a durable high-water mark
+  before returning a sequence.
+
+Acceptance:
+
+- the backend carries the controller-assigned generation and exact admission
+  sequence on every durable SET, returns both through lookup, and reports a
+  stale-generation rejection distinctly;
+- failures are reported without pretending the pin was installed or removed;
+- a delayed SET or DROP below the tombstone generation is rejected, and a
+  same-generation SET cannot resurrect a dropped owner; tests cover both
+  orderings before and after restart/compaction;
+- callers can distinguish `PS_STATUS_STALE` from a general daemon error;
+- standalone, PostgreSQL integration, and retention recovery tests pass.
+
+Expected scope: one PR.
+
+### R1. Register reader and materializer owner generations
+
+Status: **implemented for managed materializers and fixed/advancing readers;
+decision D2 is accepted below**.
+
+Deliverables:
+
+- stable owner identity and monotonically replaceable generation for each
+  managed materializer and fixed/advancing reader;
+- registration before a process can consume retained history;
+- atomic advancing-reader handoff: prepare and validate the newer view while
+  the old pin remains active, then prevent every old-view request while the
+  durable pin advances and the runtime switches views (or use an equivalent
+  protocol with the same no-gap property);
+- pins survive ordinary process shutdown and restart.  Release happens only
+  during authoritative deprovisioning or after a durable handoff to another
+  owner that protects an equal-or-older safe horizon;
+- authoritative deprovisioning first fences new operations for that owner and
+  drains every already-admitted page, WAL, and index operation (or retains an
+  equivalent per-operation pin) before durably dropping the owner pin;
+- supervisor handoff/restart behavior that never creates an unprotected window;
+- status/inspection output that identifies active and stale owners.
+
+Safety rule: uncertainty keeps data.  An ambiguous SET/DROP must either leave
+the old pin/view pair usable or fail closed until a later authoritative
+reconciliation proves which durable owner state won.
+
+Acceptance:
+
+- process start, handoff, advancement, clean stop, crash, daemon restart, and
+  duplicate-owner tests cover each lifecycle transition;
+- no runtime can serve or redo at LSN `R` unless its required resource masks are
+  protected at or below `R`;
+- a registration racing page/WAL/index reclamation either installs before
+  cutoff selection or is rejected below the already durable frontier; it can
+  never report protection for reclaimed history;
+- a stale owner can be identified and explicitly reconciled without wall-clock
+  expiry changing correctness.
+
+Expected scope: two PRs, materializer then reader.
+
+### R2. Prune page versions during image compaction
+
+Status: **implemented in the reclamation roll-up**.
+
+Image compaction consumes exact page-history fences, retains discrete reader
+and descendant bases, publishes the durable frontier before source retirement,
+and fails closed below reclaimed history.
+
+An effective floor of zero means that no retention owner constrains page
+history; it is not a literal LSN cutoff.  In that case the GC cutoff is the
+latest horizon proven durable and materialized for the timeline.  Compaction
+must fail closed if no such horizon has been established.  All page-history
+pins and reclamation frontiers are ordered `(LSN, admission_sequence)` fences,
+not bare LSNs: for every retained fence compaction preserves the newest version
+not later than that exact fence.  This keeps the version visible before a
+same-LSN hint rewrite as well as the version visible after it.
+
+Branch points are discrete structural base requirements, not moving retention
+floors.  A child at fork fence `F` requires the parent base visible at `F`, but
+does not pin every later parent version.  The parent's operational GC cutoff
+and fixed-reader pins follow the same discrete-base rule: each fixed fence
+retains the state visible at that fence while the operational frontier may
+advance past it.  The bounded-space soak keeps a fixed reader alive while its
+timeline receives continuing updates and verifies bounded page, forkmeta,
+WAL-index, and raw-WAL storage.
+The operational frontier may continue to advance while compaction retains
+those discrete bases for all live descendants.  Durable timeline metadata stores the complete fork tuple
+`(branch_lsn, branch_admission_sequence)`, not a bare LSN; restart, ancestor
+reads, page/forkmeta visibility, and compaction all apply that tuple so a
+same-LSN post-fork mutation cannot enter the child.
+
+Branch creation participates in the same cutoff-selection fence as owner SET.
+It validates the requested `(LSN, admission_sequence)` against the durable
+page, WAL, WAL-index, and forkmeta frontiers before publishing the child; a
+frontier already beyond any required base rejects the branch.  Control-object
+versions are protected independently by the WAL floor: compaction retains the
+newest usable control image and redo-floor note at or below every retained WAL
+boundary even when the page-history floor is newer.
+If SLRU capture yields a replay base `C` earlier than branch fence `L`, branch
+preparation validates and temporarily pins both WAL and page history at `C`
+before seeding: WAL protects the replay stream, while page history protects the
+exact SLRU image that seeding must resolve at `C`.  Both protections remain
+until the branch artifact and its structural retention are durable.
+Temporary pins belong to a durable branch-preparation operation ID with
+`preparing -> committed|aborting -> complete` transitions.  Success converts
+them atomically to structural retention; abort first fences the operation and
+drains admitted seeding, then authoritatively drops both pins.  Restart resumes
+either transition idempotently, so an abandoned preparation cannot leave an
+unbounded orphan.  Fault tests stop before and after every state publication,
+pin SET/DROP, seeding drain, and structural handoff.
+
+Deliverables:
+
+- a precise keep/drop rule that retains the newest required base version at or
+  below the floor and every version required above it;
+- descendant pins projected through each fork cap;
+- structural branch ancestry preserved independently of explicit owners;
+- install-new-before-delete-old manifest transition;
+- durable publication of the full `(LSN, admission_sequence)` page reclamation
+  frontier before any pruned source image layer is marked deleting or removed;
+  recovery must therefore reject a below-frontier SET or branch even after a
+  crash at every replacement/frontier/source-retirement boundary;
+- publication of the replacement to every durability tier represented by its
+  sources before deletion begins there (or retention of the old remote copies
+  until that publication is durable);
+- idempotent local and remote deletion retries;
+- crash-safe page-log reclamation after the pruned replacement and frontier are
+  durable: recovery ignores dropped references, mixed segments are rewritten
+  or retained until every live record is covered, and only then are source
+  segments removed;
+- pruning statistics and inspection output.
+
+Acceptance:
+
+- reads at every retained horizon agree before and after compaction;
+- reads below the declared floor may be rejected, but never return a wrong
+  version;
+- branch divergence, relation truncate/drop/recreate, restart, and injected GC
+  failures preserve the rule;
+- repeated update/compact cycles stop growing retained page history.
+
+Expected scope: one implementation PR and, if needed, one fault-test PR.
+
+### R3. Reclaim shipped WAL
+
+Status: **R3a immutable segment/store primitives and live-path integration are
+implemented.  R3b-1 supplies the durable retained-base foundation and R3b-2
+supplies a standalone physical immutable-prefix reclamation primitive; the R3
+cutoff policy, core maintenance integration, and complete shipped-WAL gate
+remain open**.
+
+The transition path accepts the existing arbitrary-size archive IPC chunks in
+the flat staging log, seals every complete contiguous segment-aligned 1 MiB
+logical range into an immutable segment, and prefers validated segments for
+reads.  Startup reopens the segment catalog, removes only strictly recognized
+staging orphans,
+validates headers and bounded payload chunks, compares the sealed prefix with
+the still-authoritative flat history, and seals any complete tail missed by a
+pre-publication crash.  R3b may make retained-base metadata authoritative and
+reclaim flat prefixes only after R4 removes their remaining raw-WAL
+dependencies.
+
+Each flat `wal_<timeline>` record is self-describing.  The POSIX backend copies
+the retained suffix from a complete record boundary, fsyncs it, and atomically
+replaces the old log while serializing physical append/truncate publication.
+The core holds a WAL catalog cutover lock, translates every surviving physical
+offset, and trims only records fully covered by validated immutable segments.
+Restart discovers the immutable store's start from its own headers instead of
+depending on the removed flat prefix; retries are compared against immutable
+bytes, so reclaim cannot reopen a divergent-history window.  Concurrent reads
+either finish on the old inode/offset catalog or begin on the new pair.
+
+This bounds the duplicate flat staging tail.  R3b-1 adds a checksummed v2
+identity carrying the physical directory start, retained base, and append end,
+validates that tuple against the complete contiguous directory on reopen,
+migrates the old v1 identity only after validation, and exposes a monotonic
+logical retained-base advance.  That low-level advance deliberately never
+authorizes deletion.  R3b-2 adds
+`ps_wal_store_reclaim_prefix(target_lsn)`: under the WAL mutex it first
+atomically publishes matching retained-base and physical-start frontiers, then
+unlinks only segments strictly below the aligned target.  The mutex drains an
+already-started read and bars new reads below the published frontier.  Partial
+unlink updates the in-memory catalog only after each successful unlink;
+directory-fsync ambiguity fences the instance, and reopen uses the published
+frontier to validate and idempotently retry any residual authorized prefix.
+The primitive rejects rollback, unaligned or beyond-end targets and never
+selects a retention cutoff.  It does not integrate core maintenance, owner
+admission, flat-WAL reclamation, or WAL-index replacement-base policy.  The
+compacted WAL index still names FPI records in raw WAL; until those FPIs are
+published as independent replacement page bases, their immutable WAL segments
+remain reconstruction dependencies.
+
+Deliverables:
+
+- segmented WAL storage or another agreed crash-safe prefix-reclaim format;
+- persisted base/end metadata with checksum and reopen validation;
+- WAL append and base/end replacement share a cutover lock (or frozen sequence
+  plus durable tail handoff), so an append acknowledged during reclamation is
+  represented exactly once in the replacement metadata or its tail.  Crash
+  tests overlap appends with every metadata publication boundary;
+- append/read across physical segment boundaries and branch ancestry;
+- reclamation driven by an independently advancing operational WAL cutoff;
+  fixed-reader and branch fences retain only their discrete replacement bases
+  and do not pin every later WAL record;
+- the authoritative per-timeline WAL retained-base frontier is durably
+  published before any segment below it is unlinked.  SET and branch admission
+  consult that same metadata; crash tests stop between frontier publication and
+  each unlink and prove recovery rejects requests below the retained base;
+- a read-lifetime pin/reference for every selected physical WAL segment, with
+  unlink deferred until existing readers drain (or an equivalent epoch/barrier),
+  including a concurrent read-versus-reclaim fault test;
+- explicit protection for restorable control images, in-progress WAL-index
+  scanning, and the durable WAL-index resume position even while no scan is
+  running.  Reclamation cannot cross the undecoded interval after that resume
+  point unless durable replacement page coverage proves the entire interval is
+  unnecessary;
+- migration or fail-closed handling for the existing flat format.
+
+R3b-2 delivers the standalone frontier-before-unlink, mutex reader barrier,
+partial/idempotent prefix unlink, and ambiguous directory-fsync fence portions
+of these requirements.  Its residual-prefix path fully enumerates and validates
+canonical names, sorts candidates, requires a contiguous suffix immediately
+below the target, and only then unlinks in ascending order.  The main catalog
+path also revalidates each complete segment header, length, and payload CRC
+immediately before unlink, so corruption stops at the current segment and
+cannot cross it.  The focused tests also use real child `_exit` stops before
+unlink, after a partial unlink, and before directory fsync, plus a deterministic
+reader/reclaimer mutex ordering.  Scan errors and corrupt candidates cause zero
+further deletion or an immediate stop, while a corrupt low residual prefix makes
+reopen fail closed until repaired.
+Operational cutoff selection, core maintenance wiring, retention-owner
+admission, WAL-index dependency removal, and continuous bounded-space
+acceptance are now supplied conservatively by R3b-3 on the POSIX path.
+
+R3b-3 is the conservative POSIX/core policy integration for that reclaimer.
+It admits at most one LIVE timeline per maintenance tick, drains ordinary
+admission before taking the WAL-index prune/publish gates, and takes one
+timeline WAL write lock.  All shard locks are released after the in-memory
+WAL-index dependency snapshot and before control-image reads, layer I/O,
+metadata publication, or unlink.  The candidate is the segment-aligned-down
+minimum of the effective WAL retention floor, durable WAL-index progress, and
+the oldest surviving raw WAL dependency.  Missing durable proof, pending or
+malformed snapshot state, non-POSIX providers, and any publication/unlink
+failure do not authorize deletion and retry after one second.  Durable
+retained-base metadata, including a naturally nonzero base after restart, is
+the sole admission frontier; physical directory start is not a runtime field
+or fence.
+
+This R3b-3 slice intentionally does not implement sparse/discrete retained
+base crossing or a bounded fixed-reader soak; those remain explicit follow-up
+acceptance work.
+
+With no owner floor, the WAL cutoff is the newest restart/recovery boundary
+whose control image and required WAL are durably published.  It is independent
+of discrete ancestor WAL bases required by live branches.  Reclamation fails
+closed until that boundary is proven, and persists its resulting per-timeline
+frontier so later pins and branches below it are rejected.
+
+The WAL cutoff also includes the oldest raw WAL record referenced by every
+surviving WAL-index reconstruction chain.  R3 cannot cross an indexed FPI/base
+until R4 has durably published an equivalent replacement page base and removed
+that WAL dependency; index progress by itself never authorizes WAL deletion.
+
+Acceptance:
+
+- WAL read/restore results are identical before and after reclaim at every
+  retained LSN;
+- reclaim never crosses a control, branch, reader, materializer, or indexing
+  requirement;
+- crash at create, fsync, publish, and unlink boundaries reopens safely;
+- a continuous WAL-only workload reaches bounded WAL disk usage.
+
+Expected scope: two or three PRs (format, reclaimer, crash/migration coverage),
+coordinated or stacked with R4 where the acceptance criteria overlap.
+
+### R4. Compact and reclaim the WAL index
+
+Status: **implemented for the MVP POSIX path**.  New records durably carry
+known/FPI metadata and decoded record-end LSNs; legacy records remain unknown
+and conservatively unprunable.  Timeline compaction proves every page across
+all configured shards, retains the union of the operational FPI-led chain,
+discrete owner/branch chains, and the future tail, and falls back to a complete
+snapshot if any shard cannot prove a base.  A checksummed durable timeline
+frontier rejects unrepresented reads, pins, and branches after restart.
+
+Snapshot publication now also exposes an explicit staged boundary: prepare
+writes, checksum-validates, and fsyncs every immutable shard without changing
+the selected manifest; commit revalidates those files and atomically selects
+the generation.  R4 frontier integration can therefore publish its durable
+reclamation fence between prepare and commit, matching the page-compaction
+write-replacement-before-frontier-before-retirement ordering.  Live cutover
+uses exactly that order, then removes discarded entries from memory only after
+the compacted manifest is selected.  If a crash leaves the durable frontier
+ahead of the selected snapshot, recovery serves the conservative old snapshot
+but backpressures WAL-index append/progress, WAL-index pin mutation, and branch
+creation until it retries the already-prepared generation; its immutable
+replacement inputs therefore cannot diverge during the recovery window.
+
+R4a publishes every per-shard snapshot as an immutable checksummed file before
+atomically replacing one checksummed timeline manifest.  Recovery validates
+the complete selected generation and never discovers an unpublished partial
+generation by directory scan.  Identical publication retries are idempotent,
+divergent retries and generation rollback fail closed, and old generations
+remain reachable for reader-drain and later reclamation.  Live maintenance now
+freezes append/progress and drains admitted index readers under the existing
+publish lock, publishes all shard images, and records each source-log offset.
+Recovery restores the selected generation and replays only the tail after those
+absolute offsets.  Once a newer manifest is durable, maintenance validates it
+and idempotently removes older immutable snapshot shard generations; newer
+unpublished retry files are preserved.  New payloads also name one prepared,
+durable log epoch per shard.  The manifest atomically selects those empty log
+epochs with the snapshot, later appends land only in the selected epochs, and
+maintenance removes legacy/older log epochs.  Snapshot entries are now pruned;
+raw WAL reclamation remains R3b.
+
+Deliverables:
+
+- compacted per-(timeline, shard) durable index representation;
+- removal below an independently advancing operational WAL-index cutoff while
+  retaining the necessary reconstruction base at every fixed owner/branch
+  fence;
+- atomic publication and old-log deletion;
+- bounded startup replay and compaction scheduling off serve threads.
+
+With no owner floor, the WAL-index cutoff is the latest completely indexed and
+durably published WAL horizon for which every retained page also has a durable
+reconstruction base.  Index progress alone is not a reclamation proof: for each
+page, compaction retains its required FPI/base entry and every redo entry from
+that base through each retained horizon.  Discrete branch-point lookup bases
+are retained separately.  Compaction fails closed without that proof and
+persists the per-(timeline, shard) reclaimed frontier before removing entries,
+so a later registration below it cannot be admitted.  Timeline-level SET and
+branch admission atomically aggregate these frontiers and reject below the
+maximum reclaimed tuple across every relevant shard; a lagging shard cannot
+mask missing history on a more advanced shard while frontiers move.
+
+Index append and compaction publication share a cutover protocol.  The
+compactor freezes an append sequence under the shard append lock, publishes a
+replacement through that sequence, then hands off and durably appends any tail
+before replacing the old log.  All replacement shards and the shard-0 durable
+progress record are named by one durable publication generation.  The complete
+old generation remains reachable until every replacement shard and its exact
+required-byte offsets are durable, after which one atomic generation manifest
+makes the new set visible; recovery selects only a complete generation and
+never combines old shards with new progress.  Acknowledged concurrent appends
+can never be omitted by publication.
+Publication also runs on the owning shard's run-to-completion path and drains
+all admitted `walidx_get()` readers before retiring the old arrays/log.  An
+equivalent epoch/reference scheme is acceptable only if old representations
+remain reachable until their final reader exits; tests overlap reads with
+cutover and retirement.
+
+Acceptance:
+
+- retained `redo_page_asof` results match before and after compaction;
+- incomplete final records, complete corruption, interrupted publication, and
+  daemon restart are covered, including concurrent appends at every publication
+  crash boundary;
+- repeated WAL indexing and compaction reaches bounded index size.
+
+Expected scope: one or two PRs.
+
+### R4b. Compact and reclaim fork metadata
+
+Status: **runtime implementation, the POSIX crash matrix, and the composed
+H1 publication scenarios are implemented, and the acceptance matrix's
+concurrency clause is closed on POSIX**.  Per-horizon existence/size
+equivalence across compaction is exercised by the R6 soak's reader and
+branch verifications, every publication boundary by the composed daemon
+scenarios, and crash recovery by the matrix; and acknowledged concurrent
+mutations are verified exactly once at every publication boundary, two
+ways.  The matrix's deterministic concurrent appender -- which holds
+admission-rd until the maintenance pass has entered its blocking
+admission-wr behind it, then completes its append and records the ack --
+now runs at prepare, manifest-commit and snapshot-GC as well as
+source-rewrite (every boundary sits under that admission-wr, so at each
+the acknowledged mutations are the last before the frozen sequence).  It
+creates a relation of its own and grows it, under one admission-rd hold,
+with both acks entered in its ledger before the hold is released, so the
+crash cannot land between a mutation and its ack; recovery must show the
+relation at exactly the acknowledged size and -- since a SET or GROW is
+idempotent, and neither existence nor size can tell one application from
+two -- carry each acknowledged event's record exactly once across what
+recovery composes (the selected snapshot's checkpoint and tail parts and
+the source records after its base marker, or the whole source when
+nothing is selected).  The composed `forkmeta` workload's post-cutoff
+trickle is tracked by its oracle: the seed enters every trickle create
+and growth in a ledger (`--ack-file`) twice, as pending before the
+request is sent and as acknowledged once the daemon has answered, each
+entry fsynced before the next step; the first eight relations are
+acknowledged while maintenance is still paused, so the ledger is never
+empty at the crash; the verify after recovery, and again after the
+additional restart, requires every acknowledged create to exist and every
+acknowledged growth to show exactly two blocks, allows a pending,
+unacknowledged step either outcome (the daemon may have answered without
+the client recording it), holds a growth never sent to zero, and nothing
+else; and the harness counts each acknowledged event's record across the
+selected generation's parts and the source behind its marker, requiring
+exactly one.  SPDK remains outside the claim.
+
+The pure forkmeta keep-planner and exhaustive unit/property coverage now define
+the event visibility, exact-fence base retention, legacy sequence handling, and
+fail-closed input contract.  Meson and standalone CI run this planner directly.
+A durable POSIX checkpoint/captured-tail format foundation now also exists: a
+single selected generation is discovered through a checksummed manifest, with
+immutable checkpoint and tail files, staged prepare/commit, exact tuple fences,
+bounded reads, recovery, and conservative GC.  This runtime slice now wires
+that format into daemon/tiering builds and core maintenance: the controller
+holds the admission, all-shard, page-prune, WAL-index, and map fences, derives
+the cutoff from the lexicographic minimum durable page frontier, commits the
+manifest, atomically rewrites the forkmeta epoch with a matching snapshot-base
+marker, and leaves the live in-memory arrays conservative for SPDK readers;
+restart rebuilds compacted arrays from the selected snapshot.  The versioned
+snapshot payload records the exact cutoff and frozen admission highwater.
+Startup treats the selected snapshot as authoritative over an old epoch, while
+preserving a matching marker's complete post-cutover suffix.  Ambiguous
+manifest publication or source rewrite poisons the runtime until restart.  The
+first crash-matrix slice now covers real child-process aborts at durable
+prepare, manifest-commit, source-rewrite, and completed snapshot-generation GC
+boundaries. It reopens each store in a fresh parent, checks the exact named
+fault report and exit 88, and covers deterministic concurrent append overlap
+plus four configured POSIX shards. This work does not claim coverage of every
+internal unlink/fsync instruction, SPDK hardware, or the remaining composed H1
+crash scenarios at the time it landed; the composed `forkmeta` daemon
+scenarios now cover those boundaries, with the acknowledged-append ledger
+as their concurrent-mutation oracle, and SPDK stays outside the claim.
+
+The shared append-only `forkmeta` stream reconstructs historical relation
+existence and size, so it is retained with page history rather than treated as
+current-state-only metadata.
+
+Deliverables:
+
+- compaction against an independently advancing operational forkmeta cutoff;
+  each owner/branch fence below it retains only the exact visible base tuple.
+  With no proven operational cutoff compaction fails closed and does not use a
+  fixed owner's minimum as the moving cutoff;
+- discrete descendant fork fences retained as required historical bases rather
+  than projected as a moving floor that pins all later parent metadata;
+- for each relation incarnation and each retained owner/branch fence, the
+  definitive create/size/existence base visible at that `(LSN,
+  admission_sequence)` fence, plus every event required above the operational
+  cutoff;
+- preservation of same-LSN admission ordering needed by retained reader
+  fences;
+- restartpoint/materialization publication captures and durably stores a full
+  `(LSN, admission_sequence)` barrier; an LSN-only marker never authorizes a
+  page or forkmeta cutoff when same-LSN mutations can exist;
+- bounded replay from an atomically published checkpoint plus tail, with the
+  old log removed only after the replacement and directory entry are durable.
+- an append cutover barrier or sequence handoff: publication freezes a precise
+  input sequence, and every concurrent create/extend/truncate/drop/recreate is
+  either included in the replacement tail or redirected to the new log before
+  publication becomes visible; no append may fall between snapshots.
+
+Acceptance:
+
+- relation existence and size at every retained horizon match before and after
+  compaction;
+- crashes before replacement publication, after publication, and during old
+  log removal reopen to the complete old state only before the replacement is
+  durably published and to the complete new state after publication; no fault
+  during source-log removal may roll acknowledged metadata back;
+- concurrent metadata mutations at every publication/crash boundary reopen
+  with every acknowledged event exactly once;
+- H1 exercises each publication boundary before R6 begins its soak
+  (composed daemon scenarios now cover prepare, manifest commit, source
+  rewrite, and snapshot GC).
+
+Expected scope: one implementation PR and one crash-test PR.
+
+### R5. Delete timelines durably
+
+Status: **foundation, POSIX runtime quiescence, layer/private-WAL cleanup, and forkmeta filtering implemented**.  The first
+slice adds legacy-only migration and V2 create/event mixed records,
+LIVE/DELETING state plus a reserved DELETED format value with incarnation,
+BEGIN_DELETE/STATE IPC, and descendant/retention-owner admission vetoes.  The
+POSIX path now holds an independent lifecycle read gate across every complete
+ordinary request and maintenance task, including handed-off async workers;
+BEGIN_DELETE takes lifecycle
+write, then admission write, then map write.  A fair turnstile closes new
+readers once a delete writer queues, independent of the platform's default
+pthread rwlock reader/writer preference.  SPDK BEGIN_DELETE remains
+fail-closed: async request drain is still follow-up work.  DELETING timelines
+now durably mark and asynchronously reclaim manifest-owned local and remote
+layers, resume after restart, retry provider failures with backoff, and
+reconcile deterministic remote objects from completed-but-unpublished uploads.
+DELETING owners are also removed from the shared forkmeta checkpoint, tail,
+and source epoch through the existing crash-safe R4b publication protocol;
+surviving owners are retained losslessly in the deletion-forced generation.
+The POSIX deletion worker now also removes the target's flat and immutable WAL,
+WAL-index epochs/watermarks, and WAL-index snapshot directory after validating
+the complete owner-scoped set.  Partial removal reopens without parsing the
+deleting owner's artifacts and resumes idempotently; live sibling artifacts are
+untouched.  POSIX maintenance now also parses and atomically filters every
+shared page segment containing the deleting owner, preserving survivor record
+bytes and rebasing the covered-prefix watermark before same-id replacement.
+Restart scans the filtered stream and never rebuilds DELETING owners; SPDK
+leaves this callback NULL.  POSIX maintenance now revalidates every durable
+consumer, appends and fsyncs a same-incarnation DELETED state event, and only
+then publishes DELETED in memory.  DELETED timelines remain defined and reject
+  normal operations.  POSIX CREATE_BRANCH reuses an ID only from durable DELETED
+  with exactly the next nonzero incarnation, after purging incarnation-local
+  runtime state; STATE returns the current token and requests for incarnations
+  greater than one must carry it.  SPDK async drain remains fail-closed: its
+  daemon rejects reuse CREATE_BRANCH before shared-core entry.  WAL and control
+  restore clients receive the immutable token from their startup
+  configuration/manifest and propagate it; control restore never queries
+  mutable STATE.
+
+Deliverables:
+
+- an atomic durable transition from live to deleting that first fences all new
+  owner registrations and page/WAL/timeline operations, then drains every
+  already-admitted operation and timeline-scoped maintenance task before
+  physical cleanup.  The drain includes compaction, tier upload/eviction,
+  remote GC, and cache/background publication, so none can recreate an
+  artifact after cleanup;
+- deletion admission checks for descendants, every non-dropped durable owner
+  (whether its process is active or offline), and structural retention
+  requirements performed as part of that fenced transition; only an
+  authoritative DROP or completed safe handoff removes an owner's veto;
+- durable timeline tombstone/state transition carrying a monotonically
+  increasing timeline incarnation generation;
+- idempotent removal of manifests, layers, page segments, WAL, WAL index,
+  control/SLRU metadata, fork metadata, and object-tier copies;
+- remote uploads use a durable operation identity or upload-intent record
+  published before object creation.  Startup and deletion reconcile every
+  completed-but-unpublished upload, so a crash between `upload_layer()` and
+  manifest publication cannot leave an undiscoverable object or collide with
+  a reused layer identity;
+- shard page segments shared with live timelines are reclaimed only by a
+  crash-safe filtered rewrite plus durable coverage transition; deletion never
+  unlinks a mixed source segment and never permits ID reuse while an
+  old-incarnation record remains recoverable from it;
+- the shared `forkmeta` log is reclaimed by an R4b-style crash-safe filtered
+  checkpoint/tail rewrite that removes only the deleted incarnation; deletion
+  never unlinks the shared stream or permits ID reuse until the filtered
+  replacement and its coverage transition are durable;
+- restart resumes deletion and never resurrects a deleted timeline;
+- timeline-ID reuse is permitted only after cleanup is durable and only with a
+  CREATE_BRANCH target token exactly one greater than the DELETED token;
+  delayed metadata, retention mutations, and requests from an older
+  incarnation are rejected.  The existing page, forkmeta, WAL, and layer
+  formats remain unchanged: the durable DELETED event is the cutover proof
+  that all old-incarnation consumers and writers have drained before reuse;
+- before a numeric timeline ID becomes reusable, deletion purges every
+  shard-local page/fork/WAL index and materialized-page cache entry for the old
+  incarnation (or those runtime keys include the incarnation); tests reuse the
+  ID immediately with identical relation keys and horizons without restarting;
+- retention owner IDs carry an incarnation token allocated from one named,
+  durable controller allocation domain.  Tokens are globally monotonic within
+  that domain, are carried by every SET/DROP and durable owner record, and are
+  never inferred from a per-owner generation.  Authoritative
+  DROP durably closes that incarnation; after every operation admitted under it
+  has drained, its generation tombstone may be folded into a bounded allocation-
+  domain frontier even past lower live tokens.  Every live or undrained token at
+  or below that frontier remains an explicit durable exception.  Allocation
+  must durably reserve that exception before returning a token to its caller,
+  or frontier advancement must be capped by a controller-published safe
+  allocation watermark.  Each reservation carries a durable, idempotent
+  allocation-operation identity before token delivery.  On retry or startup,
+  the controller either returns the same token or durably closes an
+  undelivered reservation after proving no caller can possess it; fault tests
+  cover crashes before reservation, after reservation, and during token
+  delivery so interrupted allocations cannot accumulate permanent live
+  exceptions.  Exceptions persist a live/closed state: only a live
+  exception admits SET/DROP, while a closed exception rejects all new mutations
+  but remains until already-admitted operations drain.  Removing it then makes the
+  already-advanced frontier reject delayed mutations.  Thus metadata is bounded
+  by active/undrained owners rather than historical reader churn.  Reuse
+  requires a higher owner incarnation.  Deleting a timeline incarnation may
+  reclaim all of its owner records while retaining the timeline-incarnation
+  fence;
+- crash-safe checkpoint/compaction of the shared timeline-state log, retaining
+  each slot's current state and maximum incarnation while bounding startup
+  replay;
+- a timeline-state append cutover lock or frozen-sequence plus tail-handoff
+  protocol, so concurrent create/delete/incarnation events acknowledged during
+  checkpoint publication are present exactly once in either the replacement or
+  its durable tail;
+- inspection reports pending and failed cleanup.
+
+Acceptance:
+
+- unsafe deletes fail before mutation;
+- every fault boundary leaves the timeline either fully readable or durably
+  deleting/deleted;
+- repeated delete requests are idempotent;
+- repeated delete/recreate cycles reuse the bounded ID space without aliasing
+  an older incarnation, including across daemon restart;
+- repeated provision/drop churn on one long-lived timeline keeps owner metadata
+  bounded and rejects delayed SET/DROP from every folded owner incarnation;
+- concurrent timeline transitions at every state-log publication crash boundary
+  reopen with no lost state or incarnation event;
+- deleting a branch does not affect its parent or siblings.
+
+Expected scope: one or two PRs.
+
+### R6. Prove bounded space
+
+Status: **soak in CI and scheduled nightly; every persisted category the
+soak's owner mix exercises is proven bounded on CI-sized and 6000/8000-round
+runs, the operational cutoff no longer needs a page-history owner, and
+SLRU-class and reader-artifact versions follow the relation plan. The artifact
+lifecycle follow-up adds completion intervals and durable drop
+events, so dropped objects' last data generations can be reclaimed after their
+retained dependencies disappear. Small lifecycle metadata tombstones remain;
+the fixed-key soak is not a proof of bounded metadata for unbounded distinct
+keys. See `ARTIFACT_LIFECYCLE.md` for the protocol and deterministic validation**.
+
+`pagestore_soak_test` is the acceptance harness.  It plays every retention
+role over the daemon protocol: a WAL-shipping writer with a bounded live set
+(update, extend, truncate, unlink/recreate), a materializer that mirrors
+control note/image pairs, publishes durable WAL-index progress, and advances
+an exact `(LSN, admission_seq)` owner pin, an advancing and a fixed reader
+whose pinned views are verified by as-of reads and sizes, copy-on-write
+branches that are written, read for fork-point isolation, durably deleted, and
+reused by incarnation, and clean/crash daemon restarts with full-model
+re-verification.  Physical bytes are sampled per persisted category against
+declared during-run and quiescent bounds derived from the controller
+configuration, and the report carries logical/physical bytes, approximate
+write amplification, per-controller lag, throttle and wait time, catch-up
+time, and active owners.  Bugs it exposed and the fixes that landed with it:
+control-image/note pairs are now pruned like relation pages but fenced by every
+retained WAL boundary and planned over the complete version chain
+(`pagestore_control_prune_test`); WAL-index compaction takes durable stored
+page versions and fork-level deaths as replacement bases
+(`ps_walidx_prune_plan_bases`, reclaim core cases); and forkmeta snapshot
+compaction exempts frontier-less branch timelines instead of failing closed
+for every timeline, capping the cutoff at each live branch's fork point so
+its own lower-LSN mutations stay admissible, while reclaim-debt accounting
+stays strict.  Control-image retention also fences every retained SLRU seed
+and reader artifact, keeps one physical copy per retained version across
+mirror retries, and is rescheduled whenever a WAL-resource pin or a deleted
+branch cap changes; single-page redo starts from the stored replacement base
+when the WAL index no longer carries a full-page image.  Longer runs
+then exposed unbounded fork-lifecycle history: image compaction now drops
+page versions invalidated at every horizon they serve, the forkmeta planner
+keeps only the base, inheritance fence, and growth per horizon plus the
+definitive events a retained version or a still-indexed WAL record needs, and
+deletion-forced generations compact survivors whenever a cutoff is proven
+(`pagestore_lifecycle_prune_test`, `ps_forkmeta_prune_plan_required`).
+
+Add a deterministic soak scenario with bounded live data but repeated updates,
+WAL generation, compaction, reader advancement, branch creation/deletion, and
+daemon restart.
+
+Acceptance:
+
+- page history, shipped WAL, WAL index, and deleted-timeline debris each remain
+  within a declared bound while the workload continues;
+- the append-only shared `forkmeta` log is compacted/reclaimed and its physical
+  bytes are included in the declared bound;
+- retention owner/tombstone metadata and the timeline-state log remain within
+  declared bounds across repeated owner and timeline incarnations;
+- each reclaimer has a declared maximum lag/catch-up interval, and controller
+  backpressure bounds foreground admission when maintenance exceeds it;
+- the report includes logical live bytes, physical bytes, write amplification,
+  per-category GC lag/catch-up time, backpressure time, and active retention
+  owners;
+- retained SQL-visible state remains correct throughout the run.
+
+The operational cutoff is now derived from what the writing compute already
+publishes (the materializer's WAL/WAL-index pin at its restart redo, or the
+newest checkpoint note's redo for a direct-write compute), so a materializer-only or
+branch-compute topology prunes page history and control images without a
+page-history owner; the branch controller's base pin carries page history
+while a branch is prepared, and a kept checkpoint image retains its
+exact-redo twin.
+
+The materializer's own WAL-index horizon is page-protected by the cutoff
+derived from its pin, so stored pages replace its FPI-led chains.  Two
+2026-09-13/14 nightly dispatches (runs 34747373574, 34825221247) failed seed
+20260909's `wal` bound by a few KiB; the cause is explained and fixed: the
+reclaimer's raw WAL-index dependency floor only moved at a WAL-index
+controller-forced publication (~1000 rounds here) with nothing requesting one
+on the reclaimer's own behalf, and its one-second no-progress backoff was not
+cancelled by the publication that unblocked it.  `wal_segment_reclaim_one` now
+requests an on-demand, fence-keyed compacted WAL-index publication for a
+segment blocked only by that stale floor (re-issued only on a raw-floor or
+retention-registry fence change, not on every durable progress op, which the
+backend materializer publishes once per indexing batch and which alone can
+never retire the blocking item), and the backoff is cancelled by a
+proof-epoch bump on every event that can move a proof input, rate limited to
+a 20 ms floor so a retention pin drop -- dispatched without the admission
+lock -- cannot turn drop-heavy churn into a drain storm.  Independent review
+of the first version of this fix found and fixed a lost-wakeup ordering bug
+(the backoff must record the epoch read before this attempt's own proof
+inputs, not a fresh read at arm time, which can race with exactly that
+unlocked drop window) and the progress-keyed over-triggering above.  The
+soak's `wal` bound is restated from five declared terms (18 KiB tighter) with
+a per-sample check tying physical WAL to the soak's own fences, reporting the
+observed margin as `wal_fence_slack_max` (expected up to roughly 2.1 MiB:
+1 MiB alignment, 1 MiB for one fully proven segment awaiting
+publication+GC+the 20 ms floor+reclaim, and ~130-200 KiB of raw items pinned
+below a held reader's or branch's horizon).  A second review round closed two
+more gaps: WAL_INDEX-only pin changes now also bump the reclaimer's proof and
+fence epochs (they were previously fenced by the compaction plan but not
+wired into either epoch, since the pin-mutation sites gated the bump on
+PAGE_HISTORY/WAL resources only), and the request's
+`walidx_snapshot_end[tl] < progress` guard was removed, since a fence change
+can make the plan drop more at the very same durable-progress-covered
+end_lsn a prior publication already reached.  Seed 20260909 at 8000 rounds
+now peaks at ~1.7-1.8 MiB, stable across CPU regimes.
+Resolved (2026-09-20): two residuals left after the fix above were closed --
+(1) a replacement base or full-page-image item that becomes durable/arrives
+with no retention-registry fence change at all was left to the WAL-index
+controller's own trigger; the reclaimer now arms a watch on the specific
+blocking page at every fruitless evaluation and keys the request on
+retirement evidence computed over two separate windows: a nearer protected
+horizon P (page-history/walidx fence) accepts a durable base or a newer
+FPI in [item end, P], while the farther unprotected durable-progress
+horizon U needs a newer FPI in [item end, U] specifically, since
+retain_chain applies its base-or-FPI-vs-FPI-only rule per horizon, not
+once for whichever horizon happens to be nearest.  A flush or index add
+that changes either window's evidence wakes the watch within the 20 ms
+floor -- only while that window has not already found what it needs, so
+an already-satisfied window cannot be re-triggered by every later,
+unrelated flush of the same shard -- and the next evaluation (<= 1 s idle)
+catches any change that arrived without a wake; a request is not re-issued
+while both windows and the raw floor/fence epoch are unchanged (a
+watched-item count change from a partial retirement is a bounded
+exception: one extra fruitless re-request, not a repeat).  (2)
+control-image/note pruning is scheduled on every retention change but
+executes only at the next shard compaction, which reads image layers only:
+a superseded control note that is still memtable-resident is invisible to
+it, so the WAL retention floor it sets could trail a fence release by up to
+2 MiB of control-shard page writes (the default `flush_pages`) instead of
+one compaction pass; the reclaimer now requests a flush of the control
+shard when the retention floor's note term alone holds a segment boundary
+and the note that sets it is superseded -- below the PAGE_HISTORY effective
+floor and not the newest note at or below any control-note prune fence --
+keyed on (note lsn, admission_seq, fence_epoch) so an unchanged decision is
+never re-issued, and marks the shard's page-prune-due flag only together
+with that flush request; a layer-resident superseded note is left to the
+due mark the fence change already set.  Neither residual is exercised by
+the soak's own workload, so its acceptance bounds are unchanged; see the
+new reclaim-core test cases below.  A follow-up review (also 2026-09-20,
+see the 2026-09-20 progress-log row below) found each of these two fixes
+had a design gap and closed both, plus three lower-severity issues, on the
+same branch before it shipped.  A second review pass (also 2026-09-20, see
+MVP_STATUS.md's second 2026-09-20 progress note) found the residual-1 watch's
+single-window (h_cap) evidence approximation missed the ordinary
+production case of a protected fence nearer than progress -- described
+above, in the two-window language that replaces the exactness claim the
+single-window design could not actually meet -- and closed it too.
+Nothing remains before the gate closes beyond keeping the nightly soak
+green.
+
+The nightly long-run configuration is `.github/workflows/pagestore-nightly.yml`
+(three seeds, 8000 rounds each, scheduled daily and dispatchable with chosen
+seeds/rounds; reports summarized per job and retained as artifacts).  The
+schedule fires only once the workflow file is on the repository's default
+branch, which GitHub requires for `schedule` and `workflow_dispatch`.
+
+Expected scope: one PR.  Passing it closes the retention MVP gate.
+
+### R5b. Add reclaimer backpressure controllers
+
+Status: **R5b controllers complete for PAGE, shipped-WAL, WAL-index, and
+forkmeta; queue-bound soak/tuning remains R6 work**.
+
+R5b-1 adds lean independent PAGE and shipped-WAL lag controllers.  They publish
+high-water/catch-up configuration, hysteretic throttle state, transitions, and
+foreground wait time; POSIX foreground mutations wait before entering runtime
+locks, while reads and maintenance continue.  PAGE debt is limited to complete
+flush-covered segments, and WAL debt uses the existing retention, raw
+dependency, and branch proofs.  R5b-2 adds an independent POSIX WAL-index
+controller whose debt is the saturating sum of append tails, obsolete
+epoch/watermark bytes, and obsolete snapshot generations.  Its bounded
+metadata-only refresh validates selected manifest/shard identity while
+immutable payload checksums remain a startup/publication responsibility, and
+per-timeline tail candidates can force fair snapshot publication below the
+geometric trigger.  Forkmeta adds a POSIX-only compacted-source baseline plus
+append growth and obsolete snapshot/temp debris, with bounded metadata
+observation and forced fair snapshot maintenance.  Queue-bound soak evidence
+and controller-specific tuning remain follow-up work in R6; forkmeta does not
+include any forkmeta-index or H0 changes.
+
+Expected scope: one or two PRs.  R6 consumes these controls; it does not
+introduce them.
+
+## Crash and compatibility work
+
+### H0. Add common fault and inspection primitives
+
+Status: **read-only aggregate, per-timeline, and minimal relation inspection
+foundation complete; composed H1 scenarios remain**.
+
+The first H0 slice uses one canonical fault catalog for C and Python, proves a
+pre-armed daemon fault was reached, and checks two recovery opens.  Existing
+page-compaction, GC mark-delete, page-frontier, and WAL-index-frontier crash
+windows use the same registry.  The lock-free `daemon.after_ready` point also
+supports error and bounded pause actions, with real crash/error/pause daemon
+recovery scenarios.  H0b now supplies bounded seqlock snapshots and the strict,
+read-only `private-test-ipc` inspection schema v4 contract for aggregate health,
+manifest, GC, owners, backpressure, and pruning observations plus the
+per-timeline foundation, including runtime probing of every advertised operation
+and strict
+boolean/nonnegative-counter response typing.  Runtime profiles now advertise
+protocol version 45 and schema version 4.  The minimal H1 relation operation
+uses a dedicated request/response slot isolated from ordinary I/O channels,
+with daemon-instance/generation/deadline fencing, strict read-only opcode and
+parameter validation, expected timeline-incarnation fencing, as-of
+existence/fork-size results, and explicit `selected_version: null` when the
+core cannot prove one aggregate version.  The relation mailbox is advertised
+only by the POSIX frontend; standalone relation assertions are capability-gated
+so the SPDK frontend remains runnable without that POSIX-only mailbox.
+The first composed H1 materializer slice is now implemented: the two
+restartpoint plans pause the checkpointer child after relation-page sync/before
+marker write and after marker sync, then stop and recover the whole
+materializer.  The prepared-receipt/service-restore branch slice and the POSIX
+image-layer create/write/seal/manifest-ADD publication slice are also covered.
+Portable bootstrap/install is covered by the golden scenario's installer
+crash/retry matrix. Manifest replacement, reclaim, and GC H1 cases remain.
+
+Deliverables:
+
+- one test-only named fault registry with crash/error/pause actions and hit
+  counts;
+- reachability accounting so an unhit expected fault fails the test;
+- harness timeouts, replay metadata, and diagnostic bundles;
+- bounded shared-memory snapshots plus a strict read-only `private-test-ipc`
+  inspection schema and capability advertisement for timeline, relation,
+  manifest/layer, retention/GC, and owner state needed by recovery assertions;
+  mutating inspection operations remain empty.  Relation requests use a
+  dedicated inspection mailbox and never claim ordinary I/O channels.
+
+Acceptance:
+
+- faults do not add durability edges or alter production behavior when disabled;
+- every run reports scenario, seed, fault, hit count, and operation identity;
+- paused faults have a watchdog and actionable diagnostics.
+- the H0b Python harness tests validate every advertised inspection operation
+  and its exact response fields, and reject extra or mutating schema entries.
+
+Expected scope: one or two PRs.
+
+### Local POSIX store ownership and orphan-layer recovery
+
+Store recovery and local provider mutations share an exclusive advisory store
+lease. Startup may remove canonical, unreferenced local layer files only after
+validating the manifest and the complete candidate namespace. Manifest-owned
+IDs, including deleting and remote-only records, remain protected. Unknown
+non-layer files and object-tier artifacts are not part of this sweep.
+
+Ambiguous manifest-tail repair must durably inhibit orphan sweeping before
+truncating the manifest, and the inhibition persists across restart. Missing
+manifest metadata does not authorize deletion. Recovery retries must preserve
+referenced data after partial unlink or directory-sync failures.
+
+Acceptance includes competing owners with distinct SHM names, release after
+process death, failed-open cleanup, canonical orphan reclamation, namespace
+validation before deletion, and continued H1 sentinel recovery. This closes
+local orphan cleanup only; the other H1 crash families and R6 space acceptance
+remain separate gates.
+
+### H1. Compose process-level crash scenarios
+
+Status: **materializer replay/restartpoint, branch prepared-receipt/service-
+restore, portable bootstrap/install, POSIX image-layer publication, POSIX
+page-pruning, POSIX WAL-index compaction, POSIX WAL reclaim, POSIX timeline
+deletion, POSIX manifest replacement, POSIX fork-metadata publication, and
+writer/reader/materializer/store restart-combination slices implemented;
+branch-compute restarts remain with the golden scenario**.
+
+Required scenario families:
+
+- materializer replay/restartpoint/durable-marker publication;
+- branch prepare, receipt publication, bootstrap install, and service restore;
+- manifest replacement and image-layer seal/publication;
+- page pruning, WAL reclaim, WAL-index compaction, remote upload intent and
+  orphan reconciliation, and timeline deletion;
+- daemon, writer, materializer, and branch-compute restart combinations.
+
+The portable install slice in `mvp_golden_test.sh` targets an offline same-build,
+default-tablespace skeleton. Four named installer-backend aborts cover maps
+installed, the pg_xact remove/rename gap, and both sides of final manifest
+publication. Each case checks the exact fault report and backend exit,
+unchanged prepared inputs and restored control, startup rejection before
+publication, full artifact recovery on retry, and byte-idempotent reinstall.
+The resulting branch must pass golden SQL fork-point, parent/child isolation,
+and restart checks. Power-loss recovery and concurrent installers/service
+managers are outside this process-abort contract.
+
+The materializer slice is split into two focused plans: one pauses after
+relation-page store sync and before marker write, and one pauses after marker
+store sync and before retention advance.  The pause is reported by the named
+fault machinery, while the harness immediately stops the complete materializer
+postmaster and lets the supervisor recover it; it does not assume that the
+checkpointer child is the supervisor's worker generation.  Each plan records
+both R1 and R2 relation metadata and requires the R2 main fork to grow.
+
+The page-pruning slice adds a `gc_seed` runtime operation to the daemon fault
+harness.  A dedicated IPC client seeds three generations of relation history
+and a newer block, arms the named fault marker, then installs a configured
+page-history owner at the cutoff; three process-abort scenarios crash after
+the durable page-prune frontier, after the compacted layer's manifest
+publication, and after the retired layer's mark-delete.  The snapshot, recovery
+read (published newest block, retained history at the cutoff, refused
+pre-cutoff version), manifest/local-layer reconciliation, and republished
+retained horizon are checked, followed by one idempotent restart.
+
+The WAL-index compaction slice reuses `gc_seed` with a `wal_index` workload:
+a fixed WAL-index reader at 40 under three FPI-led chains on one block, one
+committed interval made a snapshot candidate by `--walidx-snapshot-bytes 1`,
+and a process abort after the durable frontier.  The crash must leave the
+frontier plus the staged generation without its commit; recovery must commit
+the retried generation, serve the reader's exact chain and the newest chain,
+refuse the dropped point below the frontier, and keep the WAL-index owner.
+
+The WAL reclaim slice adds three named store-lock probes to the shipped-WAL
+prefix reclaim (`wal_reclaim.before_unlink`, `wal_reclaim.after_unlink`,
+`wal_reclaim.before_dir_fsync`) beside the existing environment hooks the
+core/store unit tests use, and a `wal_reclaim` gc_seed workload: three sealed
+1 MiB segments, a control note at the shipped end, workload-armed fault, and
+WAL-index progress through the end.  Snapshots count the sealed segments left
+on disk per stage; recovery must finish the unlink retry, refuse prefix reads,
+keep the WAL end and retain floor, clear physical reclaim debt, and leave no
+owner.
+
+The timeline deletion slice adds four lock-held probes
+(`timeline_delete.after_deleting`, `.after_wal_cleanup`,
+`.after_segment_rewrite`, `.after_deleted`) around the durable DELETING event,
+private WAL/WAL-index removal, shared segment rewrite, and the durable DELETED
+event (2026-09-20: the segment-rewrite probe was replaced by
+`.mid_segment_tombstone` and `.after_segment_tombstone` when the rewrite
+itself was replaced by in-place tombstoning -- see the F3/Q1 progress row),
+and a `timeline_delete` gc_seed workload: a branch with private shipped
+WAL, a committed WAL-index interval, an owner layer, and shared-segment pages,
+then a workload-armed BEGIN_DELETE.  Snapshots check the owner's private
+artifacts per stage; recovery must reach DELETED with its incarnation token,
+keep the parent readable, reject branch reads, remove every owner artifact,
+reconcile the manifest, and register no owner.
+
+The manifest replacement slice adds two map-held probes around the atomic
+`layers.manifest` rewrite (`manifest_compact.after_tmp_sync`,
+`manifest_compact.after_rename`), removes a crashed compaction's temp log on
+manifest open, and adds a `manifest_compact` gc_seed workload that writes 320
+pages under a harness-held maintenance pause (`--test-maintenance-pause-file`)
+before arming the fault and releasing maintenance.  Snapshots check the temp
+file per stage; recovery must replay to a reconciled manifest, serve every
+page, and leave no temp log.
+
+The restart-combination slice adds a `restart` operation to the writer and
+materializer runtimes.  Writer-runtime targets are the writer and installed
+pinned readers (a reader restart restores its boot control image with
+`pagestore_control_restore` first); materializer-runtime targets are the
+writer, the materializer worker (replaced by the supervisor with a new
+generation), and the store (supervisor and computes stopped, daemon
+restarted on the same shared memory, computes and supervisor returned).
+`writer_reader_restart` and `materializer_restart_combinations` compose
+them with horizon, visibility, boundary, and zero-lag assertions.
+
+The fork-metadata slice composes the existing `forkmeta.*` probes on the
+daemon through a `forkmeta` gc_seed workload: the page-pruning history and
+cutoff pin prove the cutoff, thirty-two relations carry persisted fork-size
+events on both sides of it, and a post-cutoff trickle publishes the second
+generation that retires the first.  This covers the R4b acceptance item that
+H1 exercise each publication boundary in a composed process-crash scenario,
+and the trickle relations are in the oracle through the acknowledged-append
+ledger, so the concurrent-mutation clause is closed at every boundary.
+
+Acceptance:
+
+- each declared transition is exercised before and after its durability point;
+- recovery yields the complete old state only for crashes before durability
+  and the complete new state for crashes after durability; acknowledged
+  markers, deletion states, reclamation frontiers, and branch publications are
+  monotonic and cannot roll back even when they are not SQL-visible;
+- direct and recovered SQL-visible results agree at declared horizons.
+
+Expected scope: two or three focused PRs.
+
+### H2. Add persisted-format fixtures and compatibility CI
+
+Status: **daemon-side POSIX record formats covered under D5 rule 2,
+including legacy fixtures exercised by each format change; rule 3's
+container obligations met for the POSIX and SPDK container identities and
+a fail-closed, durably published SPDK superblock; rule 1's payload-identity
+binding done for the paths that hand bytes to PostgreSQL (the shipped-WAL
+envelope and restore command, the control image's WAL segment size, the
+page and relation-map paths PostgreSQL's own loaders already verify, and
+the SLRU seed pages on every seeding path) with the seeders' replay proven
+against recovery's; rule 4's store-object families done (the backend's
+object payloads have their identities in `pagestore_artifact_format.h`,
+the raw values carry an identity trailer, and `posix-backend-objects` is
+the current fixture) and its backend data-directory artifacts done (the
+prepared branch and reader files and the two raw-value markers have their
+identities in the same header, the markers carry an identity trailer, and
+`pgdata-artifacts` is their fixture, loaded through the backend's own
+loaders) and the controller's and supervisor's JSON files done (their
+layouts live in `pagestore_artifact_schema.py`, every one carries a
+schema member and the ones a later run relies on a checksum, and
+`controller-json` is their fixture).  H2 is complete.**
+
+The controller's and supervisor's JSON.  `pagestore_branch_prepare`
+persists its configuration (schema 2), its crash journal
+`pagestore_branch.prepare.json` (schema 2 with `crc32`; schema 1, a
+receipt without the prepared-manifest identity, is refused by name) and
+its retention generation authority `branch-retention-generation-<id>.json`
+(schema 2 with `crc32`; 1 read as legacy); `pagestore_materializer_supervisor`
+its configuration (schema 4), `status.json` (schema 3 with `crc32`; 2 and a
+status without the member read as legacy) and the materializer's retention
+generation authority `retention-owner-<id>.json` (schema 1 with `crc32`;
+the original, without the member, read as legacy), which the controller
+reads too.  `pagestore_artifact_schema.py`, installed beside both tools,
+holds each kind's schema, accepted and refused schemas, checksum rule and
+key set; both tools stamp what they write and judge what they read through
+it, so an unknown schema, a missing or wrong checksum or a member the
+layout does not define fails closed before the tool interprets a value,
+and `--identities` prints the table the fixture pins.  The fixture
+`controller-json` holds what real runs left behind -- the golden scenario
+captures the controller's three files, the managed materializer smoke the
+supervisor's three -- and `harness/pagestore_controller_fixture.py --check`
+(Python only, so the standalone lane runs it) holds the identities to it,
+loads every artifact, and applies forty mutations: an unknown or null
+schema, a file that is not JSON, an unknown member, a wrong or missing
+checksum and a member edited under a stale one are refused; each legacy
+layout is accepted; the journal's schema 1 is refused.  The legacy and
+refused schemas come from the fixture's own identity table, not from the
+reader under test, so a reader that drops a legacy schema fails the
+check rather than shrinking it.
+
+Data-directory artifacts.  The files a compute leaves for another to load
+-- the prepared branch's `pagestore_branch.manifest` (JSON, format 2; 1
+read as legacy) and `pagestore_branch.bootstrap` ("PSBB" v1, CRC-bound to
+the manifest text), the prepared reader's `pagestore_reader.manifest`
+(JSON, format 3; 2 legacy), `pagestore_reader.snapshot` (the reader
+snapshot object's layout) and `pagestore_reader.catalog` ("PSCP" v1), the
+reader's relation-map intent marker `.pagestore-reader-map-pending` and
+the SLRU mirror's continuity marker `pagestore.slru_mirror_primed` -- have
+their names, layouts and identities in `pagestore_artifact_format.h`,
+pinned field by field to the backend's structs, and are reported by
+`pagestore_format_versions` as the `pgdata` family.  The two markers were
+bare values (a horizon, a checkpoint redo); they keep the value at 0 and
+gain the identity trailer at 8, a legacy 8-byte (or, for the primed
+marker, empty) one still reads, and one naming another identity fails
+closed: the reader refuses to adopt the map next to it, and the mirror
+reads it as debt.  `pagestore_pgdata_artifact_check()` loads one artifact
+through the loader a compute uses and reports its identity, so
+`harness/pagestore_pgdata_fixture.py --check --build` can start a scratch
+cluster of the checking build, load every artifact of the fixture and
+require the loaders to refuse twenty-one declared mutations (a flipped
+header, map or xid byte, a truncation, a bumped format, an edited manifest
+member, a bootstrap whose manifest no longer matches its CRC, a marker
+with a foreign trailer; a legacy marker is accepted).  The fixture is
+captured from a real backend: `integration_test.sh` copies the prepared
+branch and reader it made into `$PAGESTORE_PGDATA_FIXTURE_CAPTURE` with
+the identity each loader binds them to, and has the backend publish the
+two markers there (`pagestore_pgdata_marker_write()`), since a live
+cluster removes the intent on adoption and renews the stamp at every
+checkpoint.  Without a PostgreSQL build the check holds only the compiled
+identities to the fixture (the standalone lane); the integration lane
+runs the loaders.
+
+Payload identity, per path.  The shipped-WAL envelope (`walv1_*` header
+version 2) records the payload's own identity from the WAL page header it
+begins with -- `xlp_magic`, which PostgreSQL bumps with every WAL format
+change, `xlp_info`, and the cluster's WAL segment size from a long page
+header -- in the eight bytes version 1 reserved, so no offset moves and a
+version-1 envelope still decodes as one that recorded nothing.  The page
+header fields are read in host byte order, as PostgreSQL wrote them, and
+the long header's segment size where the writer's ABI put it (the store
+recognizes the 8-byte- and 4-byte-aligned layouts by their contents).  The
+store copies the values and re-derives them from the payload's first chunk
+once per open before serving any range of a segment, interior ranges
+included: an envelope whose recorded identity is not what its payload
+carries fails the read, whatever the chunk hashes say about the bytes.
+`pagestore_walrestore` is the loader, built with the PostgreSQL headers so
+it reads the page header with this build's `XLogLongPageHeaderData`.  Before
+it turns a segment name into an LSN it reads the timeline's newest mirrored
+control image and requires its `xlog_seg_size` to be `--segsize` -- a size
+the cluster was not initialized with maps the name to a range the store
+legitimately has nothing at, which would otherwise read as an archive miss
+-- and before handing a reconstructed segment to recovery it requires
+`xlp_magic` to be this build's `XLOG_PAGE_MAGIC`, `xlp_xlog_blcksz` to be
+its `XLOG_BLCKSZ`, the long page header's `xlp_seg_size` to be that same
+size, `xlp_sysid` to be the control image's system identifier, and
+`xlp_pageaddr` to be the segment start the name maps to -- the checks
+`XLogReaderValidatePageHeader()` would make next, whose failure outside
+standby mode ends recovery quietly.  A mismatch, and a store that refuses
+the read (a
+corrupt or resealed segment, WAL reclaimed below the frontier, a fenced
+incarnation), exits with a status above 125, which `RestoreArchivedFile()`
+treats as fatal to recovery -- any other nonzero status means "no such
+archive file" and would end recovery quietly -- and names the cause on
+stderr.  `pagestore_control_restore --payload-identity` prints the build's
+tuple (version constants and layout parameters) so the fixture check can
+ask whether a fixture's payload is loadable by the checking build
+(`--postgres-payload-identity-tool`; the identity includes where the
+build's `XLogLongPageHeaderData` puts the segment size and the build's WAL
+block size, so a fixture captured under the other ABI or another
+`--with-wal-blocksize` is foreign too, and a capture stamps its shipped WAL
+with the capturing build's magic and block size so a release branch can
+capture the fixture that matches it): a current fixture captured
+under another build is skipped as "payload needs a PostgreSQL build with
+XLOG_PAGE_MAGIC ..." rather than failed as a broken envelope, and when no
+current fixture matches the build the check fails on `pagestore`
+(`--require-build-match`, which CI passes there) and warns elsewhere -- so
+a release branch that has just received a format change is not left red,
+carries the fixture captured under its own build once it captures one, and
+recaptures rather than patches a `pagestore` fixture cherry-picked there.  The control image now also refuses
+an image whose `xlog_seg_size` differs from the target cluster's own
+`pg_control`.  Relation pages need no envelope field: PostgreSQL verifies
+`pd_pagesize_version` (`BLCKSZ | PG_PAGE_LAYOUT_VERSION`) on every page the
+buffer manager reads through smgr, uninitialized pages excepted, and the
+relation maps the reader and branch bootstrap install are read by
+`load_relmap_file`, which checks `RELMAPPER_FILEMAGIC` and the map CRC.
+SLRU pages carry no native identity and are bound by the control tuple
+alone.  The fixture `posix-wal-payload-identity` is current: its shipped
+WAL begins with a genuine long page header, `fixture.json` records the
+payload identity the archive carries, the check verifies every version-2
+envelope against its payload, and a `wal_segment.payload_identity` mutation
+(a resealed envelope naming another magic) is use-rejected.
+
+The slice adds `pagestore_format.h` identities reported by every format-owning
+module, the `pagestore_format_versions` tool, the `fixture` workload of
+`pagestore_gc_crash_client`, `harness/pagestore_fixture.py` (capture and
+check), and `fixtures/posix-mvp-baseline`.  The check enforces identity
+freshness, reopen with the oracle across a restart, and thirty-six declared
+mutations with their documented outcomes.  It surfaced and fixed two defects
+(relocated stores refused by absolute layer locations; a damaged forkmeta
+marker discarding acknowledged post-cutover events).  The gap it documented
+(forkmeta source records had no checksum) is closed by FKM3 records, the
+same 64-byte layout with a CRC-24 in the former pad bytes; FKM2 stays
+readable and its fixture is the legacy one.
+
+Fixture families:
+
+- timeline metadata and retention registry;
+- manifest and image/delta layer headers/indexes;
+- page segments, shipped WAL metadata, and WAL index;
+- control, SLRU, reader, branch-bootstrap, and fork-metadata artifacts.  The
+  forkmeta checkpoint/tail format is checksummed; fixtures cover legacy reopen
+  or migration, truncation, and corruption of a structurally complete record;
+
+Acceptance:
+
+- supported old fixtures reopen or upgrade to the documented state;
+- unsupported newer/unknown versions fail closed with an actionable error;
+- checksum corruption and illegal truncation are rejected;
+- every persisted-format change must update or add a fixture.
+
+Expected scope: one or two PRs.  Passing it with H1 closes the crash/compatibility
+MVP gate.
+
+## Work that follows the MVP
+
+These items matter, but should not delay the two remaining MVP gates unless
+measurement proves they block the acceptance scenarios:
+
+- user-tablespace portable branch bootstrap;
+- materializer PGDATA provisioning and service-manager integration;
+- object-tier cache budget/residency;
+- production S3 provider;
+- sparse image indexes and a separate layer-block cache;
+- immutable WAL delta sealing and bounded redo-chain compaction;
+- cost-aware materialized-page cache admission and proven redo avoidance;
+- size-tiered/incremental compaction, key-range pruning, and bloom filters;
+- per-shard manifest/layer map/cache and replicated timeline metadata;
+- asynchronous POSIX I/O and explicit CPU/IO scheduling;
+- SPDK image-layer recovery/GC;
+- production backup/restore, observability, alerting, and repair procedures.
+
+## Decisions for discussion
+
+Record the selected answer and rationale here before implementing the dependent
+work.
+
+### D1. Owner identity authority
+
+Selected: deployment/controller-assigned stable 64-bit owner ID plus a
+monotonic generation stored in controller state and carried on every durable
+SET/DROP.  The retention registry stores the maximum generation, including as
+a durable non-enumerable tombstone after DROP, and rejects stale or
+same-generation resurrection.  Delayed cleanup from an old supervisor therefore
+cannot remove or resurrect its replacement's pin.  A replacement supervisor
+updates the same owner key rather than adding another logical owner.
+
+Alternative: derive identity from PGDATA or reader artifact.  This is easier to
+bootstrap but makes cloning and deliberate replacement ambiguous.
+
+Decision: **accepted 2026-08-12**.
+
+The authority is a deployment/controller-assigned nonzero 64-bit `owner_id`
+plus a monotonically increasing 32-bit `generation`, both durably stored by the
+controller.  The key remains `(timeline, owner_kind, owner_id)`.  Generation 0
+is reserved for retention records written by the pre-D1 protocol; a controller
+starts at generation 1 and must fail rather than wrap.
+
+The store persists the greatest observed generation, including after DROP.
+SET/DROP below that generation return `PS_STATUS_STALE`; DROP leaves an
+unenumerated tombstone, so a delayed request cannot resurrect or remove state
+after restart or compaction.  SET at the current live generation may update the
+horizon, and a greater generation atomically takes over the key.  For log
+compatibility only, generation-0 SET-after-DROP retains the legacy unfenced
+behavior until a generation-1 controller takes over the key.  The existing
+materializer supervisor `owner_epoch` and `worker_generation` are local process
+coordination fields, not this controller authority.
+
+### D2. Owner release and stale-owner policy
+
+Selected: ordinary process shutdown retains the durable pin.  Release requires
+explicit authoritative deprovisioning or a safe durable horizon handoff;
+generation replacement alone must quiesce the old runtime before its pin is
+superseded.  Never use wall-clock lease expiry for correctness.  Stale owners
+retain space until controller/operator reconciliation proves them dead.
+
+Decision: **accepted 2026-08-12**.
+
+Correctness never depends on wall-clock expiry.  A controller replacement
+increments the durable generation only after quiescing the old consumer, then
+atomically supersedes the old owner.
+Crashes, timeouts, ambiguous failures, and ordinary supervisor handoff retain
+the last pin.  DROP is reserved for explicit deprovision after consumption has
+stopped; if that proof or the DROP acknowledgement is uncertain, the pin stays.
+
+### D3. Shipped-WAL physical layout
+
+Recommended: immutable fixed-size logical WAL segment files plus small durable
+timeline metadata recording the retained base and append end.  Reclaim deletes
+whole old files and retains the boundary file when needed.
+
+Alternative: periodically rewrite the flat file.  It minimizes format count but
+causes unbounded copy cost and a larger crash-publication protocol.
+
+Decision: **accepted 2026-08-14**.  Use immutable fixed-size logical WAL
+segments with checksummed metadata and bounded chunk validation.  The segment
+store is integrated into daemon append/read/recovery with the flat log retained
+as migration/tail authority.  The first R3b slice supplies the durable
+retained-base metadata and monotonic publication primitive; later R3b slices
+must add read pins, segment deletion, and reclamation of the corresponding
+flat prefix.
+
+### D4. Timeline deletion with descendants
+
+Recommended for MVP: reject deletion while any descendant exists.  Do not add
+cascade or ancestry reparenting semantics.
+
+Decision: **accepted 2026-08-25**.  Reject deletion while any live or deleting
+descendant exists; do not cascade or reparent.  The first lifecycle slice
+implements this rule before durable transition publication.
+
+### D5. Persisted-format support window
+
+Decision: **accepted**, as the four rules below.  They separate what the page
+store owns (its envelopes and containers) from what PostgreSQL owns (the bytes
+inside them), because only the former can have a page-store support window.
+
+1. **PostgreSQL-native payloads are wrapped, never rewritten.**  Relation
+   pages (with their `pd_lsn`), the `ControlFileData` image, WAL segment
+   bytes, SLRU pages, and `pg_filenode.map` contents are stored as the bytes
+   PostgreSQL wrote and handed back to PostgreSQL code to load: pages to the
+   buffer manager through smgr, the control image through
+   `pagestore_control_restore`, WAL through the restore command, SLRUs and
+   relation maps by installing the files.  The page store does not interpret
+   a payload beyond the fields it needs to key and fence it (`pd_lsn`, the
+   checkpoint redo, the segment start).  The rule binds the *persisted*
+   payload: what the store holds is byte-exact.  Where an install step must
+   derive a different PostgreSQL object from a stored one, that derivation
+   is an explicit, named transformation on PostgreSQL's own definitions and
+   never a second persisted format.  Two such steps exist today, and each
+   fixture checks the stored input byte-exactly and the installed output
+   against the named transformation, not for byte equality with the input:
+   - the archive-bootstrap control install: after checking the control
+     image's compatibility tuple against the running build,
+     `pagestore_control_restore --archive-bootstrap` copies the stored
+     `ControlFileData`, sets `minRecoveryPoint`/`minRecoveryPointTLI` to the
+     checkpoint redo and its timeline, clears the backup start/end fields,
+     recomputes the CRC with PostgreSQL's algorithm, and installs the
+     result, so a fresh skeleton enters archive recovery at the stored
+     checkpoint instead of trusting a foreign `initdb` state;
+   - SLRU seeding for a branch (`pagestore_seed_clog`,
+     `pagestore_seed_commit_ts`, `pagestore_seed_multixact`, driven by
+     `pagestore_seed_branch_slrus()`): each page over the fork's horizon is
+     the stored seed page at the base cutoff `C` with the shipped WAL in
+     `(C, target]` applied, written as whole segments under `pg_xact`,
+     `pg_commit_ts`, and `pg_multixact`.  The seed pages and the WAL bytes
+     are PostgreSQL's, but the appliers are not: `ps_clog_apply_range()`
+     and the commit-ts and multixact seeders decode the records and set
+     the status bits, timestamps, and member slots themselves, mirroring
+     `clog_redo`, `CommitTsRedo`, and `multixact_redo` rather than calling
+     them.  That mirror is page-store-owned transformation logic: it is
+     versioned with the envelope, bound to the PostgreSQL version whose
+     redo it mirrors, and it must be proven equivalent to actual recovery
+     by an independent result, not by a fixture that would only compare
+     the mirror with itself.  That proof is the branch controller's
+     `--verify-seed-against-materializer`: while the materializer is paused
+     at the fork LSN `L` right after a restartpoint flushed its SLRUs --
+     PostgreSQL recovery's own result for the same WAL through `L` -- the
+     controller sets `pagestore.seed_reference_slru_dir` to the
+     materializer's data directory, and every page the seeders reconstruct
+     (base snapshot at `C` plus their replay of `(C, L]`) is compared byte
+     for byte with the same page there before it is written; a difference,
+     or a page the reference does not have, fails the preparation naming
+     the SLRU, the page and the byte, and a preparation that seeded pages
+     but compared none fails too.  Zero bootstrap pages an empty or
+     segment-aligned horizon writes below its first live entry make no
+     claim about recovery's state and are not compared.  The golden
+     scenario runs with the flag, gives every SLRU real content before the
+     fork (commit timestamps on, a two-member multixact), and requires
+     reconstructed pages of `pg_xact`, `pg_commit_ts` and both
+     `pg_multixact` halves to have been compared; the integration test
+     drives the mismatch and missing-segment refusals with a forged
+     reference.  Refactoring the appliers onto PostgreSQL's redo routines
+     would retire the obligation.  The transformation is version checked
+     on every path: `pagestore_seed_branch_slrus_impl()`, which the
+     serialized controller, the public `pagestore_seed_branch_slrus()` and
+     the legacy `pagestore_prepare_branch_impl()` all reach, resolves the
+     mirrored control image at the base cutoff and refuses a cutoff with
+     no image to bind to; the image's compatibility tuple is checked by
+     `pagestore_control_image_compatible()` (the checks startup makes,
+     plus `xlog_seg_size` against this cluster's) there and where the
+     controller derives its horizons from the checkpoint image.
+   A payload's version is therefore
+   PostgreSQL's, and whether a payload can be loaded by a different
+   PostgreSQL build is PostgreSQL's question, not a page-store migration.
+   That identity is the full compatibility tuple PostgreSQL itself checks
+   when it opens a cluster, not the version constants alone: a build with a
+   different `BLCKSZ`, `XLOG_BLCKSZ`, `RELSEG_SIZE`, `SLRU_PAGES_PER_SEGMENT`,
+   `MAXALIGN`, `NAMEDATALEN`, `INDEX_MAX_KEYS`, `TOAST_MAX_CHUNK_SIZE`,
+   `LOBLKSIZE`, or float format writes incompatible page, WAL, and SLRU
+   bytes under the same `PG_CONTROL_VERSION` and `CATALOG_VERSION_NO`, and
+   a cluster initialized with another `--wal-segsize` names a different
+   LSN range by the same segment file name.  The tuple is therefore the
+   version constants (`PG_CONTROL_VERSION`, `CATALOG_VERSION_NO`,
+   `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, `PG_PAGE_LAYOUT_VERSION`)
+   together with the layout parameters `ControlFileData` records --
+   those `pagestore_control_restore` already compares one by one, and
+   `xlog_seg_size`, which it only checks for legality today and which the
+   WAL restore path uses to turn a requested file name into an LSN range,
+   so the WAL segment envelope binds the control image's `xlog_seg_size`
+   and checks it against the `xlp_seg_size` of the long page header it
+   carries and against the requesting cluster, as `xlogreader` itself
+   rejects a mismatch.  Envelopes record that tuple for their payload,
+   and a control-image reference covers only what `ControlFileData`
+   contains: the control and catalog versions and the layout parameters.
+   `XLOG_PAGE_MAGIC`, `RELMAPPER_FILEMAGIC`, and `PG_PAGE_LAYOUT_VERSION`
+   live in the native headers of the WAL page, the relation map, and the
+   relation page, so the envelope or loader that hands one of those
+   payloads to PostgreSQL binds or checks that native identity as well
+   (the WAL segment envelope against the first page header it carries, the
+   relation-map envelope against the map's own magic, the page path
+   against the page header) rather than relying on the control image.  A
+   relation block that is still uninitialized is legitimately all zero
+   (`PageIsNew()`: `pd_upper == 0`, `pd_pagesize_version == 0`), and the
+   zero-extension path serves unwritten blocks that way, so the page-header
+   check applies only to initialized pages; a new page carries no native
+   identity and is bound by the control tuple alone.
+   Loaders compare the tuple with the running build, and a mismatch fails
+   closed naming the payload identity rather than the envelope.  Some
+   object payloads are page-store-defined rather than PostgreSQL's, and
+   those are versioned as envelopes: the reader's running-transaction
+   snapshot (PostgreSQL has no stable serialization for it) and the raw
+   values consumers `memcpy` out of an object -- the checkpoint-redo
+   `XLogRecPtr` in control block 1 that the WAL retention floor derives
+   from, the `PS_KLASS_SLRU_WM` watermark and the `PS_KLASS_SLRU_TOMB`
+   truncation cutoff.  Those three keep their value at byte 0, where
+   every reader finds it, and carry an identity trailer (magic and
+   version) at byte 8, which a legacy object leaves zero: a zero trailer
+   is accepted, a trailer naming another format or version is refused by
+   the backend's readers and makes the daemon's WAL floor unknown (fail
+   closed) rather than misread as a floor, a watermark, or a cutoff.
+   Every such payload -- the three raw values, the materializer marker and
+   release and writer checkpoint control blocks, and the five reader
+   snapshot objects -- has its layout and identity in the shared
+   `pagestore_artifact_format.h`, is reported by
+   `pagestore_format_versions`, and is seeded by the fixture workload so
+   the fixture carries one of each and the reopen oracle checks the store
+   hands every one back intact (the reader objects with PostgreSQL's
+   CRC-32C, which the freestanding header reproduces and
+   `pagestore_control_restore --payload-identity` proves against
+   `pg_crc32c` where both are linked).
+2. **Envelopes -- the daemon's record formats -- keep a fixture for every
+   version shipped on `pagestore` after the MVP baseline.**  A supported
+   older version is readable or has an explicit migration; anything newer,
+   unknown, checksum-corrupt, or illegally truncated fails closed with an
+   actionable error.  Every format change updates or adds a fixture, and the
+   compiled identities must match the committed fixture.  Release branches
+   may define a narrower cross-major window.
+3. **Containers are per provider, are registered separately from the
+   records they hold, and carry the same support window as records.**  A
+   record format is provider-neutral and one fixture proves it for every
+   provider; a provider must not fork it.  Each provider registers the
+   identity of its own container format -- the POSIX store's file naming
+   and directory layout, the SPDK store's `spdk_super` (the two legacy struct
+   images and the checksummed v2) and its on-device segment extent layout -- so a container
+   change is caught by the identity check even where its fixture cannot
+   run in CI, and rule 2 applies to it: a container shipped after the MVP
+   baseline stays openable by a later release or migrates explicitly (as
+   the V1 superblock already does), a change that would strand an earlier
+   post-baseline store is not a compatible change, and the POSIX fixture
+   keeps the earlier layout as a legacy fixture rather than being
+   recaptured over it.  Registration is not the whole obligation.  A
+   container whose metadata is unknown, newer, truncated, or corrupt must
+   fail the open, never degrade to a default that can overwrite existing
+   data; and the metadata a container depends on to place new data must be
+   published durably -- written to a temporary file, fsynced, renamed over
+   the old copy, the directory fsynced, with every failure propagated to
+   the caller -- because a valid but stale copy that survives a lost write
+   or crash reopens to the same overwrite.  The SPDK superblock now meets
+   both (`pagestore_spdk_super.c`, a module without SPDK dependencies so
+   the format is unit-tested and reported on every host): v2 is
+   little-endian, length-prefixed and checksummed and records the shard
+   count it was written for; the earlier sharded struct (version word 1)
+   and single-shard struct (no version word) images are decoded and
+   rewritten as v2 at the next publication; a truncated, foreign, newer,
+   corrupt, differently sized, or differently sharded superblock refuses
+   the open instead of restarting every shard at segment zero (the shard
+   count is part of the extent layout, so a store recorded for N shards is
+   never sliced or extended to another N, and a superblock longer than its
+   layout is refused rather than read as a prefix); publication first
+   flushes the NVMe namespace, so counts are never durable ahead of the
+   extents they cover on a volatile write cache, then writes a temporary
+   file, fsyncs, renames, fsyncs the directory, and returns any failure to
+   `spdk_sync()`.  Both providers register their container identity: the
+   POSIX directory layout and file naming as `posix_container`, and the
+   SPDK superblock versions and the on-device extent layout as
+   `spdk_container`.  The SPDK container fixture itself follows the MVP: it
+   needs the device layout split from NVMe I/O behind a file-backed shim
+   before it can be captured and checked without hardware.
+4. **Backend-side artifacts follow rule 2 for their envelopes and rule 1
+   for their payloads.**  Reader and branch manifests, the branch bootstrap,
+   reader snapshot and catalog files, the reader's published snapshot
+   objects, the materializer and writer control blocks, and the durable
+   controller artifacts that recovery of an interrupted operation depends
+   on -- the CRC-protected branch preparation journal
+   (`pagestore_branch.prepare.json`), the branch retention-generation
+   authority file that fences owner-generation reuse, the branch
+   controller's configuration (loaded, schema-checked, and matched against
+   the journal's configuration identity before an interrupted operation
+   can be resumed), the reader-map intent marker
+   (`.pagestore-reader-map-pending`, whose exact name and raw `XLogRecPtr`
+   content restart recognizes to retry a relation-map installation that
+   crashed before the pin advanced), the materializer
+   supervisor's configuration, status, and its own generation-authority
+   file (`retention-owner-<id>.json`, read independently of the status and
+   published before a new worker generation is registered), and the SLRU
+   mirror continuity
+   markers (`pagestore.slru_mirror_debt`, and
+   `pagestore.slru_mirror_primed` with its raw eight-byte checkpoint-redo
+   stamp, whose presence and stamp decide at boot whether the stored SLRU
+   mirror is complete or the cluster carries mirror debt) -- are page-store
+   envelopes with
+   a fixture and a support window of their own (their readers enforce
+   exact schemas, so a schema change without a retained fixture and
+   migration could leave a controller unable to resume or clean up, with
+   the writer restricted, the materializer paused, or a pin stranded); the
+   relation
+   maps, SLRU pages, and control image they carry are PostgreSQL payloads
+   whose version identity the envelope records and the loader checks.  A
+   fixture whose payload names a different PostgreSQL version reports
+   "payload needs PostgreSQL <version>" and is not treated as a broken
+   envelope.
+
+D5 note (2026-09-19): the reader snapshot's DATA object gained a second
+`dbOid` partition -- a retention owner id instead of a real database Oid, for
+the artifact an explicit exact-R publish produces, distinct from the
+automatic checkpoint-driven snapshot's `dbOid = InvalidOid` -- after two
+producers sharing one key silently collided in CI (RELEASE_VALIDATION.md's
+"Integration-lane finding: a silent artifact key collision"). The manifest
+could not reuse the same partitioning trick on the existing MANIFEST object:
+that object's `dbOid` slot is already a namespace of real database OIDs (the
+automatic per-database manifest, tracked and retired by the reader database
+barrier), and an owner id equal to a live database's OID would alias it. The
+explicit publish's manifest instead got a new, dedicated object,
+`PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT`, keyed by the owner id. Both
+changes are store *address-space* partitions/additions, not envelope or
+payload changes: the bytes at any of these keys are unchanged, so neither
+bumped `PS_READER_SNAPSHOT_MANIFEST_FORMAT`/`PS_READER_SNAPSHOT_FORMAT` and
+neither needed fixture regeneration (`fixtures/pgdata-artifacts` and
+`fixtures/posix-artifact-lifecycle`, checked with `--require-build-match`,
+both still pass unchanged). Rule 4's "reader's published snapshot objects"
+now additionally means: one producer per key, with an owner id reserved for
+exact-R rather than an automatic key's `InvalidOid` or the automatic
+manifest's real-database-OID namespace.
+
+Open follow-ups from this fix (R5-5, tracked in RELEASE_VALIDATION.md's
+"Open follow-up work" section, not blocking): (a) an admission/storage
+refusal inside `artifact_store_record()` poisons the whole daemon's artifact
+path for the rest of its lifetime (`artifact_io_failed`), not just the one
+request -- now visible as `PS_ARTIFACT_REFUSE_STORE_RECORD`/`POISONED`
+instead of a bare -1, but the poisoning-on-one-refusal semantics need their
+own review; (b) `append_page_impl`'s page-prune-frontier fence can refuse a
+late-shipped SLRU/reader-snapshot artifact at or below the cutoff independent
+of key/generation ordering -- a separate hazard from the collision fixed
+here.
+
+**Resolved 2026-09-20:** `append_page_impl()` returned the same `-1` for an
+admission refusal (nothing durable changed) and a real storage failure
+(bytes may be on disk); the lifecycle layer poisoned on either. Fix: a
+`PsAppendOutcome` classifies every return site
+(`append_page_raw_outcome()`); the lifecycle layer now poisons only on a
+real I/O failure or a sync failure following an appended record, and every
+other refusal returns a named, non-poisoning reason
+(`PS_ARTIFACT_REFUSE_UNFENCED`/`_FORKMETA_CUTOFF`/`_SYNC`/`_LEGACY_BYPASS`/
+`_IMMUTABLE_MISMATCH`, appended to the existing enum, no `PS_SHM_VERSION`
+bump). (b) turned out not to be a separate hazard: the cutoff derivation
+proves `cutoff <= frontier <= floor <= every active pin`, so a generation at
+a pinned LSN is never below the cutoff -- the actual defect was that
+`ps_artifact_begin` was not fence-checked at all, so a BEGIN at an unfenced
+LSN was admitted pre-cutover (refused instead on its first WRITE) and
+refused by the forkmeta growth check post-cutover, both misreported and both
+poisoning under (a)'s bug. `ps_artifact_begin` now checks the same fence
+predicate the data append uses (`artifact_lsn_fenced()`) before admitting a
+new generation; the forkmeta growth check remains as defence in depth for
+one theoretical structural gap and is now named
+(`PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF`). No producer clamping, no cutoff
+derivation change. Tests: T1/T2/T4 in `pagestore_artifact_lifecycle_test.c`,
+T5/T6 in `pagestore_forkmeta_cutover_test.c`, each fails on the pre-fix tree
+and passes on this one. See `RELEASE_VALIDATION.md`'s R5-5 section for the
+full derivation and `ARTIFACT_LIFECYCLE.md`'s "Refusals and failures" for
+the resulting semantics.
+
+The forkmeta orphaned-ordered-record adoption rule (`fork_event_adopt_orphaned_seg()`
+and `fork_event_adopt_orphaned_commit_seg()`, PR fixing the PR #262 review
+finding and its follow-up review findings F2/F3/F5/R2-F1) is not an envelope
+migration under this decision: `ForkMetaRecV2`/FKM3 layout, kinds, and the
+snapshot payload format are unchanged, and `pagestore_format_versions` reports
+the same identities before and after.  It is a content-level recovery rule,
+explicit and logged, not a silent tolerance of a new envelope shape, gated on
+a stated proof (`fork_meta_orphan_proven()`: the selected forkmeta snapshot's
+freeze sequence covers the record's admission sequence) that is NECESSARY but
+not, by itself, SUFFICIENT proof against a torn append (finding R2-F1,
+independent re-review): a refused record's admission sequence is still
+observed to prevent identity reuse on retry, so a later cutover can freeze
+past a torn record's sequence too, on any rescan after that cutover, not only
+the one immediately following a crash.  The growth-class rule needs no
+further proof (a torn growth append leaves no durable marker or in-memory
+event at all, so it is sound unconditionally); the commit-class rule adds a
+second, path-specific torn-exclusion proof on top of the freeze filter:
+residency on the image-layer path (a layer-resident record's marker append
+cannot still be in flight, since staging happens only after that append
+returns) or, on the segment-suffix path, that at least one complete record
+follows the unmatched record in the same segment (a torn body is always the
+last complete record of its segment).  It is exercised by
+`test_orphaned_ordered_marker_adopted()`,
+`test_orphaned_ordered_marker_not_adopted_on_mismatch()`,
+`test_orphaned_commit_marker_adopted()`,
+`test_orphaned_commit_marker_segment_path()`,
+`test_orphaned_commit_marker_segment_path_last_is_retired()`,
+`test_orphaned_commit_marker_not_proven()`,
+`test_orphaned_commit_marker_size_mismatch()`,
+`test_torn_commit_append_never_adopted()` (folding in the reviewer's
+standalone `torn_test.c` reproduction of R2-F1),
+`test_torn_growth_append_never_adopted()`,
+`test_deletion_filtered_forkmeta()` and its commit-shape variant
+(`pagestore_forkmeta_cutover_test.c`), and by `integration_test.sh`'s
+clean-shutdown reopen of its own retained store, which asserts the reopen
+succeeds, that no segment tail was retired and no record was refused.
+**Resolved (2026-09-20):** the root cause -- `page_cleanup_rewrite_segment()`
+relocating survivors and rebasing the watermark -- is fixed by tombstoning in
+place instead (`page_cleanup_tombstone_segment()`, invariant I3: segment
+bytes are immutable once written, a record's `(seg_id, seg_off)` never
+changes, the flush watermark never retreats).  `integration_test.sh`'s
+adoption-count assertion is now a hard `== 0` invariant, not a detector, for
+any store this daemon has ever fully owned.  See the D5 note below for the
+persisted-format change this needed, and RELEASE_VALIDATION.md's "Resolved:
+pruned ordered marker rescanned after a timeline-delete rewrite" for Q1 (the
+worse, no-crash-required silent data loss the same root cause produced) and
+the T7 follow-up (repair for a store that deleted a timeline before this fix
+-- separate PR, not blocking).
+
+D5 note (2026-09-20): timeline-delete tombstoning added three new
+`page_segment` identities, `SEG_HOLE48_MAGIC`/`SEG_HOLE56_MAGIC`/
+`SEG_HOLE64_MAGIC` ("SEH0"/"SEH1"/"SEH2"), one per existing record header
+shape (48/56/64 bytes) -- the header size the hole must skip is carried by
+the magic alone, matching the shape it replaces.  Only `SEG_HOLE56_MAGIC` and
+`SEG_HOLE64_MAGIC` are registered as identities `pagestore_format_versions`
+pins to a fixture: the daemon writes only admission-era records today
+(56/64-byte headers), so `SEG_HOLE48_MAGIC` -- reachable only by tombstoning
+a legacy 48-byte-header record, never produced by a live write -- stays a
+readable format without a fixture requiring an instance of it, the same
+precedent the pre-admission live magics above it already follow.
+
+Following D5 rules 2-3, the format change demoted the fixture that shipped
+at the pre-fix commit and added a new one rather than recapturing in place:
+`fixtures/posix-artifact-lifecycle` (the format that shipped before this PR)
+now carries `role: legacy` with its tarball, `format.json`, and `fixture.json`
+restored byte-identical from `origin/pagestore`, so it still proves the new
+daemon opens a store written by the previous format unchanged.
+`fixtures/posix-timeline-delete-holes` is the new current-role fixture: a
+full `fixture`-workload capture (`check_segment_formats()`/
+`check_archived_identities()` require every advertised identity present in
+some current fixture) whose deleted branch's target records are still
+memtable-resident, unflushed, when the extend-phase daemon's clean stop
+happens -- `ps_memtable_discard_timeline()` empties the memtable of exactly
+the target's own entries during deletion cleanup, so with no other write
+left in the memtable, `ps_core_close()`'s unconditional flush-if-nonempty
+never fires and the captured holes sit *above* the final flush watermark,
+inside the region a reopen actually rescans.  That placement is deliberate
+and load-bearing for the fixture's mutation check
+(`page_segment.hole_bad_len`, a corrupted hole `len` must be refused) and for
+proving the base daemon's own failure mode directly: opening the archived
+store with the pre-fix `pagestore_daemon` binary fails closed with
+`incompatible record magic 0x53454831` at the first hole's offset, not a
+silent stale-format acceptance.
+
+An older (pre-fix) daemon opening a store containing a hole fails closed
+this way only when the hole lies in the region that daemon's `recover()`
+actually rescans -- above its own last flush watermark.  A hole the fixed
+daemon tombstoned and then flushed past (the ordinary case) sits below the
+watermark, where a downgraded daemon's `recover()` never revisits it at all
+and reopens successfully, oblivious to the hole; that store is fine to keep
+reading, but is not a store to run a further timeline deletion against on
+the old daemon -- `timeline_delete_page_cleanup_one()`'s validate-only pass 1
+never expects a `SEG_HOLE*_MAGIC` word and has no path that produces one, so
+any deletion whose target shares a segment with an existing hole stalls in
+DELETING, retryable but never progressing, until the store is reopened by a
+daemon that understands holes.  The new daemon reads every store written
+entirely before this fix unchanged (no hole magics exist in them, and a
+rebased watermark from a pre-fix deletion is simply a valid,
+never-retreating-further watermark to the new daemon).  The manifest's
+flush-watermark rebase record (`PS_MANIFEST_REBASE_FLUSH_WATERMARK`) is no
+longer written -- its parser stays, permanently, to replay a pre-fix
+manifest -- so this is not a manifest format change, only the page-segment
+family's.
+
+### D6. MVP deployment boundary
+
+Recommended: keep default-tablespace local POSIX as the MVP boundary.  Treat
+user tablespaces, S3, SPDK layers, and service-manager packaging as follow-up
+work.
+
+Decision: **accepted for MVP**.  Default-tablespace local POSIX is the required
+deployment boundary.  User tablespaces, S3, SPDK layers, and service-manager
+packaging do not block MVP completion.
+
+## Proposed PR sequence
+
+The default sequence was:
+
+1. R3b retained-base foundation, then the WAL reclaimer enabled by replacement-base compaction -- done;
+2. R4b forkmeta compaction/reclamation and publication crash tests -- done;
+3. R5 timeline deletion -- done;
+4. R5b reclaimer backpressure controllers -- done;
+5. H0 fault/inspection primitives -- done;
+6. H1 composed crash scenarios -- done;
+7. H2 format fixtures and compatibility CI -- done;
+8. R6 bounded-space acceptance and final MVP status update -- soak and
+   nightly lane done; the seed-20260909 `wal`-bound flake is explained and
+   fixed (#265); the reader-snapshot FSM reopen blocker the fix's PRs hit is
+   fixed (#264), with its F3 root cause (a pruned ordered marker rescanned
+   after a timeline-delete rewrite) tracked as an open, explicitly
+   release-blocking follow-up in `RELEASE_VALIDATION.md` -- not an MVP gate,
+   since #264's F2 mitigation already turns it into a logged pruning
+   reversal rather than silent loss, and gate 5's format fixtures stay
+   complete; the artifact-key collision that made #264/#265/#266 all fail
+   the integration lane identically is fixed (#266); the final status update
+   follows a green scheduled-nightly run history against the post-fix
+   revision.
+
+What remains: the three-seed scheduled nightly lane accumulating a green run
+history against `316401d8d4b` and later (the fixes above), then the final
+MVP status update.  A manually dispatched run against that revision,
+[35458043758](https://github.com/clapdb/postgres/actions/runs/35458043758)
+(seed 20260909, 8000 rounds, 2026-09-19), confirms the fix on one dispatched
+run -- 45024 checks, 0 failures, `physical_max.wal` 1736704 bytes against the
+4667392 bound, `wal_fence_slack_max` 1568768 bytes -- but it is not yet the
+scheduled-run history this gate asks for.
+
+Keep each PR independently reviewable and keep the existing standalone and
+golden suites green.  If work packages depend on one another before their base
+lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
+
+## Progress log
+
+| Date | Change | Evidence |
+|---|---|---|
+| 2026-08-12 | Established completion plan after PRs #174 and #175 landed | Existing pagestore CI green; remaining gates from `MVP_STATUS.md` |
+| 2026-08-14 | Completed R0/R1 owner lifecycle and R2 page pruning; added R3a immutable WAL segment/store primitives | Stacked PRs #177-#191, standalone/integration CI, bounded-churn and publication-crash tests |
+| 2026-08-14 | Added R4a live snapshot/log-epoch cutover and GC, then persisted known/FPI plus record-end metadata needed for safe replacement-base selection | Stacked PRs #195-#197 plus the replacement-base metadata follow-up; standalone and integration coverage |
+| 2026-08-23 | Landed the R4b runtime cutover foundation: durable frontier-gated normalized forkmeta snapshots, all-shard run-to-completion maintenance, source-log rewrite/epoch marker, startup reconcile, poison-on-ambiguous rewrite, and daemon/tiering wiring | Strict standalone, ASan/UBSan unit coverage, focused Meson, and existing pagestore suite; publication crash matrix remains a follow-up |
+| 2026-08-25 | Added R5 POSIX runtime quiescence: lifecycle read coverage for complete requests and synchronous/asynchronous maintenance, fair queued-writer turnstile, and deterministic ordinary/maintenance/delete-drain tests | Focused POSIX timeline test: 58 checks, 0 failures; tiering worker/publication test: 23 checks, 0 failures; SPDK async drain remains explicitly fail-closed/follow-up |
+| 2026-08-26 | Added R5 manifest-owned layer cleanup for DELETING timelines: durable per-layer tombstones, asynchronous local/remote deletion, restart resume, orphan-object reconciliation, and retry backoff | Timeline cleanup/restart/failure coverage; strict focused suites and standalone 1998-check suite |
+| 2026-08-26 | Added R5 deletion-filtered forkmeta cutover: explicit DELETING owners are omitted from checkpoint, tail, and rewritten source while live and pre-metadata owners survive | Forced/ordinary generation, marker-only owner, multi-delete, restart, rewrite-failure, and existing crash-matrix coverage |
+| 2026-08-26 | Added R5 owner-scoped POSIX WAL cleanup for DELETING timelines: flat/immutable WAL and WAL-index logs/snapshots are validated, durably removed, and purged from runtime state without publishing DELETED | Focused normal/fail-closed/restart/sibling tests plus WAL, snapshot, forkmeta crash, and 1998-check standalone coverage; shared page segments remain |
+| 2026-08-26 | Added R5 durable DELETED publication and incarnation-aware numeric-ID reuse: the same-incarnation DELETED event is fsynced after owner-scoped cleanup, and CREATE_BRANCH admits only the exact next token after runtime reset | Focused normal/ASan publication, immediate same-horizon reuse, stale-token/parent fencing, restart, repeated-cycle, sibling-safety, and ambiguous-append coverage; SPDK async drain remains fail-closed |
+| 2026-09-05 | Completed R5b forkmeta reclamation backpressure: stable compacted-source baseline debt, bounded fail-closed POSIX metadata observation, forkmeta-specific mutation admission, shared-memory/inspect/daemon metrics, and forced fair snapshot/GC catch-up | Focused POSIX backpressure, daemon, inspect, and forkmeta observer/controller coverage; queue-bound soak and tuning remain R6 |
+| 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
+| 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
+| 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-10 | Sealed forkmeta source and snapshot payload records as FKM3 (FKM2 layout, CRC-24 in the former pad bytes; a complete record with a bad checksum refuses to open instead of being treated as a torn tail); FKM2 stays readable; `fixtures/posix-mvp-baseline` becomes the legacy fixture and `fixtures/posix-forkmeta-crc` the current one; the fixture check distinguishes legacy (reopen/oracle) from current (identity pin plus mutations) fixtures and takes several directories | First format change through the fixture process; cutover, crash-matrix, timeline, lifecycle unit tests; both fixtures checked; standalone and integration lanes |
+| 2026-09-10 | Added the first H2 persisted-format fixture slice: per-module format identities and `pagestore_format_versions`, a `fixture` workload covering every daemon-side POSIX family, `harness/pagestore_fixture.py` capture/check with identity freshness, reopen-and-restart oracle, and thirty-six mutation cases, `fixtures/posix-mvp-baseline`, meson and standalone CI checks; fixed relocated-store layer locations and a damaged forkmeta marker discarding post-cutover events; documented the forkmeta record checksum gap | Fixture check locally against the captured baseline; layer-store and forkmeta crash-matrix unit tests; standalone and integration lanes; D5 remains open and is flagged as an assumption |
+| 2026-09-10 | Added the H1 fork-metadata publication crash slice: a `forkmeta` gc_seed workload (page-pruning cutoff, thirty-two relations with create/zero-extend/truncate events on both sides of the cutoff, post-cutoff trickle for the second generation) composing the four existing `forkmeta.*` probes, with staged/selected/marker/GC snapshots, settled-generation recovery, current and retained fork sizes, refused below-cutoff queries, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Added the H1 restart-combination slice: a `restart` operation for the writer runtime (writer, installed pinned readers via boot-control restore) and the materializer runtime (writer, supervisor-replaced worker, store with all computes down), plus `writer_reader_restart` and `materializer_restart_combinations` scenarios asserting reader horizon and prepared-xid hiding across restarts and materialized boundaries after writer, worker, and store restarts | Harness validation tests and meson plan checks; both scenarios in the integration CI lane; no SPDK execution |
+| 2026-09-10 | Added the H1 manifest replacement crash slice: map-held probes after the fsync'd compacted temp log and after its rename, crashed temp-log removal on manifest open, a `manifest_compact` gc_seed workload (320 pages under a harness-held maintenance pause, workload-armed fault and release), per-stage temp-file snapshots, reconciled-manifest recovery with every page served and no temp log, and idempotent restart | Harness validation tests; two meson/CI scenarios against the POSIX daemon; manifest unit test; no SPDK execution |
+| 2026-09-10 | Added the H1 timeline deletion crash slice: lock-held probes after the durable DELETING event, after private WAL/WAL-index removal, after a shared segment rewrite, and after the durable DELETED event; a `timeline_delete` gc_seed workload (branch with private WAL, WAL-index interval, owner layer, shared-segment pages, workload-armed BEGIN_DELETE); per-stage private-artifact snapshots, DELETED-with-token recovery, parent readable, branch reads rejected, owner artifacts gone, manifest reconciled, no owner, and idempotent restart | Harness validation tests; four meson/CI scenarios against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Added the H1 WAL reclaim crash slice: named store-lock probes before the first unlink, after each unlink, and before the residual-prefix directory fsync; a `wal_reclaim` gc_seed workload (three sealed segments, control note at the shipped end, workload-armed fault, WAL-index progress); per-stage sealed-segment snapshot counts, unlink-retry recovery, refused prefix reads, WAL end/retain floor, cleared reclaim debt, no owner, and idempotent restart | Harness validation tests; three meson/CI scenarios against the POSIX daemon; fault registry and WAL-store unit tests; no SPDK execution |
+| 2026-09-10 | Added the H1 WAL-index compaction crash slice: a `wal_index` gc_seed workload (fixed WAL-index reader at 40 under three FPI-led chains, one committed interval, workload-armed fault), a `--walidx-snapshot-bytes` daemon trigger override, and a process abort after the durable WAL-index frontier with staged-generation snapshot, retried commit, chain/refusal reads, owner, and idempotent-restart checks | Harness validation tests; meson/CI scenario against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Added the H1 page-pruning crash slice: a `gc_seed` daemon-harness operation backed by `pagestore_gc_crash_client` (three history generations, newer block, workload-armed fault, configured cutoff at 3500), three process aborts after the durable prune frontier, the compacted layer's manifest publication, and the retired layer's mark-delete, with snapshot, recovery-read, manifest reconciliation, retained-horizon, and idempotent-restart checks | Harness validation tests; three meson/CI scenarios against the POSIX daemon; no SPDK execution |
+| 2026-09-10 | Made the materializer's WAL-index horizon page-protected by its own derived cutoff (unless another WAL-index-only owner shares the LSN), so stored pages replace its FPI-led chains and the soak's WAL bound returns to two publication intervals | Reclaim-core case (a WAL/WAL-index materializer pin authorizes the base at its horizon; a shared LSN still does not); control/lifecycle/standalone suites; integration lane; 2400/8000-round soaks within the tighter bound |
+| 2026-09-10 | Added SLRU-class and reader-artifact retention: seeds (replay bases), reader snapshots, the live SLRU mirror, tombstones, and the watermark follow the relation plan below their consumers' pins and branch fork points, and a retired artifact releases its control-image fence (the registry now counts artifact versions) | Control-prune cases for a pinned reader, a branch fork point, a dropped pin, retry collapse, fence release, and restart; lifecycle/reclaim/standalone suites; integration lane; 2400/8000-round soaks |
+| 2026-09-10 | Added the nightly long-run soak workflow: a seed matrix (default three seeds at 8000 rounds) built from the freestanding daemon and harness, scheduled daily and dispatchable with chosen seeds/rounds, with per-job report summaries and 30-day JSON artifacts | Workflow YAML validated; the same soak binary and report format as the pull-request lane |
+| 2026-09-10 | Derived the operational page-history cutoff from the writing compute (the materializer's restart-redo pin, or the newest checkpoint note's redo), kept the exact-redo twin of every retained checkpoint image, gave the branch controller's base pin page history, and modeled the real materializer mask plus progress marker in the soak | Control-prune cases for marker and note cutoffs with refusal below the frontier and restart; lifecycle/reclaim/standalone suites; integration lane with pruning active in the golden and branch-boot flows; 2400/8000-round soaks |
+| 2026-09-11 | Rolled the merged #238-#248 stack (SLRU/reader retention, materializer horizon, the H1 page-prune/WAL-index/WAL-reclaim/timeline-delete/manifest/restart/forkmeta slices, the first H2 fixture slice, FKM3) onto `pagestore`; the stacked PRs had each merged into the PR below them, so their content had stopped on the top branch | PR #249, ancestry-only merge with the tree of the reviewed #248 head; pagestore CI green |
+| 2026-09-11 | Scheduled the nightly soak: GitHub runs schedules only from the default branch and `master` is reserved for the upstream mirror, so `pagestore` became the repository's default branch and the workflow gained a schedule guard (this repository or `PAGESTORE_NIGHTLY_ENABLED=1`; manual dispatch always); the interim copy on `master` (#250) is withdrawn | A 200-round dispatch resolved and checked out `pagestore` at the #249 merge, 1426 checks, 0 failures; after the default-branch change a 100-round dispatch ran from `pagestore` itself (run 34610482840, 978 checks, 0 failures) |
+| 2026-09-12 | Decided D5: PostgreSQL-native payloads are wrapped and never rewritten, with their PostgreSQL version identity recorded in the envelope and checked by the loader; daemon envelopes keep a fixture per shipped version with explicit migration or fail-closed; container formats are registered per provider (SPDK `spdk_super` and extent layout included, its fixture after the MVP); backend artifacts follow the same envelope/payload split | `MVP_COMPLETION_PLAN.md` D5; the H2 backend slices are sequenced against these rules |
+| 2026-09-12 | Registered the POSIX and SPDK container identities and made the SPDK superblock fail closed and durable: `pagestore_spdk_super.c` (no SPDK dependency) decodes the checksummed v2 and both legacy struct images, refuses truncated, overlong, foreign, newer, corrupt, differently sized or differently sharded superblocks instead of zeroing the segment counts, publishes v2 through NVMe flush, temp/fsync/rename/dir-fsync with failures returned to `spdk_sync()`; `posix_container` and `spdk_container` join `pagestore_format_versions` and the current fixture's identity table | `pagestore_spdk_super_test` (69 checks) in meson and the standalone lane; the fixture check passes against both fixtures; the SPDK daemon links with the module |
+| 2026-09-12 | Bound the PostgreSQL payload identity on the paths that hand bytes to PostgreSQL: shipped-WAL envelope version 2 records `xlp_magic`, `xlp_info` and the WAL segment size from the payload's page header (read in host byte order, as PostgreSQL wrote it) in the bytes version 1 reserved, the store re-derives them from the first chunk once per open before serving any range, `pagestore_walrestore` (now built with the PostgreSQL headers) refuses a WAL page magic or segment size the payload was not written for, and a read the store refuses, with an exit status recovery treats as fatal, `pagestore_control_restore --payload-identity` prints the build's tuple and the control install refuses an image whose WAL segment size differs from the target cluster's; `posix-wal-payload-identity` is the current fixture, its predecessor legacy | `pagestore_wal_segment_test` (25 checks), fixture check across three fixtures with the new use-rejected mutation, meson fixture check against the build's identity, integration test with accept/refuse assertions for the restore command, golden scenario and managed materializer smoke with bound restore commands |
+| 2026-09-12 | Bound the SLRU seed pages' PostgreSQL identity on every seeding path (`pagestore_seed_branch_slrus_impl` resolves the control image at the base cutoff, refuses a cutoff with none, and checks its compatibility tuple; the controller's horizon derivation checks it too) and proved the seeders' replay against recovery: `pagestore.seed_reference_slru_dir` compares every reconstructed page with the paused materializer's before writing it, the branch controller sets it with `--verify-seed-against-materializer`, and the golden scenario requires pages of all four SLRUs to have been compared equal | Golden scenario (4 reconstructed pages equal), integration test (fail-closed base cutoff, forged-reference mismatch and missing-segment refusals, nothing published), branch boot test |
+| 2026-09-13 | Closed the R4b concurrency clause: the crash matrix's deterministic concurrent appender runs at every publication boundary (prepare, manifest commit, source rewrite, snapshot GC) creating and growing a relation of its own with the acks published before its admission-rd is released, and recovery must show the acknowledged size and carry each acknowledged event's record exactly once across the selected snapshot parts and the source suffix; the composed `forkmeta` workload records every trickle create and growth in a ledger (`--ack-file`) as pending and then acknowledged, the first eight relations acknowledged before maintenance may run, its verify oracle holds recovery, and the additional restart, to each acknowledged step exactly once while allowing an in-flight step either outcome, and the harness counts each acknowledged event's record in the durable set, requiring one | `pagestore_forkmeta_crash_matrix_test` (273 checks, repeated runs), the four composed forkmeta scenarios (58--66 acknowledged appends verified each, twice, one in flight; every acknowledged record counted once), harness unit tests, standalone suite |
+| 2026-09-19 | Explained and closed the nightly `wal`-bound flake (seed 20260909, runs 34747373574/34825221247): the WAL reclaimer's raw WAL-index dependency floor only moved at a WAL-index controller-forced publication, and its one-second no-progress backoff was not cancelled when a proof input changed; `wal_segment_reclaim_one` now requests an on-demand compacted WAL-index publication for a segment blocked only by the stale raw floor, and the backoff is cancelled by a proof-epoch bump on retention/WAL-index-publish/GC/progress/timeline-delete events; the soak's `wal` during-bound is restated from five declared terms (4667392, 18 KiB tighter) with a per-sample check tying physical WAL to the soak's own fences (`wal_fence_slack_max` in the report) | Three new `pagestore_wal_reclaim_core_test` cases (fail on 59fc63bc4d2, pass with the fix; 128 checks, 0 failures total); reclaim core, walidx snapshot/prune, control/lifecycle prune, artifact lifecycle, gc, and standalone suites green; seed 20260909 at 8000 rounds 5/5 plain and 3/3 contended runs, seeds 7/4242 at 8000 rounds, and the 2400-round PR-lane size, all with `physical_max.wal` well under the new bound and the fence check reporting 0 failures |
+| 2026-09-19 | Independent review of the `wal`-bound fix found and closed three gaps before merge: (1) a lost-wakeup ordering bug -- the no-progress backoff must record the proof epoch as read before this attempt's own proof inputs, not a fresh read at arm time, because a retention pin drop (dispatched without the admission lock) landing in the window this attempt has released walidx_prune_lock/wal_lock for the retention-floor scan could otherwise bump the epoch before the backoff recorded it and the wakeup would be lost; (2) the epoch-cancelled retry needed a rate limit (WAL_RECLAIM_REARM_MIN_NS, 20 ms) since every re-evaluation is a full drain and PIN_DROP does not itself drain admission; (3) the reclaim-due request must be fence-keyed (re-issued only when the raw floor or a retention-registry fence changed since the last served request, tracked via a dedicated `walidx_reclaim_fence_epoch`, not `retention_effective_floor`'s own numeric value, which a newly reserved pin need not move) rather than progress-keyed, since the backend materializer publishes durable WAL-index progress once per indexing batch and a progress advance alone can never retire the blocking item; also reset the three new per-timeline request-tracking arrays (and the pre-existing force_due/gc_force_due/reclaim_due flags, a latent in-process-reopen leak) in `ps_core_open_impl` | Extended `test_no_progress_backoff_follows_proof` and `test_unreplaceable_dependency_requests_once` (both fail on the pre-review branch head: the former needs `sleep` past the rate-limit floor, the latter sees the snapshot generation grow past 2 on progress-only advances); new `test_epoch_retries_are_rate_limited` and `test_backoff_epoch_predates_attempt_inputs` reclaim-core cases; `maintenance_until_count`'s iteration budget raised (2048) to accommodate the rate-limit floor under real per-pass I/O cost; 169 reclaim-core checks, 0 failures; full standalone suite green; seed 20260909 at 8000 rounds 5/5 plain and 3/3 contended, `physical_max.wal` ~1.7-1.8 MiB (unchanged order of magnitude) |
+| 2026-09-19 | Round-2 review of the `wal`-bound fix found and closed two more gaps before merge: (1) the three PS_OP_RETENTION_PIN_SET/RESERVE/DROP sites only bumped the reclaimer's proof/fence epochs when the changed resources included PAGE_HISTORY or WAL, but `walidx_prune_fences` fences the compaction plan on WAL_INDEX pins too, so a WAL_INDEX-only pin drop/move left the reclaimer fruitless-suppressed until the WAL-index controller's own trigger noticed independently -- fixed by also bumping on `(old|new) & PS_RETENTION_RESOURCE_WAL_INDEX`; (2) the retained `walidx_snapshot_end[tl] < progress` guard on the reclaim-due request was removed: "a publication already covering current progress cannot drop more" is false for fence changes, since removing a fence lets the plan drop more raw items at the very same end_lsn a prior publication already reached (the publish path's own write-section guard already admits `end_lsn == previous_end` when `reclaim_due` is set).  Also hardened two flaky test assertions (measure elapsed since the arm instead of assuming two fsyncs cost nothing; assert the final drain count advances by exactly one instead of landing on an absolute value) and rewrote `maintenance_until_count` to bound on wall-clock time (1 s) instead of a fixed iteration count, since a store with other work pending can report "did work" on every pass without ever idling, making a fixed budget's real cost scenario-dependent | New `test_walidx_only_pin_drop_requests_compaction` (fails without the epoch-bump fix and the guard removal: the store stays stuck after dropping the WAL_INDEX-only pin); 176 reclaim-core checks, 0 failures, stable across repeated runs; full standalone suite green; seed 20260909 at 8000 rounds |
+| 2026-09-19 | Fixed the PR #262 review finding (`RELEASE_VALIDATION.md`): a live ordered write's in-memory fork history recorded a plain GROW instead of the bound marker recovery would rebuild, so a second forkmeta cutover in one daemon lifetime published a plain GROW and the store could not reopen. `append_page_impl()`'s live path now inserts the marker-plus-activation recovery itself rebuilds; `replay_page_record()` gained a fail-closed `fork_event_adopt_orphaned_seg()` fallback that heals a store already in the broken state by matching a plain GROW's exact nonzero admission identity, logging each adoption; `recover_layer_prefix()`/`recover()` log the refused/retired record's full tuple instead of a bare stale-errno message. No persisted format changed | `pagestore_forkmeta_cutover_test` new cases `test_live_ordered_marker_survives_two_cutovers`, `test_live_ordered_commit_marker_survives_two_cutovers`, `test_live_ordered_marker_walless_survives_two_cutovers`, `test_orphaned_ordered_marker_adopted`, `test_orphaned_ordered_marker_not_adopted_on_mismatch` (331 checks total, each new case failing before the fix and passing after); `pagestore_forkmeta_crash_matrix_test` (273 checks) and `pagestore_test` (2074 checks) unaffected; `integration_test.sh` gained a clean-shutdown reopen of its own retained store (`ok - retained store reopens independently after clean shutdown`, `ok - no orphaned ordered records were adopted on reopen`; FAILs on the reverted core); format fixtures (`posix-mvp-baseline`, `posix-forkmeta-crc`, `posix-artifact-lifecycle`) and `pagestore_format_versions` unchanged; the real daemon opening the preserved failing integration store logs 625 adoptions and reaches `ready` |
+| 2026-09-19 | Revision 2 on independent review of the fix above (findings F2/F3/F5): generalized the adoption rule to a stated proof, `fork_meta_orphan_proven()` (the selected forkmeta snapshot's freeze sequence covers the record's admission sequence -- provably true only for a durably-appended-then-lost marker, never a torn append, because the admission write lock that computes freeze_seq drains every append holding the admission read lock across `append_page_impl()`), applied to both the existing growth-class rule and a new commit-class rule (`fork_event_adopt_orphaned_commit_seg()`, an inert `FEV_SEG_COMMIT_BOUND` proven safe by the fork's size rather than by identity, since a commit-class rewrite never left a plain GROW to match) on both the layer and segment-suffix recovery paths -- F2 closed a real gap: the FSM/VM commit-rewrite pattern could not self-heal before this.  Identified and recorded as open (not fixed here, kept reviewable): F3, a pre-existing defect where `fork_meta_snapshot_build()` degrades/drops a marker whose page version was pruned from memory, and a timeline-delete rewrite rebasing the flush watermark to 0 makes the next open rescan and meet that orphan; this PR mitigates its commit-class outcome (a silently retired segment tail) into a logged pruning reversal via F2, adds regression assertions that fail on the baseline core, and records the mechanism, invariant (I3), and follow-up design in `RELEASE_VALIDATION.md`.  Reworded every "self-heals" / "never needs the adoption rule" overclaim across the code comments, test comments, and docs to the precise statement (proof + growth-or-size match).  F5 (linear event scans over inert commit markers, O(N) per record for FSM/VM forks) noted as a tracked follow-up, no code change | `pagestore_forkmeta_cutover_test` new cases `test_orphaned_commit_marker_adopted`, `test_orphaned_commit_marker_segment_path`, `test_orphaned_commit_marker_not_proven`, `test_orphaned_commit_marker_size_mismatch`, `test_deletion_filtered_forkmeta_commit_shape`, plus `test_orphaned_ordered_marker_adopted` migrated off a no-snapshot construction onto the real forkmeta snapshot publication API (459 checks total; the four new positive assertions fail with the freeze-proof/commit-rule change reverted and pass with it; the two F3 regression assertions fail on the unmodified baseline and pass on the branch); `pagestore_forkmeta_crash_matrix_test` (273 checks) and `pagestore_test` (2074 checks) unaffected; `integration_test.sh`'s reopen guard gained two more assertions (`ok - no segment tail was retired on reopen`, `ok - no ordered record was refused on reopen`) and reworded the adoption-count assertion as the F3 detector (this run: 0/0/0); format fixtures and `pagestore_format_versions` unchanged; admission-read-lock-across-append_page_impl citation: `pagestore_daemon.c` `run_request()` (`ps_admission_read_lock()` at the write-op branch, held across `run_request_admitted()`, released only after it returns) |
+| 2026-09-19 | Revision 3 (R2-F1) on further independent review: the freeze proof (`fork_meta_orphan_proven()`) is NOT a torn-append exclusion by itself, correcting Revision 2's row above -- a refused record's admission_seq is still observed to prevent identity reuse, so a later cutover can freeze past a torn record's own sequence too, making the predicate alone say "proven" on any rescan after that cutover, not only the first one after a crash (reviewer evidence: `review-fsm/torn_test.c`, `./torn_test 8`, lifetime 3 adopted a never-acknowledged torn commit-class body and served the wrong tag).  Kept the freeze predicate as a necessary filter only and added the real, path-specific torn-exclusion proof for the commit-class rule: unchanged (residency) on the image-layer path; on the segment-suffix path (`recover()`), added a one-slot look-ahead -- a refused, otherwise-adoptable commit-class record is stashed instead of retired immediately, and resolved (inert marker inserted, logged with the complete record's offset) only when the next record in the same segment parses completely, or retired (now saying `no complete record follows in this segment`) if the scan ends first -- because a torn body is structurally always the last complete record of its segment (`append_page_impl()` advances the shard cursor only after the marker append succeeded).  Deliberately kept `admission_seq_observe()`/`segment_order_id_observe()` on every replayed record including refused ones (removing them to make the freeze proof sound would let a post-crash retry collide with the torn record's own identity).  The growth-class rule needed no change (sound unconditionally on both paths, proven separately).  Reworded the three "torn append's sequence is always above every freeze sequence" claims (`pagestore_core.c`, `RELEASE_VALIDATION.md`, the cutover test's header comment) to state the necessary-only status precisely.  Also initialized an unrelated pre-existing uninitialized-read (`byte` in a corruption-fixture helper, `pagestore_forkmeta_cutover_test.c`) flagged by static analysis while this code was already being touched | `pagestore_forkmeta_cutover_test` new cases `test_torn_commit_append_never_adopted` (fails on the Revision-2 core: lifetime 3 adopts and serves the torn tag; passes with the look-ahead), `test_torn_growth_append_never_adopted`, `test_orphaned_commit_marker_segment_path_last_is_retired`; `test_orphaned_commit_marker_segment_path` reworked onto a fork+`_exit()` harness (a clean `close_runtime()` unconditionally flushes every memtable into a layer, so the prior close-based construction never actually exercised the segment-suffix path at all) with a following complete record, now asserting the `... followed by a complete record at offset N` line (490 checks total); reviewer's `./torn_test 8` (rebuilt against the new objects) retires again in lifetime 3 and serves the committed tag; `review-fsm/dbg_test2.c` commit-shape scenario still adopts and serves LSN 200; `review-fsm/store-commit` still reopens with two adoptions (layer path, unaffected); `store-failing` still reopens with 625 adoptions, 0 commit adoptions (all growth-class); `pagestore_forkmeta_crash_matrix_test` (273 checks) and `pagestore_test` (2074 checks) unaffected; fixture check (54 checks) and `pagestore_format_versions` unchanged; `integration_test.sh` (278 ok, all four guard counts 0); standalone-lane `cc -O2 -Wall -Wextra -Werror` compiles of `pagestore_forkmeta_cutover_test`, `pagestore_daemon`, and `pagestore_forkmeta_crash_matrix_test` against the new core are clean |
+| 2026-09-12 | Gave the controller's and supervisor's JSON artifacts their identities and fixture: `pagestore_artifact_schema.py` holds each kind's schema, accepted/refused schemas, checksum rule and key set, both tools stamp and judge through it (the retention authorities and the supervisor status gain a schema member and `crc32`, their previous layouts read as legacy), and `fixtures/controller-json`, captured from the golden scenario and the managed materializer smoke, is checked by `harness/pagestore_controller_fixture.py` in the standalone lane | controller fixture check (6 artifacts load, 40 mutations refused or accepted as declared), both tools' unit suites, golden scenario and managed materializer smoke with the capture hooks |
+| 2026-09-12 | Gave the backend's data-directory artifacts their identities and fixture: `pagestore_artifact_format.h` names and lays out the prepared branch's manifest and bootstrap, the prepared reader's manifest, snapshot and catalog provenance, the reader-map intent marker and the SLRU mirror's primed marker (both now value at 0 with an identity trailer at 8, legacy read, foreign fails closed), the backend's structs are pinned to them, `pagestore_format_versions` reports the `pgdata` family, `pagestore_pgdata_artifact_check()` loads an artifact through its production loader, `integration_test.sh` captures a real backend's artifacts, and `fixtures/pgdata-artifacts` is checked by `harness/pagestore_pgdata_fixture.py` -- identities in the standalone lane, loaders and twenty-one mutations in a scratch cluster in the integration lane | pgdata fixture check (8 artifacts load, 21 mutations rejected or accepted as declared), store fixture check across four fixtures, standalone suite, integration test (with the capture hook), golden scenario, branch boot test |
+| 2026-09-12 | Gave the backend's store-object payloads their identities: `pagestore_artifact_format.h` (freestanding) holds the layouts of the redo note, SLRU watermark and tombstone (value at 0, identity trailer at 8, zero for legacy), the materializer marker and release and writer checkpoint blocks, and the five reader snapshot objects, plus PostgreSQL's CRC-32C; the backend stamps and checks the trailers, the daemon's WAL floor fails closed on a note it cannot read, `pagestore_format_versions` reports all twelve identities, the fixture workload seeds one of each and verifies them on reopen, `posix-backend-objects` is the current fixture and `posix-wal-payload-identity` legacy | `pagestore_control_prune_test` (legacy note counts, foreign trailer makes the floor unknown), fixture check across four fixtures, standalone suite, integration test, golden scenario, materializer smoke; `--payload-identity` proves the header's CRC-32C against `pg_crc32c` |
+| 2026-09-09 | Added the R6 bounded-space soak (`pagestore_soak_test`, standalone CI) and closed four retention gaps it exposed: control-object version pruning fenced by retained WAL boundaries, WAL-index replacement bases from durable stored page versions and fork deaths, forkmeta cutoff exemption for frontier-less branch timelines, and bounded fork-lifecycle history (invalidated versions dropped by image compaction, base/fence/growth planner with required invalidation fences, compacting deletion-forced generations) | 2400/6000/8000-round runs (three seeds): every category within bound, WAL reclaimed to the last immutable segment, forkmeta at 5-22 KB; lifecycle (178), control-prune (32), WAL-index planner (27), forkmeta planner (12040), reclaim core (95), timeline (316), backpressure (369), forkmeta cutover/crash (259/245), gc (93), standalone (2074), and backpressure daemon (79) suites green |
+| 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
+| 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
+| 2026-08-28 | Added R3b-2 standalone crash-safe physical immutable-prefix reclamation: `ps_wal_store_reclaim_prefix()` publishes retained/physical frontiers before unlink, uses the WAL mutex as a reader drain/barrier, fully validates/sorts residual candidates before ascending unlink, revalidates every main-catalog candidate immediately before unlink, keeps partial unlink catalog state exact, fences ambiguous directory fsync, and retries residual prefixes after restart; no core maintenance or cutoff policy | Final focused WAL-store test: 167 checks, 0 failures; includes reverse-enumeration candidate ordering, scan-error zero-unlink, low/middle main-catalog corruption and residual corruption, lowest/middle unlink failures, per-candidate header/CRC validation, real fork/`_exit` stops before unlink/after partial unlink/before directory fsync, pending-reclaim advance fencing, deterministic reader-barrier timing, idempotence, boundary rejection, and restart retry |
+| 2026-08-28 | Added conservative R3b-3 POSIX/core WAL reclaim policy integration: cheap WAL-lock-only due preselection plus bounded no-progress backoff, durable retained-base admission with per-level WAL-lock read rechecks and inherited-parent fallback, fair one-LIVE-timeline scheduling ahead of continuous tier/remote-GC work, admission drain plus WAL-index freeze and single-timeline WAL locking, target branch/control caps, dependency/retention/progress minimum cutoff (including progress beyond the sealed prefix), residual-prefix retry at an already-published frontier, DELETED-descendant release, fail-closed pending-proof/publication handling, and one-second retry backoff; physical directory start is not a runtime fence and pre-metadata timelines retain local WAL reads | Focused core policy test: 66 checks, 0 failures; covers empty and boundary-floor preselection, ancestry and natural nonzero child fallback, child-local controls and target branch caps, LIVE/DELETING/DELETED structural floors and WAL-index exceptions, timeline isolation, naturally nonzero starts, unaligned and boundary-crossing flat progress tails, snapshot recovery plus WAL/WAL-index re-ship admission after base advancement, pre-metadata reads, restart/residual retry, fenced residual-query suppression, read/frontier publication and floor-scan lock-order races, no-proof candidate fairness, pending durable-proof cleanup failure, metadata publication failure/backoff, and admission concurrency; sparse/discrete base crossing and bounded fixed-reader soak remain out of scope |
+| 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
+| 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
+| 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |
+| 2026-09-19 | Fixed a silent artifact-key collision between the automatic checkpoint-driven reader snapshot and an explicit exact-R publish (PRs #264/#265/#266 all failed the integration lane identically at "daemon reported error for op 34"): the explicit publish now uses an owner-scoped `dbOid` key for its DATA object instead of sharing the automatic snapshot's `InvalidOid` key, publishes its manifest under a new dedicated `PS_READER_SNAPSHOT_OWNER_MANIFEST_OBJECT` rather than aliasing the automatic per-database manifest's real-database-OID namespace at `MANIFEST_OBJECT`, and no longer publishes the automatic-only "global" manifest fallback; `ps_artifact_begin`/`commit`/`drop` report a refusal reason (`PsArtifactRefuseReason`, append-only) that the daemon logs and the client echoes instead of a bare op number, closing the diagnostic gap that made the original failures a one-line mystery for three PRs in a row (D5 note above; RELEASE_VALIDATION.md's "Integration-lane finding") | `pagestore_artifact_lifecycle_test.c`'s `test_reader_snapshot_owner_key_split` covers the refusal-reason plumbing and the per-`dbOid` producer independence the fix relies on (it cannot reach the base bug itself, which was `pagestore.c`'s key choice, not the lifecycle); `integration_test.sh`'s reader section is the actual regression test -- it forces the collision order deterministically (polls the automatic generation into existence before the explicit publish) instead of racing worker timing, fails with the key reverted ("artifact begin: newer generation exists"), and asserts no refusal line at the end of a passing run; full `meson test --suite pagestore` (74/74), all three fixture checks (store, pgdata, controller) unchanged with `--require-build-match`, `KEEPTMP=1 integration_test.sh`, `mvp_golden_test.sh`, and `branch_boot_test.sh` all green |
+| 2026-09-20 | Follow-up review of the above artifact-key fix found and fixed a second, latent collision before it shipped: the explicit publish's manifest had reused MANIFEST_OBJECT's `dbOid` slot, which is the automatic per-database manifest's real-database-OID namespace (tracked/retired by the reader database barrier) -- an owner id equal to a live database's OID would have aliased that database's manifest and risked the barrier dropping it. Gave the explicit manifest its own object number instead (see D5 note); corrected two doc inaccuracies (the unit test does not reach the base bug; the owner id is range-checked, not truncated); mapped the "refused before ps_artifact_begin ran at all" case (`PS_ARTIFACT_REFUSE_NONE`, the daemon's klass/timeline gates) to an explicit message instead of a bare "none"; recorded the R4-2 poisoning and forkmeta-cutoff-vs-fenced-artifact follow-ups as open in RELEASE_VALIDATION.md | Full `meson test --suite pagestore` (74/74), all three fixture checks unchanged with `--require-build-match`, the unit test in both SLRU/reader-snapshot klass modes, `KEEPTMP=1 integration_test.sh`, `mvp_golden_test.sh`, and `branch_boot_test.sh` all green |
+| 2026-09-20 | Filled in the first post-fix nightly soak dispatch: after #265 (the `wal`-bound flake fix) merged to `pagestore`, manually dispatched the `pagestore nightly soak` workflow at `316401d8d4b` (the #264 merge commit); recorded its numbers in `RELEASE_VALIDATION.md` and `MVP_STATUS.md` in place of the `<PAGESTORE_NIGHTLY_POSTFIX_RUN_ID>` placeholder, and updated this plan's item 8/"What remains" and `MVP_STATUS.md`'s "Recommended sequence" to reflect that the flake (#265), the FSM reopen blocker (#264), and the artifact-key collision (#266) are all fixed, while F3's root cause stays an open, explicitly release-blocking (not MVP-gating) follow-up per `RELEASE_VALIDATION.md` | Run [35458043758](https://github.com/clapdb/postgres/actions/runs/35458043758): seed 20260909, 8000 rounds, 45024 checks, 0 failures, both during-run and quiescent bounds satisfied, `physical_max.wal` 1736704 bytes against the 4667392 bound, `wal_fence_slack_max` 1568768 bytes; one dispatched run, not yet the three-seed scheduled-run history the gate asks for |
+| 2026-09-20 | Resolved F5 (design A, PR 1 of 2; see RELEASE_VALIDATION.md's "Resolved: linear event scans over inert commit markers (F5)"): added a `(lsn, admission_seq)` position index over the fork-event array both insertion routines already kept in that order (`fork_event_lower_bound`/`upper_bound`/`identity_range`, bisected `fork_event_insert_pos`), gated by a per-fork `nlegacy_seq` counter so a fork holding a legacy sequence-zero event keeps the exact old linear code as its fallback; routed `fork_asof_hop`, `fork_inheritance_fenced`, `fork_event_activate_seg`, `fork_event_adopt_orphaned_seg`, `fork_event_commit_adoptable`, and `fork_meta_snapshot_marker_present` through it, and reordered `fork_meta_snapshot_append_source_markers`'s `&&` chain so the index-backed presence check runs before the version-chain walk. Added a randomized self-test (`ps_test_fork_event_index_selftest`) cross-checking every fast path against the original linear algorithms -- including, after review, that `fork_event_insert_pos()`'s slot matches a read-only reference walk for every insert, not only in aggregate -- and a deterministic step-counter scaling guard (`ps_test_fork_event_scan_steps`/`ps_test_fork_event_count`) proving sublinearity without a wall clock. Review also found the scaling case disk-bound (`flush_pages = 1` flushed one image layer per rewrite -- fine on tmpfs, ~100-300s on the standalone lane's real disk) and fixed it: K dropped 20,000 -> 5,000, the store reopens with `flush_pages` raised above K before the rewrite loop (captured at `ps_core_open()`, so a reopen is required to change it), and the wall-clock ceiling is now a logged warning, not an assertion (the step counter is the actual guard). No persisted-format change; PR 2 (design B) will bound the in-memory array itself by compacting the inert markers a cutover already drops durably | New `pagestore_forkmeta_cutover_test` cases: `test_fork_event_index_selftest` (6 combinations x 2000 events x 4000 queries, all failing checks would surface as a nonzero 1-based check number; a deliberate mutation of `fork_event_upper_bound`'s comparison was confirmed to make it fail) and `test_fork_event_index_scaling` (K=5,000 FSM-pattern rewrites; asserts scan steps < K*128 for the writes, the cutover, and the reopen -- confirmed to fail deterministically with the index disabled: 25,010,000 / 12,507,500 / 12,507,501 steps respectively, versus the unmodified core's now-unreachable ~K^2 cost; measured 0.25s on tmpfs and 2.5s on a disk-backed directory for the whole case); full suite green across three consecutive runs (5512/0 `pagestore_forkmeta_cutover_test` each run, ~6.2s on tmpfs; 2074/0 `pagestore_test`, 273/0 crash matrix, 245/0 lifecycle prune, 151/0 control prune, 93/0 gc, 176/0 wal reclaim core, 73/0 artifact lifecycle, 17043/0 forkmeta prune unaffected); `meson test -C build --suite pagestore` 74/74 (cutover case 41.5s under parallel load, still well inside the 120s timeout); all three fixture checks (store, pgdata, controller) unchanged; `KEEPTMP=1 integration_test.sh` (279 ok) and `mvp_golden_test.sh` (40 ok) both green. `fev_bench.c` (now in-tree, developer tool, not wired into CI/meson) at K=50,000: live path 41.7 -> 11.9 us/write, cutover 0.536 s -> 0.143 s, reopen 1.052 s -> 0.451 s (flat/linear in K instead of quadratic; full table in RELEASE_VALIDATION.md) |
+| 2026-09-20 | Resolved both R5-5 follow-ups above. (a) `append_page_impl()` returned the same `-1` for an admission refusal (nothing durable changed) and a real storage failure (bytes may be on disk); `artifact_store_record()`/`ps_artifact_write()` poisoned on either. A `PsAppendOutcome` out-parameter now classifies every return site (`append_page_raw_outcome()`, rc contract unchanged); the lifecycle layer poisons only on a real I/O failure or a sync failure following an appended record; five named, non-poisoning reasons are appended to `PsArtifactRefuseReason` (`_UNFENCED`, `_FORKMETA_CUTOFF`, `_SYNC`, `_LEGACY_BYPASS`, `_IMMUTABLE_MISMATCH`; no `PS_SHM_VERSION` bump, matching #266); `ps_artifact_write` gained the reason out-parameter WRITE never had, and the daemon now logs a WRITE refusal and returns its reason in `ch->result` for `EXTEND`/`WRITEV` on an SLRU/reader-artifact key, which the reader-artifact worker WARNING sites pick up through `edata->message` with no code change of their own. (b) was not a separate hazard: the derivation `cutoff <= frontier <= floor <= every active same-timeline page-history pin` proves a pinned generation is never below the cutoff; the real defect was that `ps_artifact_begin` had no fence check at all, so a BEGIN at an unfenced LSN was admitted pre-cutover (refused on its first WRITE instead) and refused by the forkmeta growth check post-cutover, both misreported and both poisoning under (a)'s bug. `ps_artifact_begin` now calls the same fence predicate the data append uses (`artifact_lsn_fenced()`, extracted so both share it), ordered after the same-LSN completed-generation short-circuit so an immutable re-ship keeps working; the forkmeta growth check remains as defence in depth for one theoretical structural gap and is now named. No producer clamping, no cutoff-derivation change, DROP stays unfenced | New tests T1 `test_admission_refusal_does_not_poison`, T2 `test_io_failure_still_poisons`, T4 (write-path reason observability) in `pagestore_artifact_lifecycle_test.c`; T5 `test_artifact_generation_vs_cutoff`, T6 `test_artifact_forkmeta_cutoff_reason` in `pagestore_forkmeta_cutover_test.c`; each fails on the pre-fix tree (core change stashed) and passes on this one. `pagestore_artifact_lifecycle_test` 96/96 both klass modes (was 73/73); `pagestore_forkmeta_cutover_test` 527/527 (was 490/490); full `meson test --suite pagestore` 74/74; all three fixture checks unchanged with `--require-build-match`; standalone `-O2 -Wall -Wextra -Werror` compiles of the daemon and both affected test binaries clean; `KEEPTMP=1 integration_test.sh` green including two new daemon-log assertions (no `reason=poisoned`, no `reason=storage failure`); `mvp_golden_test.sh` and `branch_boot_test.sh` both green |
+| 2026-09-20 | Independent review of the fix above found the core code correct (every `append_page_impl` return site classified right, the BEGIN gate is the exact data-append fence predicate under the same locks, the BEGIN-admitted/pin-dropped-before-WRITE race verified safe) but the tests and docs incomplete: (1) `integration_test.sh`'s `reason=store record` grep could never match, since `PS_ARTIFACT_REFUSE_STORE_RECORD`'s reworded name string is "storage failure recording the lifecycle page ..." -- fixed to grep the stable `reason=storage failure` prefix, with the same correction in the three doc citations of it; (2) B2's BEGIN-time gate made `ps_artifact_write`'s own outcome-classified non-poisoning branch dead in every existing test (restoring blanket poisoning there passed `pagestore_artifact_lifecycle_test` 96/96 unchanged) -- added `test_artifact_write_unfenced_after_pin_drop` (T7, `pagestore_forkmeta_cutover_test.c`): BEGIN admitted at a pinned LSN, the pin is dropped via the daemon's `PS_OP_RETENTION_PIN_DROP` meta op (the raw registry drop does not mark page-prune due), maintenance runs until the frontier passes that LSN, and the attempt's data WRITE -- now unfenced by a legitimate TOCTOU race B2 cannot close -- is refused UNFENCED without poisoning, leaks no fence, and the attempt is cleanly superseded and completes; verified this fails (7 of its 20 checks) with blanket write poisoning restored in a scratch copy. Also: appended `PS_ARTIFACT_REFUSE_RECORD_UNREADABLE` (enum still append-only) for three sites that reused STORE_RECORD's now-misleading "poisoned until reopen" wording for a non-poisoning existing-record read failure (`ps_artifact_begin`/`write`/`drop`); the two plain-append branches in `ps_artifact_write` (unversioned key, legacy token-0 write) now classify their outcome instead of leaving the reason at NONE ("refused before admission"); reworded the `PS_ARTIFACT_REFUSE_SYNC` comments (the pre-record sync's pages are already appended -- what's absent is a COMMIT record indexing them complete, not "nothing durable"); noted in `ARTIFACT_LIFECYCLE.md` that an empty (zero-page) generation at an unfenced LSN is refused at BEGIN exactly like one with pages; corrected the fail-before claims to be precise per test (gate-only removal: one failure each in T1 and T5; blanket-poisoning-only, both guards: zero `pagestore_artifact_lifecycle_test` failures, one `pagestore_forkmeta_cutover_test` failure before T7 existed (T6, whose FORKMETA_CUTOFF-refused BEGIN goes through the same `artifact_store_record()` guard) plus seven more once T7 exists; T2/T4 fail-before is compile-time, not run-time, since the pre-fix `ps_artifact_write` signature and enum do not support what they assert). No core-code change beyond the reason enum addition and the two reason-plumbing branches; no producer clamping, no cutoff-derivation change, no `PS_SHM_VERSION` bump | `pagestore_artifact_lifecycle_test` 96/96 both klass modes (unchanged); `pagestore_forkmeta_cutover_test` 548/548 (was 527/527, +21 from T7); verified T7 fails 7/20 with blanket write poisoning restored in a scratch copy, and verified (for the doc's precise fail-before claims) that reverting only B2 fails exactly T1+T5, and reverting both poisoning guards fails zero lifecycle checks and T6+T7 (8) in the cutover file; full `meson test --suite pagestore` 74/74; all three fixture checks unchanged with `--require-build-match`; standalone `-O2 -Wall -Wextra -Werror` compiles of the daemon and both affected test binaries clean (the now-unused `append_page_raw()` wrapper was removed rather than suppressed, since removing its last two callers made it an unused-function `-Werror` failure); `KEEPTMP=1 integration_test.sh`, `mvp_golden_test.sh`, `branch_boot_test.sh` all green |
+| 2026-09-20 | Fixed the F3/Q1 root cause (RELEASE_VALIDATION.md): timeline-delete's `page_cleanup_rewrite_segment()` relocated survivor records into a rebuilt replacement segment and, when covered-prefix bytes moved, rebased the shard's flush watermark to `(seg, 0)` -- the next open then rescanned the whole segment (F3: a pruned ordered marker's record meets no in-memory identity) and, worse, once a later flush moved the watermark again, a survivor's image-index entry (still carrying its pre-rewrite offset) and its true (post-rewrite, relocated) offset could straddle the new watermark so neither the layer replay nor the segment rescan ever found it -- silent loss of already-flushed, acknowledged data with no crash required (Q1). Restored invariant I3 (segment bytes immutable once written, a record's `(seg_id, seg_off)` never changes, the watermark never retreats) by replacing the rewrite with `page_cleanup_tombstone_segment()`: every target record is overwritten in place with a hole record of identical size (body zeroed, magic changed to one of three new `SEG_HOLE48/56/64_MAGIC` values, one per header shape; write order is zero body, then magic, then `sync()` once per segment, so every intermediate state parses either as an ordinary DELETING-timeline record or as a hole), validated in a read-only first pass (so a malformed segment fails closed without writing any hole) before a second pass performs the writes. No survivor is ever relocated, no image-index entry goes stale, the memtable and page index need no update, and space is reclaimed the way any other covered segment already is, by segment GC once the whole segment is below the watermark. Added a cassert-only invariant check in `page_remove_compacted_versions()` (a removed version's segment record must be below the watermark). Renamed the deletion fault points (`timeline_delete.after_segment_rewrite` to `timeline_delete.after_segment_tombstone`) and added `timeline_delete.mid_segment_tombstone` (fires after the first hole of a segment, before the rest), with crash-matrix coverage at both. D5: see the D5 note above (three new `page_segment` identities; `posix-artifact-lifecycle` recaptured with a hole carrying live survivors both before and after it). T7 (repair for a store that deleted a timeline before this fix, so a Q1-affected version can still be lost) is a tracked follow-up, not blocking | `test_hole_record_skipped_on_reopen`/`test_hole_record_bad_len_rejected` (hand-crafted hole bytes; the second proves a hole with a wrong `len` fails closed, distinct from a live record's torn-tail tolerance, since a torn hole write always leaves the pre-tombstone magic in place); `test_timeline_delete_keeps_offsets()` (folds `$SP/f3/q1_test.c`'s three variants -- crash right after the tombstone pass, crash after one more flush, clean close after one more flush -- into one test; fails on the unmodified rewrite in variants 1/2 with survivors unreadable, asserts survivors served with their LSNs, NBLOCKS intact, zero retire/refuse/adopt, the ordered survivor's marker count is 1 after a forced cutover, the shard watermark never retreats, and the segment's byte size right after the tombstone pass equals its size before the deletion); `test_timeline_delete_reclaims_by_segment_gc()`; `test_timeline_delete_crash_matrix()` (both new fault points, with a segment laid out as a compaction-pruned survivor, target records, a live survivor, one more target record -- zero adopt/retire/refuse on reopen, deletion resumes to DELETED, both survivors resolve); `test_deletion_filtered_forkmeta`/`_commit_shape` tightened from `>= 1` to `== 0` adoptions; seven `pagestore_timeline_test.c` cases (`test_deleting_timeline_page_cleanup` and its pure-target variant, `_backpressure_debt`, `_pending_remove`, `_prefix_hole`, `_retired_short_segment`; `_fail_closed` and `_oversized` unchanged) updated from asserting the segment shrinks/empties to asserting it keeps its exact size, with PAGE-debt settlement moved from cleanup-time to segment-GC-reclaim-time; full `meson test --suite pagestore` (74/74) including both regenerated fixture checks (`posix-artifact-lifecycle`, `pgdata-artifacts`) and all renamed/new fault-scenario harness tests green |
+| 2026-09-20 | Closed the two residuals left after the `wal`-bound fix (2026-09-19 rows above): (1) a replacement base that becomes durable, or a full-page-image item that arrives, with no retention-registry fence change at all was left to the WAL-index controller's own trigger; `wal_reclaim_raw_dependency_floor` now also records the (key, block, end_lsn) of up to 8 items at the blocking minimum LSN, and a fruitless-suppressed reclaim-due request arms a per-timeline watch naming the exact governing horizon and event kind (a durable version in `[item end, horizon]`, fired from `flush_memtable`; or, for a horizon whose owner holds no page history, a newer FPI item, fired from `walidx_add_batch_locked`) via a new `walidx_horizon_protected_owner()` helper; either fire site bumps a new `walidx_reclaim_base_epoch`, a fourth key the fruitless test checks alongside raw/fence/generation.  (2) a superseded control note that is memtable-resident is invisible to compaction (image layers only) yet counted by `wal_retain_floor_level`, so the WAL floor stuck around for up to 2 MiB of control-shard page writes (the default `flush_pages`) instead of one compaction pass; `retention_effective_floor_internal` gained an optional `pin_floor_out` (the floor before the note-derived WAL term) so the reclaimer can tell "the note term alone holds the boundary" apart from a pin/branch-cap/raw-floor block without a second scan, and when that is so and the note is superseded (not the newest note at or below any live fence, via `control_prune_fences`, and below the operational floor via `control_checkpoint_cutoff`) but not yet `walidx_base_version_durable`, the reclaimer sets `page_flush_requested[shard]`, serviced in `ps_core_maintenance_impl` before the compaction phase-1 scan; `compact_timeline` bumps `wal_reclaim_proof_changed()` once per pass that actually dropped a control-class version (never on an ordinary relation-page compaction, to avoid the v1 per-flush-drain pathology).  Neither residual is exercised by the soak's own workload (it flushes every 8 pages and re-permits the request on every materializer publication anyway), so this is behavior-neutral for it.  (Superseded the same day by the 2026-09-20 review-driven revision below: the base-epoch/`walidx_horizon_protected_owner()` design here was replaced by an unconditional watch keyed on retirement evidence, and the control-note fix here was given a corrected superseded predicate and a dedup key.) | Three new `pagestore_wal_reclaim_core_test` cases -- `test_late_durable_base_requests_compaction`, `test_late_fpi_requests_compaction`, `test_superseded_note_in_memtable_is_pruned` (its own twin-rule negative-half assertions construct a second store where the fence stays live and assert the note is never touched) -- each failing on 316401d8d4b and passing with the fix (207 checks, 0 failures; 5 of those checks fail on the unmodified core); full standalone suite green (`pagestore_test` 2074, `pagestore_gc_test` 93, `pagestore_control_prune_test` 151, `pagestore_lifecycle_prune_test` 245, `pagestore_walidx_snapshot_test` 76, `pagestore_walidx_prune_test` 30, `pagestore_artifact_lifecycle_test` 73 both modes, `pagestore_forkmeta_prune_test` 17043, `pagestore_forkmeta_snapshot_test` 198, `pagestore_fault_test`, `pagestore_timeline_test` 316, `pagestore_backpressure_test` 369, `pagestore_backpressure_daemon_test` 79); reclaim core 3x plain + 1x under `taskset -c 0,1` with 4 busy loops, all green; seed 20260909 at 8000 rounds 5/5 plain (`physical_max.wal` 1785856-1806336 bytes, `wal_fence_slack_max` 1743360 every run) and 3/3 contended, seeds 7 and 4242 at 8000 rounds, and the 2400-round PR-lane default, all green with unchanged bounds |

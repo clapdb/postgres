@@ -1,0 +1,37 @@
+/* contrib/pagestore/pagestore--1.0.sql */
+
+CREATE FUNCTION pagestore_shipped_wal_lsn()
+RETURNS pg_lsn
+AS 'MODULE_PATHNAME', 'pagestore_shipped_wal_lsn'
+LANGUAGE C PARALLEL RESTRICTED;
+
+CREATE FUNCTION pagestore_materializer_lag_bytes()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pagestore_materializer_lag_bytes'
+LANGUAGE C PARALLEL RESTRICTED;
+
+CREATE FUNCTION pagestore_materialized_wal_lsn()
+RETURNS pg_lsn
+AS 'MODULE_PATHNAME', 'pagestore_materialized_wal_lsn'
+LANGUAGE C PARALLEL RESTRICTED;
+
+CREATE FUNCTION pagestore_materializer_status(
+    OUT shipped_wal_lsn pg_lsn,
+    OUT materialized_wal_lsn pg_lsn,
+    OUT lag_bytes bigint,
+    OUT release_checkpoint_lsn pg_lsn)
+RETURNS record
+AS 'MODULE_PATHNAME', 'pagestore_materializer_status'
+LANGUAGE C PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION pagestore_shipped_wal_lsn() IS
+'end of the durable WAL prefix available to this pagestore timeline';
+
+COMMENT ON FUNCTION pagestore_materializer_lag_bytes() IS
+'bytes from this declared pagestore materializer flushed watermark to its durable WAL end';
+
+COMMENT ON FUNCTION pagestore_materialized_wal_lsn() IS
+'last restartpoint boundary made durable by this declared pagestore materializer role';
+
+COMMENT ON FUNCTION pagestore_materializer_status() IS
+'store-observed materializer progress for writer-side control-plane monitoring';

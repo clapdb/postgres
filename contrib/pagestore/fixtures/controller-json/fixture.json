@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "controller-json",
+  "role": "current",
+  "captured": "2026-09-12",
+  "description": "the JSON artifacts real runs of the branch controller and the materializer supervisor left behind: each tool's configuration, the controller's completed journal and retention generation authority, the supervisor's status and the materializer's retention generation authority",
+  "artifacts": {
+    "branch_config": "controller/branch-prepare.json",
+    "branch_journal": "controller/pagestore_branch.prepare.json",
+    "branch_retention_generation": "controller/branch-retention-generation-1.json",
+    "supervisor_config": "supervisor/materializer-supervisor.json",
+    "supervisor_status": "supervisor/status.json",
+    "retention_authority": "supervisor/retention-owner-1.json"
+  },
+  "files": [
+    "controller",
+    "controller/branch-prepare.json",
+    "controller/branch-retention-generation-1.json",
+    "controller/pagestore_branch.prepare.json",
+    "supervisor",
+    "supervisor/materializer-supervisor.json",
+    "supervisor/retention-owner-1.json",
+    "supervisor/status.json"
+  ]
+}

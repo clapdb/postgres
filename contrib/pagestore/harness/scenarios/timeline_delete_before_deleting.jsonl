@@ -1,0 +1,3 @@
+{"schema":1,"scenario":"timeline-delete-before-deleting","seed":3162299,"contracts":["fault_reachability","prune_publication","retained_horizon","restart_idempotence"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
+{"op":"gc_seed","id":"seed-branch","target":"store","workload":"timeline_delete_abort"}
+{"op":"crash","id":"timeline_delete_before_deleting","target":"store","model":"process_abort","fault":"timeline_delete.before_deleting","action":"crash","hit":1}

@@ -1,0 +1,3 @@
+# Python bytecode from the declarative harness and its helpers
+__pycache__/
+*.pyc

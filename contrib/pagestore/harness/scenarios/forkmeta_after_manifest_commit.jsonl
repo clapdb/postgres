@@ -1,0 +1,3 @@
+{"schema":1,"scenario":"forkmeta-after-manifest-commit","seed":4472135,"contracts":["fault_reachability","prune_publication","retained_horizon","restart_idempotence"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
+{"op":"gc_seed","id":"seed-forks","target":"store","workload":"forkmeta"}
+{"op":"crash","id":"forkmeta_after_manifest_commit","target":"store","model":"process_abort","fault":"forkmeta.after_manifest_commit","action":"crash","hit":1}

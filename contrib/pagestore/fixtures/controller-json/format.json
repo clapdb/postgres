@@ -1,0 +1,65 @@
+[
+  {
+    "family": "controller",
+    "artifact": "branch controller configuration (JSON, schema member)",
+    "magic": "0x00000000",
+    "version": 2,
+    "legacy": [],
+    "refused": [],
+    "checksum": false
+  },
+  {
+    "family": "controller",
+    "artifact": "branch-retention-generation-<id>.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 2,
+    "legacy": [
+      1
+    ],
+    "refused": [],
+    "checksum": true
+  },
+  {
+    "family": "controller",
+    "artifact": "pagestore_branch.prepare.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 2,
+    "legacy": [],
+    "refused": [
+      1
+    ],
+    "checksum": true
+  },
+  {
+    "family": "supervisor",
+    "artifact": "materializer supervisor configuration (JSON, schema member)",
+    "magic": "0x00000000",
+    "version": 4,
+    "legacy": [],
+    "refused": [],
+    "checksum": false
+  },
+  {
+    "family": "supervisor",
+    "artifact": "retention-owner-<id>.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 1,
+    "legacy": [
+      "none"
+    ],
+    "refused": [],
+    "checksum": true
+  },
+  {
+    "family": "supervisor",
+    "artifact": "status.json (JSON, schema member, crc32)",
+    "magic": "0x00000000",
+    "version": 3,
+    "legacy": [
+      "none",
+      2
+    ],
+    "refused": [],
+    "checksum": true
+  }
+]

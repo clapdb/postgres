@@ -1,0 +1,901 @@
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+
+# The daemon core's own debug-only invariant checks (pagestore_core.c's
+# assert()s, gated on this macro so a cassert=false release daemon or the
+# standalone cc lane -- which does not define it -- compiles them out
+# rather than paying for them, or trusting them, in production): live only
+# in a cassert build, matching the rest of the project's cassert convention.
+pagestore_cassert_c_args = get_option('cassert') ? ['-DPAGESTORE_ASSERT_CHECKING'] : []
+
+pagestore_sources = files(
+  'backend_localsvc.c',
+  'backend_passthrough.c',
+  'pagestore_fault.c',
+  'pagestore.c',
+  'pagestore_control.c',
+  'pagestore_slru.c',
+  'walredo_client.c',
+)
+
+if host_system == 'windows'
+  pagestore_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
+    '--NAME', 'pagestore',
+    '--FILEDESC', 'pagestore - pluggable storage backend smgr shim',])
+endif
+
+pagestore = shared_module('pagestore',
+  pagestore_sources,
+  kwargs: contrib_mod_args,
+)
+contrib_targets += pagestore
+
+install_data(
+  'pagestore.control',
+  'pagestore--1.0.sql',
+  'pagestore--1.0--1.1.sql',
+  'pagestore--1.1.sql',
+  'pagestore--1.1--1.2.sql',
+  'pagestore--1.2.sql',
+  kwargs: contrib_data_args,
+)
+
+if host_system != 'windows'
+  # The recovery worker is an ordinary PostgreSQL process; this small
+  # stdlib-only POSIX control-plane process owns its lifecycle and publishes
+  # machine-readable state.
+  install_data(
+    'pagestore_materializer_supervisor.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_materializer_supervisor',
+  )
+  # This one-shot controller owns the writer/materializer correctness window
+  # while selecting and preparing a branch boundary.
+  install_data(
+    'pagestore_branch_prepare.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_branch_prepare',
+  )
+  install_data(
+    'pagestore_branch_fault.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_branch_fault.py',
+  )
+  # The layouts of both tools' JSON artifacts (schema numbers, checksums,
+  # key sets), imported beside the installed tools like the fault helper.
+  install_data(
+    'pagestore_artifact_schema.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_artifact_schema.py',
+  )
+  # The installed controller resolves the canonical registry beside its
+  # helper, just as source-tree tests do.
+  install_data(
+    'pagestore_fault_points.def',
+    install_dir: dir_bin,
+    install_mode: 'r--r--r--',
+  )
+endif
+
+# Standalone storage daemon for the "localsvc" backend.  Freestanding: it
+# includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
+pagestore_daemon = executable('pagestore_daemon',
+  files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
+        'pagestore_fault.c',
+        'pagestore_layer.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_daemon
+
+# Deterministic POSIX image-layer crash workload/oracle used by the H1 harness
+# slice.  It only speaks the standalone daemon IPC protocol.
+pagestore_layer_crash_client = executable('pagestore_layer_crash_client',
+  files('pagestore_layer_crash_client.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_layer_crash_client
+
+# Deterministic POSIX page-pruning crash workload/oracle used by the H1
+# harness slice: history below a configured cutoff is compacted, and the
+# scenarios crash at the replacement publication, the source mark-delete, and
+# the durable frontier advance.
+pagestore_format_versions = executable('pagestore_format_versions',
+  files('pagestore_format_versions.c', 'pagestore_core.c', 'pagestore_fault.c',
+        'storage_posix.c', 'pagestore_layer.c', 'pagestore_store_owner.c',
+        'pagestore_layer_store.c', 'pagestore_manifest.c', 'pagestore_memtable.c',
+        'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_retention.c',
+        'pagestore_wal_store.c', 'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c', 'pagestore_spdk_super.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+
+# The SPDK store's container metadata (superblock) is versioned, checksummed
+# and published durably by a module without SPDK dependencies, so its format
+# is proven here on every host.
+pagestore_spdk_super_test = executable('pagestore_spdk_super_test',
+  files('pagestore_spdk_super_test.c', 'pagestore_spdk_super.c'),
+  install: false,
+)
+test('pagestore_spdk_super',
+  pagestore_spdk_super_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+pagestore_gc_crash_client = executable('pagestore_gc_crash_client',
+  files('pagestore_gc_crash_client.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_gc_crash_client
+
+# Pure process-local unit test for the first crash-only named fault registry.
+pagestore_fault_test = executable('pagestore_fault_test',
+  files('pagestore_fault_test.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_fault',
+  pagestore_fault_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+pagestore_materializer_marker_test = executable('pagestore_materializer_marker_test',
+  files('pagestore_materializer_marker_test.c'),
+  install: false,
+)
+test('pagestore_materializer_marker',
+  pagestore_materializer_marker_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Import an existing PGDATA's relation files into the daemon, so a whole
+# database can be moved onto the page store.  Freestanding like the daemon.
+pagestore_import = executable('pagestore_import',
+  files('pagestore_import.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_import
+
+# Reconstruct a standard WAL segment from the store's shipped WAL; usable as a
+# restore_command so a recovery instance can replay store-resident WAL.  A
+# frontend program: it checks the payload's page header with this build's
+# XLogLongPageHeaderData layout and XLOG_PAGE_MAGIC before handing it on.
+pagestore_walrestore = executable('pagestore_walrestore',
+  files('pagestore_walrestore.c'),
+  dependencies: [frontend_code],
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_walrestore
+
+# Restore global/pg_control from the store's mirrored control image, as of a
+# branch's fork LSN (PGCONTROL_ON_STORE_DESIGN.md restore protocol).  A
+# frontend program: it CRC-verifies ControlFileData via libpgport.
+pagestore_control_restore = executable('pagestore_control_restore',
+  files('pagestore_control_restore.c'),
+  dependencies: [frontend_code],
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_control_restore
+
+# Throughput probe: forks a daemon, writes a dataset, times reading it back.
+# Indicative only (see pagestore_bench.c); freestanding like the daemon.
+pagestore_bench = executable('pagestore_bench',
+  files('pagestore_bench.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_bench
+
+# Private, read-only shared-memory inspector for the pagestore harness.  It
+# deliberately does not link PostgreSQL libraries or expose mutation commands.
+pagestore_inspect = executable('pagestore_inspect',
+  files('pagestore_inspect.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_inspect
+
+# Standalone test harness: drives the daemon over the shared-memory protocol
+# with no PostgreSQL instance.  Run independently of the PG test suites with:
+#   meson test -C <build> --suite pagestore
+pagestore_test = executable('pagestore_test',
+  files('pagestore_test.c'),
+  install: false,
+)
+test('pagestore_standalone',
+  pagestore_test,
+  args: [pagestore_daemon, pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 120,
+)
+
+# Focused POSIX mailbox lifecycle coverage.  It drives only the inspector and
+# forked lock/lease holders; no pagestore daemon or SPDK frontend runs.
+pagestore_inspect_mailbox_test = executable('pagestore_inspect_mailbox_test',
+  files('pagestore_inspect_mailbox_test.c'),
+  install: false,
+)
+test('pagestore_inspect_mailbox',
+  pagestore_inspect_mailbox_test,
+  args: [pagestore_inspect],
+  depends: [pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Unit test for the immutable image-layer file format (no daemon, no PG).
+pagestore_layer_test = executable('pagestore_layer_test',
+  files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c',
+        'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_layer',
+  pagestore_layer_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Unit test for the filesystem-backed remote object provider (no daemon, no PG).
+pagestore_layer_store_test = executable('pagestore_layer_store_test',
+  files('pagestore_layer_store_test.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_layer.c',
+        'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_layer_store',
+  pagestore_layer_store_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Integration test for idle layer upload and durable remote manifest state.
+pagestore_tiering_test = executable('pagestore_tiering_test',
+  files('pagestore_tiering_test.c', 'pagestore_core.c', 'pagestore_fault.c', 'storage_posix.c',
+        'pagestore_layer.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_tiering',
+  pagestore_tiering_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Runtime forkmeta cutover/reopen smoke.  This deliberately exercises the
+# normal frontier-gated path; the process-crash boundaries are tested below.
+pagestore_forkmeta_cutover_test = executable('pagestore_forkmeta_cutover_test',
+  files('pagestore_forkmeta_cutover_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_forkmeta_cutover',
+  pagestore_forkmeta_cutover_test,
+  suite: ['pagestore'],
+  timeout: 120,
+)
+
+# Focused POSIX process-crash matrix for runtime forkmeta cutover.  The shared
+# core probes are also safe for the optional SPDK frontend; this filesystem
+# matrix itself intentionally runs only with the POSIX storage implementation.
+pagestore_forkmeta_crash_matrix_test = executable('pagestore_forkmeta_crash_matrix_test',
+  files('pagestore_forkmeta_crash_matrix_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_forkmeta_crash_matrix',
+  pagestore_forkmeta_crash_matrix_test,
+  suite: ['pagestore'],
+  timeout: 120,
+)
+
+# Focused POSIX-only unit test for the durable timeline deletion lifecycle.
+# It links the shared core directly; it does not start a daemon or exercise
+# the optional SPDK frontend.
+pagestore_timeline_test = executable('pagestore_timeline_test',
+  files('pagestore_timeline_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_RETENTION_TEST', '-DPAGESTORE_RELATION_INSPECTION_TEST']
+          + pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_timeline',
+  pagestore_timeline_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Focused shared-core tests for the conservative POSIX WAL reclaim policy.
+pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
+  files('pagestore_wal_reclaim_core_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_wal_reclaim_core',
+  pagestore_wal_reclaim_core_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Control-object retention during image compaction: the newest pg_control
+# image/note pair at or below every retained WAL boundary survives, so the WAL
+# retention floor can advance; planned over the complete version chain.
+pagestore_control_prune_test = executable('pagestore_control_prune_test',
+  files('pagestore_control_prune_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_control_prune',
+  pagestore_control_prune_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+pagestore_artifact_lifecycle_test = executable('pagestore_artifact_lifecycle_test',
+  files('pagestore_artifact_lifecycle_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_artifact_lifecycle',
+  pagestore_artifact_lifecycle_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+test('pagestore_artifact_lifecycle_reader',
+  pagestore_artifact_lifecycle_test,
+  env: ['PAGESTORE_ARTIFACT_TEST_READER=1'],
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Bounded fork-lifecycle history: invalidated page versions leave image
+# layers, and forkmeta compaction keeps only base, fence, and growth per
+# horizon plus the fences a retained version or indexed record still needs.
+pagestore_lifecycle_prune_test = executable('pagestore_lifecycle_prune_test',
+  files('pagestore_lifecycle_prune_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_lifecycle_prune',
+  pagestore_lifecycle_prune_test,
+  suite: ['pagestore'],
+  timeout: 120,
+)
+
+# R6 bounded-space soak: one real POSIX daemon under a seeded writer,
+# materializer, reader, branch, and restart workload with declared physical
+# bounds per persisted category.  PAGESTORE_SOAK_ROUNDS lengthens the run.
+pagestore_soak_test = executable('pagestore_soak_test',
+  files('pagestore_soak_test.c'),
+  install: false,
+)
+test('pagestore_soak',
+  pagestore_soak_test,
+  args: [pagestore_daemon],
+  depends: [pagestore_daemon],
+  suite: ['pagestore'],
+  timeout: 600,
+)
+
+# Deterministic page/WAL lag-controller and admission-wait coverage.
+pagestore_backpressure_test = executable('pagestore_backpressure_test',
+  files('pagestore_backpressure_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_BACKPRESSURE_TEST'] + pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_backpressure',
+  pagestore_backpressure_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Real POSIX daemon coverage for deferred mutation admission and prompt
+# shutdown.  The maintenance pause option is test-only and keeps controller
+# refreshes live while making reclaim progress deterministic.
+pagestore_backpressure_daemon_test = executable('pagestore_backpressure_daemon_test',
+  files('pagestore_backpressure_daemon_test.c'),
+  install: false,
+)
+test('pagestore_backpressure_daemon',
+  pagestore_backpressure_daemon_test,
+  args: [pagestore_daemon],
+  depends: [pagestore_daemon],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Unit test for the durable layer manifest replay (no daemon, no PG).
+pagestore_manifest_test = executable('pagestore_manifest_test',
+  files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_manifest',
+  pagestore_manifest_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Unit test for durable retention pins, replay and churn compaction.
+pagestore_retention_test = executable('pagestore_retention_test',
+  files('pagestore_retention_test.c', 'pagestore_retention.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_retention',
+  pagestore_retention_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Unit test for crash-safe compaction/GC recovery (no daemon, no PG).
+pagestore_gc_test = executable('pagestore_gc_test',
+  files('pagestore_gc_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_gc',
+  pagestore_gc_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Pure keep/drop rule for retention-driven image compaction.
+pagestore_prune_test = executable('pagestore_prune_test',
+  files('pagestore_prune_test.c', 'pagestore_prune.c'),
+  install: false,
+)
+test('pagestore_prune',
+  pagestore_prune_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Pure replacement-base chain selection for WAL-index compaction.
+pagestore_walidx_prune_test = executable('pagestore_walidx_prune_test',
+  files('pagestore_walidx_prune_test.c', 'pagestore_walidx_prune.c'),
+  install: false,
+)
+test('pagestore_walidx_prune',
+  pagestore_walidx_prune_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Pure keep/drop rule for fork-metadata compaction.
+pagestore_forkmeta_prune_test = executable('pagestore_forkmeta_prune_test',
+  files('pagestore_forkmeta_prune_test.c', 'pagestore_forkmeta_prune.c'),
+  install: false,
+)
+test('pagestore_forkmeta_prune',
+  pagestore_forkmeta_prune_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Persisted immutable shipped-WAL segment header and checksum contract.
+pagestore_wal_segment_test = executable('pagestore_wal_segment_test',
+  files('pagestore_wal_segment_test.c', 'pagestore_wal_segment.c'),
+  install: false,
+)
+test('pagestore_wal_segment',
+  pagestore_wal_segment_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Atomic immutable segment publication and cross-segment shipped-WAL reads.
+pagestore_wal_store_test = executable('pagestore_wal_store_test',
+  files('pagestore_wal_store_test.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_fault.c'),
+  install: false,
+)
+test('pagestore_wal_store',
+  pagestore_wal_store_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Crash-atomic prefix replacement for the authoritative flat shipped-WAL log.
+storage_posix_wal_test = executable('storage_posix_wal_test',
+  files('storage_posix_wal_test.c', 'storage_posix.c', 'pagestore_store_owner.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('storage_posix_wal',
+  storage_posix_wal_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+storage_posix_fork_owner_test = executable('storage_posix_fork_owner_test',
+  files('storage_posix_fork_owner_test.c', 'storage_posix.c',
+        'pagestore_store_owner.c', 'pagestore_manifest.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('storage_posix_fork_owner',
+  storage_posix_fork_owner_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Crash-atomic multi-shard WAL-index snapshot generation publication.
+pagestore_walidx_snapshot_test = executable('pagestore_walidx_snapshot_test',
+  files('pagestore_walidx_snapshot_test.c', 'pagestore_walidx_snapshot.c'),
+  install: false,
+)
+test('pagestore_walidx_snapshot',
+  pagestore_walidx_snapshot_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Crash-atomic single-stream fork-metadata checkpoint and captured-tail
+# publication.  This foundation is deliberately independent of the runtime
+# fork-metadata append path.
+pagestore_forkmeta_snapshot_test = executable('pagestore_forkmeta_snapshot_test',
+  files('pagestore_forkmeta_snapshot_test.c', 'pagestore_forkmeta_snapshot.c'),
+  install: false,
+)
+test('pagestore_forkmeta_snapshot',
+  pagestore_forkmeta_snapshot_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
+pagestore_pgcache_test = executable('pagestore_pgcache_test',
+  files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),
+  install: false,
+)
+test('pagestore_pgcache',
+  pagestore_pgcache_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# The harness input contract is stdlib-only and intentionally fast.  Keep it in
+# the regular pagestore suite so scenario/capability changes fail before the
+# slower PostgreSQL integration coverage runs.
+pagestore_harness_python = find_program('python3')
+test('pagestore_store_owner_recovery',
+  pagestore_harness_python,
+  args: [files('harness/tests/test_store_owner_recovery.py'),
+         '--daemon-binary', pagestore_daemon,
+         '--inspect-binary', pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 120,
+)
+test('pagestore_harness_plan',
+  pagestore_harness_python,
+  args: [files('harness/tests/test_plan.py')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+if host_system != 'windows'
+  test('pagestore_materializer_supervisor',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_materializer_supervisor.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+  test('pagestore_branch_prepare',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_branch_prepare.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+  test('pagestore_bootstrap_install_oracle',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_bootstrap_install_oracle.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+endif
+test('pagestore_harness_reader_visibility_plan',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--validate', files('harness/scenarios/reader_visibility.jsonl')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_writer_lifecycle_plan',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--validate', files('harness/scenarios/writer_lifecycle.jsonl')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_materializer_lifecycle_plan',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--validate', files('harness/scenarios/materializer_lifecycle.jsonl')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+foreach materializer_fault_scenario : [
+  'materializer_restartpoint_after_relation_sync_before_marker',
+  'materializer_restartpoint_after_marker_sync',
+  'materializer_restart_combinations',
+  'writer_reader_restart',
+]
+  test('pagestore_harness_' + materializer_fault_scenario + '_plan',
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--validate', files('harness/scenarios/' + materializer_fault_scenario + '.jsonl')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+endforeach
+test('pagestore_harness_daemon_smoke',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--daemon-smoke', files('harness/scenarios/daemon_readiness.jsonl'),
+         '--daemon-binary', pagestore_daemon,
+         '--inspect-binary', pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_daemon_recovery',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--daemon-smoke', files('harness/scenarios/daemon_recovery.jsonl'),
+         '--daemon-binary', pagestore_daemon,
+         '--inspect-binary', pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_daemon_fault_recovery',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--daemon-fault-recovery', files('harness/scenarios/daemon_fault_recovery.jsonl'),
+         '--daemon-binary', pagestore_daemon,
+         '--inspect-binary', pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+foreach fault_scenario : ['daemon_fault_error', 'daemon_fault_pause']
+  test('pagestore_harness_' + fault_scenario,
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--daemon-fault-recovery', files('harness/scenarios/' + fault_scenario + '.jsonl'),
+           '--daemon-binary', pagestore_daemon,
+           '--inspect-binary', pagestore_inspect],
+    depends: [pagestore_daemon, pagestore_inspect],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+endforeach
+foreach layer_fault_scenario : [
+  'image_layer_after_create',
+  'image_layer_after_write',
+  'image_layer_after_seal',
+  'image_layer_after_manifest_add',
+]
+  test('pagestore_harness_' + layer_fault_scenario,
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--daemon-fault-recovery', files('harness/scenarios/' + layer_fault_scenario + '.jsonl'),
+           '--daemon-binary', pagestore_daemon,
+           '--layer-client-binary', pagestore_layer_crash_client,
+           '--inspect-binary', pagestore_inspect],
+    depends: [pagestore_daemon, pagestore_layer_crash_client, pagestore_inspect],
+    suite: ['pagestore'],
+    timeout: 60,
+  )
+endforeach
+# Persisted-format fixture: the compiled identities must match the committed
+# fixture, the fixture must reopen with its oracle intact, and every declared
+# mutation must be rejected as documented.  The archive holds the raw C
+# structures a little-endian host wrote, and both the daemon and the checker
+# read them in native order, so the fixture is skipped where the host byte
+# order differs; a big-endian baseline would be a second archive.
+if host_machine.endian() == 'little'
+# Cheap, single-step guard that must run before the two format-fixture tests
+# below: every current fixture's format.json must agree with the same
+# pagestore_format_versions snapshot.  PR #262 regenerated
+# posix-artifact-lifecycle/format.json but not pgdata-artifacts/format.json
+# after a persisted-format bump; each of those tests only compares its own
+# fixture against the compiled identities, so the two drifting apart was
+# only caught on the base branch after merge (PR #263).
+test('pagestore_fixture_identities',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_fixture_identities.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline',
+         meson.current_source_dir() / 'fixtures' / 'posix-forkmeta-crc',
+         meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
+         meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
+         meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes',
+         meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
+         '--format-tool', pagestore_format_versions],
+  depends: [pagestore_format_versions],
+  suite: ['pagestore'],
+  timeout: 60,
+)
+test('pagestore_persisted_format_fixture',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_fixture.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline',
+         meson.current_source_dir() / 'fixtures' / 'posix-forkmeta-crc',
+         meson.current_source_dir() / 'fixtures' / 'posix-wal-payload-identity',
+         meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
+         meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes',
+         '--daemon-binary', pagestore_daemon,
+         '--client-binary', pagestore_gc_crash_client,
+         '--inspect-binary', pagestore_inspect,
+         '--format-tool', pagestore_format_versions,
+         # this build's PostgreSQL payload identity: a current fixture whose
+         # shipped WAL this build cannot load is skipped, and CI on
+         # `pagestore` requires one it can
+         '--postgres-payload-identity-tool', pagestore_control_restore],
+  depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect,
+            pagestore_format_versions, pagestore_control_restore],
+  suite: ['pagestore'],
+  timeout: 300,
+)
+# The data-directory artifacts a compute leaves for another to load
+# (pagestore_artifact_format.h, family "pgdata"): here only the compiled
+# identities are held to the fixture; the integration lane, which has a
+# PostgreSQL build, also loads every artifact through the backend's loaders
+# and applies the declared mutations (harness/pagestore_pgdata_fixture.py
+# --build).
+test('pagestore_pgdata_format_fixture',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_pgdata_fixture.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
+         '--format-tool', pagestore_format_versions],
+  depends: [pagestore_format_versions],
+  suite: ['pagestore'],
+  timeout: 60,
+)
+endif
+# The JSON artifacts of the branch controller and the materializer
+# supervisor (pagestore_artifact_schema.py): the tools' identities must
+# match the fixture, every captured artifact must load through the shared
+# reader, and each declared mutation must be refused (or, for a legacy
+# layout, accepted).  Python and JSON only, so it runs on every host,
+# whatever its byte order.
+test('pagestore_controller_format_fixture',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_controller_fixture.py'),
+         '--check', meson.current_source_dir() / 'fixtures' / 'controller-json'],
+  suite: ['pagestore'],
+  timeout: 60,
+)
+foreach prune_fault_scenario : [
+  'page_prune_after_frontier',
+  'page_compaction_after_publish',
+  'page_gc_after_mark_delete',
+  'wal_index_after_frontier',
+  'wal_reclaim_before_unlink',
+  'wal_reclaim_after_unlink',
+  'wal_reclaim_before_dir_fsync',
+  'timeline_delete_after_deleting',
+  'timeline_delete_after_wal_cleanup',
+  'timeline_delete_mid_segment_tombstone',
+  'timeline_delete_after_segment_tombstone',
+  'timeline_delete_after_deleted',
+  'timeline_delete_before_deleting',
+  'manifest_compact_after_tmp_sync',
+  'manifest_compact_after_rename',
+  'forkmeta_after_prepare',
+  'forkmeta_after_manifest_commit',
+  'forkmeta_after_source_rewrite',
+  'forkmeta_after_snapshot_gc',
+]
+  test('pagestore_harness_' + prune_fault_scenario,
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--daemon-fault-recovery', files('harness/scenarios/' + prune_fault_scenario + '.jsonl'),
+           '--daemon-binary', pagestore_daemon,
+           '--gc-client-binary', pagestore_gc_crash_client,
+           '--inspect-binary', pagestore_inspect],
+    depends: [pagestore_daemon, pagestore_gc_crash_client, pagestore_inspect],
+    suite: ['pagestore'],
+    timeout: 90,
+  )
+endforeach

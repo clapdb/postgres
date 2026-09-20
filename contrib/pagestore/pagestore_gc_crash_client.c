@@ -1,0 +1,2978 @@
+/*-------------------------------------------------------------------------
+ *
+ * pagestore_gc_crash_client.c
+ *	Deterministic IPC workload/oracle for the POSIX page-pruning H1 crash
+ *	slice.
+ *
+ * The seed writes three generations of relation history and a newer block 0,
+ * arms the named fault marker the harness hands it, then installs a
+ * configured page-history owner at 3500.  That cutoff makes
+ * maintenance compact the history below it: the replacement layer is
+ * published, the retired sources are marked for deletion, and the durable
+ * page-prune frontier advances, which are the three named process-abort
+ * boundaries this slice crashes at.  The seed then waits to be reaped, so a
+ * workload that ends before the fault is reported as unreached.
+ *
+ * The verify mode checks, after recovery, that the newest block 0 and a block
+ * present only in the compacted layer read back, that the retained block 0
+ * history at the cutoff is still served, and that the pruned history below
+ * the cutoff cannot be resurrected once recovery cleanup has run.
+ *
+ * The wal_index workload targets the WAL-index compaction boundary instead:
+ * a fixed WAL-index reader at 40 under three FPI-led chains on one block and
+ * one committed interval, armed before the commit that makes the interval a
+ * snapshot candidate.  Its verify mode waits for the retried generation to
+ * serve the reader's chain plus the newest chain and requires the dropped
+ * point below the durable frontier to stay refused.
+ *
+ * The wal_reclaim workload ships three sealed 1 MiB segments, publishes a
+ * control note at the shipped end, arms the fault, and commits WAL-index
+ * progress through the end so the whole prefix is reclaimable.  Its verify
+ * mode waits for the prefix reads to be refused and requires the WAL end and
+ * retain floor to stay at the shipped end.
+ *
+ * The timeline_delete workload creates a branch with private shipped WAL, a
+ * committed WAL-index interval, an owner layer, and shared-segment pages,
+ * arms the fault, and issues BEGIN_DELETE.  Its verify mode waits for
+ * DELETED, keeps the parent's page readable, and requires branch reads to be
+ * rejected.
+ *
+ * The manifest_compact workload writes 320 pages while the harness holds
+ * maintenance paused, then arms the fault and releases maintenance so layer
+ * compaction churn grows the manifest log past its rewrite trigger.  Its
+ * verify mode reads every page back.
+ *
+ * The forkmeta workload layers persisted fork-size events for many relations
+ * on the page_prune history, arms the fault, installs the cutoff pin, and
+ * keeps trickling fork events so a second generation retires the first.
+ * Its verify mode checks current sizes, retained size history above the
+ * cutoff, and refused queries below it, on top of the page_prune oracle.
+ *
+ *-------------------------------------------------------------------------
+ */
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <errno.h>
+
+#include "pagestore_artifact_format.h"
+#include "pagestore_ipc.h"
+#include "pagestore_shm.h"
+
+#define TEST_REL 4343u
+#define TEST_OWNER UINT64_C(23000)
+#define TEST_CUTOFF UINT64_C(3500)
+
+/* wal_index workload: one metadata-complete WAL-index interval on timeline 0
+ * with a fixed WAL-index reader below the operational chain.  Compaction
+ * keeps the reader's exact FPI-led chain (10, 30) and the newest chain
+ * (90, 110) and drops the middle chain (50, 70). */
+#define WALIDX_BLOCK 12u
+#define WALIDX_WAL_BYTES 512u
+#define WALIDX_READER UINT64_C(5001)
+#define WALIDX_READER_LSN UINT64_C(40)
+#define WALIDX_DROPPED_LSN UINT64_C(60)
+
+/* wal_reclaim workload: three complete 1 MiB shipped-WAL segments on timeline
+ * 0 whose control note and WAL-index progress both reach the end, so the
+ * whole sealed prefix is reclaimable. */
+#define RECLAIM_SEGMENT (UINT64_C(1024) * 1024)
+#define RECLAIM_SEGMENTS 3u
+#define RECLAIM_TOTAL (RECLAIM_SEGMENT * RECLAIM_SEGMENTS)
+#define RECLAIM_CHUNK (64u * 1024u)
+
+/* timeline_delete workload: a branch of timeline 0 with its own shipped WAL,
+ * WAL-index interval, and flushed relation pages, then BEGIN_DELETE. */
+#define DELETE_BRANCH 1u
+/* aligned to the immutable segment size so the branch's shipped WAL seals a
+ * complete wal_segments_<tl> segment the deletion has to reclaim too */
+#define DELETE_FORK_LSN RECLAIM_SEGMENT
+#define DELETE_WAL_SEGMENT_CHUNKS 16u
+#define DELETE_SURVIVOR_BRANCH 2u
+#define DELETE_WAL_BYTES 65536u
+#define DELETE_PAGES 24u
+/* a fresh branch of a fresh store gets its first incarnation token; the
+ * verify oracle compares recovery against that seeded value */
+#define DELETE_INCARNATION UINT64_C(1)
+
+/* manifest_compact workload: enough flushed layers and compaction churn,
+ * released from a paused maintenance loop, that the manifest log is rewritten. */
+#define MANIFEST_PAGES 320u
+
+/* forkmeta workload: the page_prune history plus persisted fork-size events
+ * (create, zero-extend, truncate) on many relations, so the fork-metadata
+ * log exceeds the snapshot trigger once the page frontier proves a cutoff. */
+#define FORKMETA_FIRST_REL 5000u
+#define FORKMETA_RELS 32u
+#define FORKMETA_TRICKLE_REL 7000u
+#define FORKMETA_TRICKLE_RELS 400u
+/* trickle relations acknowledged before maintenance may run at all, so the
+ * ledger is never empty at a crash boundary */
+#define FORKMETA_TRICKLE_LEDGER_MIN 8u
+
+/* fixture workload: every persisted family on one store, then a clean exit.
+ * The shipped WAL keeps one sealed segment because the control note's redo
+ * sits inside it, so the WAL segment format is part of the fixture. */
+#define FIXTURE_WAL_END (RECLAIM_SEGMENT + 64u * 1024u)
+#define FIXTURE_WAL_REDO (RECLAIM_SEGMENT / 2)
+/* The PostgreSQL identity the fixture's shipped WAL carries: a 16 MiB WAL
+ * segment size, and the WAL page magic and WAL block size of the build the
+ * fixture is captured under, in a long page header at LSN 0 and a short one
+ * at every later page boundary the store seals on.  The fixture tool passes
+ * the capturing build's values (pagestore_control_restore --payload-identity)
+ * through PAGESTORE_FIXTURE_XLOG_MAGIC and PAGESTORE_FIXTURE_XLOG_BLCKSZ, and
+ * the same values from fixture.json when it verifies a captured store; the
+ * defaults are the pagestore branch's at the time of writing. */
+#define FIXTURE_XLP_MAGIC_DEFAULT 0xD120u
+#define FIXTURE_XLP_LONG_HEADER 0x0002u
+#define FIXTURE_XLP_SEG_SIZE (16u * 1024u * 1024u)
+#define FIXTURE_XLP_BLCKSZ_DEFAULT 8192u
+
+static void die(const char *message);
+
+static uint32_t
+fixture_env_u32(const char *name, uint32_t fallback)
+{
+	const char *value = getenv(name);
+	char	   *end;
+	unsigned long parsed;
+
+	if (value == NULL || *value == '\0')
+		return fallback;
+	errno = 0;
+	parsed = strtoul(value, &end, 0);
+	if (errno != 0 || *end != '\0' || parsed == 0 || parsed > UINT32_MAX)
+		die("invalid fixture identity in the environment");
+	return (uint32_t) parsed;
+}
+
+/* The harness names the fixture's role (PAGESTORE_FIXTURE_ROLE); absent, the
+ * store is held to the current format. */
+static int
+fixture_role_legacy(void)
+{
+	const char *role = getenv("PAGESTORE_FIXTURE_ROLE");
+
+	if (role == NULL || *role == '\0' || strcmp(role, "current") == 0)
+		return 0;
+	if (strcmp(role, "legacy") == 0)
+		return 1;
+	die("PAGESTORE_FIXTURE_ROLE is neither current nor legacy");
+	return 0;
+}
+
+/* posix-timeline-delete-holes' capture sets this so the same "fixture"
+ * workload also seeds its deleted-branch-with-holes scenario; absent (every
+ * other "fixture"-workload capture, including posix-artifact-lifecycle),
+ * fixture_extend()/fixture_verify() run exactly as before this fixture
+ * existed. */
+static int
+fixture_capture_holes(void)
+{
+	const char *v = getenv("PAGESTORE_FIXTURE_DELETE_HOLES");
+
+	return v != NULL && *v != '\0' && strcmp(v, "0") != 0;
+}
+
+static uint16_t
+fixture_xlp_magic(void)
+{
+	uint32_t	magic = fixture_env_u32("PAGESTORE_FIXTURE_XLOG_MAGIC", FIXTURE_XLP_MAGIC_DEFAULT);
+
+	if (magic > 0xffffu)
+		die("PAGESTORE_FIXTURE_XLOG_MAGIC does not fit xlp_magic");
+	return (uint16_t) magic;
+}
+
+static uint32_t
+fixture_xlp_blcksz(void)
+{
+	return fixture_env_u32("PAGESTORE_FIXTURE_XLOG_BLCKSZ", FIXTURE_XLP_BLCKSZ_DEFAULT);
+}
+
+/*
+ * PostgreSQL's WAL page headers, declared with the same member types so the
+ * host ABI lays them out exactly as the PostgreSQL build on this host does
+ * (a 4-byte-aligned uint64 packs the long header differently from an
+ * 8-byte-aligned one).  This client has no PostgreSQL headers.
+ */
+typedef struct FixtureXLogPageHeaderData
+{
+	uint16_t	xlp_magic;
+	uint16_t	xlp_info;
+	uint32_t	xlp_tli;
+	uint64_t	xlp_pageaddr;
+	uint32_t	xlp_rem_len;
+} FixtureXLogPageHeaderData;
+
+typedef struct FixtureXLogLongPageHeaderData
+{
+	FixtureXLogPageHeaderData std;
+	uint64_t	xlp_sysid;
+	uint32_t	xlp_seg_size;
+	uint32_t	xlp_xlog_blcksz;
+} FixtureXLogLongPageHeaderData;
+#define FIXTURE_BRANCH 1u
+#define FIXTURE_DELETED_BRANCH 2u
+/* Above the WAL end: maintenance may publish the parent's WAL-index frontier
+ * at any point up to FIXTURE_WAL_END before the branches are created, and a
+ * fork below a published frontier is refused. */
+#define FIXTURE_FORK_LSN (FIXTURE_WAL_END + UINT64_C(65536))
+#define FIXTURE_BRANCH_LSN (FIXTURE_FORK_LSN + UINT64_C(4000))
+#define FIXTURE_CLAMPED_LSN (FIXTURE_FORK_LSN - UINT64_C(4000))
+#define FIXTURE_CLAMPED_BLOCK 3u
+#define FIXTURE_WALLESS_BLOCK 4u
+#define FIXTURE_TAIL_REL 8000u
+#define FIXTURE_TAIL_LSN UINT64_C(9000)
+/* posix-timeline-delete-holes only (PAGESTORE_FIXTURE_DELETE_HOLES): a third
+ * scenario, appended in the extension phase so its records land past the
+ * post-recovery flush and stay unflushed through to the archive (see
+ * fixture_extend_holes()'s header comment). */
+#define FIXTURE_HOLES_TARGET_BRANCH 3u
+#define FIXTURE_HOLES_LSN (FIXTURE_FORK_LSN + UINT64_C(6000))
+
+static void *shm_base;
+static int shm_fd = -1;
+static int channel = -1;
+static uint32_t page_size;
+static const char *arm_marker;
+static const char *resume_file;
+/* where the seed records the admission sequence its reservation was granted,
+ * so the oracle can require the durable frontier to carry it */
+static const char *cutoff_seq_file;
+/* forkmeta workload: where the seed records each trickle append the daemon
+ * acknowledged, so the verify oracle can hold recovery to every one of them */
+static const char *ack_file;
+static const char *workload = "page_prune";
+
+static void
+die(const char *message)
+{
+	fprintf(stderr, "pagestore_gc_crash_client: %s\n", message);
+	exit(1);
+}
+
+static void
+attach(const char *name)
+{
+	PsShmHeader *header;
+
+	shm_fd = ps_shm_open(name, O_RDWR, 0600);
+	if (shm_fd < 0)
+		die("cannot open shared memory");
+	shm_base = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+					shm_fd, 0);
+	if (shm_base == MAP_FAILED)
+		die("cannot map shared memory");
+	header = (PsShmHeader *) shm_base;
+	if (header->magic != PS_SHM_MAGIC ||
+		ps_load_acquire(&header->startup_state) != PS_SHM_READY ||
+		header->nshards != 1)
+		die("daemon is not ready for the single-shard H1 workload");
+	page_size = header->page_size;
+	if (page_size == 0 || page_size > PS_IO_UNIT)
+		die("invalid daemon page size");
+	for (uint32_t i = 0; i < header->nchannels; i++)
+		if (ps_cas(&ps_channel(shm_base, i)->claimed, 0, 1))
+		{
+			channel = (int) i;
+			return;
+		}
+	die("no free daemon channel");
+}
+
+static void
+detach(void)
+{
+	if (shm_base != NULL && shm_base != MAP_FAILED)
+	{
+		if (channel >= 0)
+			ps_store_release(&ps_channel(shm_base, channel)->claimed, 0);
+		munmap(shm_base, PS_SHM_SIZE);
+	}
+	if (shm_fd >= 0)
+		close(shm_fd);
+}
+
+static PsChannel *
+execute(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	ps_request_generation_next(ch);
+	ps_store_release(&ch->state, PS_STATE_REQUEST);
+	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
+		;
+	return ch;
+}
+
+static void
+set_relation(PsChannel *ch)
+{
+	memset(&ch->key, 0, sizeof(ch->key));
+	ch->key.spcOid = 1;
+	ch->key.dbOid = 1;
+	ch->key.relNumber = TEST_REL;
+	ch->key.forkNum = 0;
+	ch->key.klass = PS_KLASS_RELATION;
+	ch->timeline = 0;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	ch->incarnation = 0;
+	ch->blocknum = 0;
+	ch->nblocks = 0;
+	ch->old_nblocks = 0;
+	ch->parent_timeline = 0;
+}
+
+static void
+fill_page(unsigned char *page, uint64_t lsn, unsigned char tag)
+{
+	uint32_t	high = (uint32_t) (lsn >> 32);
+	uint32_t	low = (uint32_t) lsn;
+
+	memcpy(page, &high, sizeof(high));
+	memcpy(page + sizeof(high), &low, sizeof(low));
+	for (uint32_t i = 8; i < page_size; i++)
+		page[i] = (unsigned char) (tag ^ (i & 0xff));
+}
+
+static int
+page_has_tag(const unsigned char *page, unsigned char tag)
+{
+	for (uint32_t i = 8; i < page_size; i++)
+		if (page[i] != (unsigned char) (tag ^ (i & 0xff)))
+			return 0;
+	return 1;
+}
+
+static void
+write_block(unsigned char *page, uint32_t block, uint64_t lsn,
+			unsigned char tag)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	fill_page(page, lsn, tag);
+	set_relation(ch);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	memcpy(ch->data, page, page_size);
+	if (execute()->status != PS_STATUS_OK)
+		die("history write failed");
+}
+
+static void
+arm_fault(void)
+{
+	int			fd;
+
+	if (arm_marker != NULL)
+	{
+		fd = open(arm_marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		if (fd < 0)
+			die("cannot arm the named fault marker");
+		close(fd);
+	}
+	/* Maintenance was paused while this seed installed the condition its
+	 * boundary needs; releasing it here means the first pass it runs is
+	 * planned against that condition and can reach the armed probe. */
+	if (resume_file != NULL && unlink(resume_file) != 0 && errno != ENOENT)
+		die("cannot release the paused maintenance loop");
+}
+
+static void
+wait_forever(void)
+{
+	/* The fault fires in daemon maintenance, not in this request stream.
+	 * Stay alive until the harness reaps this process, so a daemon that
+	 * never reaches the boundary is reported as an unreached fault. */
+	for (;;)
+		pause();
+}
+
+static void
+page_history_seed(unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = 500;
+	if (execute()->status != PS_STATUS_OK)
+		die("relation create failed");
+	/* three generations of block 0 plus seven blocks per generation that
+	 * exist only in the layers compaction rewrites */
+	for (uint32_t batch = 1; batch <= 3; batch++)
+	{
+		write_block(page, 0, batch * 1000, (unsigned char) (batch * 10));
+		for (uint32_t i = 1; i < 8; i++)
+		{
+			uint32_t	block = (batch - 1) * 7 + i;
+
+			write_block(page, block, batch * 1000 + i, (unsigned char) block);
+		}
+	}
+	write_block(page, 0, 4000, 40);
+}
+
+/* The durable page cutoff that lets maintenance retire the history below
+ * it, and the page frontier that proves the fork-metadata cutoff. */
+static void
+page_cutoff_pin(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->blocknum = PS_RETENTION_OWNER_CONFIGURED;
+	ch->parent_timeline = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	ch->old_nblocks = 1;
+	ch->req_seq = TEST_OWNER;
+	ch->req_lsn = TEST_CUTOFF;
+	if (execute()->status != PS_STATUS_OK)
+		die("page-history owner registration failed");
+	/* The reservation answers with the admission sequence it was granted;
+	 * the durable frontier the pruning pass publishes must carry exactly
+	 * that sequence at the cutoff, not merely the same LSN. */
+	if (ch->datalen != sizeof(uint64_t))
+		die("page-history owner registration did not report its sequence");
+	{
+		uint64_t	granted;
+
+		memcpy(&granted, ch->data, sizeof(granted));
+		if (granted == 0)
+			die("page-history owner registration reported sequence zero");
+		if (cutoff_seq_file != NULL)
+		{
+			FILE	   *out = fopen(cutoff_seq_file, "w");
+
+			if (out == NULL ||
+				fprintf(out, "%llu\n", (unsigned long long) granted) < 0 ||
+				fflush(out) != 0 || fsync(fileno(out)) != 0 || fclose(out) != 0)
+				die("cannot publish the granted admission sequence");
+		}
+	}
+}
+
+static void
+seed(void)
+{
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	page_history_seed(page);
+	page_cutoff_pin();
+	/* Arm the named fault only once the cutoff is durable: the probes also
+	 * run for the flush-driven compactions that had nothing to retire, so a
+	 * marker created earlier could be consumed by a pass planned against the
+	 * old floor and validate the wrong transition.  The registry reads the
+	 * marker at probe time, so arming after daemon start is the same
+	 * protocol the standalone crash cases use. */
+	arm_fault();
+	free(page);
+	wait_forever();
+}
+
+/* ---- forkmeta workload ------------------------------------------------- */
+
+static void verify(void);
+
+static void
+set_forkmeta_relation(PsChannel *ch, uint32_t index)
+{
+	set_relation(ch);
+	ch->key.relNumber = FORKMETA_FIRST_REL + index;
+}
+
+/* Even relations truncate below the cutoff, odd ones above it, so the
+ * snapshot compacts one half and retains the other half's history. */
+static uint32_t
+forkmeta_expected_size(uint32_t index)
+{
+	return index % 2 == 0 ? 2 : 3;
+}
+
+static void
+forkmeta_create_grow(uint32_t rel, uint64_t lsn, uint32_t nblocks)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = lsn;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork create failed");
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_ZEROEXTEND;
+	ch->blocknum = 0;
+	ch->nblocks = nblocks;
+	ch->req_lsn = lsn + 1000;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork zero-extend failed");
+}
+
+/* Persisted fork-size events the segment log cannot re-derive: a create and
+ * an allocation-only growth below the page cutoff for every relation, then
+ * a truncate below the cutoff (even) or above it (odd). */
+static void
+forkmeta_events_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	for (uint32_t i = 0; i < FORKMETA_RELS; i++)
+	{
+		forkmeta_create_grow(FORKMETA_FIRST_REL + i, 1000 + i, 4);
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_TRUNCATE;
+		ch->nblocks = forkmeta_expected_size(i);
+		ch->req_lsn = i % 2 == 0 ? 2500 + i : 4500 + i;
+		if (execute()->status != PS_STATUS_OK)
+			die("fork truncate failed");
+	}
+}
+
+/*
+ * The concurrent-append ledger.  Every trickle event is entered here twice
+ * -- as pending before its request is sent, as acknowledged once the daemon
+ * has answered -- each entry fsynced before the next step, so whatever the
+ * crash boundary the verify oracle knows which appends were acknowledged and
+ * holds recovery to each of them, once: an acknowledged create must exist,
+ * an acknowledged growth must show exactly that size.  A pending entry with
+ * no acknowledgement is an append the daemon may or may not have applied
+ * before it died (it can have answered without this client recording it):
+ * recovery may show either outcome, and nothing else.
+ */
+static void
+forkmeta_ledger(uint32_t rel, const char *op, const char *state)
+{
+	FILE	   *out;
+
+	if (ack_file == NULL)
+		return;
+	out = fopen(ack_file, "a");
+	if (out == NULL || fprintf(out, "%u %s %s\n", rel, op, state) < 0 ||
+		fflush(out) != 0 || fsync(fileno(out)) != 0 || fclose(out) != 0)
+		die("cannot record a trickle append in the ledger");
+}
+
+/* One trickle relation: a create and a growth to two blocks, each entered
+ * in the ledger before it is sent and again once the daemon has
+ * acknowledged it. */
+static void
+forkmeta_trickle_one(uint32_t j)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint32_t	rel = FORKMETA_TRICKLE_REL + j;
+
+	forkmeta_ledger(rel, "create", "pending");
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = 6000 + j;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork create failed");
+	forkmeta_ledger(rel, "create", "ok");
+	forkmeta_ledger(rel, "grow", "pending");
+	set_relation(ch);
+	ch->key.relNumber = rel;
+	ch->opcode = PS_OP_ZEROEXTEND;
+	ch->blocknum = 0;
+	ch->nblocks = 2;
+	ch->req_lsn = 7000 + j;
+	if (execute()->status != PS_STATUS_OK)
+		die("fork zero-extend failed");
+	forkmeta_ledger(rel, "grow", "ok");
+}
+
+static void
+forkmeta_seed(void)
+{
+	unsigned char *page = malloc(page_size);
+	uint32_t	j = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	page_history_seed(page);
+	forkmeta_events_seed();
+	free(page);
+	/* The first trickle relations are acknowledged while maintenance is
+	 * still paused, so whichever boundary the crash lands on, the ledger
+	 * holds appends the oracle must find; the rest overlap the passes. */
+	for (; j < FORKMETA_TRICKLE_LEDGER_MIN; j++)
+		forkmeta_trickle_one(j);
+	arm_fault();
+	page_cutoff_pin();
+	/* Keep appending fork-size events after the cutoff is proven, so a
+	 * second generation is published and the first one is retired; this is
+	 * the only way the snapshot GC boundary is reached.  Each acknowledged
+	 * event goes into the ledger, so the crash lands amid appends the oracle
+	 * tracks. */
+	{
+		struct timespec pause_interval = {0, 20000000};
+
+		for (; j < FORKMETA_TRICKLE_RELS; j++)
+		{
+			forkmeta_trickle_one(j);
+			nanosleep(&pause_interval, NULL);
+		}
+	}
+	wait_forever();
+}
+
+/* a trickle relation's ledger state: how far its create and growth got */
+#define TRICKLE_UNSENT 0
+#define TRICKLE_PENDING 1
+#define TRICKLE_ACKED 2
+
+/*
+ * Hold recovery to the ledger.  An acknowledged create must exist; an
+ * acknowledged growth must show exactly two blocks; a pending, unacknowledged
+ * step may have landed or not -- so a pending create may or may not exist,
+ * and a pending growth shows zero or two blocks -- a growth never sent shows
+ * zero, and no relation shows anything else.
+ */
+static void
+forkmeta_check_acks(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	FILE	   *in;
+	uint32_t	rel;
+	char		op[16];
+	char		state[16];
+	unsigned char create[FORKMETA_TRICKLE_RELS];
+	unsigned char grow[FORKMETA_TRICKLE_RELS];
+	uint32_t	verified = 0;
+	uint32_t	pending = 0;
+
+	if (ack_file == NULL)
+		return;
+	in = fopen(ack_file, "r");
+	if (in == NULL)
+		die("the acknowledged-append ledger is missing");
+	memset(create, TRICKLE_UNSENT, sizeof(create));
+	memset(grow, TRICKLE_UNSENT, sizeof(grow));
+	for (;;)
+	{
+		char		line[64];
+		unsigned char *slot;
+		unsigned char value;
+		size_t		len;
+
+		if (fgets(line, sizeof(line), in) == NULL)
+			break;
+		len = strlen(line);
+		/* the seed is killed once the daemon has crashed, possibly
+		 * mid-entry: an unterminated final line is a torn entry, not a
+		 * record, and the step it would have named stays as it was */
+		if (len == 0 || line[len - 1] != '\n')
+		{
+			if (fgetc(in) != EOF)
+				die("the acknowledged-append ledger has an overlong entry");
+			break;
+		}
+		if (sscanf(line, "%u %15s %15s", &rel, op, state) != 3)
+			die("the acknowledged-append ledger has a malformed entry");
+		if (rel < FORKMETA_TRICKLE_REL || rel >= FORKMETA_TRICKLE_REL + FORKMETA_TRICKLE_RELS)
+			die("the acknowledged-append ledger names a relation outside the trickle");
+		if (strcmp(op, "create") == 0)
+			slot = &create[rel - FORKMETA_TRICKLE_REL];
+		else if (strcmp(op, "grow") == 0)
+			slot = &grow[rel - FORKMETA_TRICKLE_REL];
+		else
+			die("the acknowledged-append ledger names an unknown operation");
+		if (strcmp(state, "pending") == 0)
+			value = TRICKLE_PENDING;
+		else if (strcmp(state, "ok") == 0)
+			value = TRICKLE_ACKED;
+		else
+			die("the acknowledged-append ledger names an unknown state");
+		if (value <= *slot)
+			die("the acknowledged-append ledger is out of order");
+		*slot = value;
+	}
+	fclose(in);
+	for (uint32_t j = 0; j < FORKMETA_TRICKLE_LEDGER_MIN; j++)
+		if (grow[j] != TRICKLE_ACKED)
+			die("the acknowledged-append ledger lacks the appends made before the fault");
+	for (uint32_t j = 0; j < FORKMETA_TRICKLE_RELS; j++)
+	{
+		uint32_t	exists;
+		uint32_t	nblocks = 0;
+
+		if (create[j] == TRICKLE_UNSENT)
+			continue;
+		set_relation(ch);
+		ch->key.relNumber = FORKMETA_TRICKLE_REL + j;
+		ch->opcode = PS_OP_EXISTS;
+		if (execute()->status != PS_STATUS_OK)
+			die("existence query failed after recovery");
+		exists = ch->result;
+		if (exists)
+		{
+			set_relation(ch);
+			ch->key.relNumber = FORKMETA_TRICKLE_REL + j;
+			ch->opcode = PS_OP_NBLOCKS;
+			if (execute()->status != PS_STATUS_OK)
+				die("size query failed after recovery");
+			nblocks = ch->result;
+		}
+		if ((create[j] == TRICKLE_ACKED && !exists) ||
+			(grow[j] == TRICKLE_ACKED && nblocks != 2) ||
+			(grow[j] == TRICKLE_PENDING && nblocks != 0 && nblocks != 2) ||
+			(grow[j] == TRICKLE_UNSENT && nblocks != 0) ||
+			(!exists && nblocks != 0))
+		{
+			fprintf(stderr, "pagestore_gc_crash_client: relation %u after recovery: "
+					"exists=%u blocks=%u, ledger create=%u grow=%u\n",
+					FORKMETA_TRICKLE_REL + j, exists, nblocks, create[j], grow[j]);
+			exit(1);
+		}
+		if (grow[j] == TRICKLE_ACKED)
+			verified++;
+		else
+			pending++;
+	}
+	fprintf(stderr, "pagestore_gc_crash_client: %u acknowledged trickle "
+			"appends verified after recovery, %u in flight at the crash\n",
+			verified, pending);
+}
+
+static void
+forkmeta_check(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	for (uint32_t i = 0; i < FORKMETA_RELS; i++)
+	{
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_NBLOCKS;
+		if (execute()->status != PS_STATUS_OK ||
+			ch->result != forkmeta_expected_size(i))
+		{
+			fprintf(stderr, "pagestore_gc_crash_client: relation %u has %u "
+					"blocks after recovery, expected %u\n",
+					FORKMETA_FIRST_REL + i, (unsigned) ch->result,
+					forkmeta_expected_size(i));
+			exit(1);
+		}
+		/* the growth to four blocks is retained above the cutoff for the
+		 * odd relations, whose truncate comes later */
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_NBLOCKS;
+		ch->req_lsn = 4200 + i;
+		if (execute()->status != PS_STATUS_OK ||
+			ch->result != (i % 2 == 0 ? 2u : 4u))
+			die("recovery lost the fork size history retained above the cutoff");
+		/* history below the durable cutoff is refused, never guessed */
+		set_forkmeta_relation(ch, i);
+		ch->opcode = PS_OP_NBLOCKS;
+		ch->req_lsn = 2200 + i;
+		if (execute()->status == PS_STATUS_OK)
+			die("recovery answered a fork size query below the durable cutoff");
+	}
+}
+
+static void
+forkmeta_verify(void)
+{
+	verify();
+	forkmeta_check();
+	forkmeta_check_acks();
+}
+
+/* ---- wal_index workload ------------------------------------------------ */
+
+/* The WAL-index chains sit at base + {10, 30, 50, 70, 90, 110}; the fixed
+ * reader at base + 40 keeps the first chain exact. */
+static void
+walidx_pin_reader(uint64_t base)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->blocknum = PS_RETENTION_OWNER_READER;
+	ch->parent_timeline = PS_RETENTION_RESOURCE_WAL_INDEX;
+	ch->old_nblocks = 1;
+	ch->req_seq = WALIDX_READER;
+	ch->req_lsn = base + WALIDX_READER_LSN;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixed WAL-index reader registration failed");
+}
+
+static void
+walidx_batch_add(uint64_t base)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+	const uint64_t lsns[] = {10, 30, 50, 70, 90, 110};
+	const uint32_t flags[] = {
+		PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+		PS_WAL_INDEX_FLAG_KNOWN,
+		PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+		PS_WAL_INDEX_FLAG_KNOWN,
+		PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+		PS_WAL_INDEX_FLAG_KNOWN
+	};
+
+	set_relation(ch);
+	for (uint32_t i = 0; i < 6; i++)
+	{
+		entries[i].key = ch->key;
+		entries[i].block = WALIDX_BLOCK;
+		entries[i].flags = flags[i];
+		entries[i].lsn = base + lsns[i];
+		entries[i].end_lsn = base + lsns[i] + 1;
+	}
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = 6;
+	ch->datalen = 6 * sizeof(*entries);
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL-index batch add failed");
+}
+
+static void
+walidx_commit(uint64_t end_lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = end_lsn;
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL-index progress commit failed");
+}
+
+static void
+walidx_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = 0;
+	ch->datalen = WALIDX_WAL_BYTES;
+	memset(ch->data, 0, WALIDX_WAL_BYTES);
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL append failed");
+	walidx_pin_reader(0);
+	/* Arm before the commit that makes the interval a snapshot candidate:
+	 * nothing is published before progress moves, so this is the only
+	 * publication the daemon can reach. */
+	walidx_batch_add(0);
+	arm_fault();
+	walidx_commit(WALIDX_WAL_BYTES);
+	wait_forever();
+}
+
+static void
+walidx_batch_and_commit(uint64_t base, uint64_t end_lsn)
+{
+	walidx_batch_add(base);
+	walidx_commit(end_lsn);
+}
+
+/* ---- manifest_compact workload ----------------------------------------- */
+
+static void read_latest(unsigned char *page, uint32_t block);
+static void die_page(const char *message, uint32_t block,
+					 const unsigned char *page);
+static void delete_seed_survivor(unsigned char *page);
+static void delete_verify_survivor(unsigned char *page);
+static void delete_verify_live(void);
+static uint64_t page_lsn(const unsigned char *page);
+static int walidx_get(uint64_t lsn_max, PsWalRec *out, uint32_t max_out, int *count);
+
+
+
+static unsigned char
+manifest_tag(uint32_t block)
+{
+	return (unsigned char) (block * 7 + 1);
+}
+
+static void
+manifest_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	set_relation(ch);
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = 100;
+	if (execute()->status != PS_STATUS_OK)
+		die("relation create failed");
+	/* Maintenance is paused by the harness while these land: the write path
+	 * still flushes full memtables into layers (ADD and watermark records),
+	 * but layer compaction and the manifest rewrite wait for the release. */
+	for (uint32_t block = 0; block < MANIFEST_PAGES; block++)
+		write_block(page, block, 1000 + block, manifest_tag(block));
+	free(page);
+	arm_fault();
+	wait_forever();
+}
+
+static void
+manifest_verify(void)
+{
+	unsigned char *page = malloc(page_size);
+
+	if (page == NULL)
+		die("out of memory");
+	for (uint32_t block = 0; block < MANIFEST_PAGES; block++)
+	{
+		read_latest(page, block);
+		/* the tag repeats every 256 blocks, so the page's unique LSN is what
+		 * proves this block is not an alias of another one */
+		if (!page_has_tag(page, manifest_tag(block)) ||
+			page_lsn(page) != 1000 + block)
+			die_page("recovery does not serve a page written before the "
+					 "manifest rewrite", block, page);
+	}
+	free(page);
+}
+
+/* ---- timeline_delete workload ------------------------------------------ */
+
+static uint64_t branch_incarnation;
+
+static void
+set_timeline(PsChannel *ch, uint32_t timeline, uint64_t incarnation)
+{
+	ch->timeline = timeline;
+	ch->incarnation = incarnation;
+}
+
+static void
+delete_write_block(unsigned char *page, uint32_t timeline, uint64_t incarnation,
+				   uint32_t block, uint64_t lsn, unsigned char tag)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	fill_page(page, lsn, tag);
+	set_relation(ch);
+	set_timeline(ch, timeline, incarnation);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	memcpy(ch->data, page, page_size);
+	if (execute()->status != PS_STATUS_OK)
+		die("branch page write failed");
+}
+
+static void
+delete_wal_append(uint32_t timeline, uint64_t incarnation, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	set_timeline(ch, timeline, incarnation);
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = lsn;
+	ch->datalen = DELETE_WAL_BYTES;
+	memset(ch->data, (int) (timeline + 1), DELETE_WAL_BYTES);
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL append failed");
+}
+
+static int
+timeline_state(uint32_t timeline, uint64_t *incarnation)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->timeline = timeline;
+	ch->opcode = PS_OP_TIMELINE_STATE;
+	if (execute()->status != PS_STATUS_OK)
+		return -1;
+	if (incarnation != NULL)
+		*incarnation = ch->req_seq;
+	return (int) ch->result;
+}
+
+static void
+delete_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	parent_incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	set_relation(ch);
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = 100;
+	if (execute()->status != PS_STATUS_OK)
+		die("relation create failed");
+	delete_write_block(page, 0, 0, 0, 200, 7);
+	delete_wal_append(0, 0, 0);
+	if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE)
+		die("timeline 0 is not live");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, 0);
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->parent_timeline = 0;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = parent_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch create failed");
+	branch_incarnation = ch->incarnation;
+	if (branch_incarnation != DELETE_INCARNATION)
+		die("branch did not receive its expected first incarnation token");
+	/* private shipped WAL, a complete immutable segment of it, plus a
+	 * committed WAL-index interval */
+	for (uint32_t chunk = 0; chunk < DELETE_WAL_SEGMENT_CHUNKS; chunk++)
+		delete_wal_append(DELETE_BRANCH, branch_incarnation,
+						  DELETE_FORK_LSN + (uint64_t) chunk * DELETE_WAL_BYTES);
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	{
+		PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+		entries[0].key = ch->key;
+		entries[0].block = 0;
+		entries[0].flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+		entries[0].lsn = DELETE_FORK_LSN + 16;
+		entries[0].end_lsn = DELETE_FORK_LSN + 17;
+	}
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = 1;
+	ch->datalen = sizeof(PsWalIndexEntry);
+	if (execute()->status != PS_STATUS_OK)
+		die("branch WAL-index add failed");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = DELETE_FORK_LSN + DELETE_WAL_BYTES;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch WAL-index progress commit failed");
+	/* A live sibling with the same kind of private state: owner-scoped
+	 * cleanup that reached past its owner would take these with it, and no
+	 * scenario would notice while the root has none of them. */
+	delete_seed_survivor(page);
+	/* enough branch pages in shared segments that maintenance flushes an
+	 * owner layer and the deletion must rewrite segments and retire a layer */
+	for (uint32_t block = 0; block < DELETE_PAGES; block++)
+		delete_write_block(page, DELETE_BRANCH, branch_incarnation, block,
+						   DELETE_FORK_LSN + 1000 + block,
+						   (unsigned char) (0x40 + block));
+	/* a zero-extend is the one growth with no page record, so it leaves an
+	 * owner-scoped fork-size event the deletion must settle while the
+	 * parent's own fork metadata stays untouched */
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_ZEROEXTEND;
+	ch->blocknum = DELETE_PAGES;
+	ch->nblocks = 1;
+	ch->req_lsn = DELETE_FORK_LSN + 2000;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch zero-extend failed");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != DELETE_PAGES + 1)
+		die("branch zero-extend did not grow the relation");
+	free(page);
+	arm_fault();
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, branch_incarnation);
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->req_seq = branch_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("BEGIN_DELETE failed");
+	wait_forever();
+}
+
+/* The sibling branch: private shipped WAL, a committed WAL-index interval,
+ * and one page of its own, none of which the deletion may touch. */
+static void
+delete_seed_survivor(unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	parent_incarnation = 0;
+	uint64_t	incarnation;
+
+	if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE)
+		die("timeline 0 is not live");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, 0);
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->parent_timeline = 0;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = parent_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("survivor branch create failed");
+	incarnation = ch->incarnation;
+	delete_wal_append(DELETE_SURVIVOR_BRANCH, incarnation, DELETE_FORK_LSN);
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	{
+		PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+		entries[0].key = ch->key;
+		entries[0].block = 0;
+		entries[0].flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+		entries[0].lsn = DELETE_FORK_LSN + 16;
+		entries[0].end_lsn = DELETE_FORK_LSN + 17;
+	}
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = 1;
+	ch->datalen = sizeof(PsWalIndexEntry);
+	if (execute()->status != PS_STATUS_OK)
+		die("survivor WAL-index add failed");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->req_seq = DELETE_FORK_LSN + DELETE_WAL_BYTES;
+	if (execute()->status != PS_STATUS_OK)
+		die("survivor WAL-index progress commit failed");
+	delete_write_block(page, DELETE_SURVIVOR_BRANCH, incarnation, 0,
+					   DELETE_FORK_LSN + 3000, 0x5A);
+}
+
+/* The sibling is untouched by its neighbour's deletion. */
+static void
+delete_verify_survivor(unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	incarnation = 0;
+
+	if (timeline_state(DELETE_SURVIVOR_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation == 0)
+		die("deletion did not leave the sibling branch live");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("sibling branch read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x5A))
+		die_page("deletion damaged the sibling's own page", 0, page);
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != DELETE_FORK_LSN + DELETE_WAL_BYTES)
+		die("deletion changed the sibling's WAL end");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = DELETE_FORK_LSN;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK || ch->result != 64)
+		die("deletion damaged the sibling's shipped WAL");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != (unsigned char) (DELETE_SURVIVOR_BRANCH + 1))
+			die("deletion corrupted the sibling's shipped WAL bytes");
+	set_relation(ch);
+	set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+	/* 0/0 reads the committed progress back as req_lsn */
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != DELETE_FORK_LSN + DELETE_WAL_BYTES)
+		die("deletion dropped the sibling's WAL-index progress");
+	/* the progress record alone says nothing about the indexed entry */
+	{
+		PsWalRec	out[4];
+		int			count = 0;
+
+		set_relation(ch);
+		set_timeline(ch, DELETE_SURVIVOR_BRANCH, incarnation);
+		ch->opcode = PS_OP_WAL_INDEX_GET;
+		ch->blocknum = 0;
+		ch->nblocks = 0;
+		ch->req_lsn = DELETE_FORK_LSN + DELETE_WAL_BYTES;
+		ch->pad1 = 0;
+		if (execute()->status != PS_STATUS_OK)
+			die("deletion dropped the sibling's WAL-index entry");
+		count = (int) ch->result;
+		if (count < 1)
+			die("deletion left the sibling's WAL-index chain empty");
+		memcpy(out, ch->data, sizeof(*out));
+		if (out[0].lsn != DELETE_FORK_LSN + 16 ||
+			out[0].end_lsn != DELETE_FORK_LSN + 17 ||
+			(out[0].flags & (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI)) !=
+			(PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI))
+			die("deletion damaged the sibling's WAL-index entry");
+	}
+}
+
+/* The crash landed before the DELETING record was durable, so the request is
+ * lost: the branch is still live, still serves its own pages, and keeps every
+ * artifact the deletion would have reclaimed. */
+static void
+delete_verify_live(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	if (timeline_state(DELETE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation != DELETE_INCARNATION)
+		die("a deletion that never became durable did not leave the branch live");
+	/* Its ancestry is durable metadata of its own.  Every page this branch
+	 * serves below was seeded privately, so create metadata replaced with the
+	 * same id and incarnation but a different parent or fork point would pass
+	 * every other check here while moving the branch's as-of boundary. */
+	{
+		uint64_t	parent_incarnation = 0;
+
+		if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE ||
+			parent_incarnation == 0)
+			die("the parent timeline is not live after a lost deletion request");
+		set_relation(ch);
+		set_timeline(ch, DELETE_BRANCH, incarnation);
+		ch->opcode = PS_OP_TIMELINE_INFO;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1)
+			die("the surviving branch lost its persisted ancestry");
+		if (ch->parent_timeline != 0 || ch->req_lsn != DELETE_FORK_LSN ||
+			ch->req_seq != parent_incarnation)
+			die("the surviving branch changed its persisted fork identity");
+	}
+	for (uint32_t block = 0; block < DELETE_PAGES; block++)
+	{
+		set_relation(ch);
+		set_timeline(ch, DELETE_BRANCH, incarnation);
+		ch->opcode = PS_OP_READV;
+		ch->blocknum = block;
+		ch->nblocks = 1;
+		if (execute()->status != PS_STATUS_OK)
+			die("the surviving branch does not serve its own page");
+		memcpy(page, ch->data, page_size);
+		if (!page_has_tag(page, (unsigned char) (0x40 + block)))
+			die_page("the surviving branch lost its own page", block, page);
+	}
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, incarnation);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != DELETE_PAGES + 1)
+		die("the surviving branch lost its zero-extended size");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != DELETE_FORK_LSN +
+		(uint64_t) DELETE_WAL_SEGMENT_CHUNKS * DELETE_WAL_BYTES)
+		die("the surviving branch lost part of its shipped WAL extent");
+	/* the whole extent, not only its first bytes: a truncation that keeps
+	 * the prefix and the artifact names would otherwise pass */
+	for (uint32_t chunk = 0; chunk < DELETE_WAL_SEGMENT_CHUNKS; chunk++)
+	{
+		set_relation(ch);
+		set_timeline(ch, DELETE_BRANCH, incarnation);
+		ch->opcode = PS_OP_WAL_READ;
+		ch->req_lsn = DELETE_FORK_LSN + (uint64_t) chunk * DELETE_WAL_BYTES;
+		ch->datalen = 64;
+		if (execute()->status != PS_STATUS_OK || ch->result != 64)
+			die("the surviving branch lost its shipped WAL");
+		for (uint32_t i = 0; i < 64; i++)
+			if (ch->data[i] != (unsigned char) (DELETE_BRANCH + 1))
+				die("the surviving branch's shipped WAL is corrupt");
+	}
+	delete_verify_survivor(page);
+	free(page);
+}
+
+static void
+delete_verify(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	struct timespec pause_interval = {0, 20000000};
+	uint64_t	incarnation = 0;
+	int			state = -1;
+
+	if (page == NULL)
+		die("out of memory");
+	for (int i = 0; i < 500; i++)
+	{
+		state = timeline_state(DELETE_BRANCH, &incarnation);
+		if (state == PS_TIMELINE_DELETED)
+			break;
+		nanosleep(&pause_interval, NULL);
+	}
+	if (state != PS_TIMELINE_DELETED)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: branch did not reach DELETED "
+				"(state %d)\n", state);
+		exit(1);
+	}
+	if (incarnation != DELETE_INCARNATION)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: DELETED branch reports incarnation "
+				"%llu, seeded %llu\n", (unsigned long long) incarnation,
+				(unsigned long long) DELETE_INCARNATION);
+		exit(1);
+	}
+	/* the parent keeps serving its own page and its own shipped WAL; the
+	 * branch rejects reads */
+	read_latest(page, 0);
+	if (!page_has_tag(page, 7))
+		die_page("deletion damaged the parent's page", 0, page);
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != DELETE_WAL_BYTES)
+		die("deletion changed the parent's WAL end");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = 0;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK || ch->result != 64)
+		die("deletion damaged the parent's shipped WAL");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != 1)
+			die("deletion corrupted the parent's shipped WAL bytes");
+	/* the parent's fork metadata survives the owner-scoped filtering */
+	set_relation(ch);
+	ch->opcode = PS_OP_EXISTS;
+	if (execute()->status != PS_STATUS_OK || ch->result == 0)
+		die("deletion dropped the parent's relation from its fork metadata");
+	set_relation(ch);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != 1)
+		die("deletion changed the parent's relation size");
+	set_relation(ch);
+	set_timeline(ch, DELETE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status == PS_STATUS_OK)
+		die("a DELETED branch still serves reads");
+	delete_verify_survivor(page);
+	free(page);
+}
+
+/* ---- fixture workload -------------------------------------------------- */
+
+static void check_pin_identity(uint32_t timeline, uint32_t owner_kind,
+							   uint64_t owner_id, uint32_t resource,
+							   uint64_t lsn, const char *missing,
+							   const char *changed);
+static void walidx_pin_reader(uint64_t base);
+static void walidx_batch_and_commit(uint64_t base, uint64_t end_lsn);
+static void walidx_check(uint64_t base, uint64_t end);
+static void write_control(uint32_t block, uint64_t version, uint64_t redo);
+static void fixture_backend_objects_seed(void);
+static void fixture_backend_objects_check(void);
+static void control_key(PsKey *key);
+static int read_object_block(const PsKey *key, uint32_t block, uint64_t version,
+							 unsigned char *page, uint64_t *resolved);
+static int wal_read_status(uint64_t lsn);
+
+static uint64_t
+fixture_create_branch(uint32_t timeline)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	parent_incarnation = 0;
+
+	if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE)
+		die("timeline 0 is not live");
+	set_relation(ch);
+	set_timeline(ch, timeline, 0);
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->parent_timeline = 0;
+	ch->req_lsn = FIXTURE_FORK_LSN;
+	ch->req_seq = parent_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("branch create failed");
+	return ch->incarnation;
+}
+
+
+/* The fixture includes a complete sparse generation, an interrupted newer
+ * attempt and a dropped object. Reads must use the completion interval. */
+static void
+fixture_artifact_request(PsKey key, uint32_t op, uint64_t lsn, uint64_t token,
+	uint32_t block, uint32_t count, int value, uint64_t *out)
+{
+	PsChannel *ch = ps_channel(shm_base, channel);
+	set_relation(ch);
+	ch->key = key;
+	ch->opcode = op;
+	ch->req_lsn = lsn;
+	ch->req_seq = token;
+	ch->blocknum = block;
+	ch->nblocks = count;
+	memset(ch->data, value, page_size);
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture artifact lifecycle operation failed");
+	if (out) *out = ch->req_seq;
+}
+
+static void
+fixture_artifacts_seed(void)
+{
+	PsKey key = {.klass = PS_KLASS_SLRU, .relNumber = 900};
+	uint64_t token;
+	uint64_t lsn = FIXTURE_WAL_END + 100;
+	fixture_artifact_request(key, PS_OP_ARTIFACT_BEGIN, lsn, 0, 0, 0, 0, &token);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn, token, 0, 1, 0xA1, NULL);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn, token, 2, 1, 0xA2, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_COMMIT, lsn, token, 0, 2, 0, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_BEGIN, lsn + 10, 0, 0, 0, 0, &token);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn + 10, token, 0, 1, 0xB1, NULL);
+	key.relNumber = 901;
+	fixture_artifact_request(key, PS_OP_ARTIFACT_BEGIN, lsn, 0, 0, 0, 0, &token);
+	fixture_artifact_request(key, PS_OP_EXTEND, lsn, token, 0, 1, 0xA1, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_COMMIT, lsn, token, 0, 1, 0, NULL);
+	fixture_artifact_request(key, PS_OP_ARTIFACT_DROP, lsn + 20, 0, 0, 0, 0, NULL);
+}
+
+static void
+fixture_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	lsn = 0;
+	uint64_t	incarnation;
+
+	if (page == NULL)
+		die("out of memory");
+	/* page history and persisted fork-size events, then the cutoff: every
+	 * event below the cutoff must land before its frontier is published,
+	 * because history below a durable frontier is refused */
+	page_history_seed(page);
+	forkmeta_events_seed();
+	page_cutoff_pin();
+	/* shipped WAL with one sealed segment that stays retained, a WAL-index
+	 * interval with a fixed reader, and the control note that derives the
+	 * WAL floor inside that segment */
+	while (lsn < FIXTURE_WAL_END)
+	{
+		set_relation(ch);
+		ch->opcode = PS_OP_WAL_APPEND;
+		ch->req_lsn = lsn;
+		ch->datalen = RECLAIM_CHUNK;
+		memset(ch->data, (int) (1 + lsn / RECLAIM_SEGMENT), RECLAIM_CHUNK);
+		/* a WAL page header where a sealed store segment will begin, so the
+		 * envelope records a payload identity the way it does for real WAL */
+		if (lsn % RECLAIM_SEGMENT == 0)
+		{
+			unsigned char *page = ch->data;
+			FixtureXLogLongPageHeaderData header;
+
+			/* laid out and byte-ordered as this host's PostgreSQL would */
+			memset(&header, 0, sizeof(header));
+			header.std.xlp_magic = fixture_xlp_magic();
+			header.std.xlp_info = lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0;
+			header.std.xlp_pageaddr = lsn;
+			memset(page, 0, sizeof(header));
+			if (header.std.xlp_info != 0)
+			{
+				header.xlp_sysid = UINT64_C(0x7061676573746f72);	/* "pagestor" */
+				header.xlp_seg_size = FIXTURE_XLP_SEG_SIZE;
+				header.xlp_xlog_blcksz = fixture_xlp_blcksz();
+				memcpy(page, &header, sizeof(header));
+			}
+			else
+				memcpy(page, &header.std, sizeof(header.std));
+		}
+		if (execute()->status != PS_STATUS_OK)
+			die("WAL append failed");
+		lsn += RECLAIM_CHUNK;
+	}
+	/* the index interval lives above the WAL floor the note derives */
+	walidx_pin_reader(FIXTURE_WAL_REDO);
+	write_control(0, FIXTURE_WAL_END, FIXTURE_WAL_REDO);
+	write_control(1, FIXTURE_WAL_END, FIXTURE_WAL_REDO);
+	/* the backend's other object payloads, one of each */
+	fixture_backend_objects_seed();
+	fixture_artifacts_seed();
+	walidx_batch_and_commit(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
+	/* a live branch with its own page version, and a deleted branch */
+	incarnation = fixture_create_branch(FIXTURE_BRANCH);
+	delete_write_block(page, FIXTURE_BRANCH, incarnation, 0,
+					   FIXTURE_BRANCH_LSN, 0x77);
+	/* the branch's own shipped WAL; its WAL-index interval is added by the
+	 * extension, after the snapshot cutover has emptied the epoch logs */
+	delete_wal_append(FIXTURE_BRANCH, incarnation, FIXTURE_FORK_LSN);
+	/* One record of every page-segment format the daemon writes today: an
+	 * ordinary versioned record above, a below-floor copy whose record is
+	 * clamped to the branch point, and a zero-version (WAL-less) record. */
+	delete_write_block(page, FIXTURE_BRANCH, incarnation, FIXTURE_CLAMPED_BLOCK,
+					   FIXTURE_CLAMPED_LSN, 0x55);
+	delete_write_block(page, FIXTURE_BRANCH, incarnation, FIXTURE_WALLESS_BLOCK,
+					   0, 0x66);
+	incarnation = fixture_create_branch(FIXTURE_DELETED_BRANCH);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_DELETED_BRANCH, incarnation);
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->req_seq = incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("BEGIN_DELETE failed");
+	free(page);
+}
+
+static void fixture_extend_holes(void);
+static void fixture_verify_holes(void);
+
+/* Fork-size events appended after the snapshot cutover live in the source
+ * epoch's tail rather than in the checkpoint, so the fixture carries both. */
+static void
+fixture_extend(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	incarnation = 0;
+
+	/* posix-timeline-delete-holes' scenario runs first: BEGIN_DELETE forces
+	 * its own forkmeta snapshot cutover (deletion durably filters the
+	 * target's own events before DELETED), which would otherwise absorb
+	 * the tail_rel growth event below into a new checkpoint and leave the
+	 * source epoch back at its bare marker -- exactly what this function's
+	 * own header comment says must not happen to that record. */
+	if (fixture_capture_holes())
+		fixture_extend_holes();
+	forkmeta_create_grow(FIXTURE_TAIL_REL, FIXTURE_TAIL_LSN, 2);
+	/* The cutover leaves every epoch log empty, so the records of the
+	 * WAL-index log format itself are appended afterwards, on the branch
+	 * whose WAL the extension phase no longer snapshots. */
+	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation == 0)
+		die("fixture branch is not live for its WAL-index interval");
+	{
+		PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+		set_relation(ch);
+		set_timeline(ch, FIXTURE_BRANCH, incarnation);
+		entries[0].key = ch->key;
+		entries[0].block = 0;
+		entries[0].flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+		entries[0].lsn = FIXTURE_FORK_LSN + 16;
+		entries[0].end_lsn = FIXTURE_FORK_LSN + 17;
+		ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+		ch->nblocks = 1;
+		ch->datalen = sizeof(*entries);
+		if (execute()->status != PS_STATUS_OK)
+			die("fixture branch WAL-index add failed");
+	}
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = FIXTURE_FORK_LSN;
+	ch->req_seq = FIXTURE_FORK_LSN + DELETE_WAL_BYTES;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch WAL-index progress commit failed");
+}
+
+/*
+ * posix-timeline-delete-holes only.  By this point in the extension phase,
+ * the daemon's own reopen (recovering the seed phase's on-disk state, whose
+ * flush watermark was never set because fixture_seed()'s clean stop left
+ * its memtable empty) has already replayed everything into the memtable
+ * and, since recover() flushes a nonempty memtable once at the end of its
+ * scan, durably published it -- the memtable is now empty again and the
+ * watermark sits at the end of everything seeded so far.  Nothing run in
+ * fixture_extend() above touches the memtable (forkmeta/WAL-index writes
+ * are separate formats).
+ *
+ * ps_core_close() unconditionally flushes a *nonempty* memtable on clean
+ * shutdown (flush_memtable() itself is the only thing that skips an empty
+ * one).  So the only way a hole can survive to the archived store above the
+ * watermark is for the memtable to hold nothing else in it at shutdown --
+ * this scenario therefore adds no other page write: it creates the target
+ * branch, writes exactly its two records (one plain, one zero-version,
+ * covering both tombstoned header shapes), deletes it, and waits for
+ * DELETED.  Deletion's own cleanup discards the target's two memtable
+ * entries (ps_memtable_discard_timeline()) once its records are tombstoned,
+ * so by the time the extension phase ends the memtable is empty again and
+ * the clean stop's flush is a no-op -- the tombstoned holes stay in the
+ * unflushed tail, above the watermark, in the archived store.  A downgraded
+ * (pre-fix) daemon's recover() therefore *does* reach them on reopen and
+ * fails closed on the unrecognized magic (verified against the pre-fix
+ * daemon binary; see RELEASE_VALIDATION.md's D5 note) -- unlike a hole left
+ * behind a watermark that already advanced past it, which a downgraded
+ * daemon never rescans at all.
+ */
+static void
+fixture_extend_holes(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	target_incarnation;
+	struct timespec pause_interval = {0, 20000000};
+	PsTimelineState state = (PsTimelineState) -1;
+
+	if (page == NULL)
+		die("out of memory");
+	target_incarnation = fixture_create_branch(FIXTURE_HOLES_TARGET_BRANCH);
+	/* target record 1: plain versioned (56-byte header) */
+	delete_write_block(page, FIXTURE_HOLES_TARGET_BRANCH, target_incarnation,
+					   0, FIXTURE_HOLES_LSN, 0xD1);
+	/* target record 2: zero-version, WAL-less (64-byte header) */
+	delete_write_block(page, FIXTURE_HOLES_TARGET_BRANCH, target_incarnation,
+					   1, 0, 0xD2);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_HOLES_TARGET_BRANCH, target_incarnation);
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->req_seq = target_incarnation;
+	if (execute()->status != PS_STATUS_OK)
+		die("holes fixture: BEGIN_DELETE failed");
+	for (int i = 0; i < 500; i++)
+	{
+		if (timeline_state(FIXTURE_HOLES_TARGET_BRANCH, NULL) == PS_TIMELINE_DELETED)
+		{
+			state = PS_TIMELINE_DELETED;
+			break;
+		}
+		nanosleep(&pause_interval, NULL);
+	}
+	if (state != PS_TIMELINE_DELETED)
+		die("holes fixture: target branch did not reach DELETED");
+	free(page);
+}
+
+/* The seed wrote each 64 KiB chunk full of a byte derived from its position,
+ * so a compatibility regression that shifts or truncates the persisted WAL is
+ * visible in the bytes, not only in the request status. */
+static void
+fixture_wal_check(uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char expected = (unsigned char) (1 + lsn / RECLAIM_SEGMENT);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = lsn;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture shipped WAL is not readable");
+	if (ch->result != 64)
+		die("fixture shipped WAL returned a short read");
+	/* A fixture seeded since the envelope records payload identity stamps
+	 * a WAL page header where each store segment begins; one seeded before
+	 * that is filler throughout.  Either way the bytes are what the seed
+	 * wrote, and a header, once present, must keep its magic, flags, and
+	 * the long header's segment size at LSN 0. */
+	{
+		FixtureXLogLongPageHeaderData header;
+
+		/* laid out and byte-ordered as the seed stamped it */
+		memcpy(&header, ch->data, sizeof(header));
+		if (header.std.xlp_magic == fixture_xlp_magic())
+		{
+			if (header.std.xlp_info != (lsn % FIXTURE_XLP_SEG_SIZE == 0 ? FIXTURE_XLP_LONG_HEADER : 0))
+				die("fixture shipped WAL lost its page header flags");
+			if (lsn % FIXTURE_XLP_SEG_SIZE == 0 &&
+				(header.xlp_seg_size != FIXTURE_XLP_SEG_SIZE ||
+				 header.xlp_xlog_blcksz != fixture_xlp_blcksz()))
+				die("fixture shipped WAL lost its segment or block size");
+			for (uint32_t i = sizeof(header); i < 64; i++)
+				if (ch->data[i] != expected)
+					die("fixture shipped WAL returned the wrong bytes");
+			return;
+		}
+	}
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != expected)
+			die("fixture shipped WAL returned the wrong bytes");
+}
+
+/* The branch keeps its own shipped WAL, and the archived WAL-index entry
+ * points into that stream: corruption confined to the branch's WAL leaves
+ * timeline 0's bytes and the entry itself intact. */
+static void
+fixture_branch_wal_check(uint64_t incarnation)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = FIXTURE_FORK_LSN;
+	ch->datalen = 64;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch WAL is not readable");
+	if (ch->result != 64)
+		die("fixture branch WAL returned a short read");
+	for (uint32_t i = 0; i < 64; i++)
+		if (ch->data[i] != (unsigned char) (FIXTURE_BRANCH + 1))
+			die("fixture branch WAL returned the wrong bytes");
+}
+
+static void
+fixture_verify(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	verify();
+	forkmeta_check();
+	set_relation(ch);
+	ch->key.relNumber = FIXTURE_TAIL_REL;
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK || ch->result != 2)
+		die("fixture lost the fork-size events appended after the snapshot cutover");
+	/* The create record's LSN is the acknowledged as-of boundary of this
+	 * relation's existence, and forkmeta source records carry no checksum of
+	 * their own: a byte flipped inside one is caught only by an oracle that
+	 * asks on both sides of the boundary the archive records.  The latest
+	 * size is the same either way. */
+	{
+		uint64_t	root_incarnation = 0;
+		/* an as-of horizon includes the events strictly below it, so each
+		 * boundary is pinned by the pair of answers around its LSN */
+		const struct
+		{
+			uint32_t	opcode;
+			uint64_t	lsn;
+			uint64_t	expected;
+			const char *complaint;
+		} boundaries[] = {
+			{PS_OP_EXISTS, FIXTURE_TAIL_LSN, 0,
+			 "fixture relation already exists at its create event"},
+			{PS_OP_EXISTS, FIXTURE_TAIL_LSN + 1, 1,
+			 "fixture relation does not exist above its create event"},
+			{PS_OP_NBLOCKS, FIXTURE_TAIL_LSN + 1000, 0,
+			 "fixture relation is already grown at its growth event"},
+			{PS_OP_NBLOCKS, FIXTURE_TAIL_LSN + 1001, 2,
+			 "fixture relation is not grown above its growth event"},
+		};
+
+		if (timeline_state(0, &root_incarnation) != PS_TIMELINE_LIVE ||
+			root_incarnation == 0)
+			die("fixture root timeline is not live");
+		for (unsigned i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++)
+		{
+			set_relation(ch);
+			ch->key.relNumber = FIXTURE_TAIL_REL;
+			ch->opcode = boundaries[i].opcode;
+			ch->req_lsn = boundaries[i].lsn;
+			ch->req_seq = root_incarnation;
+			if (execute()->status != PS_STATUS_OK ||
+				ch->result != boundaries[i].expected)
+				die(boundaries[i].complaint);
+		}
+	}
+	set_relation(ch);
+	walidx_check(FIXTURE_WAL_REDO, FIXTURE_WAL_END);
+	/* Both seeded pins must still belong to the owners that took them.  The
+	 * horizon checks above and the retain-floor check below hold for a pin
+	 * whose owner metadata a format migration rewrote, and that pin can no
+	 * longer be advanced or dropped by its real owner. */
+	check_pin_identity(0, PS_RETENTION_OWNER_READER, WALIDX_READER,
+					   PS_RETENTION_RESOURCE_WAL_INDEX,
+					   FIXTURE_WAL_REDO + WALIDX_READER_LSN,
+					   "fixture lost the archived WAL-index reader's pin",
+					   "fixture changed the archived WAL-index reader's identity");
+	check_pin_identity(0, PS_RETENTION_OWNER_CONFIGURED, TEST_OWNER,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, TEST_CUTOFF,
+					   "fixture lost the archived page-history owner's pin",
+					   "fixture changed the archived page-history owner's identity");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_END)
+		die("fixture WAL end changed");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_REDO)
+		die("fixture WAL retain floor changed");
+	if (!fixture_role_legacy())
+	{
+		PsKey key = {.klass = PS_KLASS_SLRU, .relNumber = 900};
+		set_relation(ch); ch->key = key; ch->opcode = PS_OP_READ_AT;
+		ch->blocknum = 0; ch->req_lsn = UINT64_MAX;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1 ||
+			ch->req_lsn != FIXTURE_WAL_END + 100 || ch->data[0] != 0xA1)
+			die("fixture exposed incomplete artifact generation");
+		set_relation(ch); ch->key = key; ch->opcode = PS_OP_READ_AT;
+		ch->blocknum = 2; ch->req_lsn = UINT64_MAX;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1 || ch->data[0] != 0xA2)
+			die("fixture lost sparse committed artifact page");
+		set_relation(ch); key.relNumber = 901; ch->key = key;
+		ch->opcode = PS_OP_READ_AT; ch->req_lsn = UINT64_MAX; ch->blocknum = 0;
+		if (execute()->status != PS_STATUS_OK || ch->result != 0)
+			die("fixture resurrected dropped artifact");
+	}
+	fixture_wal_check(0);
+	fixture_wal_check(RECLAIM_SEGMENT);
+	/* A fixture seeded before the backend objects were part of it carries
+	 * a legacy redo note and none of the others; one seeded since carries
+	 * all of them, and the store must hand every one back intact.  Only a
+	 * fixture the harness declares legacy may lack them: a current one
+	 * whose note has no identity is a capture that went wrong, not a
+	 * legacy store. */
+	{
+		unsigned char *note = malloc(page_size);
+		PsKey		ckey;
+		PsArtifactTrailer trailer;
+
+		if (note == NULL)
+			die("out of memory");
+		control_key(&ckey);
+		if (read_object_block(&ckey, PS_REDO_NOTE_BLOCK, UINT64_MAX, note, NULL) != 1)
+			die("fixture redo note is not readable");
+		memcpy(&trailer, note + PS_ARTIFACT_TRAILER_OFFSET, sizeof(trailer));
+		free(note);
+		if (trailer.magic != 0 || !fixture_role_legacy())
+			fixture_backend_objects_check();
+	}
+	if (timeline_state(FIXTURE_BRANCH, &incarnation) != PS_TIMELINE_LIVE ||
+		incarnation == 0)
+		die("fixture branch is not live");
+	fixture_branch_wal_check(incarnation);
+	/* The persisted ancestry is part of the format too.  A migration that
+	 * keeps the branch live but decodes a different fork point moves every
+	 * as-of boundary a compute already holds, and rejects the exact
+	 * PS_OP_REQUIRE_BRANCH it would issue -- while the pages that remain
+	 * visible below read exactly as before. */
+	{
+		uint64_t	parent_incarnation = 0;
+
+		if (timeline_state(0, &parent_incarnation) != PS_TIMELINE_LIVE ||
+			parent_incarnation == 0)
+			die("fixture parent timeline is not live");
+		set_relation(ch);
+		set_timeline(ch, FIXTURE_BRANCH, incarnation);
+		ch->opcode = PS_OP_TIMELINE_INFO;
+		if (execute()->status != PS_STATUS_OK || ch->result != 1)
+			die("fixture branch lost its persisted ancestry");
+		if (ch->parent_timeline != 0 || ch->req_lsn != FIXTURE_FORK_LSN ||
+			ch->req_seq != parent_incarnation)
+			die("fixture branch changed its persisted fork identity");
+	}
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x77))
+		die_page("fixture branch lost its own page version", 0, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 1;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch inherited read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 1))
+		die_page("fixture branch lost its inherited page", 1, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = FIXTURE_CLAMPED_BLOCK;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch clamped read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x55))
+		die_page("fixture branch lost its clamped page version",
+				 FIXTURE_CLAMPED_BLOCK, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = FIXTURE_WALLESS_BLOCK;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("fixture branch WAL-less read failed");
+	memcpy(page, ch->data, page_size);
+	if (!page_has_tag(page, 0x66))
+		die_page("fixture branch lost its WAL-less page version",
+				 FIXTURE_WALLESS_BLOCK, page);
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_BRANCH, incarnation);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	if (execute()->status != PS_STATUS_OK ||
+		ch->req_lsn != FIXTURE_FORK_LSN + DELETE_WAL_BYTES)
+		die("fixture branch lost its WAL-index progress");
+	/* The progress record is only half the log format: read the seeded
+	 * entry back so the current WAL-index record reader is exercised too. */
+	{
+		PsWalRec	out[4];
+
+		set_relation(ch);
+		set_timeline(ch, FIXTURE_BRANCH, incarnation);
+		ch->opcode = PS_OP_WAL_INDEX_GET;
+		ch->blocknum = 0;
+		ch->nblocks = 0;
+		ch->req_lsn = FIXTURE_FORK_LSN + DELETE_WAL_BYTES;
+		ch->pad1 = 0;
+		if (execute()->status != PS_STATUS_OK || (int) ch->result < 1)
+			die("fixture branch lost its WAL-index entry");
+		memcpy(out, ch->data, sizeof(*out));
+		/* The entry's source timeline is what directs replay to a WAL
+		 * stream; an entry that kept its LSNs and flags but moved to
+		 * timeline 0 would send the reader to the wrong shipped WAL. */
+		if (out[0].lsn != FIXTURE_FORK_LSN + 16 ||
+			out[0].end_lsn != FIXTURE_FORK_LSN + 17 ||
+			out[0].timeline != FIXTURE_BRANCH ||
+			(out[0].flags & (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI)) !=
+			(PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI))
+			die("fixture branch WAL-index entry changed");
+	}
+	if (timeline_state(FIXTURE_DELETED_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
+		die("fixture deleted branch is not DELETED");
+	if (fixture_capture_holes())
+		fixture_verify_holes();
+	free(page);
+}
+
+/* posix-timeline-delete-holes only: the target branch reached DELETED and
+ * stays unreadable (its two records are tombstoned holes, verified
+ * directly against the archived store's bytes by the fixture's
+ * page_segment.hole_bad_len mutation, not by this oracle). */
+static void
+fixture_verify_holes(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	unsigned char *page = malloc(page_size);
+	uint64_t	incarnation = 0;
+
+	if (page == NULL)
+		die("out of memory");
+	if (timeline_state(FIXTURE_HOLES_TARGET_BRANCH, &incarnation) != PS_TIMELINE_DELETED)
+		die("holes fixture: target branch is not DELETED");
+	set_relation(ch);
+	set_timeline(ch, FIXTURE_HOLES_TARGET_BRANCH, incarnation);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	if (execute()->status == PS_STATUS_OK)
+		die("holes fixture: a DELETED branch still serves reads");
+	free(page);
+}
+
+/* ---- wal_reclaim workload ---------------------------------------------- */
+
+static void
+set_control(PsChannel *ch)
+{
+	set_relation(ch);
+	memset(&ch->key, 0, sizeof(ch->key));
+	ch->key.klass = PS_KLASS_CONTROL;
+}
+
+/* Publishes one control block at the given version; block 1 carries the
+ * redo floor note that derives the timeline's WAL cutoff. */
+static void
+write_control(uint32_t block, uint64_t version, uint64_t redo)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint32_t	nblocks;
+
+	set_control(ch);
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("control object create failed");
+	set_control(ch);
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK)
+		die("control object size read failed");
+	nblocks = ch->result;
+	set_control(ch);
+	ch->opcode = block < nblocks ? PS_OP_WRITEV : PS_OP_EXTEND;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->req_lsn = version;
+	memset(ch->data, block == 0 ? 0xC3 : 0, page_size);
+	if (block == 1)
+	{
+		/* the redo note: value at 0, identity trailer after it, as the
+		 * backend's control mirror writes it */
+		memcpy(ch->data, &redo, sizeof(redo));
+		ps_artifact_trailer_set(ch->data, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION);
+	}
+	if (execute()->status != PS_STATUS_OK)
+		die("control block write failed");
+}
+
+/*
+ * The backend's own object payloads (pagestore_artifact_format.h), seeded so
+ * the fixture carries one of each and the reopen oracle can check that the
+ * store hands them back intact: the headed control blocks, the SLRU mirror's
+ * watermark and a tombstone, and the five reader snapshot objects.  Their
+ * values are arbitrary but internally consistent (complements, CRC-32C).
+ */
+#define FIXTURE_BACKEND_VERSION FIXTURE_WAL_END
+#define FIXTURE_BACKEND_TIMELINE 0u	/* every headed object names the timeline */
+#define FIXTURE_FIRST_NORMAL_XID 3u	/* FirstNormalTransactionId */
+#define FIXTURE_TOMBSTONE_SLRU "pg_xact"	/* the tombstone's object: its id */
+#define FIXTURE_READER_GLOBAL 0u	/* InvalidOid */
+#define FIXTURE_READER_DB 1u
+#define FIXTURE_READER_TS 1663u		/* pg_default */
+#define FIXTURE_READER_GLOBAL_TS 1664u	/* pg_global */
+#define FIXTURE_READER_RELMAP_BYTES 512u
+
+static void
+write_object_block(const PsKey *key, uint32_t block, uint64_t version,
+				   const unsigned char *image, uint32_t len)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint32_t	nblocks;
+
+	set_relation(ch);
+	ch->key = *key;
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("backend object create failed");
+	set_relation(ch);
+	ch->key = *key;
+	ch->opcode = PS_OP_NBLOCKS;
+	if (execute()->status != PS_STATUS_OK)
+		die("backend object size read failed");
+	nblocks = ch->result;
+	/* blocks are appended in order; extend through the one requested */
+	for (uint32_t b = nblocks; b <= block; b++)
+	{
+		set_relation(ch);
+		ch->key = *key;
+		ch->opcode = b < nblocks ? PS_OP_WRITEV : PS_OP_EXTEND;
+		ch->blocknum = b;
+		ch->nblocks = 1;
+		ch->req_lsn = version;
+		memset(ch->data, 0, page_size);
+		if (b == block)
+			memcpy(ch->data, image, len);
+		if (execute()->status != PS_STATUS_OK)
+			die("backend object block write failed");
+	}
+	if (block < nblocks)
+	{
+		set_relation(ch);
+		ch->key = *key;
+		ch->opcode = PS_OP_WRITEV;
+		ch->blocknum = block;
+		ch->nblocks = 1;
+		ch->req_lsn = version;
+		memset(ch->data, 0, page_size);
+		memcpy(ch->data, image, len);
+		if (execute()->status != PS_STATUS_OK)
+			die("backend object block write failed");
+	}
+}
+
+/* Read a block as of 'version' (UINT64_MAX: the newest); 1 when found, with
+ * the version the store resolved it at in *resolved. */
+static int
+read_object_block(const PsKey *key, uint32_t block, uint64_t version,
+				  unsigned char *page, uint64_t *resolved)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->key = *key;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = version;
+	if (execute()->status != PS_STATUS_OK)
+		return -1;
+	if (ch->result != 0)
+		memcpy(page, ch->data, page_size);
+	if (resolved != NULL)
+		*resolved = ch->req_lsn;
+	return ch->result != 0;
+}
+
+/*
+ * Read a seeded object block the way the backend's loaders do: as of the
+ * version it was published at, requiring the store to resolve it at exactly
+ * that version.  A store that reopened or migrated it to another version
+ * would pass a newest-wins read while every loader that names the version
+ * -- the reader snapshot, ready record, manifest and barrier -- refused it.
+ */
+static void
+read_seeded_block(const PsKey *key, uint32_t block, unsigned char *page,
+				  const char *what)
+{
+	uint64_t	resolved = 0;
+	char		message[160];
+
+	if (read_object_block(key, block, FIXTURE_BACKEND_VERSION, page, &resolved) != 1)
+	{
+		snprintf(message, sizeof(message), "fixture %s is not readable", what);
+		die(message);
+	}
+	if (resolved != FIXTURE_BACKEND_VERSION)
+	{
+		snprintf(message, sizeof(message), "fixture %s is not at its published version", what);
+		die(message);
+	}
+}
+
+static void
+control_key(PsKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	key->klass = PS_KLASS_CONTROL;
+}
+
+static void
+slru_mirror_key(PsKey *key, uint32_t klass, uint32_t obj)
+{
+	memset(key, 0, sizeof(*key));
+	key->klass = klass;
+	key->spcOid = 0;			/* the timeline; ps_slru_obj_key() brands it */
+	key->relNumber = obj;
+}
+
+/* The backend keys the snapshot data, ready record and database barrier
+ * globally (InvalidOid) and the manifest and relation map once globally and
+ * once per database; the fixture seeds each where its loader looks. */
+static void
+reader_key(PsKey *key, uint32_t object, uint32_t db)
+{
+	memset(key, 0, sizeof(*key));
+	key->klass = PS_KLASS_READER_SNAPSHOT;
+	key->dbOid = db;
+	key->relNumber = object;
+}
+
+static uint32_t
+crc32c_of(const void *data, size_t len)
+{
+	return PS_CRC32C_FIN(ps_crc32c_update(PS_CRC32C_INIT, data, len));
+}
+
+static void
+fixture_backend_objects_seed(void)
+{
+	unsigned char image[4096];
+	PsKey		key;
+	uint64_t	v = FIXTURE_BACKEND_VERSION;
+
+	/* control block 2: the admission fence, paired with the image and note
+	 * (pagestore_ipc.h); seeded before the higher blocks so extending to
+	 * them never leaves a zero filler where the fence belongs */
+	{
+		PsAdmissionFence fence = {0};
+
+		fence.magic = PS_ADMISSION_FENCE_MAGIC;
+		fence.version = PS_ADMISSION_FENCE_VERSION;
+		fence.redo_lsn = FIXTURE_WAL_REDO;
+		fence.admission_seq = 1;
+		control_key(&key);
+		write_object_block(&key, PS_ADMISSION_FENCE_BLOCK, v, (const unsigned char *) &fence, sizeof(fence));
+	}
+	/* control block 3: materializer marker */
+	{
+		PsMaterializerMarkerFormat m = {0};
+
+		m.magic = PS_MATERIALIZER_MARKER_MAGIC;
+		m.version = PS_MATERIALIZER_MARKER_VERSION;
+		m.timeline = FIXTURE_BACKEND_TIMELINE;
+		m.materialized_lsn = FIXTURE_WAL_REDO;
+		m.materialized_lsn_complement = ~m.materialized_lsn;
+		control_key(&key);
+		write_object_block(&key, PS_MATERIALIZER_MARKER_BLOCK, v,
+						   (const unsigned char *) &m, sizeof(m));
+	}
+	/* control block 4: materializer release */
+	{
+		PsMaterializerReleaseFormat r = {0};
+
+		r.magic = PS_MATERIALIZER_RELEASE_MAGIC;
+		r.version = PS_MATERIALIZER_RELEASE_VERSION;
+		r.timeline = FIXTURE_BACKEND_TIMELINE;
+		r.materialized_lsn = FIXTURE_WAL_REDO;
+		r.materialized_lsn_complement = ~r.materialized_lsn;
+		/* a release names a checkpoint completed after the materialized
+		 * point; the backend's reader rejects one that does not */
+		r.checkpoint_lsn = FIXTURE_WAL_END;
+		r.checkpoint_lsn_complement = ~r.checkpoint_lsn;
+		control_key(&key);
+		write_object_block(&key, PS_MATERIALIZER_RELEASE_BLOCK, v,
+						   (const unsigned char *) &r, sizeof(r));
+	}
+	/* control block 5: writer checkpoint */
+	{
+		PsWriterCheckpointFormat c = {0};
+
+		c.magic = PS_WRITER_CHECKPOINT_MAGIC;
+		c.version = PS_WRITER_CHECKPOINT_VERSION;
+		c.timeline = FIXTURE_BACKEND_TIMELINE;
+		c.checkpoint_lsn = FIXTURE_WAL_REDO;
+		c.checkpoint_lsn_complement = ~c.checkpoint_lsn;
+		control_key(&key);
+		write_object_block(&key, PS_WRITER_CHECKPOINT_BLOCK, v,
+						   (const unsigned char *) &c, sizeof(c));
+	}
+	/* SLRU mirror watermark and one truncation tombstone: raw values with
+	 * the identity trailer */
+	{
+		uint64_t	w = FIXTURE_WAL_END;
+		int64_t		cutoff = 0;
+
+		memset(image, 0, sizeof(image));
+		memcpy(image, &w, sizeof(w));
+		ps_artifact_trailer_set(image, PS_SLRU_WATERMARK_MAGIC, PS_SLRU_WATERMARK_VERSION);
+		slru_mirror_key(&key, PS_KLASS_SLRU_WM, 0);
+		write_object_block(&key, 0, v, image, 16);
+
+		memset(image, 0, sizeof(image));
+		memcpy(image, &cutoff, sizeof(cutoff));
+		ps_artifact_trailer_set(image, PS_SLRU_TOMBSTONE_MAGIC, PS_SLRU_TOMBSTONE_VERSION);
+		slru_mirror_key(&key, PS_KLASS_SLRU_TOMB, ps_slru_object_id(FIXTURE_TOMBSTONE_SLRU));
+		write_object_block(&key, 0, v, image, 16);
+	}
+	/* reader snapshot objects 0..4 */
+	{
+		PsReaderSnapshotManifestFormat manifest = {0};
+		PsReaderSnapshotHeaderFormat header = {0};
+		PsReaderSnapshotReadyFormat ready = {0};
+		PsReaderRelmapFormat relmap = {0};
+		PsReaderDatabaseBarrierFormat barrier = {0};
+		PsReaderDatabaseEntryFormat entry = {0};
+		uint32_t	xids[2] = {700, 703};
+		uint32_t	global_relmap_crc = 0;
+		uint32_t	c;
+
+		header.read_lsn = FIXTURE_WAL_END;
+		header.magic = PS_READER_SNAPSHOT_MAGIC;
+		header.format = PS_READER_SNAPSHOT_FORMAT;
+		header.timeline = FIXTURE_BACKEND_TIMELINE;
+		header.count = 2;
+		header.xmin = 700;
+		header.xmax = 704;
+		c = ps_crc32c_update(PS_CRC32C_INIT, &header, offsetof(PsReaderSnapshotHeaderFormat, crc));
+		c = ps_crc32c_update(c, xids, sizeof(xids));
+		header.crc = PS_CRC32C_FIN(c);
+		memset(image, 0, sizeof(image));
+		memcpy(image, &header, sizeof(header));
+		memcpy(image + sizeof(header), xids, sizeof(xids));
+		reader_key(&key, PS_READER_SNAPSHOT_DATA_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, image, sizeof(header) + sizeof(xids));
+
+		ready.header = header;
+		ready.block_count = 1;
+		ready.crc = crc32c_of(&ready, offsetof(PsReaderSnapshotReadyFormat, crc));
+		reader_key(&key, PS_READER_SNAPSHOT_READY_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, (const unsigned char *) &ready, sizeof(ready));
+
+		/* the relation map: the global one (pg_global) and the database's */
+		for (int global = 1; global >= 0; global--)
+		{
+			relmap.magic = PS_READER_RELMAP_MAGIC;
+			relmap.format = PS_READER_RELMAP_FORMAT;
+			relmap.dbid = global ? FIXTURE_READER_GLOBAL : FIXTURE_READER_DB;
+			relmap.tsid = global ? FIXTURE_READER_GLOBAL_TS : FIXTURE_READER_TS;
+			relmap.size = FIXTURE_READER_RELMAP_BYTES;
+			memset(image, 0, sizeof(image));
+			for (uint32_t i = 0; i < FIXTURE_READER_RELMAP_BYTES; i++)
+				image[sizeof(relmap) + i] = (unsigned char) (i * 7 + global);
+			relmap.data_crc = crc32c_of(image + sizeof(relmap), FIXTURE_READER_RELMAP_BYTES);
+			relmap.crc = crc32c_of(&relmap, offsetof(PsReaderRelmapFormat, crc));
+			memcpy(image, &relmap, sizeof(relmap));
+			reader_key(&key, PS_READER_RELMAP_OBJECT, relmap.dbid);
+			write_object_block(&key, 0, v, image, sizeof(relmap) + FIXTURE_READER_RELMAP_BYTES);
+			if (global)
+				global_relmap_crc = relmap.data_crc;
+		}
+
+		/* the barrier lists the databases the snapshot covers; its CRC spans
+		 * the entries too, and the loader rejects an empty list */
+		barrier.read_lsn = FIXTURE_WAL_END;
+		barrier.magic = PS_READER_DATABASE_BARRIER_MAGIC;
+		barrier.format = PS_READER_DATABASE_BARRIER_FORMAT;
+		barrier.timeline = FIXTURE_BACKEND_TIMELINE;
+		barrier.database_count = 1;
+		barrier.block_count = 1;
+		entry.database_oid = FIXTURE_READER_DB;
+		entry.tablespace_oid = FIXTURE_READER_TS;
+		c = ps_crc32c_update(PS_CRC32C_INIT, &barrier, offsetof(PsReaderDatabaseBarrierFormat, crc));
+		c = ps_crc32c_update(c, &entry, sizeof(entry));
+		barrier.crc = PS_CRC32C_FIN(c);
+		memset(image, 0, sizeof(image));
+		memcpy(image, &barrier, sizeof(barrier));
+		memcpy(image + sizeof(barrier), &entry, sizeof(entry));
+		reader_key(&key, PS_READER_DATABASE_BARRIER_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, image, sizeof(barrier) + sizeof(entry));
+
+		manifest.read_lsn = FIXTURE_WAL_END;
+		manifest.artifact_size = sizeof(header) + sizeof(xids);
+		manifest.magic = PS_READER_SNAPSHOT_MANIFEST_MAGIC;
+		manifest.format = PS_READER_SNAPSHOT_MANIFEST_FORMAT;
+		manifest.timeline = FIXTURE_BACKEND_TIMELINE;
+		manifest.block_count = 1;
+		manifest.artifact_crc = header.crc;
+		manifest.global_relmap_crc = global_relmap_crc;
+		manifest.local_relmap_crc = relmap.data_crc;
+		manifest.crc = crc32c_of(&manifest, offsetof(PsReaderSnapshotManifestFormat, crc));
+		/* once globally, once for the database, as the backend publishes it */
+		reader_key(&key, PS_READER_SNAPSHOT_MANIFEST_OBJECT, FIXTURE_READER_GLOBAL);
+		write_object_block(&key, 0, v, (const unsigned char *) &manifest, sizeof(manifest));
+		reader_key(&key, PS_READER_SNAPSHOT_MANIFEST_OBJECT, FIXTURE_READER_DB);
+		write_object_block(&key, 0, v, (const unsigned char *) &manifest, sizeof(manifest));
+	}
+}
+
+static void
+fixture_backend_objects_check(void)
+{
+	unsigned char *page = malloc(page_size);
+	PsKey		key;
+
+	if (page == NULL)
+		die("out of memory");
+	/* the raw-value objects must carry exactly this build's identity: a
+	 * capture that left one unstamped is not a current fixture */
+	control_key(&key);
+	read_seeded_block(&key, PS_REDO_NOTE_BLOCK, page, "redo note");
+	if (!ps_artifact_trailer_is(page, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION))
+		die("fixture redo note lost its identity");
+	{
+		PsAdmissionFence fence;
+
+		read_seeded_block(&key, PS_ADMISSION_FENCE_BLOCK, page, "admission fence");
+		memcpy(&fence, page, sizeof(fence));
+		if (fence.magic != PS_ADMISSION_FENCE_MAGIC || fence.version != PS_ADMISSION_FENCE_VERSION ||
+			fence.redo_lsn != FIXTURE_WAL_REDO || fence.admission_seq == 0)
+			die("fixture admission fence is not intact");
+	}
+	{
+		PsMaterializerMarkerFormat m;
+
+		read_seeded_block(&key, PS_MATERIALIZER_MARKER_BLOCK, page, "materializer marker");
+		memcpy(&m, page, sizeof(m));
+		if (m.magic != PS_MATERIALIZER_MARKER_MAGIC || m.version != PS_MATERIALIZER_MARKER_VERSION ||
+			m.timeline != FIXTURE_BACKEND_TIMELINE ||
+			m.materialized_lsn != FIXTURE_WAL_REDO ||
+			m.materialized_lsn_complement != ~m.materialized_lsn)
+			die("fixture materializer marker is not intact");
+	}
+	{
+		PsMaterializerReleaseFormat r;
+
+		read_seeded_block(&key, PS_MATERIALIZER_RELEASE_BLOCK, page, "materializer release");
+		memcpy(&r, page, sizeof(r));
+		if (r.magic != PS_MATERIALIZER_RELEASE_MAGIC || r.version != PS_MATERIALIZER_RELEASE_VERSION ||
+			r.timeline != FIXTURE_BACKEND_TIMELINE ||
+			r.materialized_lsn != FIXTURE_WAL_REDO ||
+			r.materialized_lsn_complement != ~r.materialized_lsn ||
+			r.checkpoint_lsn_complement != ~r.checkpoint_lsn ||
+			r.checkpoint_lsn <= r.materialized_lsn)
+			die("fixture materializer release is not intact");
+	}
+	{
+		PsWriterCheckpointFormat c;
+
+		read_seeded_block(&key, PS_WRITER_CHECKPOINT_BLOCK, page, "writer checkpoint");
+		memcpy(&c, page, sizeof(c));
+		if (c.magic != PS_WRITER_CHECKPOINT_MAGIC || c.version != PS_WRITER_CHECKPOINT_VERSION ||
+			c.timeline != FIXTURE_BACKEND_TIMELINE ||
+			c.checkpoint_lsn != FIXTURE_WAL_REDO ||
+			c.checkpoint_lsn_complement != ~c.checkpoint_lsn)
+			die("fixture writer checkpoint is not intact");
+	}
+	{
+		uint64_t	w;
+
+		int64_t		cutoff;
+
+		slru_mirror_key(&key, PS_KLASS_SLRU_WM, 0);
+		read_seeded_block(&key, 0, page, "SLRU watermark");
+		if (!ps_artifact_trailer_is(page, PS_SLRU_WATERMARK_MAGIC, PS_SLRU_WATERMARK_VERSION))
+			die("fixture SLRU watermark lost its identity");
+		memcpy(&w, page, sizeof(w));
+		if (w != FIXTURE_WAL_END)
+			die("fixture SLRU watermark is not intact");
+		/* at the object a reader of that SLRU asks for */
+		slru_mirror_key(&key, PS_KLASS_SLRU_TOMB, ps_slru_object_id(FIXTURE_TOMBSTONE_SLRU));
+		read_seeded_block(&key, 0, page, "SLRU tombstone");
+		if (!ps_artifact_trailer_is(page, PS_SLRU_TOMBSTONE_MAGIC, PS_SLRU_TOMBSTONE_VERSION))
+			die("fixture SLRU tombstone lost its identity");
+		memcpy(&cutoff, page, sizeof(cutoff));
+		if (cutoff != 0)
+			die("fixture SLRU tombstone is not intact");
+	}
+	{
+		PsReaderSnapshotManifestFormat manifest[2];	/* [1] global, [0] the database's */
+		PsReaderSnapshotHeaderFormat header;
+		PsReaderSnapshotReadyFormat ready;
+		PsReaderRelmapFormat relmap;
+		PsReaderDatabaseBarrierFormat barrier;
+		PsReaderDatabaseEntryFormat entry;
+		uint32_t	c;
+
+		/* both manifests -- startup selects the global one, a database's
+		 * reader its own -- and each must describe the data and relation
+		 * maps below, as pagestore_load_published_reader_snapshot() demands */
+		for (int global = 1; global >= 0; global--)
+		{
+			PsReaderSnapshotManifestFormat *m = &manifest[global];
+
+			reader_key(&key, PS_READER_SNAPSHOT_MANIFEST_OBJECT,
+					   global ? FIXTURE_READER_GLOBAL : FIXTURE_READER_DB);
+			read_seeded_block(&key, 0, page, "reader manifest");
+			memcpy(m, page, sizeof(*m));
+			if (m->magic != PS_READER_SNAPSHOT_MANIFEST_MAGIC ||
+				m->format != PS_READER_SNAPSHOT_MANIFEST_FORMAT ||
+				m->timeline != FIXTURE_BACKEND_TIMELINE ||
+				m->read_lsn != FIXTURE_WAL_END ||
+				m->artifact_size < sizeof(PsReaderSnapshotHeaderFormat) ||
+				m->block_count != (m->artifact_size + page_size - 1) / page_size ||
+				m->crc != crc32c_of(m, offsetof(PsReaderSnapshotManifestFormat, crc)))
+				die("fixture reader manifest is not intact");
+		}
+
+		reader_key(&key, PS_READER_SNAPSHOT_DATA_OBJECT, FIXTURE_READER_GLOBAL);
+		read_seeded_block(&key, 0, page, "reader snapshot");
+		memcpy(&header, page, sizeof(header));
+		/* the count sizes the checksummed span: judge it before trusting it
+		 * as a length, or a mutated header reads past the page */
+		if (header.magic != PS_READER_SNAPSHOT_MAGIC || header.format != PS_READER_SNAPSHOT_FORMAT ||
+			header.timeline != FIXTURE_BACKEND_TIMELINE ||
+			header.read_lsn != FIXTURE_WAL_END || header.reserved != 0 ||
+			header.count != 2)
+			die("fixture reader snapshot is not intact");
+		c = ps_crc32c_update(PS_CRC32C_INIT, &header, offsetof(PsReaderSnapshotHeaderFormat, crc));
+		c = ps_crc32c_update(c, page + sizeof(header), header.count * sizeof(uint32_t));
+		if (header.crc != PS_CRC32C_FIN(c))
+			die("fixture reader snapshot is not intact");
+		/* what pagestore_validate_reader_snapshot() demands of the xids:
+		 * normal, within [xmin, xmax), ascending -- plain comparisons
+		 * suffice for the fixture's small, unwrapped ids */
+		if (header.xmin < FIXTURE_FIRST_NORMAL_XID || header.xmax < header.xmin)
+			die("fixture reader snapshot has an invalid xid range");
+		for (uint32_t i = 0; i < header.count; i++)
+		{
+			uint32_t	xid;
+
+			memcpy(&xid, page + sizeof(header) + i * sizeof(xid), sizeof(xid));
+			if (xid < FIXTURE_FIRST_NORMAL_XID || xid < header.xmin || xid >= header.xmax)
+				die("fixture reader snapshot has an invalid xid");
+			if (i > 0)
+			{
+				uint32_t	prev;
+
+				memcpy(&prev, page + sizeof(header) + (i - 1) * sizeof(prev), sizeof(prev));
+				if (prev >= xid)
+					die("fixture reader snapshot xids are not ascending");
+			}
+		}
+		for (int global = 1; global >= 0; global--)
+			if (manifest[global].artifact_crc != header.crc ||
+				manifest[global].artifact_size !=
+				sizeof(header) + header.count * sizeof(uint32_t))
+				die("fixture reader manifest does not describe the snapshot");
+
+		reader_key(&key, PS_READER_SNAPSHOT_READY_OBJECT, FIXTURE_READER_GLOBAL);
+		read_seeded_block(&key, 0, page, "reader ready record");
+		memcpy(&ready, page, sizeof(ready));
+		if (ready.header.magic != PS_READER_SNAPSHOT_MAGIC ||
+			ready.header.format != PS_READER_SNAPSHOT_FORMAT ||
+			ready.header.timeline != FIXTURE_BACKEND_TIMELINE ||
+			ready.header.read_lsn != FIXTURE_WAL_END ||
+			ready.header.count != header.count ||
+			ready.block_count != (sizeof(ready.header) + ready.header.count * sizeof(uint32_t) +
+								  page_size - 1) / page_size ||
+			ready.reserved != 0 ||
+			ready.crc != crc32c_of(&ready, offsetof(PsReaderSnapshotReadyFormat, crc)))
+			die("fixture reader ready record is not intact");
+
+		for (int global = 1; global >= 0; global--)
+		{
+			uint32_t	db = global ? FIXTURE_READER_GLOBAL : FIXTURE_READER_DB;
+
+			reader_key(&key, PS_READER_RELMAP_OBJECT, db);
+			read_seeded_block(&key, 0, page, "reader relation map");
+			memcpy(&relmap, page, sizeof(relmap));
+			if (relmap.magic != PS_READER_RELMAP_MAGIC || relmap.format != PS_READER_RELMAP_FORMAT ||
+				relmap.dbid != db ||
+				relmap.tsid != (global ? FIXTURE_READER_GLOBAL_TS : FIXTURE_READER_TS) ||
+				relmap.size != FIXTURE_READER_RELMAP_BYTES ||
+				relmap.size > page_size - sizeof(relmap) ||
+				relmap.crc != crc32c_of(&relmap, offsetof(PsReaderRelmapFormat, crc)) ||
+				relmap.data_crc != crc32c_of(page + sizeof(relmap), relmap.size))
+				die("fixture reader relation map is not intact");
+			/* every manifest names the global map; each names the local one */
+			for (int m = 1; m >= 0; m--)
+				if (relmap.data_crc != (global ? manifest[m].global_relmap_crc
+									   : manifest[m].local_relmap_crc))
+					die("fixture reader manifest does not describe the relation map");
+		}
+
+		reader_key(&key, PS_READER_DATABASE_BARRIER_OBJECT, FIXTURE_READER_GLOBAL);
+		read_seeded_block(&key, 0, page, "reader database barrier");
+		memcpy(&barrier, page, sizeof(barrier));
+		/* the same conditions the backend's loader applies, then the CRC
+		 * over the header and the entries it announces */
+		if (barrier.magic != PS_READER_DATABASE_BARRIER_MAGIC ||
+			barrier.format != PS_READER_DATABASE_BARRIER_FORMAT ||
+			barrier.timeline != FIXTURE_BACKEND_TIMELINE ||
+			barrier.read_lsn != FIXTURE_WAL_END || barrier.reserved != 0 ||
+			barrier.database_count != 1 || barrier.block_count != 1)
+			die("fixture reader database barrier is not intact");
+		memcpy(&entry, page + sizeof(barrier), sizeof(entry));
+		c = ps_crc32c_update(PS_CRC32C_INIT, &barrier, offsetof(PsReaderDatabaseBarrierFormat, crc));
+		c = ps_crc32c_update(c, &entry, sizeof(entry));
+		if (barrier.crc != PS_CRC32C_FIN(c) || entry.database_oid != FIXTURE_READER_DB ||
+			entry.tablespace_oid != FIXTURE_READER_TS)
+			die("fixture reader database barrier is not intact");
+	}
+	free(page);
+}
+
+static void
+reclaim_seed(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	uint64_t	lsn = 0;
+
+	while (lsn < RECLAIM_TOTAL)
+	{
+		set_relation(ch);
+		ch->opcode = PS_OP_WAL_APPEND;
+		ch->req_lsn = lsn;
+		ch->datalen = RECLAIM_CHUNK;
+		memset(ch->data, (int) (1 + lsn / RECLAIM_SEGMENT), RECLAIM_CHUNK);
+		if (execute()->status != PS_STATUS_OK)
+			die("WAL append failed");
+		lsn += RECLAIM_CHUNK;
+	}
+	write_control(0, RECLAIM_TOTAL, RECLAIM_TOTAL);
+	write_control(1, RECLAIM_TOTAL, RECLAIM_TOTAL);
+	/* The retained base needs both the note and durable WAL-index progress
+	 * through the sealed prefix; arm before the commit that completes it. */
+	arm_fault();
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = 0;
+	ch->req_seq = RECLAIM_TOTAL;
+	if (execute()->status != PS_STATUS_OK)
+		die("WAL-index progress commit failed");
+	wait_forever();
+}
+
+static int
+wal_read_status(uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = lsn;
+	ch->datalen = 64;
+	return execute()->status;
+}
+
+static void
+reclaim_verify(void)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+	struct timespec pause_interval = {0, 20000000};
+	int			reclaimed = 0;
+
+	/* Recovery retries the interrupted prefix unlink asynchronously; the
+	 * sealed prefix must be gone within a bounded wait. */
+	for (int i = 0; i < 500; i++)
+	{
+		if (wal_read_status(0) != PS_STATUS_OK &&
+			wal_read_status(RECLAIM_TOTAL - RECLAIM_SEGMENT) != PS_STATUS_OK)
+		{
+			reclaimed = 1;
+			break;
+		}
+		nanosleep(&pause_interval, NULL);
+	}
+	if (!reclaimed)
+		die("recovery did not finish reclaiming the sealed WAL prefix");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_SIZE;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != RECLAIM_TOTAL)
+		die("recovery changed the timeline's WAL end");
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
+	if (execute()->status != PS_STATUS_OK || ch->req_lsn != RECLAIM_TOTAL)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: recovery reports WAL retain "
+				"floor %llu, expected %llu\n", (unsigned long long) ch->req_lsn,
+				(unsigned long long) RECLAIM_TOTAL);
+		exit(1);
+	}
+}
+
+/* Returns the daemon status; on OK fills *count and out[] (up to max_out). */
+static int
+walidx_get(uint64_t lsn_max, PsWalRec *out, uint32_t max_out, int *count)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_WAL_INDEX_GET;
+	ch->blocknum = WALIDX_BLOCK;
+	ch->nblocks = 0;
+	ch->req_lsn = lsn_max;
+	ch->pad1 = 0;
+	execute();
+	*count = (int) ch->result;
+	if (ch->status == PS_STATUS_OK && *count > 0)
+		memcpy(out, ch->data,
+			   (size_t) (*count < (int) max_out ? *count : (int) max_out) *
+			   sizeof(*out));
+	return ch->status;
+}
+
+/* Reads at the durable frontier (end) see the compacted chains; a read at
+ * the reader's exact pin sees its chain; unrepresented points are refused. */
+static void
+walidx_check(uint64_t base, uint64_t end)
+{
+	PsWalRec	out[8];
+	struct timespec pause_interval = {0, 20000000};
+	int			count = 0;
+	int			compacted = 0;
+
+	/* Restart retries the prepared generation behind its durable frontier
+	 * asynchronously; the compacted chains must appear within a bounded
+	 * wait. */
+	for (int i = 0; i < 500; i++)
+	{
+		if (walidx_get(end, out, 8, &count) == PS_STATUS_OK && count == 4)
+		{
+			compacted = 1;
+			break;
+		}
+		nanosleep(&pause_interval, NULL);
+	}
+	if (!compacted)
+	{
+		fprintf(stderr, "pagestore_gc_crash_client: recovery did not serve the "
+				"compacted WAL-index chains (count %d)\n", count);
+		exit(1);
+	}
+	/* The seeded tuples, not only their positions: a recovery that keeps the
+	 * LSNs but drops an end position, a flag or the source timeline no longer
+	 * describes chains WAL replay can follow. */
+	if (out[0].lsn != base + 10 || out[1].lsn != base + 30 ||
+		out[2].lsn != base + 90 || out[3].lsn != base + 110)
+	{
+		const uint64_t expect_lsn[] = {10, 30, 90, 110};
+		const uint32_t expect_flags[] = {
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN
+		};
+
+		for (int i = 0; i < 4; i++)
+			if (out[i].lsn != expect_lsn[i] ||
+				out[i].end_lsn != expect_lsn[i] + 1 ||
+				out[i].flags != expect_flags[i] || out[i].timeline != 0)
+			{
+				fprintf(stderr, "pagestore_gc_crash_client: unexpected compacted "
+						"chain %d: lsn=%llu end=%llu flags=%u timeline=%u\n", i,
+						(unsigned long long) out[i].lsn,
+						(unsigned long long) out[i].end_lsn,
+						out[i].flags, out[i].timeline);
+				exit(1);
+			}
+	}
+	/* the fixed reader's retained chain, in full: an end position, a flag or
+	 * a source timeline lost here sends WAL replay to the wrong range */
+	if (walidx_get(base + WALIDX_READER_LSN, out, 8, &count) != PS_STATUS_OK ||
+		count != 2 ||
+		out[0].lsn != base + 10 || out[1].lsn != base + 30 ||
+		out[0].end_lsn != base + 11 || out[1].end_lsn != base + 31 ||
+		out[0].flags != (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) ||
+		out[1].flags != PS_WAL_INDEX_FLAG_KNOWN ||
+		out[0].timeline != 0 || out[1].timeline != 0)
+		die("recovery lost the fixed reader's retained WAL-index chain");
+	if (walidx_get(base + WALIDX_DROPPED_LSN, out, 8, &count) == PS_STATUS_OK)
+		die("recovery resurrected a WAL-index point below the durable frontier");
+}
+
+/*
+ * A retained pin must still be the owner that took it.  Every horizon check
+ * passes just as well for a pin that kept its LSN and resources but lost its
+ * owner identity, and that pin can no longer be advanced or dropped by the
+ * owner it belongs to.
+ */
+static void
+check_pin_identity(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				   uint32_t resource, uint64_t lsn, const char *missing,
+				   const char *changed)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->timeline = timeline;
+	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	if (execute()->status != PS_STATUS_OK || ch->result != 1)
+		die(missing);
+	if (ch->timeline != timeline || ch->blocknum != owner_kind ||
+		ch->req_seq != owner_id || ch->old_nblocks != 1 ||
+		ch->parent_timeline != resource || ch->req_lsn != lsn)
+		die(changed);
+}
+
+static void
+walidx_verify(void)
+{
+	walidx_check(0, WALIDX_WAL_BYTES);
+	/* only this workload seeds that reader, so the check lives here rather
+	 * than in the shared chain oracle */
+	check_pin_identity(0, PS_RETENTION_OWNER_READER, WALIDX_READER,
+					   PS_RETENTION_RESOURCE_WAL_INDEX, WALIDX_READER_LSN,
+					   "recovery lost the seeded WAL-index reader's pin",
+					   "recovery changed the seeded WAL-index reader's identity");
+}
+
+static uint64_t
+page_lsn(const unsigned char *page)
+{
+	uint32_t	high;
+	uint32_t	low;
+
+	memcpy(&high, page, sizeof(high));
+	memcpy(&low, page + sizeof(high), sizeof(low));
+	return ((uint64_t) high << 32) | low;
+}
+
+static void
+read_latest(unsigned char *page, uint32_t block)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	if (execute()->status != PS_STATUS_OK)
+		die("latest read failed after recovery");
+	memcpy(page, ch->data, page_size);
+}
+
+static void
+die_page(const char *message, uint32_t block, const unsigned char *page)
+{
+	fprintf(stderr, "pagestore_gc_crash_client: %s (block %u resolved lsn %llu, byte 8 = 0x%02x)\n",
+			message, block, (unsigned long long) page_lsn(page), page[8]);
+	exit(1);
+}
+
+/* 1 when a version at or below lsn is served, 0 when the daemon reports
+ * none, -1 when the read itself failed.  A failure is never "pruned". */
+static int
+read_at(unsigned char *page, uint32_t block, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
+	set_relation(ch);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	if (execute()->status != PS_STATUS_OK)
+		return -1;
+	if (ch->result != 0 && page != NULL)
+		memcpy(page, ch->data, page_size);
+	return ch->result != 0;
+}
+
+static int
+read_at_found(uint32_t block, uint64_t lsn)
+{
+	int			found = read_at(NULL, block, lsn);
+
+	if (found < 0)
+		die("as-of read failed after recovery");
+	return found;
+}
+
+static void
+verify(void)
+{
+	unsigned char *page = malloc(page_size);
+	struct timespec pause_interval = {0, 20000000};
+
+	if (page == NULL)
+		die("out of memory");
+	read_latest(page, 0);
+	if (!page_has_tag(page, 40))
+		die_page("recovery does not serve the published newest block 0", 0, page);
+	read_latest(page, 1);
+	if (!page_has_tag(page, 1))
+		die_page("recovery lost a block present only in the compacted layer", 1, page);
+	/* The configured owner at 3500 keeps the newest block 0 at or below it. */
+	if (read_at(page, 0, 3500) != 1)
+		die("recovery lost the retained block 0 history at the cutoff");
+	if (!page_has_tag(page, 30))
+		die_page("recovery serves the wrong block 0 version at the cutoff", 0, page);
+	/* Recovery resumes the interrupted cleanup asynchronously; the retired
+	 * history below the cutoff must be gone within a bounded wait. */
+	for (int i = 0; i < 500 && read_at_found(0, 1000); i++)
+		nanosleep(&pause_interval, NULL);
+	if (read_at_found(0, 1000))
+		die("recovery resurrected pruned history below the cutoff");
+	free(page);
+}
+
+/* Small read-only oracle used by the real-PG DROP DATABASE integration test. */
+static int
+reader_artifact_probe(const char *name, const char *database, const char *horizon,
+	const char *expected)
+{
+	uint64_t lsn = UINT64_MAX;
+	unsigned int hi, lo;
+	uint32_t objects[] = {PS_READER_SNAPSHOT_MANIFEST_OBJECT, PS_READER_RELMAP_OBJECT};
+	int result = 0;
+	if (strcmp(horizon, "latest") != 0)
+	{
+		if (sscanf(horizon, "%x/%x", &hi, &lo) != 2)
+			return 2;
+		lsn = ((uint64_t) hi << 32) | lo;
+	}
+	attach(name);
+	for (unsigned int i = 0; i < 2; i++)
+	{
+		PsChannel *ch = ps_channel(shm_base, channel);
+		set_relation(ch);
+		memset(&ch->key, 0, sizeof(ch->key));
+		ch->key.klass = PS_KLASS_READER_SNAPSHOT;
+		ch->key.dbOid = (uint32_t) strtoul(database, NULL, 10);
+		ch->key.relNumber = objects[i];
+		ch->opcode = PS_OP_READ_AT;
+		ch->req_lsn = lsn;
+		if (execute()->status != PS_STATUS_OK)
+		{
+			result = 2;
+			break;
+		}
+		if ((ch->result != 0) != (strcmp(expected, "present") == 0))
+			result = 1;
+		if (ch->result != 0)
+			printf("%u %llu %08x\n", objects[i], (unsigned long long) ch->req_lsn,
+				~ps_crc32c_update(UINT32_MAX, ch->data, page_size));
+	}
+	detach();
+	return result;
+}
+
+int
+main(int argc, char **argv)
+{
+	const char *shm = NULL;
+	const char *mode = NULL;
+
+	if (argc == 6 && strcmp(argv[1], "--reader-artifacts") == 0)
+		return reader_artifact_probe(argv[2], argv[3], argv[4], argv[5]);
+
+	for (int i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "--shm") == 0 && i + 1 < argc)
+			shm = argv[++i];
+		else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
+			mode = argv[++i];
+		else if (strcmp(argv[i], "--arm-marker") == 0 && i + 1 < argc)
+			arm_marker = argv[++i];
+		else if (strcmp(argv[i], "--workload") == 0 && i + 1 < argc)
+			workload = argv[++i];
+		else if (strcmp(argv[i], "--resume-file") == 0 && i + 1 < argc)
+			resume_file = argv[++i];
+		else if (strcmp(argv[i], "--cutoff-seq-file") == 0 && i + 1 < argc)
+			cutoff_seq_file = argv[++i];
+		else if (strcmp(argv[i], "--ack-file") == 0 && i + 1 < argc)
+			ack_file = argv[++i];
+		else
+			die("usage: --shm NAME --mode seed|verify "
+				"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
+				"timeline_delete_abort|manifest_compact|forkmeta|fixture] "
+				"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH] "
+				"[--ack-file PATH]");
+	}
+	if (shm == NULL || mode == NULL ||
+		(strcmp(mode, "seed") != 0 && strcmp(mode, "verify") != 0 &&
+		 (strcmp(mode, "extend") != 0 || strcmp(workload, "fixture") != 0)) ||
+		(strcmp(workload, "page_prune") != 0 &&
+		 strcmp(workload, "wal_index") != 0 &&
+		 strcmp(workload, "wal_reclaim") != 0 &&
+		 strcmp(workload, "timeline_delete") != 0 &&
+		 strcmp(workload, "timeline_delete_abort") != 0 &&
+		 strcmp(workload, "manifest_compact") != 0 &&
+		 strcmp(workload, "forkmeta") != 0 &&
+		 strcmp(workload, "fixture") != 0))
+		die("usage: --shm NAME --mode seed|verify "
+			"[--workload page_prune|wal_index|wal_reclaim|timeline_delete|"
+			"timeline_delete_abort|manifest_compact|forkmeta|fixture] "
+			"[--arm-marker PATH] [--resume-file PATH] [--cutoff-seq-file PATH]");
+	attach(shm);
+	if (strcmp(workload, "fixture") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			fixture_seed();
+		else if (strcmp(mode, "extend") == 0)
+			fixture_extend();
+		else
+			fixture_verify();
+	}
+	else if (strcmp(workload, "forkmeta") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			forkmeta_seed();
+		else
+			forkmeta_verify();
+	}
+	else if (strcmp(workload, "manifest_compact") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			manifest_seed();
+		else
+			manifest_verify();
+	}
+	else if (strcmp(workload, "timeline_delete") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			delete_seed();
+		else
+			delete_verify();
+	}
+	else if (strcmp(workload, "timeline_delete_abort") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			delete_seed();
+		else
+			delete_verify_live();
+	}
+	else if (strcmp(workload, "wal_reclaim") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			reclaim_seed();
+		else
+			reclaim_verify();
+	}
+	else if (strcmp(workload, "wal_index") == 0)
+	{
+		if (strcmp(mode, "seed") == 0)
+			walidx_seed();
+		else
+			walidx_verify();
+	}
+	else if (strcmp(mode, "seed") == 0)
+		seed();
+	else
+		verify();
+	detach();
+	return 0;
+}

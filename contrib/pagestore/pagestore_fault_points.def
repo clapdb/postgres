@@ -1,0 +1,57 @@
+/*
+ * Single source of truth for C probes and harness plan validation.
+ * Keep every record on one line; the Python harness parses this strict form.
+ */
+PAGESTORE_FAULT_POINT(DAEMON_AFTER_READY, "daemon.after_ready", "store", "process_abort", "crash|error|pause", 1, 1)
+// All publication points below are lock-held and therefore remain crash-only.
+PAGESTORE_FAULT_POINT(PAGE_COMPACTION_AFTER_PUBLISH, "page_compaction.after_publish", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(PAGE_GC_AFTER_MARK_DELETE, "page_gc.after_mark_delete", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(PAGE_PRUNE_AFTER_FRONTIER, "page_prune.after_frontier", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(WAL_INDEX_AFTER_FRONTIER, "wal_index.after_frontier", "store", "process_abort", "crash", 1, 0)
+// WAL reclaim probes are ordered POSIX-local process-abort boundaries under the
+// store lock: after the durable physical frontier and before the first unlink,
+// after each authorized segment unlink (hit N = N unlinks), and after the last
+// unlink but before the directory fsync that retires the residual prefix.
+PAGESTORE_FAULT_POINT(WAL_RECLAIM_BEFORE_UNLINK, "wal_reclaim.before_unlink", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(WAL_RECLAIM_AFTER_UNLINK, "wal_reclaim.after_unlink", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(WAL_RECLAIM_BEFORE_DIR_FSYNC, "wal_reclaim.before_dir_fsync", "store", "process_abort", "crash", 1, 0)
+// Timeline deletion probes are lock-held process-abort boundaries: after the
+// fsync'd DELETING event and before its in-memory publication, after the
+// owner's private WAL/WAL-index artifacts are removed, after the first hole
+// of a shared page segment is tombstoned in place and before the rest,
+// after a shared page segment's holes are durably synced, and after the
+// fsync'd DELETED event and before its in-memory publication.
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_BEFORE_DELETING, "timeline_delete.before_deleting", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETING, "timeline_delete.after_deleting", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_WAL_CLEANUP, "timeline_delete.after_wal_cleanup", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_MID_SEGMENT_TOMBSTONE, "timeline_delete.mid_segment_tombstone", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_SEGMENT_TOMBSTONE, "timeline_delete.after_segment_tombstone", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(TIMELINE_DELETE_AFTER_DELETED, "timeline_delete.after_deleted", "store", "process_abort", "crash", 1, 0)
+// Manifest replacement probes bracket the atomic rewrite of layers.manifest
+// under map-wr: after the compacted temp file is fsync'd and before the
+// rename, and after the rename and before the directory fsync.
+PAGESTORE_FAULT_POINT(MANIFEST_COMPACT_AFTER_TMP_SYNC, "manifest_compact.after_tmp_sync", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(MANIFEST_COMPACT_AFTER_RENAME, "manifest_compact.after_rename", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_PREPARE, "forkmeta.after_prepare", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_MANIFEST_COMMIT, "forkmeta.after_manifest_commit", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SOURCE_REWRITE, "forkmeta.after_source_rewrite", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SNAPSHOT_GC, "forkmeta.after_snapshot_gc", "store", "process_abort", "crash", 1, 0)
+// Materializer restartpoint probes are pause-only: the harness kills the
+// whole recovery postmaster after the checkpointer reaches the boundary.
+PAGESTORE_FAULT_POINT(MATERIALIZER_AFTER_RELATION_SYNC, "materializer.after_relation_sync", "materializer", "process_abort", "pause", 1, 1)
+PAGESTORE_FAULT_POINT(MATERIALIZER_AFTER_MARKER_SYNC, "materializer.after_marker_sync", "materializer", "process_abort", "pause", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_BEFORE_PREPARED_RECEIPT, "branch_prepare.before_prepared_receipt", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_PREPARED_RECEIPT, "branch_prepare.after_prepared_receipt", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_MATERIALIZER_RESUME, "branch_prepare.after_materializer_resume", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_WRITER_RESTORE, "branch_prepare.after_writer_restore", "branch", "process_abort", "crash", 1, 1)
+// Image-layer H1 probes are ordered POSIX-local process-abort boundaries: the
+// file exists, has been written but not sealed, has been fsync'd, and its ADD
+// has been fsync'd in layers.manifest.  after_write is not a power-loss claim.
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_CREATE, "image_layer.after_create", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_WRITE, "image_layer.after_write", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_SEAL, "image_layer.after_seal", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_MANIFEST_ADD, "image_layer.after_manifest_add", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_MAPS, "branch_install.after_maps", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_SLRU_REMOVE, "branch_install.after_slru_remove", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_BEFORE_MANIFEST, "branch_install.before_manifest", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_MANIFEST, "branch_install.after_manifest", "branch", "process_abort", "crash", 1, 1)
