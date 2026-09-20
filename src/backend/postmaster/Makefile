@@ -26,6 +26,7 @@ OBJS = \
 	postmaster.o \
 	startup.o \
 	syslogger.o \
+	walredo.o \
 	walsummarizer.o \
 	walwriter.o
 

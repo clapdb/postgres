@@ -92,6 +92,7 @@
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
+#include "postmaster/walredo.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/inval.h"
@@ -175,6 +176,15 @@ visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint
 	char	   *map;
 	bool		cleared = false;
 
+	/*
+	 * In the wal-redo helper, skip only SCRATCH-directed clears: a heap-page
+	 * materialization's VM side effect resolves to the scratch buffer and is
+	 * irrelevant, but when the TARGET being materialized is this VM page the
+	 * clear must apply to it.
+	 */
+	if (am_walredo && WalRedoBufferIsScratch(vmbuf))
+		return false;
+
 	/* Must never clear all_visible bit while leaving all_frozen bit set */
 	Assert(flags & VISIBILITYMAP_VALID_BITS);
 	Assert(flags != VISIBILITYMAP_ALL_VISIBLE);
@@ -221,6 +231,20 @@ void
 visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+
+	/*
+	 * The wal-redo helper materializes a single heap page and has no VM fork.
+	 * visibilitymap_clear() is a no-op there, but redo callers still
+	 * ReleaseBuffer() the pin unconditionally, so hand back a valid pinned
+	 * scratch buffer (reusing the one already pinned, if any).
+	 */
+	if (am_walredo)
+	{
+		if (!BufferIsValid(*vmbuf))
+			*vmbuf = WalRedoVMBufferForHeapBlock(heapBlk,
+												 HEAPBLK_TO_MAPBLOCK(heapBlk));
+		return;
+	}
 
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*vmbuf))
@@ -287,6 +311,20 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_set %s %d", RelationGetRelationName(rel), heapBlk);
 #endif
+
+	/*
+	 * The wal-redo helper materializes a single page and has no VM fork: a
+	 * record that also sets a VM bit (e.g. an all-frozen insert) resolves the
+	 * VM block to the helper's scratch buffer, whose tag is the temp relation
+	 * -- not mapBlock -- so the checks below would reject it.  The VM side
+	 * effect is irrelevant to the held page; skip it BEFORE the recovery
+	 * assertion, which the helper (neither InRecovery nor in a critical
+	 * section) would otherwise trip on cassert builds.  A materialization
+	 * whose TARGET is this VM page proceeds: its buffer is the retagged
+	 * target, so the block check below passes.
+	 */
+	if (am_walredo && WalRedoBufferIsScratch(vmBuf))
+		return 0;
 
 	Assert(InRecovery || XLogRecPtrIsInvalid(recptr));
 	Assert(InRecovery || PageIsAllVisible((Page) BufferGetPage(heapBuf)));
