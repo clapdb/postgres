@@ -364,7 +364,8 @@ pg_current_xact_id_if_assigned(PG_FUNCTION_ARGS)
  *
  *		Return current snapshot
  *
- * Note that only top-transaction XIDs are included in the snapshot.
+ * Normally only top-transaction XIDs are included.  Recovery-shaped
+ * snapshots store every running XID in subxip, including top-level XIDs.
  */
 Datum
 pg_current_snapshot(PG_FUNCTION_ARGS)
@@ -379,8 +380,8 @@ pg_current_snapshot(PG_FUNCTION_ARGS)
 	if (cur == NULL)
 		elog(ERROR, "no active snapshot set");
 
-	/* allocate */
-	nxip = cur->xcnt;
+	/* Recovery-shaped snapshots keep their full running set in subxip. */
+	nxip = cur->takenDuringRecovery ? cur->subxcnt : cur->xcnt;
 	snap = palloc(PG_SNAPSHOT_SIZE(nxip));
 
 	/*
@@ -393,8 +394,8 @@ pg_current_snapshot(PG_FUNCTION_ARGS)
 	snap->xmax = FullTransactionIdFromAllowableAt(next_fxid, cur->xmax);
 	snap->nxip = nxip;
 	for (i = 0; i < nxip; i++)
-		snap->xip[i] =
-			FullTransactionIdFromAllowableAt(next_fxid, cur->xip[i]);
+		snap->xip[i] = FullTransactionIdFromAllowableAt(next_fxid,
+			cur->takenDuringRecovery ? cur->subxip[i] : cur->xip[i]);
 
 	/*
 	 * We want them guaranteed to be in ascending order.  This also removes

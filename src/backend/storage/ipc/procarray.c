@@ -99,6 +99,9 @@ typedef struct ProcArrayStruct
 	int			pgprocnos[FLEXIBLE_ARRAY_MEMBER];
 } ProcArrayStruct;
 
+get_snapshot_data_hook_type get_snapshot_data_hook = NULL;
+transaction_id_is_in_progress_hook_type transaction_id_is_in_progress_hook = NULL;
+
 /*
  * State for the GlobalVisTest* family of functions. Those functions can
  * e.g. be used to decide if a deleted row can be removed without violating
@@ -1411,6 +1414,11 @@ TransactionIdIsInProgress(TransactionId xid)
 	int			mypgxactoff;
 	int			numProcs;
 	int			j;
+	bool		hook_result;
+
+	if (transaction_id_is_in_progress_hook != NULL &&
+		transaction_id_is_in_progress_hook(xid, &hook_result))
+		return hook_result;
 
 	/*
 	 * Don't bother checking a transaction older than RecentXmin; it could not
@@ -2222,6 +2230,55 @@ GetSnapshotData(Snapshot snapshot)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of memory")));
+	}
+
+	/*
+	 * A fixed-snapshot provider fills the preallocated xip arrays and returns
+	 * true.  Install its xmin in the ProcArray, but deliberately do not update
+	 * GlobalVis from current cluster state: the provider's historical horizon
+	 * is necessarily the conservative visibility boundary.
+	 */
+	if (get_snapshot_data_hook != NULL && get_snapshot_data_hook(snapshot))
+	{
+		FullTransactionId fixed_fxid;
+
+		if (!TransactionIdIsNormal(snapshot->xmin) ||
+			!TransactionIdIsNormal(snapshot->xmax) ||
+			TransactionIdPrecedes(snapshot->xmax, snapshot->xmin) ||
+			snapshot->xcnt < 0 || snapshot->subxcnt < 0)
+			ereport(ERROR,
+					(errmsg("snapshot data hook returned an invalid snapshot")));
+
+		LWLockAcquire(ProcArrayLock, LW_SHARED);
+		latest_completed = TransamVariables->latestCompletedXid;
+		if (!TransactionIdIsValid(MyProc->xmin))
+			MyProc->xmin = TransactionXmin = snapshot->xmin;
+		else if (MyProc->xmin != snapshot->xmin ||
+				 TransactionXmin != snapshot->xmin)
+		{
+			LWLockRelease(ProcArrayLock);
+			ereport(ERROR,
+					(errmsg("snapshot data hook changed the transaction xmin")));
+		}
+		LWLockRelease(ProcArrayLock);
+
+		RecentXmin = snapshot->xmin;
+		fixed_fxid = FullXidRelativeTo(latest_completed, snapshot->xmin);
+		GlobalVisSharedRels.maybe_needed = fixed_fxid;
+		GlobalVisSharedRels.definitely_needed = fixed_fxid;
+		GlobalVisCatalogRels.maybe_needed = fixed_fxid;
+		GlobalVisCatalogRels.definitely_needed = fixed_fxid;
+		GlobalVisDataRels.maybe_needed = fixed_fxid;
+		GlobalVisDataRels.definitely_needed = fixed_fxid;
+		GlobalVisTempRels.maybe_needed = fixed_fxid;
+		GlobalVisTempRels.definitely_needed = fixed_fxid;
+		ComputeXidHorizonsResultLastXmin = snapshot->xmin;
+		snapshot->snapXactCompletionCount = 0;
+		snapshot->curcid = GetCurrentCommandId(false);
+		snapshot->active_count = 0;
+		snapshot->regd_count = 0;
+		snapshot->copied = false;
+		return snapshot;
 	}
 
 	/*

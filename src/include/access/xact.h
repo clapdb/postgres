@@ -53,6 +53,7 @@ extern PGDLLIMPORT int XactIsoLevel;
 
 /* Xact read-only state */
 extern PGDLLIMPORT bool DefaultXactReadOnly;
+extern PGDLLIMPORT bool transaction_read_only_forced;
 extern PGDLLIMPORT bool XactReadOnly;
 
 /* flag for logging statements in this transaction */
@@ -136,6 +137,10 @@ typedef enum
 } XactEvent;
 
 typedef void (*XactCallback) (XactEvent event, void *arg);
+
+/* Called after top-level transaction state is initialized, before use. */
+typedef void (*xact_start_hook_type) (void);
+extern PGDLLIMPORT xact_start_hook_type xact_start_hook;
 
 typedef enum
 {

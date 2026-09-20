@@ -142,6 +142,8 @@ typedef struct SMgrSortArray
 
 /* GUC variables */
 bool		zero_damaged_pages = false;
+bool		page_maintenance_suppressed = false;
+buffer_tag_read_epoch_hook_type buffer_tag_read_epoch_hook = NULL;
 int			bgwriter_lru_maxpages = 100;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
@@ -553,6 +555,24 @@ static inline int buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
 static inline int ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b);
 static int	ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
 
+static inline void
+InitBufferTagForSMgr(BufferTag *tag, SMgrRelation smgr, ForkNumber forkNum,
+					 BlockNumber blockNum)
+{
+	InitBufferTag(tag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
+	if (buffer_tag_read_epoch_hook != NULL)
+		(void) buffer_tag_read_epoch_hook(smgr->smgr_rlocator,
+										  &tag->read_epoch);
+}
+
+static inline bool
+BufferTagUsesReadEpoch(SMgrRelation smgr)
+{
+	uint32		read_epoch;
+
+	return buffer_tag_read_epoch_hook != NULL &&
+		buffer_tag_read_epoch_hook(smgr->smgr_rlocator, &read_epoch);
+}
 
 /*
  * Implementation of PrefetchBuffer() for shared buffers.
@@ -571,8 +591,7 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 	Assert(BlockNumberIsValid(blockNum));
 
 	/* create a tag so we can lookup the buffer */
-	InitBufferTag(&newTag, &smgr_reln->smgr_rlocator.locator,
-				  forkNum, blockNum);
+	InitBufferTagForSMgr(&newTag, smgr_reln, forkNum, blockNum);
 
 	/* determine its hash code and partition lock ID */
 	newHash = BufTableHashCode(&newTag);
@@ -643,9 +662,10 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
  *
  * 3.  Otherwise, the buffer wasn't already cached by PostgreSQL, and
  * USE_PREFETCH is not defined (this build doesn't support prefetching due to
- * lack of a kernel facility), direct I/O is enabled, or the underlying
- * relation file wasn't found and we are in recovery.  (If the relation file
- * wasn't found and we are not in recovery, an error is raised).
+ * lack of a kernel facility), direct I/O is enabled, the storage manager
+ * doesn't provide advisory prefetch, or the underlying relation file wasn't
+ * found and we are in recovery.  (If the relation file wasn't found and we
+ * are not in recovery, an error is raised).
  */
 PrefetchBufferResult
 PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
@@ -712,6 +732,15 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 	}
 	else
 	{
+		RelFileLocatorBackend rlocator_backend = {
+			.locator = rlocator,
+			.backend = INVALID_PROC_NUMBER
+		};
+
+		if (buffer_tag_read_epoch_hook != NULL)
+			(void) buffer_tag_read_epoch_hook(rlocator_backend,
+											  &tag.read_epoch);
+
 		bufHdr = GetBufferDescriptor(recent_buffer - 1);
 		have_private_ref = GetPrivateRefCount(recent_buffer) > 0;
 
@@ -2024,7 +2053,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	ReservePrivateRefCountEntry();
 
 	/* create a tag so we can lookup the buffer */
-	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
+	InitBufferTagForSMgr(&newTag, smgr, forkNum, blockNum);
 
 	/* determine its hash code and partition lock ID */
 	newHash = BufTableHashCode(&newTag);
@@ -2746,7 +2775,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 		ReservePrivateRefCountEntry();
 
-		InitBufferTag(&tag, &bmr.smgr->smgr_rlocator.locator, fork, first_block + i);
+		InitBufferTagForSMgr(&tag, bmr.smgr, fork, first_block + i);
 		hash = BufTableHashCode(&tag);
 		partition_lock = BufMappingPartitionLock(hash);
 
@@ -4617,7 +4646,8 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 	 * We apply the optimization iff the total number of blocks to invalidate
 	 * is below the BUF_DROP_FULL_SCAN_THRESHOLD.
 	 */
-	if (BlockNumberIsValid(nBlocksToInvalidate) &&
+	if (!BufferTagUsesReadEpoch(smgr_reln) &&
+		BlockNumberIsValid(nBlocksToInvalidate) &&
 		nBlocksToInvalidate < BUF_DROP_FULL_SCAN_THRESHOLD)
 	{
 		for (j = 0; j < nforks; j++)
@@ -4727,6 +4757,12 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	 */
 	for (i = 0; i < n && cached; i++)
 	{
+		if (BufferTagUsesReadEpoch(rels[i]))
+		{
+			cached = false;
+			break;
+		}
+
 		for (int j = 0; j <= MAX_FORKNUM; j++)
 		{
 			/* Get the number of blocks for a relation's fork. */
@@ -5292,14 +5328,14 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 	{
 		if (smgrexists(src_rel, forkNum))
 		{
-			smgrcreate(dst_rel, forkNum, false);
-
 			/*
 			 * WAL log creation if the relation is persistent, or this is the
-			 * init fork of an unlogged relation.
+			 * init fork of an unlogged relation -- before creating the
+			 * storage; see RelationCreateStorage.
 			 */
 			if (permanent || forkNum == INIT_FORKNUM)
 				log_smgrcreate(&dst_rlocator, forkNum);
+			smgrcreate(dst_rel, forkNum, false);
 
 			/* Copy a fork's data, block by block. */
 			RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum,
@@ -5457,6 +5493,13 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 
 	if (!BufferIsValid(buffer))
 		elog(ERROR, "bad buffer ID: %d", buffer);
+
+	/*
+	 * A compute that must not generate page-content WAL leaves the hint in
+	 * memory only: the buffer stays clean and no FPI_FOR_HINT is emitted.
+	 */
+	if (page_maintenance_suppressed)
+		return;
 
 	if (BufferIsLocal(buffer))
 	{

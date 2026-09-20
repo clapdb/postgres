@@ -79,6 +79,13 @@ int			DefaultXactIsoLevel = XACT_READ_COMMITTED;
 int			XactIsoLevel = XACT_READ_COMMITTED;
 
 bool		DefaultXactReadOnly = false;
+
+/*
+ * When set (by extension code in the postmaster, before backends fork),
+ * every transaction is read-only and no session can lift it -- the GUC
+ * check hooks refuse read-write mode the same way they do during recovery.
+ */
+bool		transaction_read_only_forced = false;
 bool		XactReadOnly;
 
 bool		DefaultXactDeferrable = false;
@@ -291,6 +298,8 @@ static char *prepareGID;
  * Some commands want to force synchronous commit.
  */
 static bool forceSyncCommit = false;
+
+xact_start_hook_type xact_start_hook = NULL;
 
 /* Flag for logging statements in a transaction. */
 bool		xact_is_sampled = false;
@@ -1864,6 +1873,15 @@ RecordTransactionAbort(bool isSubXact)
 	if (isSubXact)
 		XidCacheRemoveRunningXids(xid, nchildren, children, latestXid);
 
+	/*
+	 * Remember the abort record's end (mirroring XactLastCommitEnd): the
+	 * post-abort storage cleanup runs after the reset below, and storage
+	 * managers that version fork existence by WAL position stamp their
+	 * abort-path unlinks with it.
+	 */
+	if (!isSubXact)
+		XactLastAbortEnd = XactLastRecEnd;
+
 	/* Reset XactLastRecEnd until the next transaction writes something */
 	if (!isSubXact)
 		XactLastRecEnd = 0;
@@ -2127,7 +2145,7 @@ StartTransaction(void)
 	else
 	{
 		s->startedInRecovery = false;
-		XactReadOnly = DefaultXactReadOnly;
+		XactReadOnly = DefaultXactReadOnly || transaction_read_only_forced;
 	}
 	XactDeferrable = DefaultXactDeferrable;
 	XactIsoLevel = DefaultXactIsoLevel;
@@ -2214,6 +2232,9 @@ StartTransaction(void)
 	/* Schedule transaction timeout */
 	if (TransactionTimeout > 0)
 		enable_timeout_after(TRANSACTION_TIMEOUT, TransactionTimeout);
+
+	if (xact_start_hook != NULL)
+		xact_start_hook();
 
 	ShowTransactionState("StartTransaction");
 }

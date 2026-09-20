@@ -545,6 +545,15 @@ assign_timezone_abbreviations(const char *newval, void *extra)
 bool
 check_transaction_read_only(bool *newval, void **extra, GucSource source)
 {
+	/* A read-only-forced instance (a pinned pagestore reader) never yields */
+	if (*newval == false && transaction_read_only_forced &&
+		!InitializingParallelWorker)
+	{
+		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+		GUC_check_errmsg("cannot set transaction read-write mode on a read-only instance");
+		return false;
+	}
+
 	if (*newval == false && XactReadOnly && IsTransactionState() && !InitializingParallelWorker)
 	{
 		/* Can't go to r/w mode inside a r/o transaction */

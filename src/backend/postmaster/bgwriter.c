@@ -287,6 +287,7 @@ BackgroundWriterMain(const void *startup_data, size_t startup_data_len)
 			 * the end of the record.
 			 */
 			if (now >= timeout &&
+				!page_maintenance_suppressed &&
 				last_snapshot_lsn <= GetLastImportantRecPtr())
 			{
 				last_snapshot_lsn = LogStandbySnapshot();

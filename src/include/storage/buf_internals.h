@@ -110,6 +110,7 @@ typedef struct buftag
 	RelFileNumber relNumber;	/* relation file number */
 	ForkNumber	forkNum;		/* fork number */
 	BlockNumber blockNum;		/* blknum relative to begin of reln */
+	uint32		read_epoch;		/* storage-manager read-view generation */
 } BufferTag;
 
 static inline RelFileNumber
@@ -151,6 +152,7 @@ ClearBufferTag(BufferTag *tag)
 	tag->dbOid = InvalidOid;
 	BufTagSetRelForkDetails(tag, InvalidRelFileNumber, InvalidForkNumber);
 	tag->blockNum = InvalidBlockNumber;
+	tag->read_epoch = 0;
 }
 
 static inline void
@@ -161,6 +163,7 @@ InitBufferTag(BufferTag *tag, const RelFileLocator *rlocator,
 	tag->dbOid = rlocator->dbOid;
 	BufTagSetRelForkDetails(tag, rlocator->relNumber, forkNum);
 	tag->blockNum = blockNum;
+	tag->read_epoch = 0;
 }
 
 static inline bool
@@ -168,6 +171,7 @@ BufferTagsEqual(const BufferTag *tag1, const BufferTag *tag2)
 {
 	return (tag1->spcOid == tag2->spcOid) &&
 		(tag1->dbOid == tag2->dbOid) &&
+		(tag1->read_epoch == tag2->read_epoch) &&
 		(tag1->relNumber == tag2->relNumber) &&
 		(tag1->blockNum == tag2->blockNum) &&
 		(tag1->forkNum == tag2->forkNum);
@@ -290,13 +294,22 @@ typedef struct BufferDesc
  * platform with either 32 or 128 byte line sizes, it's good to align to
  * boundaries and avoid false sharing.
  */
-#define BUFFERDESC_PAD_TO_SIZE	(SIZEOF_VOID_P == 8 ? 64 : 1)
+/*
+ * pagestore's read_epoch field on BufferTag (see below) grows BufferDesc
+ * past the single 64-byte cache line 18 originally fit it in; pad to two
+ * lines instead of shrinking the epoch counter's range.
+ */
+#define BUFFERDESC_PAD_TO_SIZE	(SIZEOF_VOID_P == 8 ? 128 : 1)
 
 typedef union BufferDescPadded
 {
 	BufferDesc	bufferdesc;
 	char		pad[BUFFERDESC_PAD_TO_SIZE];
 } BufferDescPadded;
+
+StaticAssertDecl(SIZEOF_VOID_P != 8 ||
+				 sizeof(BufferDesc) <= BUFFERDESC_PAD_TO_SIZE,
+				 "BufferDesc exceeds its cache-line stride");
 
 /*
  * The PendingWriteback & WritebackContext structure are used to keep

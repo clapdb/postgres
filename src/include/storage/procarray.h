@@ -44,6 +44,14 @@ extern void KnownAssignedTransactionIdsIdleMaintenance(void);
 extern int	GetMaxSnapshotXidCount(void);
 extern int	GetMaxSnapshotSubxidCount(void);
 
+/*
+ * Optional provider for a process-local fixed MVCC snapshot.  The xip and
+ * subxip arrays are allocated before the hook is called.  A provider needing
+ * more storage is responsible for extending the arrays before returning true.
+ */
+typedef bool (*get_snapshot_data_hook_type) (Snapshot snapshot);
+extern PGDLLIMPORT get_snapshot_data_hook_type get_snapshot_data_hook;
+
 extern Snapshot GetSnapshotData(Snapshot snapshot);
 
 extern bool ProcArrayInstallImportedXmin(TransactionId xmin,
@@ -54,6 +62,9 @@ extern RunningTransactions GetRunningTransactionData(void);
 
 extern bool TransactionIdIsInProgress(TransactionId xid);
 extern bool TransactionIdIsActive(TransactionId xid);
+typedef bool (*transaction_id_is_in_progress_hook_type) (TransactionId xid,
+													 bool *result);
+extern PGDLLIMPORT transaction_id_is_in_progress_hook_type transaction_id_is_in_progress_hook;
 extern TransactionId GetOldestNonRemovableTransactionId(Relation rel);
 extern TransactionId GetOldestTransactionIdConsideredRunning(void);
 extern TransactionId GetOldestActiveTransactionId(void);

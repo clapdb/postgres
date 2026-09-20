@@ -506,6 +506,8 @@ extern void InitPostgres(const char *in_dbname, Oid dboid,
 						 const char *username, Oid useroid,
 						 bits32 flags,
 						 char *out_dbname);
+typedef void (*post_database_path_hook_type) (void);
+extern PGDLLIMPORT post_database_path_hook_type post_database_path_hook;
 extern void BaseInit(void);
 
 /* in utils/init/miscinit.c */
