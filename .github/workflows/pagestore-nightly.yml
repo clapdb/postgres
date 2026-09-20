@@ -12,12 +12,23 @@
 # the default branch this lane runs only after the file reaches that branch;
 # until then the long configuration is run on demand from a default-branch
 # checkout of `pagestore`.
+#
+# Two schedules:
+#   - daily (03:17 UTC): the `plan`/`soak` jobs below, soaking `pagestore`
+#     (or `ref`, on a manual dispatch) as before.
+#   - weekly (Sunday 05:17 UTC): the `release-plan`/`release-soak` jobs, which
+#     fan the same soak out over every release branch
+#     contrib/pagestore/release-branches.json currently lists as candidate or
+#     released -- `pagestore` itself is already covered by the daily run, so
+#     it is excluded from this matrix.
 name: pagestore nightly soak
 
 on:
   schedule:
     # 03:17 UTC daily; off the hour to avoid the shared-runner rush.
     - cron: "17 3 * * *"
+    # 05:17 UTC every Sunday: the release-branch matrix (see above).
+    - cron: "17 5 * * 0"
   workflow_dispatch:
     inputs:
       rounds:
@@ -28,6 +39,10 @@ on:
         description: "comma-separated PRNG seeds"
         required: false
         default: "20260909,7,4242"
+      ref:
+        description: "branch, tag or SHA to soak; empty = this run's own branch (the default branch on the daily schedule, or the dispatching branch)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -40,26 +55,34 @@ jobs:
     # failing run every night (the lookup below cannot resolve the branch).
     # `pg-ci.yml` gates on an opt-in variable for the same reason.  A manual
     # dispatch is always an explicit request; the schedule fires only in this
-    # repository or in a fork that opted in.
+    # repository or in a fork that opted in.  The weekly release-branch
+    # matrix schedule is handled entirely by `release-plan`/`release-soak`
+    # below, so this job (and the single-ref `soak` job that needs it) skips
+    # that trigger.
     if: >-
-      github.event_name == 'workflow_dispatch'
-      || github.repository == 'clapdb/postgres'
-      || vars.PAGESTORE_NIGHTLY_ENABLED == '1'
+      github.event.schedule != '17 5 * * 0'
+      && (github.event_name == 'workflow_dispatch'
+          || github.repository == 'clapdb/postgres'
+          || vars.PAGESTORE_NIGHTLY_ENABLED == '1')
     runs-on: ubuntu-latest
     outputs:
       seeds: ${{ steps.matrix.outputs.seeds }}
       rounds: ${{ steps.matrix.outputs.rounds }}
       timeout: ${{ steps.matrix.outputs.timeout }}
       revision: ${{ steps.revision.outputs.sha }}
+      retention_days: ${{ steps.revision.outputs.retention_days }}
     steps:
       - id: revision
         shell: bash
         env:
-          # the branch this run's soak lives on, resolved the same way the
+          # the ref this run's soak lives on: an explicit `ref` dispatch
+          # input (branch, tag or SHA) wins; otherwise the branch this
+          # workflow file itself is running from, resolved the same way the
           # matrix jobs used to resolve it
           SOAK_REF: >-
-            ${{ github.ref_name == github.event.repository.default_branch
-                && 'pagestore' || github.ref_name }}
+            ${{ github.event.inputs.ref
+                || (github.ref_name == github.event.repository.default_branch
+                    && 'pagestore' || github.ref_name) }}
           GH_TOKEN: ${{ github.token }}
         run: |
           # Every seed of a run is one experiment, so they must all test one
@@ -67,6 +90,8 @@ jobs:
           # pick up whatever `pagestore` pointed at when that job started --
           # or when a failed job was rerun days later -- while the run's
           # metadata still named the workflow's own SHA.  Resolve it once.
+          # `gh api repos/<repo>/commits/<ref>` accepts a branch, a tag or a
+          # SHA, so the `ref` input needs no extra dispatch to tell them apart.
           sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SOAK_REF}" --jq .sha)
           case "$sha" in
             [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
@@ -77,6 +102,17 @@ jobs:
               ;;
           esac
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # A candidate-tag soak is release evidence (P6 freeze/acceptance),
+          # not a routine nightly run, so its reports get the maximum
+          # retention instead of the usual 30 days.
+          case "$SOAK_REF" in
+            pagestore-candidate-*)
+              echo "retention_days=90" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "retention_days=30" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
           echo "soaking ${SOAK_REF} at $sha" >> "$GITHUB_STEP_SUMMARY"
 
       - id: matrix
@@ -197,5 +233,132 @@ jobs:
           # uploaded would fail on the duplicate name
           name: pagestore-soak-report-${{ matrix.seed }}-attempt-${{ github.run_attempt }}
           path: contrib/pagestore/soak-report-${{ matrix.seed }}.json
+          if-no-files-found: error
+          # 90 days for a `pagestore-candidate-*` tag (release evidence),
+          # 30 otherwise; see the `plan` job's `revision` step.
+          retention-days: ${{ needs.plan.outputs.retention_days }}
+
+  release-plan:
+    name: weekly release-branch soak plan
+    # This job (and `release-soak` below) is the weekly counterpart to
+    # `plan`/`soak`: instead of one ref, it soaks every branch
+    # contrib/pagestore/release-branches.json currently lists with status
+    # "candidate" or "released" (a "planned" major has no fixtures worth
+    # soaking yet).  `pagestore` itself is excluded -- the daily schedule
+    # above already covers it.
+    if: >-
+      github.event.schedule == '17 5 * * 0'
+      && (github.repository == 'clapdb/postgres'
+          || vars.PAGESTORE_NIGHTLY_ENABLED == '1')
+    runs-on: ubuntu-latest
+    outputs:
+      combos: ${{ steps.matrix.outputs.combos }}
+      has_combos: ${{ steps.matrix.outputs.has_combos }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: matrix
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          sys.path.insert(0, "contrib/pagestore/harness")
+          from pagestore_release_branches import ReleaseBranchesError, candidate_branches
+
+          try:
+              branches = [b for b in candidate_branches() if b != "pagestore"]
+          except ReleaseBranchesError as error:
+              print(f"::error::release-branches.json is invalid: {error}", file=sys.stderr)
+              raise SystemExit(1)
+
+          # Same default seeds/rounds as a plain (unparameterized) dispatch or
+          # the daily schedule; the weekly release matrix takes no inputs.
+          seeds = ["20260909", "7", "4242"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          combos = []
+          for branch in branches:
+              # One SHA per branch, resolved once and shared by every seed of
+              # that branch -- same reasoning as the `plan` job's `revision`
+              # step: every seed of one branch's soak is one experiment.
+              sha = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/commits/{branch}", "--jq", ".sha"],
+                  check=True, capture_output=True, text=True,
+              ).stdout.strip()
+              for seed in seeds:
+                  combos.append({"branch": branch, "sha": sha, "seed": seed})
+          print("combos=" + json.dumps(combos))
+          print("has_combos=" + ("true" if combos else "false"))
+          if not combos:
+              print("no candidate/released release branch yet in release-branches.json; "
+                    "nothing to soak this week", file=sys.stderr)
+          PY
+
+  release-soak:
+    name: weekly release soak ${{ matrix.branch }} seed ${{ matrix.seed }}
+    needs: release-plan
+    if: needs.release-plan.outputs.has_combos == 'true'
+    runs-on: ubuntu-latest
+    # Same fixed budget as the daily soak's default (8000 rounds -> 30
+    # minutes, see the `plan` job's `matrix` step); the weekly matrix does
+    # not accept a `rounds`/`seeds` override.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.release-plan.outputs.combos) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+
+      - name: Compile daemon and soak harness
+        working-directory: contrib/pagestore
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
+
+      - name: Run the long bounded-space soak
+        working-directory: contrib/pagestore
+        env:
+          PAGESTORE_SOAK_ROUNDS: "8000"
+          PAGESTORE_SOAK_SEED: ${{ matrix.seed }}
+          PAGESTORE_SOAK_REPORT: soak-report-${{ matrix.branch }}-${{ matrix.seed }}.json
+        run: |
+          ./pagestore_soak_test ./pagestore_daemon
+          test -s "soak-report-${{ matrix.branch }}-${{ matrix.seed }}.json"
+
+      - name: Summarize the report
+        if: always()
+        working-directory: contrib/pagestore
+        shell: bash
+        run: |
+          f="soak-report-${{ matrix.branch }}-${{ matrix.seed }}.json"
+          [ -f "$f" ] || { echo "no report written" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          python3 - "$f" "${{ matrix.branch }}" "${{ matrix.sha }}" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          res, mx, q = r["result"], r["physical_max"], r["physical_quiescent"]
+          print(f"### {sys.argv[2]} seed {r['seed']}: {r['rounds']} rounds, {res['checks']} checks, {res['failures']} failures")
+          print(f"- revision: {sys.argv[3]}")
+          print(f"- during bounds ok: {res['during_bounds_ok']}, quiescent bounds ok: {res['quiescent_bounds_ok']}")
+          print(f"- write amplification {r['write_amplification']}, files max {mx['files']}")
+          print("| category | max | quiescent | during bound | quiescent bound |")
+          print("|---|---|---|---|---|")
+          for k in ("page", "layers", "wal", "walidx", "forkmeta", "retention", "timelines", "other", "files"):
+              print(f"| {k} | {mx[k]} | {q[k]} | {r['bounds_during'][k]} | {r['bounds_quiescent'][k]} |")
+          PY
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagestore-soak-report-${{ matrix.branch }}-${{ matrix.seed }}-attempt-${{ github.run_attempt }}
+          path: contrib/pagestore/soak-report-${{ matrix.branch }}-${{ matrix.seed }}.json
           if-no-files-found: error
           retention-days: 30
