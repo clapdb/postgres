@@ -33,7 +33,7 @@ fi
 BIN=$(dirname "$PGCTL")
 ROOT=$(dirname "$BIN")
 export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
-export DYLD_LIBRARY_PATH="$ROOT/lib"
+export DYLD_LIBRARY_PATH="$ROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 # A loaded CI runner can take longer than pg_ctl's one-minute default to
 # reach a ready postmaster; a slow start is not a failed one.
 export PGCTLTIMEOUT=${PGCTLTIMEOUT:-180}
@@ -52,10 +52,10 @@ MAIN_SOCK=$(new_sockdir main)
 SHM=/psint_$$
 # The daemon's IPC segment as a filesystem path: Linux exposes POSIX shm under
 # /dev/shm; on macOS pagestore_shm.h backs it with a regular file instead.
-if [ -d /dev/shm ]; then
-	SHM_PATH="/dev/shm$SHM"
-else
+if [ "$(uname -s)" = Darwin ]; then
 	SHM_PATH="/tmp/pagestore-shm-$(id -u)/${SHM#/}"
+else
+	SHM_PATH="/dev/shm$SHM"
 fi
 remove_test_shm() {
     # Reuse the harness's fd-relative cleanup and private-directory validation.
