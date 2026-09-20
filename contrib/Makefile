@@ -29,6 +29,7 @@ SUBDIRS = \
 		ltree		\
 		oid2name	\
 		pageinspect	\
+		pagestore	\
 		passwordcheck	\
 		pg_buffercache	\
 		pg_freespacemap \
