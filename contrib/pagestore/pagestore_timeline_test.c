@@ -3283,6 +3283,160 @@ test_deleting_timeline_page_cleanup_fail_closed(void)
 }
 
 /*
+ * L1 regression (review-driven, probe_c): cleanup_last_failure_valid is a
+ * single process-global static, set only on an actual parse failure.
+ * Before L1 it was never cleared before the next timeline's scan, so a
+ * later stalled deletion whose own page_cleanup_tombstone_segment() failure
+ * sets no tuple at all (the oversized-segment early return below never
+ * reaches fail_malformed) printed the previous store's stale tuple -- a
+ * different timeline, shard, segment and offset -- as if it were this
+ * deletion's own cause.
+ */
+static void
+test_deleting_timeline_page_cleanup_stale_failure_not_reattributed(void)
+{
+	char storeA[] = "/tmp/pagestore-timeline-stale-failA-XXXXXX";
+	char storeB[] = "/tmp/pagestore-timeline-stale-failB-XXXXXX";
+	uint32_t bad_magic = 0xdeadbeefU;
+	unsigned char sparse_tail = 0;
+	char captured[4096];
+	int64_t off1;
+
+	/* Store A: a genuine malformed-record failure for timeline 901, which
+	 * fills cleanup_last_failure with timeline 901's own (shard, seg, off,
+	 * magic, len) tuple and logs it once.  Timeline IDs here are picked
+	 * unused elsewhere in this suite: timeline_cleanup_blocked_last[] is a
+	 * process-wide array that is never reset except on DELETED/reuse (L2),
+	 * so an earlier test's still-DELETING timeline with a coincidentally
+	 * identical tuple would otherwise dedup-suppress this test's own first
+	 * occurrence -- a test-suite ordering artifact, not the bug under test. */
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	check(mkdtemp(storeA) != NULL, "create store A");
+	check(ps_core_open(storeA) == 0 && create_branch(901, 0, 100) &&
+			create_branch(910, 0, 100) &&
+			write_timeline_layer(901, 0, 100) == 0,
+		  "A: write the target record");
+	off1 = ps_storage->seg_size(0, 0);
+	check(off1 > 0 && write_timeline_layer(910, 1, 200) == 0,
+		  "A: write the sibling record to corrupt");
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(901, 1, NULL),
+		  "A: corrupt the sibling's magic in place and begin deletion");
+	check(capture_stderr_maintenance(4, captured, sizeof(captured)),
+		  "A: capture stderr across 4 maintenance turns");
+	check(count_occurrences(captured, "deletion blocked") == 1,
+		  "A: the malformed-record diagnostic fires for timeline 901");
+	close_store();
+	remove_tree(storeA);
+
+	/* Store B: a fresh, unrelated store whose only DELETING timeline fails
+	 * for a reason that sets no tuple at all (an oversized segment).  Before
+	 * L1, cleanup_last_failure_valid was still whatever store A's scan left
+	 * it as, so this used to reprint store A's stale timeline-901 tuple
+	 * under timeline 902. */
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 100;
+	check(mkdtemp(storeB) != NULL, "create store B");
+	check(ps_core_open(storeB) == 0 && create_branch(902, 0, 100) &&
+			write_timeline_layer(902, 0, 100) == 0,
+		  "B: write the target record");
+	check(ps_storage->seg_write(0, 0, segment_size, &sparse_tail,
+								sizeof(sparse_tail)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(902, 1, NULL),
+		  "B: extend the segment beyond segment_size and begin deletion");
+	check(capture_stderr_maintenance(4, captured, sizeof(captured)),
+		  "B: capture stderr across 4 maintenance turns");
+	check(count_occurrences(captured, "deletion blocked") == 0,
+		  "B: an oversized-segment failure sets no tuple, and store A's "
+		  "stale tuple must not be reprinted under timeline 902 (L1)");
+	close_store();
+	remove_tree(storeB);
+}
+
+/*
+ * L2 regression (review-driven, probe_d): timeline_cleanup_blocked_last[]
+ * dedups the "deletion blocked" diagnostic by (timeline, shard, seg, off,
+ * magic, len), once per distinct tuple.  Before L2, that per-timeline dedup
+ * entry was never reset on DELETED or on slot reuse: if a reused
+ * incarnation's own deletion later blocks on the exact same tuple its prior
+ * incarnation already logged, the diagnostic stays silent even though this
+ * is a brand new stall the operator has never been told about.
+ */
+static void
+test_deleting_timeline_page_cleanup_blocked_diagnostic_resets_on_reuse(void)
+{
+	char store[] = "/tmp/pagestore-timeline-blocked-reset-XXXXXX";
+	uint32_t bad_magic = 0xdeadbeefU;
+	uint32_t good_magic = 0;
+	char captured[8192];
+	int64_t off1;
+	PsTimelineState state;
+	uint64_t inc;
+
+	/* Timeline 903 is unused elsewhere in this suite (see the comment above
+	 * the previous test for why that matters to the dedup array). */
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	check(mkdtemp(store) != NULL, "create blocked-diagnostic-reset store");
+	check(ps_core_open(store) == 0 && create_branch(903, 0, 100) &&
+			create_branch(913, 0, 100) &&
+			write_timeline_layer(903, 0, 100) == 0,
+		  "write the target record (incarnation 1)");
+	off1 = ps_storage->seg_size(0, 0);
+	check(write_timeline_layer(913, 1, 200) == 0 &&
+			ps_storage->seg_read(0, 0, (uint64_t) off1, &good_magic,
+								 sizeof(good_magic)) == 0,
+		  "write the sibling record and snapshot its live magic");
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(903, 1, NULL),
+		  "corrupt the sibling's magic and begin deleting incarnation 1");
+	check(capture_stderr_maintenance(4, captured, sizeof(captured)),
+		  "capture stderr across 4 maintenance turns (incarnation 1)");
+	check(count_occurrences(captured, "deletion blocked") == 1,
+		  "incarnation 1's blocked deletion logs once");
+
+	/* Repair the corruption, let incarnation 1's deletion finish, and reuse
+	 * the slot as incarnation 2. */
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &good_magic,
+								sizeof(good_magic)) == 0 &&
+			ps_storage->sync() == 0,
+		  "repair the corrupted magic");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	check(state_of(903, &state, &inc) && state == PS_TIMELINE_DELETED,
+		  "incarnation 1 reaches DELETED after repair");
+	check(create_branch_fenced(903, 0, 100, 2, 1),
+		  "reuse timeline 903's slot as incarnation 2");
+	check(state_of(903, &state, &inc) && state == PS_TIMELINE_LIVE &&
+			inc == 2,
+		  "incarnation 2 is LIVE");
+	check(write_timeline_layer(903, 3, 300) == 0, "incarnation 2 writes");
+
+	/* Corrupt the exact same (shard, seg, off) with the exact same magic
+	 * again, and delete incarnation 2: the dedup tuple is identical to the
+	 * one incarnation 1 already logged, so before L2 this stayed silent. */
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(903, 2, NULL),
+		  "corrupt the same tuple again and begin deleting incarnation 2");
+	check(capture_stderr_maintenance(8, captured, sizeof(captured)),
+		  "capture stderr across 8 maintenance turns (incarnation 2)");
+	check(state_of(903, &state, &inc) && state == PS_TIMELINE_DELETING,
+		  "incarnation 2's deletion is blocked (DELETING)");
+	check(count_occurrences(captured, "deletion blocked") >= 1,
+		  "incarnation 2's blocked deletion logs at least once even though "
+		  "the tuple exactly matches incarnation 1's (L2)");
+	close_store();
+	remove_tree(store);
+}
+
+/*
  * L6 fail-before family, phase 2: flips the pre-fix expectation of the test
  * above's original shape.  4 bytes of unknown-magic garbage installed
  * exactly *at* the append cursor (never inside the reachable region) must
@@ -4059,6 +4213,110 @@ test_deleting_timeline_page_cleanup_zero_tail(void)
 	remove_tree(store);
 }
 
+/*
+ * M1 regression (review-driven, probe_b): recover() does not start the
+ * watermark segment's scan at 0 -- it starts at flush_watermark.seg_off,
+ * since segments are not synced before ps_manifest_set_flush_watermark()
+ * durably records that cursor.  Before M1, pass 1 treated any end-of-log
+ * shape as the unconditional end of the reachable region, including one
+ * found *below* the watermark (a header sector lost to a crash while the
+ * pages after it and the watermark itself both survived).  That let a
+ * deletion report success while a live, recover()-replayable target record
+ * at/after the watermark was still untouched; a later reuse of the same
+ * timeline slot then silently resurrected the deleted incarnation's data
+ * on the next real restart.  This forks so the restart half genuinely
+ * re-derives state from the persisted manifest/watermark in a fresh
+ * process image -- a same-process close_store() would flush the
+ * deliberately-unflushed block-2 write this setup depends on and move the
+ * watermark past the bug entirely, per ps_core_close()'s "flush the
+ * memtable, commit its coverage watermark" contract.
+ */
+static void
+test_deleting_timeline_page_cleanup_below_watermark_no_resurrection(void)
+{
+	char store[] = "/tmp/pagestore-timeline-below-wm-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	uint64_t inc;
+	pid_t pid;
+	int status;
+
+	check(mkdtemp(store) != NULL,
+		  "create below-watermark torn-tail regression store");
+
+	pid = fork();
+	if (pid == 0)
+	{
+		unsigned char zeros[4096];
+		int64_t off_sib;
+		PsTimelineState cstate;
+		uint64_t cinc;
+
+		configure_timeline_core();
+		segment_size = 1024 * 1024;
+		flush_pages = 2;
+		if (ps_core_open(store) != 0 || !create_branch(1, 0, 100) ||
+			!create_branch(10, 0, 100))
+			_exit(1);
+		if (write_timeline_layer(1, 0, 100) != 0)	/* target: memtable (1 of 2) */
+			_exit(2);
+		off_sib = ps_storage->seg_size(0, 0);
+		if (write_timeline_layer(10, 1, 200) != 0)	/* sibling: flush advances W */
+			_exit(3);
+		if (write_timeline_layer(1, 2, 300) != 0)	/* target: below the next flush */
+			_exit(4);
+		/* Power-loss shape: the sibling's header sector is lost (reads as
+		 * zeros) while the target's second record and the flush watermark
+		 * (set when the sibling's write flushed) both survived. */
+		memset(zeros, 0, sizeof(zeros));
+		if (ps_storage->seg_write(0, 0, (uint64_t) off_sib, zeros,
+								  sizeof(zeros)) != 0 ||
+			ps_storage->sync() != 0)
+			_exit(5);
+		if (!begin_delete(1, 1, NULL))
+			_exit(6);
+		for (int i = 0; i < 64; i++)
+			(void) ps_core_maintenance();
+		if (!state_of(1, &cstate, NULL) || cstate != PS_TIMELINE_DELETED)
+			_exit(7);
+		/* Slot reuse: incarnation 2 of the same timeline. */
+		if (!create_branch_fenced(1, 0, 100, 2, 1))
+			_exit(8);
+		if (!state_of(1, &cstate, &cinc) || cstate != PS_TIMELINE_LIVE ||
+			cinc != 2)
+			_exit(9);
+		/* Crash-shaped exit: no clean close, no final memtable flush -- a
+		 * clean close would flush the still-unflushed block-2 write and
+		 * move the watermark past this setup entirely (see the comment
+		 * above the function). */
+		_exit(0);
+	}
+	check(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+			WEXITSTATUS(status) == 0,
+		  "child sets up the below-watermark torn tail, deletes the "
+		  "target, and reuses the timeline slot");
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 1;
+	check(ps_core_open(store) == 0,
+		  "restart re-derives state from the persisted watermark");
+	check(state_of(1, &state, &inc) && state == PS_TIMELINE_LIVE && inc == 2,
+		  "reused timeline is incarnation 2, LIVE, after restart");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 2, page) == 0,
+		  "reused incarnation must not resurrect the deleted incarnation's "
+		  "block 2 after a real restart");
+	check(write_timeline_layer(1, 5, 500) == 0,
+		  "reused incarnation extends the same relation with block 5");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 2, page) == 0,
+		  "old incarnation's block 2 still must not resurface once the "
+		  "reused incarnation has written further pages");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -4074,6 +4332,8 @@ main(void)
 	test_deleting_timeline_page_cleanup_backpressure_debt();
 	test_deleting_timeline_page_cleanup_pending_remove();
 	test_deleting_timeline_page_cleanup_fail_closed();
+	test_deleting_timeline_page_cleanup_stale_failure_not_reattributed();
+	test_deleting_timeline_page_cleanup_blocked_diagnostic_resets_on_reuse();
 	test_deleting_timeline_page_cleanup_oversized();
 	test_deleting_timeline_page_cleanup_prefix_hole();
 	test_deleting_timeline_page_cleanup_retired_short_segment();
@@ -4081,6 +4341,7 @@ main(void)
 	test_deleting_timeline_page_cleanup_sealed_torn_tail();
 	test_deleting_timeline_page_cleanup_retired_torn_tail();
 	test_deleting_timeline_page_cleanup_zero_tail();
+	test_deleting_timeline_page_cleanup_below_watermark_no_resurrection();
 	test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored();
 	test_v2_and_mixed_lifecycle();
 	test_relation_inspection_forkmeta_poison();
