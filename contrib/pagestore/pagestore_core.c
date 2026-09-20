@@ -4952,21 +4952,43 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  * torn (non-page_size) record header, a body that does not fit before
  * limit, or a torn bound/admission trailer field.  Those bytes are never
  * touched: a torn tail, sealed-segment garbage after a rollover, or an
- * SPDK-style zero-padded tail is not corruption, it is unreached.  Only a
- * nonzero *unknown* magic, a hole record with the wrong len, or a complete
- * record naming an impossible timeline -- all inside the reachable region,
- * i.e. bytes recover() actually replayed or would replay -- fail the whole
- * pass closed; the segment is then left completely untouched, so a
- * genuinely malformed segment fails closed and stays retryable without ever
- * writing a hole for data it could not fully account for.  Pass 2 (only
- * once pass 1 has validated the whole reachable region) writes the
- * collected holes, every one of them at or below the same cursor pass 1
- * never scanned past (PS_ASSERT below); a failure here is a genuine storage
- * I/O failure, not a data problem, and leaves some records already
- * tombstoned and some not -- both states are safe per the write order
- * above, and the next maintenance turn resumes, since an already-holed
- * record is recognized by its magic and skipped, making the retry
- * idempotent.
+ * SPDK-style zero-padded tail is not corruption, it is unreached.
+ *
+ * The one wrinkle is the watermark segment.  recover() does not start that
+ * segment's scan at 0; it starts at flush_watermark.seg_off (segments are
+ * not synced before ps_manifest_set_flush_watermark() durably records that
+ * cursor), so an end-of-log shape *below* the watermark -- e.g. a header
+ * sector lost to a crash while the pages after it and the watermark itself
+ * survived -- says nothing about whether the bytes at/after the watermark
+ * are reachable: recover() never looks below the watermark on this segment
+ * in the first place.  Pass 1 mirrors that: on an end-of-log shape below
+ * the watermark it resumes the scan at the watermark (always a record
+ * boundary -- it is a previously recorded flush cursor) instead of
+ * stopping; only an end-of-log shape at or after the watermark ends the
+ * reachable region.  Below the watermark, unreachable-but-still-referenced
+ * bytes (the power-loss-reordering case: a record whose header page was
+ * lost while a later record's pages and the watermark survived) stay
+ * physically present until segment GC, same as any other bytes below R the
+ * scan does not touch -- deletion never needs to see them because they are
+ * not reachable from this segment's own scan, only from a layer.
+ *
+ * Only a nonzero *unknown* magic, a hole record with the wrong len, or a
+ * complete record naming an impossible timeline -- all inside the reachable
+ * region, i.e. bytes recover() actually replayed or would replay -- fail
+ * the whole pass closed; the segment is then left completely untouched, so
+ * a genuinely malformed segment fails closed and stays retryable without
+ * ever writing a hole for data it could not fully account for.  A seg_read()
+ * I/O failure (header or trailer) is a distinct case: it is not a parse
+ * decision at all, so it fails the pass closed the same way but without the
+ * "malformed record" diagnostic (PsCleanupFailure is reserved for an actual
+ * parse failure).  Pass 2 (only once pass 1 has validated the whole
+ * reachable region) writes the collected holes, every one of them at or
+ * below the same cursor pass 1 never scanned past (PS_ASSERT below); a
+ * failure here is a genuine storage I/O failure, not a data problem, and
+ * leaves some records already tombstoned and some not -- both states are
+ * safe per the write order above, and the next maintenance turn resumes,
+ * since an already-holed record is recognized by its magic and skipped,
+ * making the retry idempotent.
  *
  * Caller holds every shard write lock and map write lock.  Returns 1 when
  * this pass tombstoned at least one record, 0 when no target record remains
@@ -4988,6 +5010,7 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 	uint32_t nholes = 0, hole_cap = 0;
 	uint64_t off = 0;
 	uint64_t limit;
+	uint64_t wm = 0;
 
 	errno = 0;
 	bytes = ps_storage->seg_size(s->id, seg);
@@ -4999,10 +5022,13 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 	 * Pass 1: validate the reachable region only, no writes.  'limit' is R
 	 * from invariant I4: the whole file for a sealed/retired segment (there
 	 * is no cursor to clamp it), min(bytes, cur_off) for the current
-	 * segment while its cursor is still inside this file.  A hole loop
-	 * below 'end of log' is a `break`, exactly recover()'s rule for that
-	 * same shape; only the bytes annotated 'corruption' below fail the pass
-	 * closed.
+	 * segment while its cursor is still inside this file.  An end-of-log
+	 * shape stops the scan (`break`, via the `end_of_log` label below),
+	 * exactly recover()'s rule for that same shape -- except below the
+	 * watermark ('wm'), where it resumes at the watermark instead, since
+	 * recover() replays the watermark segment starting there regardless of
+	 * what an unsynced sector below it looks like; only the bytes annotated
+	 * 'corruption' below fail the pass closed.
 	 */
 	{
 		uint64_t limit_bytes = (uint64_t) bytes;
@@ -5012,6 +5038,18 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 			s->cur_off < limit_bytes)
 			limit = s->cur_off;
 	}
+	/*
+	 * I4/M1: recover() replays the watermark segment starting at
+	 * flush_watermark.seg_off, not at 0 (recover() ~19143-19148) -- segments
+	 * are not synced before ps_manifest_set_flush_watermark(), so an
+	 * end-of-log shape below the watermark (e.g. a lost header sector after
+	 * a crash) does not mean the bytes at/after the watermark are
+	 * unreachable; recover() never even looks below the watermark on this
+	 * segment.  'wm' is 0 (a no-op resume point) for every segment other
+	 * than the one flush_watermark currently names.
+	 */
+	if (s->flush_watermark_valid && s->flush_watermark.seg_id == (uint32_t) seg)
+		wm = s->flush_watermark.seg_off;
 	while (off < limit)
 	{
 		SegRecHdr hdr = {0};	/* zeroed so a seg_read() I/O failure below
@@ -5021,33 +5059,40 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		int wal_less, bound, admission, hole;
 
 		if (limit - off < sizeof(hdr))
-			break;				/* end of log: short header (recover() short-read) */
+			goto end_of_log;	/* end of log: short header (recover() short-read) */
 		if (ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0)
-			goto fail_malformed;	/* I/O error, not a parse decision */
+			goto fail;			/* I/O error, not a parse decision: no malformed-record diagnostic */
 		if (hdr.magic == 0)
-			break;				/* end of log: zero padding / lost header (recover() 19096) */
+			goto end_of_log;	/* end of log: zero padding / lost header (recover() 19096) */
 		if (segment_record_shape(hdr.magic, &header_size, &wal_less,
 								 &bound, &admission, &hole) != 0)
 			goto fail_malformed;	/* nonzero unknown magic: corruption inside the reachable region */
 		if (hole && hdr.len != page_size)
 			goto fail_malformed;	/* hole with the wrong len: corruption (recover() 19140) */
 		if (!hole && hdr.len != page_size)
-			break;				/* end of log: torn header (recover() 19165) */
+			goto end_of_log;	/* end of log: torn header (recover() 19165) */
 		rec_len = header_size + hdr.len;
 		if (rec_len > limit - off)
-			break;				/* end of log: torn body (recover() 19181) */
+			goto end_of_log;	/* end of log: torn body (recover() 19181) */
 		if (!hole)
 		{
-			if (bound &&
-				(ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
-								   sizeof(order_id)) != 0 || order_id == 0))
-				break;			/* end of log: torn bound trailer (recover() 19173) */
-			if (admission &&
-				(ps_storage->seg_read(s->id, seg,
-								 off + header_size - sizeof(admission_seq),
-								 &admission_seq, sizeof(admission_seq)) != 0 ||
-				 admission_seq == 0))
-				break;			/* end of log: torn admission trailer (recover() 19180) */
+			if (bound)
+			{
+				if (ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
+										 sizeof(order_id)) != 0)
+					goto fail;			/* I/O error, not a parse decision */
+				if (order_id == 0)
+					goto end_of_log;	/* end of log: torn bound trailer (recover() 19173) */
+			}
+			if (admission)
+			{
+				if (ps_storage->seg_read(s->id, seg,
+										 off + header_size - sizeof(admission_seq),
+										 &admission_seq, sizeof(admission_seq)) != 0)
+					goto fail;			/* I/O error, not a parse decision */
+				if (admission_seq == 0)
+					goto end_of_log;	/* end of log: torn admission trailer (recover() 19180) */
+			}
 			if (hdr.timeline >= MAX_TIMELINES)
 				goto fail_malformed;	/* complete record, impossible owner: corruption */
 			if (hdr.timeline == target)
@@ -5078,6 +5123,20 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		}
 		off += rec_len;
 		continue;
+
+end_of_log:
+		/* I4/M1: recover() replays [wm, ...) on this segment regardless of
+		 * what lies below wm -- an end-of-log shape below the flush
+		 * watermark must not hide the records recover() would still replay
+		 * starting at wm (wm is always a record boundary: it is a cursor
+		 * position recorded by a previous flush).  Only an end-of-log shape
+		 * at or after wm is a real end of the reachable region. */
+		if (off < wm && wm <= limit)
+		{
+			off = wm;
+			continue;
+		}
+		break;
 
 fail_malformed:
 		cleanup_last_failure.shard = s->id;
