@@ -119,6 +119,14 @@ this revision before the final MVP status update.
    fixtures. The existing workflow requires a matching store fixture on
    `pagestore`, but permits a missing build match on release branches; a release
    acceptance run must require that match rather than accept the warning.
+   The supported set is PG **15–19** (`contrib/pagestore/release-branches.json`
+   is the source of truth for each major's status and sync state); PG 18 is
+   the first candidate (see V4), frozen on its own tagged upstream release
+   rather than a moving stable-branch head. `branchdb_13` and `branchdb_14`
+   are kept for reference only — 13 is already past upstream EOL and 14
+   reaches EOL 2026-11-12, both need a materially different core patch series
+   (pre-17 SLRU, no `xlogrecovery.c` split before 15, no meson before 16) —
+   and carry **no release evidence**; do not advertise them as supported.
 
 The two artifact lifecycle gaps identified in the reviewed baseline are
 addressed by the follow-up described in [`ARTIFACT_LIFECYCLE.md`](ARTIFACT_LIFECYCLE.md):
@@ -194,6 +202,15 @@ the complete relevant CI suites, golden/branch boot scenarios, multi-seed soak
 and V1–V3 against that candidate. Capture matching PostgreSQL payload fixtures
 and require `--require-build-match` for the store fixture check. Validate
 supported older formats and refusal of unsupported ones.
+
+The supported majors are **15–19**, tracked in
+`contrib/pagestore/release-branches.json`; PG **18** (`REL_18_6` plus the
+curated core patch series and a byte-identical `contrib/pagestore`, built and
+synced with `scripts/branchdb-sync.sh`) is the first candidate — its on-disk
+identity is frozen for the life of the branch, unlike PG 19, which has no
+GA/RC tag yet and would produce disposable fixtures. `branchdb_13` and
+`branchdb_14` are excluded from the supported set and carry no release
+evidence; do not run or advertise V1–V4 against them.
 
 On a clean deployment, follow the published installation and branch-creation
 instructions. For production qualification, also rehearse the documented
