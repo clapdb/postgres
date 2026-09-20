@@ -733,14 +733,31 @@ no new assumption beyond the end-of-log parse rule recovery already trusts.
 because it is the same "retirement is logical, not physical" fact this
 paragraph documents, applied to timeline-delete's own segment scan): for any
 segment, the reachable region is the prefix `[0, R)` where `R` is the first
-offset at which `recover()`'s end-of-log rule stops -- zero magic, a torn
-(non-`page_size`) record, or a body/trailer field that runs past the
-available bytes -- further bounded for the *current* segment by the append
-cursor (`R <= cur_off` when `cur_off < segment_size`; a sealed or retired
-segment has no such bound, exactly as this paragraph already describes for
-`recover()`'s own rescans). Every record any reader has ever indexed from a
-segment lies inside `[0, R)`; bytes at or beyond `R` are unreachable through
-any index and are exactly the bytes a later append is free to overwrite.
+offset *at or after* `W` at which `recover()`'s end-of-log rule stops --
+zero magic, a torn (non-`page_size`) record, or a body/trailer field that
+runs past the available bytes -- further bounded for the *current* segment
+by the append cursor (`R <= cur_off` when `cur_off < segment_size`; a sealed
+or retired segment has no such bound, exactly as this paragraph already
+describes for `recover()`'s own rescans). `W` is `recover()`'s own starting
+offset for this segment: `flush_watermark.seg_off` when this segment is the
+one the durable flush watermark names, `0` for every other segment.
+
+The qualifier matters because `recover()` does not start every segment's
+scan at `0` -- it starts the watermark segment's scan at `W`, since segments
+are not synced before `ps_manifest_set_flush_watermark()` durably records
+that cursor, so a lost header sector *below* `W` (garbage that predates the
+watermark, e.g. a sector a crash tore before the watermark itself made it to
+disk) says nothing about what `recover()` would find at or after `W` --
+`recover()` never even looks below `W` on this segment. An end-of-log shape
+below `W` is therefore not a real end of the reachable region: pass 1 must
+resume its scan at `W` (always a record boundary -- it is a previously
+recorded flush cursor) rather than stopping there, or it would leave live,
+`recover()`-replayable target records at/after `W` untouched while reporting
+the deletion complete. See the "Power-loss reordering caveat" below for what
+*is* still true about bytes below `W`. Every record `recover()` has ever
+replayed *directly from this segment* lies inside `[W, R)`; bytes at or
+beyond `R` are unreachable through any index and are exactly the bytes a
+later append is free to overwrite.
 
 **Evidence before the fix** (regression tests, `pagestore_forkmeta_cutover_test.c`,
 against the unmodified `page_cleanup_rewrite_segment()`): `test_deletion_filtered_forkmeta`
@@ -889,33 +906,49 @@ before this fix.
 proven, next to the "Retirement is logical, not physical" paragraph above
 (the same fact -- retirement is derived on every open, not made durable --
 applied to timeline-delete's own scan). In short: pass 1 now validates only
-`[0, R)`, where `R` is where `recover()`'s own end-of-log rule would stop,
-further bounded by the append cursor for the segment currently being
-appended to. The rule table, side by side with `recover()`'s equivalent
-check (`pagestore_core.c`, `recover()`, line references are for this PR's
-tree):
+`[0, R)`, where `R` is where `recover()`'s own end-of-log rule would stop *at
+or after `W`* (the watermark-segment resume rule, spelled out where I4 is
+stated), further bounded by the append cursor for the segment currently
+being appended to. The rule table, side by side with `recover()`'s
+equivalent check (`pagestore_core.c`, `recover()`, line references are for
+this PR's tree). Every "unreadable" row below means the `seg_read()` call
+for that specific field *succeeded* but the field itself was short/zero;
+an outright `seg_read()` failure is its own row, listed once at the end,
+because it is never a parse decision on either side:
 
 | Shape encountered inside pass 1's scan window | pass 1 (after this PR) | `recover()` |
 | --- | --- | --- |
-| Fewer than `sizeof(SegRecHdr)` bytes left | end of log (`break`) | end of log (short read) |
-| Magic word `0` | end of log (`break`) | end of log (`break`, magic 0 check) |
-| Nonzero, unrecognized magic | **fail closed** (`goto fail`) | **fail closed** (`goto fail`, "incompatible record magic") |
-| Hole magic with `len != page_size` | **fail closed** (`goto fail`) | **fail closed** (`goto fail`, hole len check) |
-| Non-hole record with `len != page_size` | end of log (`break`) | end of log (`break`) |
-| Record body runs past the scan window / file | end of log (`break`) | end of log (`break`) |
-| Bound `order_id` unreadable or `0` | end of log (`break`) | end of log (`break`) |
-| Admission `admission_seq` unreadable or `0` | end of log (`break`) | end of log (`break`) |
-| Complete record naming `timeline >= MAX_TIMELINES` | **fail closed** (`goto fail`) | (not reachable: `recover()` has no such record to name a target) |
-| `ps_storage->seg_read()` itself fails | **fail closed** (`goto fail`) | end of log (`break` -- `recover()` optimistically treats an unreadable header as end of log; pass 1 does not, since misreading a real I/O error as "nothing more was ever here" for a *delete* is the wrong direction to fail) |
+| Fewer than `sizeof(SegRecHdr)` bytes left | end of log (`break`, or resume at `W` -- see below) | end of log (short read) |
+| Magic word `0` | end of log (`break`, or resume at `W`) | end of log (`break`, magic 0 check) |
+| Nonzero, unrecognized magic | **fail closed** (`goto fail_malformed`) | **fail closed** (`goto fail`, "incompatible record magic") |
+| Hole magic with `len != page_size` | **fail closed** (`goto fail_malformed`) | **fail closed** (`goto fail`, hole len check) |
+| Non-hole record with `len != page_size` | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Record body runs past the scan window / file | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Bound trailer read succeeds but `order_id == 0` | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Admission trailer read succeeds but `admission_seq == 0` | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Complete record naming `timeline >= MAX_TIMELINES` | **fail closed** (`goto fail_malformed`) | (not reachable: `recover()` has no such record to name a target) |
+| `ps_storage->seg_read()` itself fails (header, bound trailer, or admission trailer) | **fail closed**, plain `goto fail` -- no "malformed record" diagnostic (L3/M2: it is an I/O failure, not a parse decision) | end of log (`break` -- `recover()` optimistically treats an unreadable header as end of log; pass 1 does not, since misreading a real I/O error as "nothing more was ever here" for a *delete* is the wrong direction to fail) |
+
+Every "end of log" row above is qualified "or resume at `W`": an
+end-of-log-shaped stumble *below* the watermark `W` does not end pass 1's
+scan -- it resumes at `W` and keeps going, per the watermark-segment rule in
+invariant I4 above. Only an end-of-log shape found at or after `W` is a real
+end of the reachable region. (This distinction does not apply to the two
+"fail closed" outcomes: corruption inside the reachable region fails the
+pass regardless of where it sits relative to `W`, because `[W, R)` -- the
+part `recover()` actually replays from this segment -- is always scanned in
+full before pass 1 can succeed.)
 
 Everything pass 1 still fails closed on is corruption of bytes *inside* the
 reachable region -- the same bytes `recover()` already trusted enough to
 replay or would trust on this segment's own terms. Everything it now treats
 as end of log is a shape `recover()` already agreed was never indexed by
-anyone. `page_cleanup_tombstone_segment()`'s two-pass, all-or-nothing
-contract is unchanged: a `goto fail` anywhere still happens before pass 2
-ever writes a byte, so a segment that is genuinely malformed inside `[0, R)`
-still fails the whole pass closed and stays retryable, writing nothing.
+anyone (from `W` onward; see the caveat below for bytes below `W`).
+`page_cleanup_tombstone_segment()`'s two-pass, all-or-nothing contract is
+unchanged: a `goto fail`/`goto fail_malformed` anywhere still happens before
+pass 2 ever writes a byte, so a segment that is genuinely malformed inside
+`[0, R)` still fails the whole pass closed and stays retryable, writing
+nothing.
 
 **No hole write ever lands at or beyond the cursor.** Pass 2 carries a
 cassert-only assertion, `seg != s->cur_seg || s->cur_off == segment_size ||
@@ -926,16 +959,43 @@ from pass 1's own scan bound (`limit`), not merely hoped for; the assertion
 exists to catch a future change to pass 1 that widens its scan window
 without updating this proof.
 
-**Power-loss reordering caveat.** The one case where indexed bytes can lie
-beyond `R`: a record's header page lost while a later record's pages and the
-manifest flush watermark survived a crash (segments are not fsynced before
-the watermark is written; `ps_storage->sync()` runs only at shutdown and on
-an explicit sync request). `recover()` already treats such a store the same
-way -- it stops at the zero/torn header and serves the later record from its
-layer, not from a segment rescan -- so deletion following the identical rule
-leaves that record's target bytes physically present until segment GC: the
-same class of "logically unreachable, physically retained" bytes retirement
-semantics already accept, not a new gap L6 introduces.
+**Power-loss reordering caveat.** Segments are not fsynced before
+`ps_manifest_set_flush_watermark()` durably records the flush cursor `W`
+(`ps_storage->sync()` runs only at shutdown and on an explicit sync
+request), so a crash can leave a record's header sector lost *below* `W`
+while the pages and the watermark that make `W` durable both survived. Two
+distinct offsets matter here, and they resolve differently:
+
+- **Below `W`.** Any record here -- whether it parses cleanly or looks like
+  an end-of-log shape -- is not what `recover()` replays from this segment
+  on the next open: `recover()` never scans below `W` on the watermark
+  segment at all. If a target record happens to sit below `W`, it was
+  already replayed during an *earlier* open (before the watermark advanced
+  past it) and is served today from the layer that earlier flush produced,
+  not from a fresh segment scan. Pass 1 still walks through this range from
+  `off = 0` and still tombstones a parseable target record it finds there
+  (there is no reason not to -- the write is safe and only helps segment
+  GC), but an end-of-log shape found below `W` is exactly the case M1 fixed:
+  it must not be mistaken for the true end of the reachable region, or a
+  live record at/after `W` would go untombstoned while pass 1 reports
+  success. Bytes below `W` that pass 1's scan cannot get past (an
+  end-of-log shape it resumes past at `W`, or, in the very rare case a
+  torn-below-`W` region also contains genuine corruption pass 1 does not
+  visit because it jumped ahead) are "logically unreachable, physically
+  retained" -- exactly the class the "Retirement is logical, not physical"
+  paragraph above already accepts for retired segment tails; they wait for
+  segment GC, same as before this PR.
+- **At or after `W`.** This is the region `recover()` actually replays
+  directly from the segment on every open, and pass 1's reachable region
+  `[W, R)` covers it completely: any target record here is found and
+  tombstoned, and any corruption here fails pass 1 closed exactly as it
+  fails `recover()`'s own open. This is the region invariant I4 is about,
+  and M1 exists to guarantee pass 1 never reports success without having
+  scanned all of it.
+
+This is not a new gap L6 introduces -- it is the same "retirement is
+logical, not physical" fact this document already documents, restated for
+timeline-delete's own scan.
 
 **Diagnostic (L2).** A stalled deletion is no longer silent.
 `timeline_delete_page_cleanup_one()` now logs, once per distinct `(timeline,
@@ -943,10 +1003,13 @@ shard, seg, off, magic, len)` tuple (not once per maintenance turn):
 `pagestore_daemon: timeline %u deletion blocked: shard %u segment %d
 malformed record at offset %llu (magic %#x len %u) inside the reachable
 region; retrying each maintenance turn`. The tuple is filled by
-`page_cleanup_tombstone_segment()` only at an actual parse failure (the
-`goto fail` sites in the rule table above marked "fail closed"), never for
-an allocation or storage I/O failure during pass 2, which is not a data
-problem and gets no "malformed record" wording.
+`page_cleanup_tombstone_segment()` only at an actual parse failure -- the
+`goto fail_malformed` sites in the rule table above (nonzero unknown magic,
+a hole with the wrong `len`, or a complete record naming an impossible
+timeline) -- never for a `seg_read()` I/O failure (L3/M2: those are a plain
+`goto fail`, skipping the tuple entirely) and never for an allocation or
+storage I/O failure during pass 2, none of which are a data problem and none
+of which get "malformed record" wording.
 
 **Contract guard, not a fail-before.** A malformed record genuinely *inside*
 the reachable region -- for example the target's sibling record's own magic
