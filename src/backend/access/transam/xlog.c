@@ -254,6 +254,7 @@ static int	LocalXLogInsertAllowed = -1;
 XLogRecPtr	ProcLastRecPtr = InvalidXLogRecPtr;
 XLogRecPtr	XactLastRecEnd = InvalidXLogRecPtr;
 XLogRecPtr	XactLastCommitEnd = InvalidXLogRecPtr;
+XLogRecPtr	XactLastAbortEnd = InvalidXLogRecPtr;
 
 /*
  * RedoRecPtr is this backend's local copy of the REDO record pointer
@@ -691,7 +692,8 @@ static bool PerformRecoveryXLogAction(void);
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
-static void UpdateControlFile(void);
+static void UpdateControlFile(XLogRecPtr update_lsn, bool checkpoint_completion);
+static inline void CallControlFileFlushHook(void);
 static char *str_time(pg_time_t tnow);
 
 static int	get_sync_bit(int method);
@@ -776,7 +778,7 @@ XLogInsertRecord(XLogRecData *rdata,
 
 	/* cross-check on whether we should be here or not */
 	if (!XLogInsertAllowed())
-		elog(ERROR, "cannot make new WAL entries during recovery");
+		elog(ERROR, "cannot make new WAL entries during recovery or on a WAL-restricted instance");
 
 	/*
 	 * Given that we're not in recovery, InsertTimeLineID is set and can't
@@ -2757,7 +2759,7 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 		{
 			ControlFile->minRecoveryPoint = newMinRecoveryPoint;
 			ControlFile->minRecoveryPointTLI = newMinRecoveryPointTLI;
-			UpdateControlFile();
+			UpdateControlFile(newMinRecoveryPoint, false);
 			LocalMinRecoveryPoint = newMinRecoveryPoint;
 			LocalMinRecoveryPointTLI = newMinRecoveryPointTLI;
 
@@ -2768,6 +2770,10 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 		}
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held (no-op in a
+	 * critical section; a later ship point picks it up then) */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -4574,14 +4580,76 @@ ReadControlFile(void)
 					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 }
 
+/* Hook for control-file writes (see UpdateControlFile) */
+control_file_write_hook_type control_file_write_hook = NULL;
+
+/* see XLogInsertAllowed() */
+bool		wal_insert_restricted = false;
+
+/* highest update_lsn passed to UpdateControlFile() in this process */
+static XLogRecPtr LastControlUpdateLSN = InvalidXLogRecPtr;
+
+/*
+ * Ship point for control-file mirrors: called at the first point after a
+ * critical section that performed control-file writes, so a mirror that
+ * could only record intent inside the section (see control_file_write_hook)
+ * can ship the queued images without waiting for the next control update.
+ */
+control_file_flush_hook_type control_file_flush_hook = NULL;
+
+/* Post-buffer-flush publication point for recovery materializers. */
+recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
+recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook = NULL;
+recovery_start_hook_type recovery_start_hook = NULL;
+
+static inline void
+CallControlFileFlushHook(void)
+{
+	/* a ship point is only a ship point outside critical sections */
+	if (CritSectionCount == 0 && control_file_flush_hook)
+		(*control_file_flush_hook) ();
+}
+
 /*
  * Utility wrapper to update the control file.  Note that the control
  * file gets flushed.
+ *
+ * update_lsn is the LSN of the specific update that caused this control
+ * write -- a checkpoint passes its completion record's end LSN, replay-time
+ * updates pass the replayed record's end LSN, and state transitions with no
+ * record of their own pass the position that makes them visible (see each
+ * caller).  checkpoint_completion distinguishes the one write that publishes
+ * a locally completed checkpoint from later writes that merely retain its
+ * checkPointCopy.  These arguments exist solely for the write hook: an
+ * external mirror of pg_control (contrib/pagestore) versions the mirrored
+ * image by update_lsn so a branch cut at LSN L can restore the control image
+ * "as of L".  The hook
+ * runs after update_controlfile() has durably written the local file, may be
+ * called inside a critical section, and therefore must not error, block, or
+ * allocate there -- it can only record intent and ship later (see
+ * PGCONTROL_ON_STORE_DESIGN.md).
  */
 static void
-UpdateControlFile(void)
+UpdateControlFile(XLogRecPtr update_lsn, bool checkpoint_completion)
 {
+	/*
+	 * Clamp the version to the image's own WAL requirement: an image whose
+	 * minRecoveryPoint points into the future must not be mirrored below it,
+	 * or a branch cut in between would restore a control file that demands
+	 * WAL past the cut.  (During normal operation minRecoveryPoint is
+	 * invalid and this is a no-op.)
+	 */
+	if (ControlFile->minRecoveryPoint > update_lsn)
+		update_lsn = ControlFile->minRecoveryPoint;
+
+	if (update_lsn > LastControlUpdateLSN)
+		LastControlUpdateLSN = update_lsn;
+
 	update_controlfile(DataDir, ControlFile, true);
+
+	if (control_file_write_hook)
+		(*control_file_write_hook) (ControlFile, update_lsn,
+									checkpoint_completion);
 }
 
 /*
@@ -5473,6 +5541,7 @@ StartupXLOG(void)
 	bool		haveTblspcMap;
 	bool		haveBackupLabel;
 	XLogRecPtr	EndOfLog;
+	XLogRecPtr	promotion_lsn;
 	TimeLineID	EndOfLogTLI;
 	TimeLineID	newTLI;
 	bool		performedWalRecovery;
@@ -5745,8 +5814,24 @@ StartupXLOG(void)
 		 * backup history file.
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
+		 *
+		 * Version the mirrored image by a non-retroactive position: the END
+		 * of the checkpoint record we start from (InitWalRecovery saved it;
+		 * the shared replay pointers are not initialized until
+		 * PerformWalRecovery, so GetCurrentReplayRecPtr() would still be
+		 * zero here).  Never the checkpoint record's START -- a branch cut
+		 * inside the record must not see an image referencing a record its
+		 * WAL does not fully contain.  Take the max with minRecoveryPoint
+		 * for the backup-label case; a too-high version is safe (a branch
+		 * merely restores an older image), a too-low one is not.
 		 */
-		UpdateControlFile();
+		{
+			XLogRecPtr	update_lsn = GetCheckPointRecordEnd();
+
+			update_lsn = Max(update_lsn, ControlFile->checkPoint);
+			update_lsn = Max(update_lsn, ControlFile->minRecoveryPoint);
+			UpdateControlFile(update_lsn, false);
+		}
 
 		/*
 		 * If there was a backup label file, it's done its job and the info
@@ -6203,6 +6288,30 @@ StartupXLOG(void)
 	 * there are no race conditions concerning visibility of other recent
 	 * updates to shared memory.
 	 */
+	/*
+	 * The transition to DB_IN_PRODUCTION inserts no WAL record of its own,
+	 * so version its control write by the record-end end-of-log -- captured
+	 * BEFORE publishing RECOVERY_STATE_DONE: once that state is visible,
+	 * XLogInsertAllowed() lets other backends reserve WAL, and a later
+	 * capture would version the image after post-promotion user WAL (a
+	 * branch cut in between would then miss the promotion image).  The raw
+	 * insert position is wrong in the other direction: it is the NEXT
+	 * record's start, which sits past the page header when the last record
+	 * ended exactly on a page boundary -- but records CAN be emitted after
+	 * the last control write without one of their own (interrupted-checksum
+	 * cleanup, the logical-decoding status record), and the promotion image
+	 * must be versioned at/after ALL of them: a version below any such
+	 * record lets a branch cut after it restore the pre-promotion control
+	 * file.  So take the insert position into the max as the upper bound of
+	 * everything inserted; the page-header overshoot it can carry is the
+	 * SAFE direction (a branch cut exactly at a page-boundary end-of-log
+	 * restores the previous image -- bounded staleness), whereas any
+	 * undershoot would be a correctness hole.
+	 */
+	promotion_lsn = Max(EndOfLog, GetXLogReplayRecPtr(NULL));
+	promotion_lsn = Max(promotion_lsn, LastControlUpdateLSN);
+	promotion_lsn = Max(promotion_lsn, GetXLogInsertRecPtr());
+
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
 
@@ -6210,8 +6319,11 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	UpdateControlFile();
+	UpdateControlFile(promotion_lsn, false);
 	LWLockRelease(ControlFileLock);
+
+	/* ship the promotion image now that ControlFileLock is released */
+	CallControlFileFlushHook();
 
 	/*
 	 * Shutdown the recovery environment.  This must occur after
@@ -6266,7 +6378,7 @@ SwitchIntoArchiveRecovery(XLogRecPtr EndRecPtr, TimeLineID replayTLI)
 	 */
 	updateMinRecoveryPoint = true;
 
-	UpdateControlFile();
+	UpdateControlFile(EndRecPtr, false);
 
 	/*
 	 * We update SharedRecoveryState while holding the lock on ControlFileLock
@@ -6277,6 +6389,9 @@ SwitchIntoArchiveRecovery(XLogRecPtr EndRecPtr, TimeLineID replayTLI)
 	SpinLockRelease(&XLogCtl->info_lck);
 
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -6305,9 +6420,12 @@ ReachedEndOfBackup(XLogRecPtr EndRecPtr, TimeLineID tli)
 	ControlFile->backupStartPoint = InvalidXLogRecPtr;
 	ControlFile->backupEndPoint = InvalidXLogRecPtr;
 	ControlFile->backupEndRequired = false;
-	UpdateControlFile();
+	UpdateControlFile(EndRecPtr, false);
 
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -6428,6 +6546,22 @@ GetRecoveryState(void)
 bool
 XLogInsertAllowed(void)
 {
+	/*
+	 * A WAL-restricted instance (extension-set; a pinned pagestore reader)
+	 * permits inserts only from the processes WAL housekeeping cannot run
+	 * without -- checkpointer, startup, bgwriter, walwriter.  Everything
+	 * else (regular backends, autovacuum, background workers) is refused
+	 * here as the fail-closed backstop behind the executor/utility gates.
+	 * This must precede the LocalXLogInsertAllowed fast path: backends
+	 * latch that to "unconditionally true" once out of recovery.
+	 */
+	if (wal_insert_restricted &&
+		MyBackendType != B_CHECKPOINTER &&
+		MyBackendType != B_STARTUP &&
+		MyBackendType != B_BG_WRITER &&
+		MyBackendType != B_WAL_WRITER)
+		return false;
+
 	/*
 	 * If value is "unconditionally true" or "unconditionally false", just
 	 * return it.  This provides the normal fast path once recovery is known
@@ -6980,7 +7114,8 @@ CreateCheckPoint(int flags)
 	{
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->state = DB_SHUTDOWNING;
-		UpdateControlFile();
+		/* no record of its own: version by the current insert position */
+		UpdateControlFile(GetXLogInsertRecPtr(), false);
 		LWLockRelease(ControlFileLock);
 	}
 
@@ -7017,6 +7152,14 @@ CreateCheckPoint(int flags)
 			END_CRIT_SECTION();
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
+
+			/*
+			 * A skipped checkpoint is still a ship point: a control image
+			 * left queued by an earlier flush-hook failure would otherwise
+			 * not be retried until WAL activity resumes, even though the
+			 * store may long since have recovered.
+			 */
+			CallControlFileFlushHook();
 			return false;
 		}
 	}
@@ -7168,6 +7311,14 @@ CreateCheckPoint(int flags)
 	END_CRIT_SECTION();
 
 	/*
+	 * First safe point after the critical section: ship any control image
+	 * queued inside it (a shutdown checkpoint's DB_SHUTDOWNING write) before
+	 * the long buffer-flush phase, so a crash during that phase does not
+	 * leave the local pg_control ahead of the mirror for its whole duration.
+	 */
+	CallControlFileFlushHook();
+
+	/*
 	 * In some cases there are groups of actions that must all occur on one
 	 * side or the other of a checkpoint record. Before flushing the
 	 * checkpoint record we must explicitly wait for any backend currently
@@ -7305,7 +7456,13 @@ CreateCheckPoint(int flags)
 	 */
 	ControlFile->unloggedLSN = pg_atomic_read_membarrier_u64(&XLogCtl->unloggedLSN);
 
-	UpdateControlFile();
+	/*
+	 * Version this write by the checkpoint record's END LSN (recptr, the
+	 * XLogInsert return), not ProcLastRecPtr (its start): a branch cut
+	 * between the record's start and end must not restore a control image
+	 * whose checkpoint record is not fully in the branch's WAL stream.
+	 */
+	UpdateControlFile(recptr, true);
 	LWLockRelease(ControlFileLock);
 
 	/* Update shared-memory copy of checkpoint XID/epoch */
@@ -7318,6 +7475,9 @@ CreateCheckPoint(int flags)
 	 * have trouble while fooling with old log segments.
 	 */
 	END_CRIT_SECTION();
+
+	/* ship the control image(s) queued under the critical section */
+	CallControlFileFlushHook();
 
 	/*
 	 * WAL summaries end when the next XLOG_CHECKPOINT_REDO or
@@ -7446,10 +7606,13 @@ CreateEndOfRecoveryRecord(void)
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->minRecoveryPoint = recptr;
 	ControlFile->minRecoveryPointTLI = xlrec.ThisTimeLineID;
-	UpdateControlFile();
+	UpdateControlFile(recptr, false);
 	LWLockRelease(ControlFileLock);
 
 	END_CRIT_SECTION();
+
+	/* ship the control image queued under the critical section */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -7638,6 +7801,7 @@ CreateRestartPoint(int flags)
 	XLogRecPtr	PriorRedoPtr;
 	XLogRecPtr	receivePtr;
 	XLogRecPtr	replayPtr;
+	XLogRecPtr	flushReplayPtr;
 	TimeLineID	replayTLI;
 	XLogRecPtr	endptr;
 	XLogSegNo	_logSegNo;
@@ -7690,8 +7854,12 @@ CreateRestartPoint(int flags)
 		{
 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 			ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
-			UpdateControlFile();
+			/* no record of its own: version by the replay position */
+			UpdateControlFile(GetXLogReplayRecPtr(NULL), false);
 			LWLockRelease(ControlFileLock);
+
+			/* ship the image queued while ControlFileLock was held */
+			CallControlFileFlushHook();
 		}
 		return false;
 	}
@@ -7730,13 +7898,28 @@ CreateRestartPoint(int flags)
 	/* Update the process title */
 	update_checkpoint_display(flags, true, false);
 
+	/*
+	 * Capture the replay boundary before flushing starts.  Replay may continue
+	 * concurrently, but all buffers dirty at this point are included in the
+	 * restartpoint; later writes can only make the stored page newer.
+	 */
+	flushReplayPtr = GetXLogReplayRecPtr(NULL);
 	CheckPointGuts(lastCheckPoint.redo, flags);
-
 	/*
 	 * This location needs to be after CheckPointGuts() to ensure that some
 	 * work has already happened during this checkpoint.
 	 */
 	INJECTION_POINT("create-restart-point", NULL);
+
+	/*
+	 * Publish any external relation/marker durability before pg_control is
+	 * advanced.  A failure leaves the old local restartpoint authoritative and
+	 * lets recovery retry this restartpoint safely.
+	 */
+	if (recovery_restartpoint_pre_control_hook &&
+		!XLogRecPtrIsInvalid(flushReplayPtr))
+		(*recovery_restartpoint_pre_control_hook) (flushReplayPtr,
+											 lastCheckPoint.redo);
 
 	/*
 	 * Remember the prior checkpoint's redo ptr for
@@ -7788,9 +7971,31 @@ CreateRestartPoint(int flags)
 			if (flags & CHECKPOINT_IS_SHUTDOWN)
 				ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
 		}
-		UpdateControlFile();
+
+		/*
+		 * Version by the replayed checkpoint record's end, but never below
+		 * minRecoveryPoint: buffer flushes for records replayed after the
+		 * checkpoint may already have advanced it, and this image requires
+		 * WAL up to that point -- a branch cut between the two must not
+		 * restore it.
+		 */
+		UpdateControlFile(Max(lastCheckPointEndPtr,
+							  ControlFile->minRecoveryPoint), false);
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
+
+	/*
+	 * Only now is the restart redo pointer durable in pg_control.  Consumers
+	 * may publish the flushed replay watermark for monitoring, but must not
+	 * release retained WAL beyond this restart location.
+	 */
+	if (recovery_restartpoint_flush_hook &&
+		!XLogRecPtrIsInvalid(flushReplayPtr))
+		(*recovery_restartpoint_flush_hook) (flushReplayPtr,
+											 lastCheckPoint.redo);
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the
@@ -8165,6 +8370,8 @@ XLogReportParameters(void)
 		 * values in pg_control either if wal_level=minimal, but seems better
 		 * to keep them up-to-date to avoid confusion.
 		 */
+		XLogRecPtr	update_lsn;
+
 		if (wal_level != ControlFile->wal_level || XLogIsNeeded())
 		{
 			xl_parameter_change xlrec;
@@ -8184,6 +8391,19 @@ XLogReportParameters(void)
 
 			recptr = XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
 			XLogFlush(recptr);
+			update_lsn = recptr;
+		}
+		else
+		{
+			/*
+			 * No record inserted (wal_level = minimal, so no archiving and
+			 * no branch reader either).  Prefer the highest record-end
+			 * control version we know; fall back to the insert position for
+			 * a first-ever write.
+			 */
+			update_lsn = LastControlUpdateLSN;
+			if (XLogRecPtrIsInvalid(update_lsn))
+				update_lsn = GetXLogInsertRecPtr();
 		}
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
@@ -8196,9 +8416,12 @@ XLogReportParameters(void)
 		ControlFile->wal_level = wal_level;
 		ControlFile->wal_log_hints = wal_log_hints;
 		ControlFile->track_commit_timestamp = track_commit_timestamp;
-		UpdateControlFile();
+		UpdateControlFile(update_lsn, false);
 
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 	}
 }
 
@@ -8387,7 +8610,12 @@ xlog_redo(XLogReaderState *record)
 		/* ControlFile->checkPointCopy always tracks the latest ckpt XID */
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->checkPointCopy.nextXid = checkPoint.nextXid;
+
+		UpdateControlFile(record->EndRecPtr, false);
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 
 		/* Update shared-memory copy of checkpoint XID/epoch */
 		SpinLockAcquire(&XLogCtl->info_lck);
@@ -8614,8 +8842,11 @@ xlog_redo(XLogReaderState *record)
 								ControlFile->track_commit_timestamp);
 		ControlFile->track_commit_timestamp = xlrec.track_commit_timestamp;
 
-		UpdateControlFile();
+		UpdateControlFile(record->EndRecPtr, false);
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 
 		/* Check to see if any parameter change gives a problem on recovery */
 		CheckRequiredParameterValues();

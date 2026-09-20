@@ -32,6 +32,7 @@ extern PGDLLIMPORT int wal_sync_method;
 extern PGDLLIMPORT XLogRecPtr ProcLastRecPtr;
 extern PGDLLIMPORT XLogRecPtr XactLastRecEnd;
 extern PGDLLIMPORT XLogRecPtr XactLastCommitEnd;
+extern PGDLLIMPORT XLogRecPtr XactLastAbortEnd;
 
 /* these variables are GUC parameters related to XLOG */
 extern PGDLLIMPORT int wal_segment_size;
@@ -227,6 +228,61 @@ extern bool RecoveryInProgress(void);
 extern RecoveryState GetRecoveryState(void);
 extern bool XLogInsertAllowed(void);
 extern XLogRecPtr GetXLogInsertRecPtr(void);
+
+/*
+ * Hook for control-file writes.  UpdateControlFile() calls it right after
+ * update_controlfile() has durably written global/pg_control, passing the
+ * just-written image and the LSN of the update that caused the write (a
+ * checkpoint's completion-record end LSN, a replayed record's end LSN, or
+ * the position that made a recordless state transition visible).  An
+ * external mirror (contrib/pagestore) versions the mirrored image by that
+ * LSN so a branch cut at L can restore pg_control "as of L".  The hook may
+ * run inside a critical section and must not error, block, or allocate
+ * there; implementations chain any previously installed hook.
+ * checkpoint_completion is true only for the control write that publishes a
+ * locally completed checkpoint's new checkPoint/checkPointCopy.
+ */
+struct ControlFileData;
+typedef void (*control_file_write_hook_type) (const struct ControlFileData *control,
+											  XLogRecPtr update_lsn,
+											  bool checkpoint_completion);
+extern PGDLLIMPORT control_file_write_hook_type control_file_write_hook;
+
+/*
+ * When set (by extension code in the postmaster, before backends fork),
+ * only WAL-essential auxiliary processes may insert WAL records; see
+ * XLogInsertAllowed().
+ */
+extern PGDLLIMPORT bool wal_insert_restricted;
+
+/*
+ * Post-critical ship point paired with control_file_write_hook: invoked at
+ * the first point outside a critical section that wrote pg_control, so a
+ * mirror can ship what it could only queue inside the section.
+ */
+typedef void (*control_file_flush_hook_type) (void);
+extern PGDLLIMPORT control_file_flush_hook_type control_file_flush_hook;
+
+/*
+ * Called after a recovery restartpoint has flushed its buffer set.  The LSN is
+ * sampled before flushing begins, so every page change through that replay
+ * position is represented in durable storage when the hook runs.
+ */
+typedef void (*recovery_restartpoint_flush_hook_type) (XLogRecPtr replay_lsn,
+														XLogRecPtr restart_redo_lsn);
+extern PGDLLIMPORT recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook;
+
+/* Called after restartpoint buffers are flushed and the injection point has
+ * run, but before the restartpoint updates durable pg_control. */
+typedef void (*recovery_restartpoint_pre_control_hook_type) (XLogRecPtr replay_lsn,
+														XLogRecPtr restart_redo_lsn);
+extern PGDLLIMPORT recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook;
+
+/* Called in the startup process after the checkpoint redo pointer is known
+ * and before the checkpoint or redo WAL is read.  Consumers that depend on
+ * retained history use this point to establish their durable protection. */
+typedef void (*recovery_start_hook_type) (XLogRecPtr redo_lsn);
+extern PGDLLIMPORT recovery_start_hook_type recovery_start_hook;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 

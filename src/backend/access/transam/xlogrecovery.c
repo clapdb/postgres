@@ -167,6 +167,7 @@ static bool recovery_signal_file_found = false;
  * checkpoint record.
  */
 static XLogRecPtr CheckPointLoc = InvalidXLogRecPtr;
+static XLogRecPtr CheckPointEndLoc = InvalidXLogRecPtr;	/* end of that record */
 static TimeLineID CheckPointTLI = 0;
 static XLogRecPtr RedoStartLSN = InvalidXLogRecPtr;
 static TimeLineID RedoStartTLI = 0;
@@ -639,10 +640,13 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		 * When a backup_label file is present, we want to roll forward from
 		 * the checkpoint it identifies, rather than using pg_control.
 		 */
+		if (recovery_start_hook)
+			(*recovery_start_hook) (RedoStartLSN);
 		record = ReadCheckpointRecord(xlogprefetcher, CheckPointLoc,
 									  CheckPointTLI);
 		if (record != NULL)
 		{
+			CheckPointEndLoc = xlogreader->EndRecPtr;
 			memcpy(&checkPoint, XLogRecGetData(xlogreader), sizeof(CheckPoint));
 			wasShutdown = ((record->xl_info & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN);
 			ereport(DEBUG1,
@@ -791,10 +795,13 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		CheckPointTLI = ControlFile->checkPointCopy.ThisTimeLineID;
 		RedoStartLSN = ControlFile->checkPointCopy.redo;
 		RedoStartTLI = ControlFile->checkPointCopy.ThisTimeLineID;
+		if (recovery_start_hook)
+			(*recovery_start_hook) (RedoStartLSN);
 		record = ReadCheckpointRecord(xlogprefetcher, CheckPointLoc,
 									  CheckPointTLI);
 		if (record != NULL)
 		{
+			CheckPointEndLoc = xlogreader->EndRecPtr;
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint record is at %X/%X",
 									 LSN_FORMAT_ARGS(CheckPointLoc))));
@@ -4588,6 +4595,19 @@ HotStandbyActiveInReplay(void)
  *
  * Exported to allow WALReceiver to read the pointer directly.
  */
+/*
+ * End LSN of the checkpoint record recovery starts from (set by
+ * InitWalRecovery once the record is read and validated).  A pg_control
+ * mirror versions the pre-redo control write by this position: the image
+ * references that checkpoint record, so it must not become visible to a
+ * branch whose WAL ends inside the record.
+ */
+XLogRecPtr
+GetCheckPointRecordEnd(void)
+{
+	return CheckPointEndLoc;
+}
+
 XLogRecPtr
 GetXLogReplayRecPtr(TimeLineID *replayTLI)
 {
