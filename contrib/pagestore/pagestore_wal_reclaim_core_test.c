@@ -660,6 +660,7 @@ test_no_progress_backoff_follows_proof(void)
 	int reclaimed;
 	double elapsed_ms = 0.0;
 	double since_arm_ms;
+	double poll_bound_ms;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, limited, 0, 1),
@@ -695,6 +696,25 @@ test_no_progress_backoff_follows_proof(void)
 			  "slow host (>= 20 ms since arm): skipping the not-yet-honored"
 			  " assertion, the bounded poll below still proves the epoch"
 			  " cancellation fired");
+	/* The poll below measures only the reclaimer's own work: the admission
+	 * drain, the raw-floor scan, and (via the epoch cancellation) skipping
+	 * the rest of the no-progress backoff.  On a fast host this reliably
+	 * lands around one rate-limit floor (~20-25 ms observed): 300 ms is a
+	 * generous but still tight bound that catches a real regression (a
+	 * retry that silently became two evaluations instead of one, say).
+	 * since_arm_ms above already measured this host's own fsync/scheduling
+	 * latency (set_wal_pin's two fsyncs); a host already slow enough to
+	 * cross the 20 ms floor before reaching this poll is also slow enough
+	 * that its fsyncs (this loop's ps_core_maintenance calls do their own)
+	 * can push the tight bound past 300 ms with no defect in the mechanism
+	 * -- confirmed by measurement: an LD_PRELOAD fsync delay reproduces
+	 * this linearly (~3x the injected per-fsync delay, from the several
+	 * fsyncs one reclaim pass performs) on this exact path, unchanged
+	 * before and after the watch/evidence work in this PR.  Fall back to
+	 * the no-progress backoff's own documented outer bound (one second)
+	 * on such a host instead of asserting a tight bound the mechanism
+	 * never promised to meet under slow I/O. */
+	poll_bound_ms = since_arm_ms < 20.0 ? 300.0 : 1000.0;
 	reclaimed = 0;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (;;)
@@ -704,13 +724,16 @@ test_no_progress_backoff_follows_proof(void)
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 		elapsed_ms = (double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
 			(double) (t1.tv_nsec - t0.tv_nsec) / 1e6;
-		if (reclaimed || elapsed_ms >= 300.0)
+		if (reclaimed || elapsed_ms >= poll_bound_ms)
 			break;
 		usleep(1000);
 	}
-	check(reclaimed && segment_count(store, 0) == 0 && elapsed_ms < 300.0,
+	check(reclaimed && segment_count(store, 0) == 0 && elapsed_ms < poll_bound_ms,
 		  "once the rate-limit floor passes, the epoch-cancelled retry"
-		  " reclaims well under the 1 s clock");
+		  " reclaims well under the 1 s clock (a fast host, unblocked in"
+		  " under 20 ms since the arm, is held to the tighter 300 ms bound;"
+		  " a host already slow by then is held only to the mechanism's own"
+		  " one-second outer bound)");
 	close_store();
 	remove_tree(store);
 }
@@ -1503,6 +1526,9 @@ test_watch_does_not_refire_on_satisfied_base_evidence(void)
 	const uint64_t F = limited + 8192;
 	char		store[] = "/tmp/pagestore-wal-policy-r2b-XXXXXX";
 	unsigned int evals = 0;
+	struct timespec tloop0, tloop1;
+	double		loop_ms;
+	unsigned int bound;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
@@ -1516,6 +1542,11 @@ test_watch_does_not_refire_on_satisfied_base_evidence(void)
 		  "stuck at 2, request served fruitless");
 	check(ps_test_wal_reclaim_watch_count(0) == 1, "watch armed (1 entry)");
 	ps_test_set_wal_reclaim_before_floor_hook(count_eval, &evals);
+	/* ps_test_wal_reclaim_maintenance() calls the reclaimer alone, not the
+	 * full maintenance dispatcher: this loop must not give unrelated
+	 * background classes (segment GC, snapshot publish, ...) a chance to
+	 * run and confound the count with their own timing. */
+	clock_gettime(CLOCK_MONOTONIC, &tloop0);
 	for (uint32_t i = 0; i < 30; i++)
 	{
 		struct timespec t0, t1;
@@ -1525,21 +1556,45 @@ test_watch_does_not_refire_on_satisfied_base_evidence(void)
 		clock_gettime(CLOCK_MONOTONIC, &t0);
 		do
 		{
-			if (!ps_core_maintenance())
+			if (!ps_test_wal_reclaim_maintenance())
 				usleep(1000);
 			clock_gettime(CLOCK_MONOTONIC, &t1);
 		} while ((double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
 				 (double) (t1.tv_nsec - t0.tv_nsec) / 1e6 < 25.0);
 	}
+	clock_gettime(CLOCK_MONOTONIC, &tloop1);
 	ps_test_set_wal_reclaim_before_floor_hook(NULL, NULL);
-	check(evals <= 2,
-		  "[bound] 30 unrelated same-shard flushes over ~750 ms must not"
-		  " drain the reclaimer once per flush -- a base already found in"
-		  " the watched window cannot be improved by an unrelated flush, so"
-		  " re-arming BASE for it is pure cost with no effect on the"
-		  " answer; before the fix, every flush fired the watch and"
-		  " cancelled the no-progress backoff, so evals tracked the flush"
-		  " count instead of the reclaimer's own rate limit");
+	loop_ms = (double) (tloop1.tv_sec - tloop0.tv_sec) * 1000.0 +
+		(double) (tloop1.tv_nsec - tloop0.tv_nsec) / 1e6;
+	/* Without a spurious fire, nothing here ever changes this item's
+	 * evidence, so only the no-progress backoff's own documented one-second
+	 * idle fallback -- not the 20 ms floor, which gates repeats, not a
+	 * first retry -- can legitimately add an evaluation, once per second of
+	 * real time this loop actually spans.  On a fast host that span is the
+	 * ~750 ms these 30 writes' own fsyncs cost, well under the fallback, so
+	 * a small constant bound (2) already has headroom; each write's own
+	 * fsync can cost much more under I/O latency (measured: 30 unrelated
+	 * writes plus their polling drove this loop past 15 s at an injected
+	 * 80 ms per-fsync delay), and every extra second of REAL, unavoidable
+	 * span the loop spends is exactly one legitimate extra fallback
+	 * opportunity, not evidence of a per-flush drain: bound on the span
+	 * actually measured, not on an assumption about how fast writing 30
+	 * pages is.  The bug this guards (every flush firing unconditionally)
+	 * ties evals to the flush count (30) regardless of loop_ms, so this
+	 * bound -- orders of magnitude below 30 for any span this test would
+	 * plausibly reach -- still catches it. */
+	bound = (unsigned int) (loop_ms / 1000.0) + 2;
+	check(evals <= bound,
+		  "[bound] 30 unrelated same-shard flushes must not drain the"
+		  " reclaimer once per flush -- a base already found in the watched"
+		  " window cannot be improved by an unrelated flush, so re-arming"
+		  " BASE for it is pure cost with no effect on the answer; before"
+		  " the fix, every flush fired the watch and cancelled the"
+		  " no-progress backoff, so evals tracked the flush count instead"
+		  " of the reclaimer's own rate limit.  The bound scales with this"
+		  " loop's own measured span (one extra allowance per second, the"
+		  " no-progress backoff's documented idle fallback), not a fixed"
+		  " assumption about host speed");
 	close_store();
 	remove_tree(store);
 }
