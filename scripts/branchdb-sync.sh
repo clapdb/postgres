@@ -331,23 +331,59 @@ cmd_sync_contrib() {
   local branch=${1:-} sha=${2:-}
   [[ -n "$branch" && -n "$sha" ]] || die "usage: $SELF sync-contrib <branch> <SHA>"
   refuse_protected_branch "$branch"
-  git rev-parse --verify --quiet "$sha" >/dev/null || die "unknown commit '$sha'"
+  git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null || die "unknown commit '$sha'"
+  git rev-parse --verify --quiet origin/pagestore >/dev/null || die "no origin/pagestore (run '$SELF fetch'?)"
+  if ! git merge-base --is-ancestor "$sha" origin/pagestore; then
+    die "'$sha' is not an ancestor of origin/pagestore; contrib/pagestore is only ever synced from a commit that has actually landed on pagestore"
+  fi
+
   local current
   current=$(git rev-parse --abbrev-ref HEAD)
   if [[ "$current" != "$branch" ]]; then
     run git checkout "$branch"
   fi
+
+  if [[ "$DRY_RUN" != "1" ]]; then
+    # Refuse to fold unrelated state into the sync commit. A staged change
+    # elsewhere would ride along on the commit below (its subject claims
+    # only "sync to pagestore@<SHA>"); an untracked file under
+    # contrib/pagestore would ride along on `git add contrib/pagestore`
+    # below and land in the tree as if pagestore itself shipped it, quietly
+    # breaking the byte-identity invariant the commit message claims to
+    # establish.
+    if ! git diff --cached --quiet; then
+      die "the index is not clean (staged changes present); sync-contrib refuses to fold them into the sync commit -- commit or unstage first"
+    fi
+    local stray
+    stray=$(git ls-files --others --exclude-standard -- contrib/pagestore)
+    if [[ -n "$stray" ]]; then
+      die "untracked file(s) under contrib/pagestore would be swept into the sync commit, refusing: $(tr '\n' ' ' <<<"$stray")"
+    fi
+  fi
+
   run git rm -rq --ignore-unmatch contrib/pagestore
   run git checkout "$sha" -- contrib/pagestore
   run git add contrib/pagestore
-  run git commit -m "contrib/pagestore: sync to pagestore@${sha}"
+
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo ">> (dry-run) would verify contrib/pagestore is now byte-identical to ${sha}"
+    echo ">> (dry-run) would verify the staged contrib/pagestore is byte-identical to ${sha} before committing"
     return 0
   fi
-  if ! git diff --quiet "$sha" HEAD -- contrib/pagestore; then
-    die "contrib/pagestore on $branch is not byte-identical to ${sha} after sync-contrib (this should not happen)"
+
+  # Verify identity on the INDEX before committing -- catching a mismatch
+  # here means nothing bad is ever actually committed, unlike checking
+  # after the fact (which can only report a bad commit that already
+  # happened).
+  if ! git diff --cached --quiet "$sha" -- contrib/pagestore; then
+    die "the staged contrib/pagestore is not byte-identical to ${sha} (this should not happen); nothing committed"
   fi
+
+  if git diff --cached --quiet; then
+    echo ">> contrib/pagestore on $branch already equals pagestore@${sha}; nothing to commit"
+    return 0
+  fi
+
+  run git commit -q -m "contrib/pagestore: sync to pagestore@${sha}"
   echo ">> contrib/pagestore on $branch is byte-identical to pagestore@${sha}"
 }
 
