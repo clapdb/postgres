@@ -104,6 +104,95 @@
 #include "utils/wait_event.h"
 #include "walredo_client.h"
 
+/*
+ * PG 18/19 API compat shims.  This file is a byte-for-byte copy of
+ * pagestore's tracked-upstream (19+) source; these macros paper over a
+ * handful of upstream signature/struct changes so it also compiles on 18,
+ * without duplicating the surrounding logic per version.  Each site that
+ * uses one is otherwise unmodified from origin/pagestore.
+ */
+
+/*
+ * XLogFindNextRecord() gained a trailing `char **errormsg` out-param after
+ * 18 (matching XLogReadRecord's shape); every call site here only checks
+ * the returned XLogRecPtr, so 18 just drops the extra argument.
+ */
+#if PG_VERSION_NUM >= 190000
+#define PS_XLogFindNextRecord(state, ptr, errmsgp) \
+	XLogFindNextRecord((state), (ptr), (errmsgp))
+#else
+#define PS_XLogFindNextRecord(state, ptr, errmsgp) \
+	XLogFindNextRecord((state), (ptr))
+#endif
+
+/*
+ * xl_multixact_truncate was simplified after 18 from an explicit
+ * start/end range (startTruncOff/endTruncOff/startTruncMemb/endTruncMemb)
+ * to a single cutoff (oldestMulti/oldestOffset).  Cross-checked against
+ * both versions' multixact_redo(): 18's endTruncOff/endTruncMemb are the
+ * exact values SetMultiXactIdLimit()/PerformOffsetsTruncation()/
+ * PerformMembersTruncation() are called with, the same role 19's
+ * oldestMulti/oldestOffset play -- so this is a pure rename, not a shape
+ * change, for every use in this file (all of which only read the new
+ * cutoff, never the old range start).
+ */
+#if PG_VERSION_NUM >= 190000
+#define PS_XLREC_MXTRUNC_OLDEST_MULTI(x)	((x).oldestMulti)
+#define PS_XLREC_MXTRUNC_OLDEST_OFFSET(x)	((x).oldestOffset)
+#else
+#define PS_XLREC_MXTRUNC_OLDEST_MULTI(x)	((x).endTruncOff)
+#define PS_XLREC_MXTRUNC_OLDEST_OFFSET(x)	((x).endTruncMemb)
+#endif
+
+/* PageSetChecksum() is PageSetChecksumInplace() before 19 (pure rename, identical signature). */
+#if PG_VERSION_NUM < 190000
+#define PageSetChecksum(page, blkno) PageSetChecksumInplace((page), (blkno))
+#endif
+
+/*
+ * CHECKPOINT_FAST is CHECKPOINT_IMMEDIATE before 19 (pure rename, same
+ * value/meaning: "do it without delays").
+ */
+#if PG_VERSION_NUM < 190000
+#define CHECKPOINT_FAST CHECKPOINT_IMMEDIATE
+#endif
+
+/*
+ * BGWORKER_INTERRUPTIBLE ("exit if this worker's database is involved in a
+ * CREATE/ALTER/DROP DATABASE") is a 19-only bgworker safety flag with no
+ * equivalent on 18; every bgworker ran without this protection before it
+ * was introduced, so the 18 build's reader-artifact workers do the same.
+ */
+#if PG_VERSION_NUM < 190000
+#define BGWORKER_INTERRUPTIBLE 0
+#endif
+
+/*
+ * pg_multixact/members uses 15-hex "long" segment names because upstream
+ * widened MultiXactOffset to 64-bit after 18 (see multixact.h's typedef);
+ * on 18, MultiXactOffset is still 32-bit and members keeps the short (4-6
+ * hex) segment name convention, same as every other SLRU.  Everywhere this
+ * file names a members segment file (branch seeding, its reference-compare
+ * path, and the zero-page bootstrap fallback) must pass the convention that
+ * matches THIS build, not assume long names unconditionally -- see the
+ * PG_MULTIXACT_MEMBERS_LONG_NAMES call sites below.
+ *
+ * This is a naming/disk-layout concern only; the members offset space
+ * itself is not given wraparound-aware handling here on 18 (unlike
+ * MultiXactId, which already uses PreviousMultiXactId-style modular
+ * arithmetic throughout) -- pagestore_seed_multixact()'s own oldest_member
+ * > next_member check (a few hundred lines below) already rejects a
+ * wrapped [oldest_member, next_member) range as an error rather than
+ * silently mis-seeding it, so a 32-bit members-offset wraparound on 18
+ * fails closed (branch creation across the wrap is refused) instead of
+ * corrupting data; it is not otherwise supported by this compat pass.
+ */
+#if PG_VERSION_NUM >= 190000
+#define PG_MULTIXACT_MEMBERS_LONG_NAMES true
+#else
+#define PG_MULTIXACT_MEMBERS_LONG_NAMES false
+#endif
+
 PG_MODULE_MAGIC;
 
 void		_PG_init(void);
@@ -254,16 +343,32 @@ pagestore_commit_ts_bounds(bool *active, TransactionId *oldest_xid,
 
 static PlannedStmt *
 pagestore_planner(Query *parse, const char *query_string, int cursor_options,
-				  ParamListInfo bound_params, ExplainState *es)
+				  ParamListInfo bound_params
+#if PG_VERSION_NUM >= 190000
+				  , ExplainState *es
+#endif
+	)
 {
 	PlannedStmt *result;
 	int			saved_max_parallel_workers_per_gather;
 	int			saved_debug_parallel_query;
 
+	/*
+	 * planner_hook_type gained a trailing ExplainState * parameter after
+	 * 18 (an unrelated upstream EXPLAIN-planning change); this function
+	 * never inspects es itself, only forwards it on, so the 18 build just
+	 * drops it from every call along with the parameter above.
+	 */
+#if PG_VERSION_NUM >= 190000
+#define PS_PLANNER_CALL(fn) fn(parse, query_string, cursor_options, bound_params, es)
+#else
+#define PS_PLANNER_CALL(fn) fn(parse, query_string, cursor_options, bound_params)
+#endif
+
 	if (!pagestore_advance_read_lsn)
 		return prev_planner_hook != NULL ?
-			prev_planner_hook(parse, query_string, cursor_options, bound_params, es) :
-			standard_planner(parse, query_string, cursor_options, bound_params, es);
+			PS_PLANNER_CALL(prev_planner_hook) :
+			PS_PLANNER_CALL(standard_planner);
 
 	saved_max_parallel_workers_per_gather = max_parallel_workers_per_gather;
 	saved_debug_parallel_query = debug_parallel_query;
@@ -272,9 +377,10 @@ pagestore_planner(Query *parse, const char *query_string, int cursor_options,
 	PG_TRY();
 	{
 		result = prev_planner_hook != NULL ?
-			prev_planner_hook(parse, query_string, cursor_options, bound_params, es) :
-			standard_planner(parse, query_string, cursor_options, bound_params, es);
+			PS_PLANNER_CALL(prev_planner_hook) :
+			PS_PLANNER_CALL(standard_planner);
 	}
+#undef PS_PLANNER_CALL
 	PG_FINALLY();
 	{
 		max_parallel_workers_per_gather =
@@ -1248,7 +1354,7 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 			{
 				char	   *ferrm;
 
-				first = XLogFindNextRecord((XLogReaderState *) reader, start, &ferrm);
+				first = PS_XLogFindNextRecord((XLogReaderState *) reader, start, &ferrm);
 			}
 			while (!XLogRecPtrIsInvalid(first))
 			{
@@ -3475,7 +3581,9 @@ ps_checkpoint_matches_control(const CheckPoint *record,
 		record->PrevTimeLineID == control->PrevTimeLineID &&
 		record->fullPageWrites == control->fullPageWrites &&
 		record->wal_level == control->wal_level &&
+#if PG_VERSION_NUM >= 190000
 		record->logicalDecodingEnabled == control->logicalDecodingEnabled &&
+#endif
 		FullTransactionIdEquals(record->nextXid, control->nextXid) &&
 		record->nextOid == control->nextOid &&
 		record->nextMulti == control->nextMulti &&
@@ -3487,8 +3595,16 @@ ps_checkpoint_matches_control(const CheckPoint *record,
 		record->time == control->time &&
 		record->oldestCommitTsXid == control->oldestCommitTsXid &&
 		record->newestCommitTsXid == control->newestCommitTsXid &&
-		record->oldestActiveXid == control->oldestActiveXid &&
-		record->dataChecksumState == control->dataChecksumState;
+		record->oldestActiveXid == control->oldestActiveXid
+#if PG_VERSION_NUM >= 190000
+		/*
+		 * dataChecksumState is 19-only (online data checksums; see C3's
+		 * commit message -- the whole feature is absent from this build's
+		 * CheckPoint/ControlFileData, so there is nothing to compare).
+		 */
+		&& record->dataChecksumState == control->dataChecksumState
+#endif
+		;
 }
 
 /*
@@ -3582,7 +3698,7 @@ ps_clog_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 		XLByteToSeg(base_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
 	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
@@ -3874,7 +3990,9 @@ pagestore_control_image_compatible(const ControlFileData *cf, const char *what)
 				 errdetail("The payload needs a PostgreSQL build with that catalog version.")));
 	if (cf->blcksz != BLCKSZ || cf->relseg_size != RELSEG_SIZE ||
 		cf->xlog_blcksz != XLOG_BLCKSZ ||
+#if PG_VERSION_NUM >= 190000
 		cf->slru_pages_per_segment != SLRU_PAGES_PER_SEGMENT ||
+#endif
 		cf->nameDataLen != NAMEDATALEN || cf->indexMaxKeys != INDEX_MAX_KEYS ||
 		cf->toast_max_chunk_size != TOAST_MAX_CHUNK_SIZE ||
 		cf->loblksize != LOBLKSIZE || cf->maxAlign != MAXIMUM_ALIGNOF ||
@@ -3884,13 +4002,18 @@ pagestore_control_image_compatible(const ControlFileData *cf, const char *what)
 				(errmsg("%s: control image layout parameters do not match this build",
 						what),
 				 errdetail("blcksz %u/%u, relseg_size %u/%u, xlog_blcksz %u/%u, "
-						   "slru_pages_per_segment %u/%u, nameDataLen %u/%u, "
+#if PG_VERSION_NUM >= 190000
+						   "slru_pages_per_segment %u/%u, "
+#endif
+						   "nameDataLen %u/%u, "
 						   "indexMaxKeys %u/%u, toast_max_chunk_size %u/%u, "
 						   "loblksize %u/%u, maxAlign %u/%u (image/build).",
 						   cf->blcksz, (unsigned) BLCKSZ,
 						   cf->relseg_size, (unsigned) RELSEG_SIZE,
 						   cf->xlog_blcksz, (unsigned) XLOG_BLCKSZ,
+#if PG_VERSION_NUM >= 190000
 						   cf->slru_pages_per_segment, (unsigned) SLRU_PAGES_PER_SEGMENT,
+#endif
 						   cf->nameDataLen, (unsigned) NAMEDATALEN,
 						   cf->indexMaxKeys, (unsigned) INDEX_MAX_KEYS,
 						   cf->toast_max_chunk_size, (unsigned) TOAST_MAX_CHUNK_SIZE,
@@ -4177,7 +4300,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 		XLByteToSeg(base_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
 	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
@@ -4543,7 +4666,7 @@ ps_mxoff_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 		XLByteToSeg(base_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
 	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
@@ -4601,8 +4724,8 @@ ps_mxoff_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 			 * MultiXactIdToOffsetPage(PreviousMultiXactId(oldestMulti)), keeping
 			 * that page's segment; a page is dropped only if its segment is below
 			 * it.  The bounded fork window cannot wrap, so segment order suffices. */
-			cutoff = (xlrec.oldestMulti == FirstMultiXactId) ? MaxMultiXactId
-				: xlrec.oldestMulti - 1;
+			cutoff = (PS_XLREC_MXTRUNC_OLDEST_MULTI(xlrec) == FirstMultiXactId) ? MaxMultiXactId
+				: PS_XLREC_MXTRUNC_OLDEST_MULTI(xlrec) - 1;
 			if (pageno / SLRU_PAGES_PER_SEGMENT <
 				((int64) cutoff / PS_MXOFF_PER_PAGE) / SLRU_PAGES_PER_SEGMENT)
 				r.page_truncated = true;
@@ -4816,7 +4939,7 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 		XLByteToSeg(base_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
 	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
@@ -4861,7 +4984,7 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
 			if (ps_mxmemb_segment_truncated(pageno / SLRU_PAGES_PER_SEGMENT,
-											xlrec.oldestOffset))
+											PS_XLREC_MXTRUNC_OLDEST_OFFSET(xlrec)))
 				r.page_truncated = true;
 		}
 	}
@@ -5034,7 +5157,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 		XLByteToSeg(base_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	reached_from = readfrom;
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
@@ -5313,7 +5436,7 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 		XLByteToSeg(base_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
 	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
@@ -5381,8 +5504,8 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 			int64		cutoff_seg;
 
 			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
-			cutoff = (xlrec.oldestMulti == FirstMultiXactId) ? MaxMultiXactId
-				: xlrec.oldestMulti - 1;
+			cutoff = (PS_XLREC_MXTRUNC_OLDEST_MULTI(xlrec) == FirstMultiXactId) ? MaxMultiXactId
+				: PS_XLREC_MXTRUNC_OLDEST_MULTI(xlrec) - 1;
 			cutoff_seg = ((int64) cutoff / PS_MXOFF_PER_PAGE) / SLRU_PAGES_PER_SEGMENT;
 			for (int64 p = 0; p < np; p++)
 			{
@@ -5489,7 +5612,7 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 		XLByteToSeg(base_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
 	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
@@ -5552,7 +5675,7 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 				int64		segno = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
 
 				if (ps_mxmemb_segment_truncated(segno,
-												xlrec.oldestOffset))
+												PS_XLREC_MXTRUNC_OLDEST_OFFSET(xlrec)))
 				{
 					present[p] = false;
 					truncated[p] = true;
@@ -6080,7 +6203,7 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 
 		XLByteToSeg(base, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
-		readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+		readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	}
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
@@ -6628,15 +6751,15 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 												mem_page_lo, mem_page_hi,
 												ps_mxmemb_seed_reconstruct_range,
 												base, target, "multixact members", false,
-												true);
+												PG_MULTIXACT_MEMBERS_LONG_NAMES);
 	}
 	else
 	{
 		mem_page_lo = next_member / PS_MXMEMB_PER_PAGE;
 		pagestore_write_zero_slru_page(memdir, "multixact members",
-									   0, true);
+									   0, PG_MULTIXACT_MEMBERS_LONG_NAMES);
 		pagestore_write_zero_slru_page(memdir, "multixact members",
-									   mem_page_lo, true);
+									   mem_page_lo, PG_MULTIXACT_MEMBERS_LONG_NAMES);
 		mem_seeded += (mem_page_lo == 0 ? 1 : 2);
 	}
 	seeded += off_seeded + mem_seeded;
@@ -8577,7 +8700,7 @@ pagestore_reader_mark_completions(XLogRecPtr start_lsn, XLogRecPtr end_lsn,
 		XLByteToSeg(start_lsn, segno, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
 	}
-	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	readfrom = PS_XLogFindNextRecord(reader, readfrom, &errm);
 	if (!XLogRecPtrIsInvalid(readfrom))
 		XLogBeginRead(reader, readfrom);
 	while (!XLogRecPtrIsInvalid(readfrom) &&
