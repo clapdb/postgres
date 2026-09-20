@@ -77,11 +77,57 @@
  * and the MultiXactOffset type this file needs are exposed directly by
  * access/multixact.h.  On 19+, multixact_internal.h pulls in multixact.h
  * itself, so a single guarded include covers both.
+ *
+ * This guard alone does NOT make pagestore_slru.c (or the rest of
+ * contrib/pagestore) compile on 18: see
+ * PG_MAJOR_PORTABILITY.md "contrib/pagestore API-surface gaps" for the full,
+ * compile-verified list (ReplOriginId, XLogFindNextRecord's arity,
+ * xl_multixact_truncate's field names, CHECKPOINT_FAST, PageSetChecksum,
+ * and more, none of them guarded yet) and for GetMultiXactInfo() itself
+ * below, whose oldestMulti/oldestOffset are not exposed by any public API
+ * before 19 -- reading them on 18 needs a small core export, tracked there
+ * as a C4 item for the "PG 18 compatibility guards" follow-up PR (built
+ * from P2's core-patch work), not something contrib can add on its own.
  */
 #if PG_VERSION_NUM >= 190000
 #include "access/multixact_internal.h"
 #else
 #include "access/multixact.h"
+
+/*
+ * MultiXactIdToOffsetPage()/MXOffsetToMemberPage() moved from static
+ * functions in access/transam/multixact.c to public inline functions in
+ * access/multixact_internal.h in the same 19 commit (bb3b1c4f646); the
+ * formula did not change, so this is a verbatim copy of 18's own
+ * multixact.c (MULTIXACT_OFFSETS_PER_PAGE through MULTIXACT_MEMBERS_PER_PAGE),
+ * not a guess -- it must be kept identical to upstream's should either
+ * change again.  Unlike GetMultiXactInfo() below, these are pure arithmetic
+ * over BLCKSZ/MultiXactOffset/TransactionId, so contrib can define them
+ * itself without a core export.
+ */
+#define MULTIXACT_OFFSETS_PER_PAGE (BLCKSZ / sizeof(MultiXactOffset))
+#define MXACT_MEMBER_BITS_PER_XACT			8
+#define MXACT_MEMBER_FLAGS_PER_BYTE			1
+#define MULTIXACT_FLAGBYTES_PER_GROUP		4
+#define MULTIXACT_MEMBERS_PER_MEMBERGROUP	\
+	(MULTIXACT_FLAGBYTES_PER_GROUP * MXACT_MEMBER_FLAGS_PER_BYTE)
+#define MULTIXACT_MEMBERGROUP_SIZE \
+	(sizeof(TransactionId) * MULTIXACT_MEMBERS_PER_MEMBERGROUP + MULTIXACT_FLAGBYTES_PER_GROUP)
+#define MULTIXACT_MEMBERGROUPS_PER_PAGE (BLCKSZ / MULTIXACT_MEMBERGROUP_SIZE)
+#define MULTIXACT_MEMBERS_PER_PAGE	\
+	(MULTIXACT_MEMBERGROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_MEMBERGROUP)
+
+static inline int64
+MultiXactIdToOffsetPage(MultiXactId multi)
+{
+	return multi / MULTIXACT_OFFSETS_PER_PAGE;
+}
+
+static inline int64
+MXOffsetToMemberPage(MultiXactOffset offset)
+{
+	return offset / MULTIXACT_MEMBERS_PER_PAGE;
+}
 #endif
 #include "access/slru.h"
 #include "catalog/pg_control.h"

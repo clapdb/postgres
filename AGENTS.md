@@ -40,20 +40,29 @@ supported `branchdb_N` with `scripts/branchdb-sync.sh`.
 - Every commit on `pagestore` that is meant to be forwarded to a
   `branchdb_N` core-patch series (as opposed to a `contrib/pagestore`-only
   commit, which travels through `sync-contrib`'s tree copy instead) must
-  carry a `Branchdb-Series: C<n>` trailer (`C1`–`C7`; see the V4 plan for
-  what each series covers) in its commit message. `scripts/branchdb-sync.sh
-  forward <FROM> <TO>` selects commits mechanically by this trailer and
-  refuses (rather than silently doing nothing, or falling back to the raw
-  commit range) when none carry it — which is the case for `pagestore`'s
-  history as of this PR; a later PR adds the trailers when the core series
-  is squashed into C1–C7 for the first `branchdb_18` sync.
+  carry a `Branchdb-Series: C<n>` trailer (`C1`–`C7`; see
+  `contrib/pagestore/PG_MAJOR_PORTABILITY.md` for the table of what each
+  series covers and its source commits) in its commit message.
+  `scripts/branchdb-sync.sh forward <FROM> <TO>` selects commits
+  mechanically by this trailer and refuses (rather than silently doing
+  nothing, or falling back to the raw commit range) when none carry it —
+  which is the case for `pagestore`'s history as of this PR; a later PR
+  adds the trailers when the core series is squashed into C1–C7 for the
+  first `branchdb_18` sync.
 - `contrib/pagestore` must be **byte-identical** between `pagestore` and
   every `branchdb_N`: version differences live inside the tree behind
-  `#if PG_VERSION_NUM` guards (today just one, in `pagestore_slru.c`, for the
-  19-only `access/multixact_internal.h`), landed on `pagestore` first, so a
-  release branch's contrib sync is a mechanical tree copy
-  (`scripts/branchdb-sync.sh sync-contrib <branch> <pagestore SHA>`),
-  verifiable with `scripts/branchdb-sync.sh verify <branch> <SHA>`.
+  `#if PG_VERSION_NUM` guards, landed on `pagestore` first, so a release
+  branch's contrib sync is a mechanical tree copy (`scripts/branchdb-sync.sh
+  sync-contrib <branch> <pagestore SHA>`), verifiable with
+  `scripts/branchdb-sync.sh verify <branch> <SHA>`. Today there is exactly
+  one such guard (`pagestore_slru.c`'s 19-only `access/multixact_internal.h`
+  include) — **that alone does not make `contrib/pagestore` build on 18**;
+  `PG_MAJOR_PORTABILITY.md` tracks the full, compile-verified list of
+  version-specific API usage still needing a guard (`ReplOriginId`,
+  `XLogFindNextRecord`'s arity, `CHECKPOINT_FAST`, and more), closed by a
+  separate "PG 18 compatibility guards" PR built from P2's work, landed on
+  `pagestore` before `branchdb_18-rc`'s `sync-contrib` can copy a tree that
+  actually compiles.
 - A PR against a `branchdb_N` branch may only contain: `Branchdb-Series:`
   cherry-picks from `pagestore` (via `forward`), a `sync-contrib` commit, a
   `minor` rebase, or a `ci:`/`docs:`/`fixtures:`-prefixed commit; merges are
