@@ -84,6 +84,25 @@
 #include "access/multixact.h"
 #endif
 #include "access/slru.h"
+
+/*
+ * PG 18's SLRU control struct (SlruCtlData, typedef'd SlruCtl) keeps Dir,
+ * long_segment_names and PagePrecedes directly on the struct; 19 renamed
+ * the type to SlruDesc and moved those three fields into a nested
+ * `options` sub-struct (an unrelated upstream refactor that landed on
+ * pagestore's tracked upstream, not part of this branch's core patch
+ * series -- see C4's commit message). Alias the type and shim the
+ * accessor so the rest of this file -- a byte-for-byte copy of
+ * pagestore's 19-shaped source -- needs no further per-site rewrite, and
+ * this block disappears (dead code, `#if 0`-equivalent) on 19.
+ */
+#if PG_VERSION_NUM < 190000
+typedef SlruCtlData SlruDesc;
+#define PS_SLRU_OPT(ctl) (*(ctl))
+#else
+#define PS_SLRU_OPT(ctl) ((ctl)->options)
+#endif
+
 #include "catalog/pg_control.h"
 #include "pagestore_artifact_format.h"
 #include "common/controldata_utils.h"
@@ -2140,7 +2159,7 @@ ps_slru_tomb_covers(SlruDesc *ctl, int64 pageno, int64 cutoff)
 		return false;
 	if (cutoff == PG_INT64_MAX)
 		return true;
-	return ctl->options.PagePrecedes(pageno, cutoff);
+	return PS_SLRU_OPT(ctl).PagePrecedes(pageno, cutoff);
 }
 
 /*
@@ -2157,10 +2176,10 @@ ps_slru_local_segment_exists(SlruDesc *ctl, int64 pageno)
 	int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
 	struct stat st;
 
-	if (ctl->options.long_segment_names)
-		snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->options.Dir, segno);
+	if (PS_SLRU_OPT(ctl).long_segment_names)
+		snprintf(path, MAXPGPATH, "%s/%015" PRIX64, PS_SLRU_OPT(ctl).Dir, segno);
 	else
-		snprintf(path, MAXPGPATH, "%s/%04X", ctl->options.Dir,
+		snprintf(path, MAXPGPATH, "%s/%04X", PS_SLRU_OPT(ctl).Dir,
 				 (unsigned int) segno);
 	return stat(path, &st) == 0;
 }
@@ -2173,10 +2192,10 @@ ps_slru_local_page_exists(SlruDesc *ctl, int64 pageno)
 	int			rpageno = (int) (pageno % SLRU_PAGES_PER_SEGMENT);
 	struct stat st;
 
-	if (ctl->options.long_segment_names)
-		snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->options.Dir, segno);
+	if (PS_SLRU_OPT(ctl).long_segment_names)
+		snprintf(path, MAXPGPATH, "%s/%015" PRIX64, PS_SLRU_OPT(ctl).Dir, segno);
 	else
-		snprintf(path, MAXPGPATH, "%s/%04X", ctl->options.Dir,
+		snprintf(path, MAXPGPATH, "%s/%04X", PS_SLRU_OPT(ctl).Dir,
 				 (unsigned int) segno);
 	return stat(path, &st) == 0 && st.st_size >= (off_t) (rpageno + 1) * BLCKSZ;
 }
@@ -2210,7 +2229,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		res = SLRU_READ_HOOK_FALLBACK;
 	}
 
-	idx = ps_slru_dir_index(ctl->options.Dir);
+	idx = ps_slru_dir_index(PS_SLRU_OPT(ctl).Dir);
 	if (idx < 0)
 		return SLRU_READ_HOOK_FALLBACK;
 	obj = ps_slru_dirmap[idx].obj;
@@ -2552,7 +2571,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		res = SLRU_READ_HOOK_FALLBACK;
 	}
 
-	idx = ps_slru_dir_index(ctl->options.Dir);
+	idx = ps_slru_dir_index(PS_SLRU_OPT(ctl).Dir);
 	if (idx < 0)
 		return SLRU_READ_HOOK_FALLBACK;
 	obj = ps_slru_dirmap[idx].obj;
@@ -2788,7 +2807,7 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 		!(*prev_slru_page_revalidate_hook) (ctl, pageno))
 		return false;
 
-	idx = ps_slru_dir_index(ctl->options.Dir);
+	idx = ps_slru_dir_index(PS_SLRU_OPT(ctl).Dir);
 	if (idx < 0)
 		return true;
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
@@ -3091,7 +3110,7 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 	if (prev_slru_truncate_hook)
 		(*prev_slru_truncate_hook) (ctl, cutoffPage, lsn);
 
-	idx = ps_slru_dir_index(ctl->options.Dir);
+	idx = ps_slru_dir_index(PS_SLRU_OPT(ctl).Dir);
 	if (idx < 0)
 		return;					/* out-of-scope SLRU: not mirrored */
 	obj = ps_slru_dirmap[idx].obj;
@@ -3345,7 +3364,7 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	if (prev_slru_page_write_hook)
 		prev_slru_page_write_hook(ctl, pageno, page, fence_lsn);
 
-	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
+	if (!ps_slru_dir_obj(PS_SLRU_OPT(ctl).Dir, &obj))
 		return;					/* out-of-scope SLRU: excluded, not mirrored */
 
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
@@ -3521,10 +3540,10 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 		ssize_t		n = -1;
 		bool		resident = false;
 
-		if (ctl->options.long_segment_names)
-			snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->options.Dir, segno);
+		if (PS_SLRU_OPT(ctl).long_segment_names)
+			snprintf(path, MAXPGPATH, "%s/%015" PRIX64, PS_SLRU_OPT(ctl).Dir, segno);
 		else
-			snprintf(path, MAXPGPATH, "%s/%04X", ctl->options.Dir,
+			snprintf(path, MAXPGPATH, "%s/%04X", PS_SLRU_OPT(ctl).Dir,
 					 (unsigned int) segno);
 
 		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -3683,7 +3702,7 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		 * One store lookup per SLRU per pass; a failed lookup just defers
 		 * the decision to the next drain.
 		 */
-		idx = ps_slru_dir_index(r->ctl->options.Dir);
+		idx = ps_slru_dir_index(PS_SLRU_OPT(r->ctl).Dir);
 
 		/*
 		 * pg_commit_ts recaptures additionally hold CommitTsLock (shared)

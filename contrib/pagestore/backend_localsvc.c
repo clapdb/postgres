@@ -2208,9 +2208,23 @@ ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
 		case T_ReindexStmt:
 			deny = "REINDEX";
 			break;
+#if PG_VERSION_NUM >= 190000
 		case T_RepackStmt:		/* REPACK (and its CLUSTER/VACUUM FULL legacy forms) */
 			deny = "REPACK";
 			break;
+#endif
+		/*
+		 * Before 19, REPACK does not exist (T_RepackStmt is a later
+		 * upstream unification of CLUSTER and VACUUM FULL, absent from
+		 * this build's nodetags.h) -- there is no case here for its 18
+		 * predecessor, T_ClusterStmt.  This switch is only a friendly,
+		 * early ERROR: any write-WAL utility that slips past it still hits
+		 * the wal_insert_restricted backstop below (xlog.c, C5) and PANICs
+		 * rather than executing, so the pinned-reader read-only guarantee
+		 * holds either way -- CLUSTER on 18 just gets the worse (PANIC)
+		 * failure mode instead of a clean ERROR here.  Left as a known gap
+		 * rather than inventing new deny-list design in this compat pass.
+		 */
 		case T_CopyStmt:
 			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
 				deny = "COPY FROM";
