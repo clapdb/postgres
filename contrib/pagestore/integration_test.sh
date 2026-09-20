@@ -57,6 +57,15 @@ if [ -d /dev/shm ]; then
 else
 	SHM_PATH="/tmp/pagestore-shm-$(id -u)/${SHM#/}"
 fi
+remove_test_shm() {
+    # Reuse the harness's fd-relative cleanup and private-directory validation.
+    python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from pagestore_harness import remove_shm
+remove_shm(sys.argv[2])
+' "$SCRIPT_DIR/harness" "$SHM"
+}
 # GNU/BSD userland shims.
 if ! command -v md5sum >/dev/null 2>&1; then
 	md5sum() { if [ $# -eq 0 ]; then md5 -q; else md5 -q "$1"; fi; }
@@ -186,14 +195,14 @@ cleanup() {
 		"${ADVANCINGDATA:+$(dirname "$ADVANCINGDATA")}" \
 		"${BADREADER:+$(dirname "$BADREADER")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}" "$SOCKROOT"
-	rm -f "$SHM_PATH"
+	remove_test_shm || exit 1
 }
 trap cleanup EXIT
 
 mkdir -p "$TS"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
-rm -f "$SHM_PATH"
+remove_test_shm || exit 1
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
 wait_daemon_ready
@@ -414,7 +423,7 @@ rm -f "$history_out"
 # exhaust the daemon's shared-memory mailboxes.
 missing_out=$(mktemp)
 walrestore_reuse_ok=1
-for _ in $(seq 1 160); do
+for ((iteration = 0; iteration < 160; iteration++)); do
 	rm -f "$missing_out"
 	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
 		--timeline 0 --incarnation 1 --segsize 16777216 FFFFFFFFFFFFFFFFFFFFFFFF \
@@ -438,7 +447,7 @@ wait_walidx_visible() {
 	local rel=$1
 	local count=0
 
-	for i in $(seq 1 200); do
+	for ((i = 1; i <= 200; i++)); do
 		count=$($P -c "SELECT pagestore_walidx_count('$rel', 0, 0);")
 		[ "${count:-0}" -gt 0 ] && return 0
 		sleep 0.1
@@ -454,7 +463,7 @@ $P -c "SELECT pg_switch_wal();" >/dev/null
 widx=0
 # Earlier sections intentionally leave about 50 MB of shipped WAL ahead of
 # this table.  Batched index publication must consume that backlog promptly.
-for i in $(seq 1 200); do
+for ((i = 1; i <= 200; i++)); do
 	widx=$($P -c "SELECT pagestore_walidx_count('widx', 0, 0);")
 	[ "${widx:-0}" -gt 0 ] && break
 	sleep 0.1
@@ -473,7 +482,7 @@ $P -c "CREATE TABLE widx_resume(id int) TABLESPACE ts;
        INSERT INTO widx_resume SELECT generate_series(1,1000);
        SELECT pg_switch_wal();" >/dev/null
 widx_resume=0
-for i in $(seq 1 200); do
+for ((i = 1; i <= 200; i++)); do
 	widx_resume=$($P -c "SELECT pagestore_walidx_count('widx_resume', 0, 0);")
 	[ "${widx_resume:-0}" -gt 0 ] && break
 	sleep 0.1
@@ -604,7 +613,7 @@ assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's
 # unlike a shared-daemon test where prior writes could push these into a layer.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach the engine before restarting the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
-rm -f "$SHM_PATH"
+remove_test_shm || exit 1
 # Never flush: the crash-recovery rows must remain segment-log-only.
 "$DAEMON" --shm "$SHM" --store "$STORE" --flush-pages 100000000 \
 	>>"$DATA/daemon.log" 2>&1 &
@@ -616,7 +625,7 @@ $P -c "CREATE TABLE crash(id int, v text) TABLESPACE ts;
 crash_ck=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach before crashing the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null      # crash: no ps_core_close() -> memtable lost
-rm -f "$SHM_PATH"
+remove_test_shm || exit 1
 # Restart and rebuild the index from the segment log.
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
@@ -1113,7 +1122,7 @@ mxlocker=$!
 # wait until A actually holds the ROW lock -- its xid lands in the tuple's xmax -- rather
 # than a fixed sleep (or a relation-level RowShareLock that is taken before the tuple lock),
 # so a slow host can't let B lock and commit the row alone
-for _ in $(seq 1 100); do
+for ((iteration = 0; iteration < 100; iteration++)); do
 	[ "$($P -c "SELECT (xmax <> '0'::xid)::int FROM mx WHERE id=1;" 2>/dev/null)" = "1" ] && break
 	sleep 0.1
 done
@@ -1669,7 +1678,7 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
 READER_SUBXID_SQL=$(mktemp)
 {
 	printf 'BEGIN; INSERT INTO reader_running VALUES (1);\n'
-	for _ in $(seq 1 20000); do
+	for ((iteration = 0; iteration < 20000; iteration++)); do
 		printf 'SAVEPOINT s; INSERT INTO reader_subxid VALUES (1); RELEASE SAVEPOINT s;\n'
 	done
 	printf "PREPARE TRANSACTION 'reader_running_at_r';\n"
@@ -2246,7 +2255,7 @@ advancingRestore=$("$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$
 # that would collide on the data directory lock.
 advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1) || {
 	advancingReady=0
-	for _ in $(seq 60); do
+	for ((iteration = 0; iteration < 60; iteration++)); do
 		if "$BIN/pg_ctl" -D "$ADVANCINGDATA" status >/dev/null 2>&1 &&
 			$PR -c "SELECT 1;" >/dev/null 2>&1; then
 			advancingReady=1
@@ -2340,7 +2349,7 @@ assert "$?" "0" "database artifacts exist before DROP DATABASE"
 $P -v ON_ERROR_STOP=1 -c "DROP DATABASE reader_aux;" >/dev/null
 $P -v ON_ERROR_STOP=1 -c "CHECKPOINT;" >/dev/null
 artifact_dropped=0
-for _ in $(seq 1 60); do
+for ((iteration = 0; iteration < 60; iteration++)); do
 	if "$artifact_probe" --reader-artifacts "$SHM" "$artifact_db_oid" latest absent >/dev/null; then
 		artifact_dropped=1
 		break
@@ -2396,7 +2405,7 @@ assert "$(grep -c 'reason=storage failure' "$DATA/daemon.log" 2>/dev/null || tru
 [ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 [ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null	# clean shutdown: ps_core_close() runs
-rm -f "$SHM_PATH"
+remove_test_shm || exit 1
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
 if daemon_shm_ready; then

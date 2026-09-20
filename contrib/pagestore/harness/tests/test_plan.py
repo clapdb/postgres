@@ -52,6 +52,54 @@ CAPABILITIES = {
 
 
 class PlanValidationTests(unittest.TestCase):
+    def test_darwin_shm_cleanup_rejects_replaced_or_public_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            victim = private / "segment"
+            victim.write_text("keep")
+            link = root / "link"
+            link.symlink_to(private, target_is_directory=True)
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(MODULE, "shm_backing_path", return_value=link / "segment"),
+            ):
+                with self.assertRaises(OSError):
+                    MODULE.remove_shm("/segment")
+            self.assertTrue(victim.exists())
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(MODULE, "shm_backing_path", return_value=victim),
+            ):
+                private.chmod(0o777)
+                with self.assertRaises(PermissionError):
+                    MODULE.remove_shm("/segment")
+                self.assertTrue(victim.exists())
+                private.chmod(0o700)
+                MODULE.remove_shm("/segment")
+                self.assertFalse(victim.exists())
+                MODULE.remove_shm("/segment")  # Missing objects are harmless.
+
+    def test_darwin_shm_cleanup_rejects_foreign_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "segment"
+            path.write_text("keep")
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(MODULE, "shm_backing_path", return_value=path),
+                mock.patch.object(MODULE.os, "getuid", return_value=os.getuid() + 1),
+            ):
+                with self.assertRaises(PermissionError):
+                    MODULE.remove_shm("/segment")
+            self.assertTrue(path.exists())
+
+    def test_darwin_shm_names_cannot_escape_directory(self):
+        for name in ("", "/", ".", "..", "/..", "a" * 256):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                MODULE.shm_backing_path(name)
+        self.assertEqual(MODULE.shm_backing_path("/a/b").name, "a_b")
+
     def write_plan(self, records):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

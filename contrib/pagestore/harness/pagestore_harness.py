@@ -1620,10 +1620,26 @@ def remove_shm(shm: str) -> None:
     if sys.platform == "darwin":
         # pagestore_shm.h backs the segment with a regular file; no POSIX shm
         # object exists, so this must run before the shm_unlink early returns.
+        path = shm_backing_path(shm)
         try:
-            shm_backing_path(shm).unlink()
+            directory = os.open(
+                path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
         except FileNotFoundError:
-            pass
+            return
+        try:
+            info = os.fstat(directory)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) & 0o077):
+                raise PermissionError("shared-memory backing directory must be private and uid-owned")
+            # Anchor unlink to the verified directory, matching ps_shm_unlink.
+            # unlink does not follow a symlink in the final name.
+            try:
+                os.unlink(path.name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(directory)
         return
     try:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -1646,7 +1662,10 @@ def remove_shm(shm: str) -> None:
 
 def shm_backing_path(shm: str) -> Path:
     """The macOS backing file for a shm name (see pagestore_shm.h)."""
-    return Path(f"/tmp/pagestore-shm-{os.getuid()}") / shm.removeprefix("/").replace("/", "_")
+    name = shm.removeprefix("/").replace("/", "_")
+    if not name or name in {".", ".."} or len(os.fsencode(name)) >= 256:
+        raise ValueError("invalid shared-memory name")
+    return Path(f"/tmp/pagestore-shm-{os.getuid()}") / name
 
 
 def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:

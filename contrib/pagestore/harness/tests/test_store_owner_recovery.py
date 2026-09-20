@@ -61,6 +61,12 @@ def private_environment() -> dict[str, str]:
 
 def shm_unlink(name: str) -> None:
     """Remove a POSIX shm object without depending on /dev/shm layout."""
+    if sys.platform == "darwin":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from pagestore_harness import remove_shm
+
+        remove_shm(name)
+        return
     libc = ctypes.CDLL(None, use_errno=True)
     unlink = libc.shm_unlink
     unlink.argtypes = [ctypes.c_char_p]
@@ -69,13 +75,6 @@ def shm_unlink(name: str) -> None:
         error = ctypes.get_errno()
         if error != errno.ENOENT:
             raise OSError(error, os.strerror(error), name)
-    if sys.platform == "darwin":
-        # pagestore_shm.h backs the segment with a regular file on macOS.
-        backing = Path(f"/tmp/pagestore-shm-{os.getuid()}") / name.removeprefix("/")
-        try:
-            backing.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def next_shm_name() -> str:
