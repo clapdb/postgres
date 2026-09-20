@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "supported": [
+    {
+      "major": 19,
+      "branch": "branchdb_19",
+      "status": "planned",
+      "base_tag": null,
+      "contrib_sha": null
+    },
+    {
+      "major": 18,
+      "branch": "branchdb_18",
+      "status": "planned",
+      "base_tag": null,
+      "contrib_sha": null
+    },
+    {
+      "major": 17,
+      "branch": "branchdb_17",
+      "status": "planned",
+      "base_tag": null,
+      "contrib_sha": null
+    },
+    {
+      "major": 16,
+      "branch": "branchdb_16",
+      "status": "planned",
+      "base_tag": null,
+      "contrib_sha": null
+    },
+    {
+      "major": 15,
+      "branch": "branchdb_15",
+      "status": "planned",
+      "base_tag": null,
+      "contrib_sha": null
+    }
+  ],
+  "unsupported": [
+    {
+      "major": 14,
+      "branch": "branchdb_14",
+      "reason": "upstream EOL 2026-11-12; no release evidence"
+    },
+    {
+      "major": 13,
+      "branch": "branchdb_13",
+      "reason": "upstream EOL 2025-11-13; no release evidence"
+    }
+  ]
+}

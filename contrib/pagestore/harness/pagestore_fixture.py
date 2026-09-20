@@ -736,11 +736,14 @@ def wait_for_forkmeta_cutover(store: Path, timeout: float) -> None:
 
 def capture(args: argparse.Namespace) -> int:
     fixture = args.capture
-    # posix-timeline-delete-holes seeds an extra deleted-branch scenario in
-    # the extension phase (fixture_extend_holes() in
+    # posix-timeline-delete-holes (and its per-PostgreSQL-release variants,
+    # e.g. posix-timeline-delete-holes-pg18) seeds an extra deleted-branch
+    # scenario in the extension phase (fixture_extend_holes() in
     # pagestore_gc_crash_client.c), so its target records stay above the
-    # flush watermark in the archived store (invariant I3's D5 note).
-    holes = fixture.name == "posix-timeline-delete-holes"
+    # flush watermark in the archived store (invariant I3's D5 note).  Match
+    # by prefix so a release recapture under a suffixed directory name still
+    # gets the extra workload.
+    holes = fixture.name.startswith("posix-timeline-delete-holes")
     fixture.mkdir(parents=True, exist_ok=True)
     # the shipped WAL is stamped with the capturing build's page magic and
     # block size, so the fixture is one that build loads; without a build
@@ -879,7 +882,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                  metadata: dict[str, Any],
                  identities: list[dict[str, Any]] | None) -> None:
     store = root / "reopen"
-    holes = fixture.name == "posix-timeline-delete-holes"
+    holes = fixture.name.startswith("posix-timeline-delete-holes")
     extract(fixture, store)
     if identities is not None:
         check_segment_formats(store, identities)
@@ -913,7 +916,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
 def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict[str, Any],
                  metadata: dict[str, Any]) -> str:
     store = root / "mutations" / case["name"]
-    holes = fixture.name == "posix-timeline-delete-holes"
+    holes = fixture.name.startswith("posix-timeline-delete-holes")
     extract(fixture, store)
     case["apply"](first_match(store, case["pattern"]))
     log = root / "mutations" / f"{case['name']}.daemon.log"

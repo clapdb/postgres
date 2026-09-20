@@ -2,11 +2,19 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+
+# The PGDATA "PG_VERSION" marker file this test seeds only has to exist and
+# hold a plausible major (the supervisor checks presence, not content -- see
+# pagestore_materializer_supervisor.py's provisioning check); read the real
+# build's major from the environment (the meson test wrapper sets it) so a
+# release-branch run stays honest instead of always claiming 19.
+PG_MAJOR = os.environ.get("PG_MAJORVERSION") or "19"
 
 PAGESTORE_ROOT = Path(__file__).resolve().parents[2]
 # the supervisor imports pagestore_artifact_schema from beside itself
@@ -28,7 +36,7 @@ class SupervisorTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.data = self.root / "data"
         self.data.mkdir()
-        (self.data / "PG_VERSION").write_text("19\n", encoding="utf-8")
+        (self.data / "PG_VERSION").write_text(f"{PG_MAJOR}\n", encoding="utf-8")
 
     def config_value(self, **overrides):
         value = {
@@ -138,7 +146,7 @@ class SupervisorTests(unittest.TestCase):
         first = MODULE.Config.load(self.write_config())
         clone = self.root / "clone"
         clone.mkdir()
-        (clone / "PG_VERSION").write_text("19\n", encoding="utf-8")
+        (clone / "PG_VERSION").write_text(f"{PG_MAJOR}\n", encoding="utf-8")
         second = MODULE.Config.load(self.write_config(
             data_dir=str(clone), state_dir=str(self.root / "clone-state")
         ))
@@ -238,7 +246,7 @@ class SupervisorTests(unittest.TestCase):
         )
         clone = self.root / "clone"
         clone.mkdir()
-        (clone / "PG_VERSION").write_text("19\n", encoding="utf-8")
+        (clone / "PG_VERSION").write_text(f"{PG_MAJOR}\n", encoding="utf-8")
         second = MODULE.Config.load(self.write_config(data_dir=str(clone)))
 
         class TakeoverSupervisor(MODULE.Supervisor):

@@ -13,6 +13,13 @@ from unittest import mock
 from pathlib import Path
 
 
+# The PGDATA "PG_VERSION" marker file this test seeds only has to exist (the
+# tool checks presence, not content -- see pagestore_branch_prepare.py's
+# provisioning check); read the real build's major from the environment (the
+# meson test wrapper sets it) so a release-branch run stays honest instead of
+# always claiming 19.
+PG_MAJOR = os.environ.get("PG_MAJORVERSION") or "19"
+
 PAGESTORE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PAGESTORE_ROOT))
 SPEC = importlib.util.spec_from_file_location(
@@ -34,8 +41,8 @@ class BranchPrepareTests(unittest.TestCase):
         self.materializer = self.root / "materializer"
         self.writer.mkdir()
         self.materializer.mkdir()
-        (self.writer / "PG_VERSION").write_text("19\n", encoding="utf-8")
-        (self.materializer / "PG_VERSION").write_text("19\n", encoding="utf-8")
+        (self.writer / "PG_VERSION").write_text(f"{PG_MAJOR}\n", encoding="utf-8")
+        (self.materializer / "PG_VERSION").write_text(f"{PG_MAJOR}\n", encoding="utf-8")
 
     def config_value(self, **overrides):
         value = {
