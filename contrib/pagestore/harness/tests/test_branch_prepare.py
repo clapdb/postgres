@@ -55,12 +55,17 @@ class BranchPrepareTests(unittest.TestCase):
         link = source / "link"
         link.symlink_to(target, target_is_directory=True)
         original_lstat = os.lstat
+        foreign_source_owner = False
 
         def root_owned_link(path):
             info = original_lstat(path)
             if Path(path) == link:
                 fields = list(info)
                 fields[4] = 0
+                return os.stat_result(fields)
+            if Path(path) == source and foreign_source_owner:
+                fields = list(info)
+                fields[4] = os.geteuid() + 1
                 return os.stat_result(fields)
             return info
 
@@ -75,6 +80,10 @@ class BranchPrepareTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ConfigError, "parent must"):
                 MODULE.validate_authority_path(link / "authority")
             target.chmod(0o700)
+            source.chmod(0o755)
+            foreign_source_owner = True
+            with self.assertRaisesRegex(MODULE.ConfigError, "owned by root or this user"):
+                MODULE.validate_authority_path(link / "authority")
 
     def config_value(self, **overrides):
         value = {

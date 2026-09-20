@@ -75,6 +75,12 @@ def validate_authority_path(authority_dir: Path) -> os.stat_result:
             raise ConfigError(
                 "retention_authority_dir ancestry must contain only directories"
             )
+        # A directory owner can replace its entries or chmod it regardless
+        # of group/world mode bits, even when the entry is root-owned.
+        if component_stat.st_uid not in {0, effective_uid}:
+            raise ConfigError(
+                "retention_authority_dir ancestry must be owned by root or this user"
+            )
         writable = component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         sticky = component_stat.st_mode & stat.S_ISVTX
         if immediate and (
