@@ -109,7 +109,12 @@
 /* We need four bytes per offset */
 #define MULTIXACT_OFFSETS_PER_PAGE (BLCKSZ / sizeof(MultiXactOffset))
 
-static inline int64
+/*
+ * Not static: exported via access/multixact.h for contrib/pagestore's
+ * store-backed SLRU mirror on 18 (19 exposes the equivalent via
+ * access/multixact_internal.h).  See that header's comment.
+ */
+int64
 MultiXactIdToOffsetPage(MultiXactId multi)
 {
 	return multi / MULTIXACT_OFFSETS_PER_PAGE;
@@ -168,8 +173,11 @@ MultiXactIdToOffsetSegment(MultiXactId multi)
 #define MAX_MEMBERS_IN_LAST_MEMBERS_PAGE \
 		((uint32) ((0xFFFFFFFF % MULTIXACT_MEMBERS_PER_PAGE) + 1))
 
-/* page in which a member is to be found */
-static inline int64
+/*
+ * page in which a member is to be found.  Not static: see
+ * MultiXactIdToOffsetPage()'s comment above.
+ */
+int64
 MXOffsetToMemberPage(MultiXactOffset offset)
 {
 	return offset / MULTIXACT_MEMBERS_PER_PAGE;
@@ -459,7 +467,7 @@ static bool MultiXactOffsetWouldWrap(MultiXactOffset boundary,
 static bool SetOffsetVacuumLimit(bool is_startup);
 static bool find_multixact_start(MultiXactId multi, MultiXactOffset *result);
 static void WriteMZeroPageXlogRec(int64 pageno, uint8 info);
-static void WriteMTruncateXlogRec(Oid oldestMultiDB,
+static XLogRecPtr WriteMTruncateXlogRec(Oid oldestMultiDB,
 								  MultiXactId startTruncOff,
 								  MultiXactId endTruncOff,
 								  MultiXactOffset startTruncMemb,
@@ -3120,6 +3128,42 @@ ReadMultiXactCounts(uint32 *multixacts, MultiXactOffset *members)
 }
 
 /*
+ * GetMultiXactInfo
+ *
+ * Returns information about the current MultiXact state, as of:
+ * multixacts: Number of MultiXacts (nextMultiXactId - oldestMultiXactId)
+ * nextOffset: Next-to-be-assigned offset
+ * oldestMultiXactId: Oldest MultiXact ID still in use
+ * oldestOffset: Oldest offset still in use
+ *
+ * Not static, and not layered on ReadMultiXactCounts(): exported via
+ * access/multixact.h for contrib/pagestore's store-backed SLRU mirror on
+ * 18, matching the shape upstream gives it in 19+ (access/
+ * multixact_internal.h) exactly -- including that it does not gate on
+ * oldestOffsetKnown the way ReadMultiXactCounts() does.  A caller during
+ * the narrow startup window before oldestOffsetKnown is set gets
+ * oldestOffset's zero-initialized value, which a page/segment cutoff
+ * computed from it treats as "nothing is prunable yet" -- conservative,
+ * matching this file's own SLRU_ON_STORE_DESIGN.md "fail conservative"
+ * rule for a caller that cannot determine coverage.
+ */
+void
+GetMultiXactInfo(uint32 *multixacts, MultiXactOffset *nextOffset,
+				 MultiXactId *oldestMultiXactId, MultiXactOffset *oldestOffset)
+{
+	MultiXactId nextMultiXactId;
+
+	LWLockAcquire(MultiXactGenLock, LW_SHARED);
+	*nextOffset = MultiXactState->nextOffset;
+	*oldestMultiXactId = MultiXactState->oldestMultiXactId;
+	nextMultiXactId = MultiXactState->nextMXact;
+	*oldestOffset = MultiXactState->oldestOffset;
+	LWLockRelease(MultiXactGenLock);
+
+	*multixacts = nextMultiXactId - *oldestMultiXactId;
+}
+
+/*
  * Multixact members can be removed once the multixacts that refer to them
  * are older than every datminmxid.  autovacuum_multixact_freeze_max_age and
  * vacuum_multixact_freeze_table_age work together to make sure we never have
@@ -3280,6 +3324,7 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	MultiXactOffset nextOffset;
 	mxtruncinfo trunc;
 	MultiXactId earliest;
+	XLogRecPtr	trunc_lsn;
 
 	Assert(!RecoveryInProgress());
 	Assert(MultiXactState->finishedStartup);
@@ -3409,26 +3454,80 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 		 MXOffsetToMemberSegment(newOldestOffset));
 
 	/*
-	 * Do truncation, and the WAL logging of the truncation, in a critical
-	 * section. That way offsets/members cannot get out of sync anymore, i.e.
-	 * once consistent the newOldestMulti will always exist in members, even
-	 * if we crashed in the wrong moment.
-	 */
-	START_CRIT_SECTION();
-
-	/*
 	 * Prevent checkpoints from being scheduled concurrently. This is critical
 	 * because otherwise a truncation record might not be replayed after a
 	 * crash/basebackup, even though the state of the data directory would
-	 * require it.
+	 * require it.  Taken before the WAL record below (rather than inside the
+	 * critical section, as before the page-store barrier existed) because
+	 * the record is now separated from the truncation by the barrier.
 	 */
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
-	/* WAL log truncation */
-	WriteMTruncateXlogRec(newOldestMultiDB,
-						  oldestMulti, newOldestMulti,
-						  oldestOffset, newOldestOffset);
+	/*
+	 * WAL-log the truncation before the page-store barrier, so the barrier
+	 * can version its tombstone by the exact truncate record -- a sampled
+	 * pre-record position would let as-of readers between the two see a
+	 * tombstone whose WAL history holds no truncation, and a crash after a
+	 * synced tombstone but before the record would leave a durable tombstone
+	 * ahead of the replayed WAL, killing still-live pages (TruncateCLOG and
+	 * TruncateCommitTs order theirs the same way).
+	 *
+	 * The barrier runs BEFORE entering the critical section: the hook may
+	 * perform synchronous store I/O and may raise an error, both
+	 * unacceptable once critical (an ERROR there escalates to PANIC).  An
+	 * error here abandons the local truncation with nothing removed yet --
+	 * retried by a later vacuum, like any other truncate failure; the
+	 * truncate record is already out, but replaying it re-runs this
+	 * barrier.  PerformOffsetsTruncation()'s own SimpleLruTruncate() call
+	 * below invokes the hook again with the same offsets cutoff, by then
+	 * inside the critical section; the hook sees it already covered and
+	 * reduces to a no-op.  Members truncation has no single-cutoff
+	 * equivalent (PerformMembersTruncation() deletes whole segments via
+	 * SlruDeleteSegment(), which runs its own pre-deletion barrier call
+	 * inside the critical section and must tolerate that per its contract).
+	 * The checkpoint-delay flag must not leak if the record insertion or the
+	 * barrier throws, so both sit inside the same cleanup scope.
+	 */
+	PG_TRY();
+	{
+		int64		offsetCutoff = MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti));
+		bool		offset_ok = false;
+
+		/*
+		 * See TruncateCLOG: no flush/barrier for a cutoff whose truncation
+		 * SimpleLruTruncate()'s wraparound backstop is going to refuse.
+		 */
+		if (slru_truncate_hook)
+		{
+			offset_ok = !MultiXactOffsetCtl->PagePrecedes(pg_atomic_read_u64(&MultiXactOffsetCtl->shared->latest_page_number),
+														  offsetCutoff);
+			if (offset_ok)
+				SimpleLruFlushCutoff(MultiXactOffsetCtl, offsetCutoff);
+		}
+
+		trunc_lsn = WriteMTruncateXlogRec(newOldestMultiDB,
+										  oldestMulti, newOldestMulti,
+										  oldestOffset, newOldestOffset);
+
+		if (offset_ok)
+			(*slru_truncate_hook) (MultiXactOffsetCtl, offsetCutoff,
+								   trunc_lsn);
+	}
+	PG_CATCH();
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/*
+	 * Do the truncation in a critical section.  That way offsets/members
+	 * cannot get out of sync anymore, i.e. once consistent the
+	 * newOldestMulti will always exist in members, even if we crashed in
+	 * the wrong moment.
+	 */
+	START_CRIT_SECTION();
 
 	/*
 	 * Update in-memory limits before performing the truncation, while inside
@@ -3554,7 +3653,7 @@ WriteMZeroPageXlogRec(int64 pageno, uint8 info)
  * We must flush the xlog record to disk before returning --- see notes in
  * TruncateCLOG().
  */
-static void
+static XLogRecPtr
 WriteMTruncateXlogRec(Oid oldestMultiDB,
 					  MultiXactId startTruncOff, MultiXactId endTruncOff,
 					  MultiXactOffset startTruncMemb, MultiXactOffset endTruncMemb)
@@ -3574,6 +3673,7 @@ WriteMTruncateXlogRec(Oid oldestMultiDB,
 	XLogRegisterData(&xlrec, SizeOfMultiXactTruncate);
 	recptr = XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID);
 	XLogFlush(recptr);
+	return recptr;
 }
 
 /*

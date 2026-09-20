@@ -29,6 +29,7 @@
 #include "access/xlogutils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc_hooks.h"
@@ -83,6 +84,8 @@ TransactionIdToCTsPage(TransactionId xid)
 static SlruCtlData CommitTsCtlData;
 
 #define CommitTsCtl (&CommitTsCtlData)
+commit_ts_bounds_hook_type commit_ts_bounds_hook = NULL;
+commit_ts_latest_hook_type commit_ts_latest_hook = NULL;
 
 /*
  * We keep a cache of the last value set in shared memory.
@@ -119,7 +122,7 @@ static bool CommitTsPagePrecedes(int64 page1, int64 page2);
 static void ActivateCommitTs(void);
 static void DeactivateCommitTs(void);
 static void WriteZeroPageXlogRec(int64 pageno);
-static void WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid);
+static XLogRecPtr WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid);
 
 /*
  * TransactionTreeSetCommitTsData
@@ -280,6 +283,10 @@ TransactionIdGetCommitTsData(TransactionId xid, TimestampTz *ts,
 	CommitTimestampEntry entry;
 	TransactionId oldestCommitTsXid;
 	TransactionId newestCommitTsXid;
+	CommitTimestampEntry cachedEntry;
+	bool		commitTsActive;
+	bool		useCachedEntry;
+	bool		boundsOverridden = false;
 
 	if (!TransactionIdIsValid(xid))
 		ereport(ERROR,
@@ -296,29 +303,27 @@ TransactionIdGetCommitTsData(TransactionId xid, TimestampTz *ts,
 
 	LWLockAcquire(CommitTsLock, LW_SHARED);
 
-	/* Error if module not enabled */
-	if (!commitTsShared->commitTsActive)
-		error_commit_ts_disabled();
-
-	/*
-	 * If we're asked for the cached value, return that.  Otherwise, fall
-	 * through to read from SLRU.
-	 */
-	if (commitTsShared->xidLastCommit == xid)
-	{
-		*ts = commitTsShared->dataLastCommit.time;
-		if (nodeid)
-			*nodeid = commitTsShared->dataLastCommit.nodeid;
-
-		LWLockRelease(CommitTsLock);
-		return *ts != 0;
-	}
-
+	commitTsActive = commitTsShared->commitTsActive;
+	useCachedEntry = commitTsShared->xidLastCommit == xid;
+	cachedEntry = commitTsShared->dataLastCommit;
 	oldestCommitTsXid = TransamVariables->oldestCommitTsXid;
 	newestCommitTsXid = TransamVariables->newestCommitTsXid;
 	/* neither is invalid, or both are */
 	Assert(TransactionIdIsValid(oldestCommitTsXid) == TransactionIdIsValid(newestCommitTsXid));
 	LWLockRelease(CommitTsLock);
+	if (commit_ts_bounds_hook != NULL)
+		boundsOverridden = commit_ts_bounds_hook(&commitTsActive,
+											 &oldestCommitTsXid,
+											 &newestCommitTsXid);
+	if (!commitTsActive)
+		error_commit_ts_disabled();
+	if (!boundsOverridden && useCachedEntry)
+	{
+		*ts = cachedEntry.time;
+		if (nodeid)
+			*nodeid = cachedEntry.nodeid;
+		return *ts != 0;
+	}
 
 	/*
 	 * Return empty if the requested value is outside our valid range.
@@ -360,6 +365,18 @@ TransactionId
 GetLatestCommitTsData(TimestampTz *ts, RepOriginId *nodeid)
 {
 	TransactionId xid;
+	TimestampTz latest_ts;
+	RepOriginId latest_nodeid;
+
+	if (commit_ts_latest_hook != NULL &&
+		commit_ts_latest_hook(&xid, &latest_ts, &latest_nodeid))
+	{
+		if (ts)
+			*ts = latest_ts;
+		if (nodeid)
+			*nodeid = latest_nodeid;
+		return xid;
+	}
 
 	LWLockAcquire(CommitTsLock, LW_SHARED);
 
@@ -815,6 +832,24 @@ DeactivateCommitTs(void)
 	 * it.  Note also that no process should be consulting this SLRU if we
 	 * have just deactivated it.
 	 */
+	/*
+	 * A store-backed SLRU mirror must durably stop serving pg_commit_ts
+	 * before the local files vanish; this reset removes them all, so the
+	 * barrier covers every page (PG_INT64_MAX).  A reset cannot be
+	 * abandoned the way a truncation can, and this also runs during
+	 * parameter-change replay -- the hook degrades store failures to a
+	 * coverage loss instead of erroring here.  Resident slots are
+	 * discarded FIRST: a leftover dirty page would later be flushed by
+	 * CheckPointCommitTs()'s unconditional SimpleLruWriteAll(), recreating
+	 * a just-deleted segment and publishing a mirror image that outranks
+	 * the delete-all tombstone, resurrecting stale commit timestamps.
+	 */
+	if (slru_truncate_hook)
+	{
+		SimpleLruDiscardAll(CommitTsCtl);
+		(*slru_truncate_hook) (CommitTsCtl, PG_INT64_MAX, InvalidXLogRecPtr);
+	}
+
 	(void) SlruScanDirectory(CommitTsCtl, SlruScanDirCbDeleteAll, NULL);
 
 	LWLockRelease(CommitTsLock);
@@ -903,7 +938,46 @@ TruncateCommitTs(TransactionId oldestXact)
 		return;					/* nothing to remove */
 
 	/* Write XLOG record */
-	WriteTruncateXlogRec(cutoffPage, oldestXact);
+	{
+		XLogRecPtr	trunc_lsn;
+		bool		barrier_ok;
+
+		/* see TruncateCLOG: no discard/barrier for a refused truncation */
+		barrier_ok = slru_truncate_hook &&
+			!CommitTsCtl->PagePrecedes(pg_atomic_read_u64(&CommitTsCtl->shared->latest_page_number),
+									   cutoffPage);
+
+		/*
+		 * Hold off checkpoint starts from the truncate record until the
+		 * barrier below has either shipped its tombstone (durable, pending
+		 * floor noted) or failed (loss counted, watermark frozen): a
+		 * checkpoint slipping into that window could complete and publish
+		 * a live-SLRU watermark past trunc_lsn while the truncation it
+		 * implies has no tombstone yet.  Same discipline as
+		 * TruncateMultiXact(); the flag must not leak on error.
+		 */
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		PG_TRY();
+		{
+			/* see TruncateCLOG: no doomed page may be flushable after this */
+			if (barrier_ok)
+				SimpleLruFlushCutoff(CommitTsCtl, cutoffPage);
+
+			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
+
+			/* same exact-LSN pre-barrier as TruncateCLOG() */
+			if (barrier_ok)
+				(*slru_truncate_hook) (CommitTsCtl, cutoffPage, trunc_lsn);
+		}
+		PG_CATCH();
+		{
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	}
 
 	/* Now we can remove the old CommitTs segment(s) */
 	SimpleLruTruncate(CommitTsCtl, cutoffPage);
@@ -1003,7 +1077,7 @@ WriteZeroPageXlogRec(int64 pageno)
 /*
  * Write a TRUNCATE xlog record
  */
-static void
+static XLogRecPtr
 WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid)
 {
 	xl_commit_ts_truncate xlrec;
@@ -1013,7 +1087,7 @@ WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid)
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfCommitTsTruncate);
-	(void) XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE);
+	return XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE);
 }
 
 /*
@@ -1057,7 +1131,10 @@ commit_ts_redo(XLogReaderState *record)
 		pg_atomic_write_u64(&CommitTsCtl->shared->latest_page_number,
 							trunc->pageno);
 
+		/* see clog_redo: serialize with the mirror's recapture pass */
+		LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
 		SimpleLruTruncate(CommitTsCtl, trunc->pageno);
+		LWLockRelease(WrapLimitsVacuumLock);
 	}
 	else
 		elog(PANIC, "commit_ts_redo: unknown op code %u", info);

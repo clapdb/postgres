@@ -107,6 +107,22 @@ extern MultiXactId MultiXactIdCreateFromMembers(int nmembers,
 extern MultiXactId ReadNextMultiXactId(void);
 extern void ReadMultiXactIdRange(MultiXactId *oldest, MultiXactId *next);
 extern bool MultiXactIdIsRunning(MultiXactId multi, bool isLockOnly);
+/*
+ * Exported for contrib/pagestore's store-backed SLRU mirror (pagestore_slru.c),
+ * which is a byte-for-byte copy of pagestore's tracked-upstream (19+) source:
+ * upstream 19 hoisted these into access/multixact_internal.h (commit
+ * bb3b1c4f646), which does not exist before 19; 18 keeps the same three
+ * computations private to multixact.c (as MultiXactIdToOffsetPage(),
+ * MXOffsetToMemberPage(), and the ReadMultiXactCounts()-shaped MultiXactState
+ * read GetMultiXactInfo() wraps upstream), so they are exported here instead
+ * of duplicating multixact.c's page-geometry macros in contrib.  See C4's
+ * commit message and pagestore_slru.c:74's multixact_internal.h guard.
+ */
+extern int64 MultiXactIdToOffsetPage(MultiXactId multi);
+extern int64 MXOffsetToMemberPage(MultiXactOffset offset);
+extern void GetMultiXactInfo(uint32 *multixacts, MultiXactOffset *nextOffset,
+							 MultiXactId *oldestMultiXactId,
+							 MultiXactOffset *oldestOffset);
 extern void MultiXactIdSetOldestMember(void);
 extern int	GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members,
 								  bool from_pgupgrade, bool isLockOnly);
