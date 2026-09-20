@@ -394,6 +394,19 @@ def capture(args: argparse.Namespace) -> int:
         metadata["pg_identity"] = {key: build_identity[key] for key in PG_IDENTITY_KEYS
                                    if key in build_identity}
     elif "pg_identity" in previous:
+        # The artifacts above were just recaptured -- possibly under a
+        # different PostgreSQL build than the one that stamped the
+        # previous pg_identity -- so silently carrying that old identity
+        # forward would let a recapture claim a build match it never
+        # proved. Refuse by default; --keep-pg-identity is an explicit
+        # acknowledgement that this recapture is known to be under the
+        # same build (e.g. a content-only refresh, no rebuild in between).
+        if not args.keep_pg_identity:
+            raise FixtureError(
+                f"{fixture} previously recorded pg_identity {previous['pg_identity']}, but this "
+                "capture was not given --postgres-payload-identity[-tool], so the new artifacts' "
+                "actual PostgreSQL identity was never checked; pass one of those, or pass "
+                "--keep-pg-identity to explicitly carry the old identity forward unchanged")
         metadata["pg_identity"] = previous["pg_identity"]
     (fixture / FIXTURE_JSON).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"captured {fixture} ({len(names)} entries)")
@@ -478,6 +491,22 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
             print(f"skip - fixture pg_identity {recorded} does not match this build's "
                   f"{building} (a fixture for another PostgreSQL release)")
             return None
+    if (build_identity is not None and args.require_build_match and role == "current"
+            and not isinstance(recorded, dict)):
+        # --require-build-match promises the checking build's identity was
+        # actually proven against some current fixture; a current fixture
+        # that predates pg_identity offers no such proof (unlike the skip
+        # branch above, which at least proves a *different* build). Letting
+        # this pass would make --require-build-match vacuous for every
+        # fixture captured before this field existed -- see
+        # PG_MAJOR_PORTABILITY.md/RELEASE_VALIDATION.md: the existing
+        # pgdata-artifacts fixture needs recapturing with
+        # --postgres-payload-identity[-tool] before anything turns this
+        # flag on for it.
+        print("FAIL - a current fixture has no pg_identity, so --require-build-match cannot "
+              "confirm the checking build loads it; recapture with "
+              "--postgres-payload-identity[-tool]")
+        return 1
     expected = json.loads((fixture / FORMAT_JSON).read_text(encoding="utf-8"))
     current = format_identities(args.format_tool)
     if role == "current":
@@ -576,6 +605,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-build-match", action="store_true",
                         help="fail, rather than warn, when no current fixture carries pgdata "
                              "artifacts the checking build loads")
+    parser.add_argument("--keep-pg-identity", action="store_true",
+                        help="--capture only: explicitly carry a previous pg_identity forward "
+                             "unchanged when this capture was not given an identity source "
+                             "(default: refuse, since the new artifacts' identity was never "
+                             "checked)")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy a failed check's tree here")
     args = parser.parse_args(argv)
