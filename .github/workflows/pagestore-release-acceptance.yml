@@ -69,18 +69,21 @@ jobs:
           # would also accept a same-named branch) so a dispatch input that
           # names something other than an actual tag is refused rather than
           # silently resolving to a moving branch.
-          sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha') || {
+          object=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object') || {
             echo "refusing '$tag': not a tag in ${GITHUB_REPOSITORY}" >&2
             exit 1
           }
-          case "$sha" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
-              ;;
-            *)
-              echo "could not resolve tag '$tag' to a commit: ${sha:-<empty>}" >&2
-              exit 1
-              ;;
-          esac
+          type=$(jq -r '.type' <<< "$object")
+          sha=$(jq -r '.sha' <<< "$object")
+          while [ "$type" = tag ]; do
+            object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$sha" --jq '.object')
+            type=$(jq -r '.type' <<< "$object")
+            sha=$(jq -r '.sha' <<< "$object")
+          done
+          if [ "$type" != commit ] || [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "could not resolve tag '$tag' to a commit: $type $sha" >&2
+            exit 1
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "release acceptance for $tag at $sha" >> "$GITHUB_STEP_SUMMARY"
@@ -330,6 +333,8 @@ jobs:
             standalone-pgdata-fixture-check.log
           if-no-files-found: warn
           retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true
 
   in-engine:
     name: in-engine acceptance (build match required)
@@ -339,6 +344,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
 
       - name: Install build dependencies
         run: |
@@ -456,6 +462,8 @@ jobs:
             | tee in-engine-pgdata-fixture-check.log
 
       - name: Run pagestore integration test
+        env:
+          PAGESTORE_INTEGRATION_EXPORT_LOGS: "1"
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
 
       - name: Collect pagestore integration test logs
@@ -508,6 +516,8 @@ jobs:
             git-describe.txt
           if-no-files-found: warn
           retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true
 
   soak:
     name: release soak seed ${{ matrix.seed }}
@@ -550,6 +560,8 @@ jobs:
           path: contrib/pagestore/soak-report-${{ matrix.seed }}.json
           if-no-files-found: error
           retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true
 
   bundle:
     name: bundle evidence
@@ -602,7 +614,8 @@ jobs:
             echo "workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "assembled: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$bundle/manifest.txt"
-          find "$bundle" -type f -exec sha256sum {} + | sort -k2 > "$bundle/sha256sums.txt"
+          (cd "$bundle" && find . -type f ! -path ./sha256sums.txt -exec sha256sum {} + | sort -k2 > sha256sums.txt)
+          (cd "$bundle" && sha256sum -c sha256sums.txt)
           tar czf "evidence-${tag}.tar.gz" "$bundle"
 
       - name: Upload evidence bundle
@@ -612,3 +625,5 @@ jobs:
           path: evidence-${{ needs.resolve.outputs.tag }}.tar.gz
           if-no-files-found: error
           retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true
