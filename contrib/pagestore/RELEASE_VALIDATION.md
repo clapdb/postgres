@@ -791,14 +791,14 @@ for pre-fix stores in `fork_event_adopt_orphaned_seg()`/`_commit_seg()`'s
 header comments); do not remove that adoption code before a release that no
 longer supports opening a store written by a pre-fix daemon.
 
-## Resolved: linear event scans over inert commit markers (F5)
+## Resolved: linear event scans over inert commit markers, and their per-lifetime memory bound (F5)
 
 Found during an earlier review. Every commit-class rewrite of a fork leaves
-one inert `FEV_SEG_GROW_BOUND`/`FEV_SEG_COMMIT_BOUND`-derived event in memory
-(still true after this fix: markers are loaded from the log/snapshot and, in
-this PR, still never compacted within a lifetime -- see the follow-up below);
+one inert `FEV_SEG_GROW_BOUND`/`FEV_SEG_COMMIT_BOUND`-derived event in memory;
 the snapshot builder drops a commit marker once its version is pruned, so the
-*durable* count is bounded by live versions. The cost was not memory (40
+*durable* count is bounded by live versions, and (design B, below) the
+*in-memory* count is now kept equal to it, once per cutover, instead of only
+at the next restart. The cost was not memory (40
 bytes/event) but algorithmic: `fork_event_activate_seg()`, both
 `fork_event_adopt_orphaned_*()` rules, and
 `fork_meta_snapshot_marker_present()` scanned a fork's event array linearly,
@@ -850,13 +850,64 @@ fork) and 1641 events on the busiest fork (a growing table, already
 O(log N) reads even before this fix); `mvp_golden_test.sh` peaks at 2
 markers on one fork.
 
-No persisted-format change; the array's *contents* and order are unchanged,
-only how they are searched. Remaining follow-ups, deliberately out of this
-PR: (1) bound the in-memory array itself by compacting the inert markers a
-successful cutover just dropped from the durable snapshot (design B, next
-PR) -- until then the array is still never compacted within a lifetime; (2)
+No persisted-format change from the index (design A); the array's *contents*
+and order are unchanged, only how they are searched.
+
+### Design B: bounding the array per daemon lifetime
+
+The index above made every *lookup* O(log N), but the array itself still grew
+without bound within one daemon lifetime: a successful cutover already
+computes, per event, whether it survives into the new checkpoint/tail (the
+snapshot builder's per-entry loop), but the in-memory copy kept every event
+regardless -- "keep the in-memory chain conservative until the next restart"
+was the comment at the call site. Design B removes that gap: the builder's
+per-entry loop now also stamps a spare `ForkEvent.snapshot_dropped` byte (0 on
+every branch that emits the event into the checkpoint or tail, 1 on the
+`else continue;` branch that drops it), and
+`fork_event_compact_dropped_markers()`, called once right after a successful
+publish (under the same admission/shard/prune/map lock set that serialized
+the build), removes every event with `snapshot_dropped && kind > FEV_DEAD`
+(an inert marker that was never activated to a size event) from each fork's
+array in place, decrementing `nlegacy_seq` and rebuilding `def_idx` as it
+goes. Deleting forks (excluded from the build wholesale) and
+`preserve_survivors` generations (every record re-emitted, nothing flagged)
+are untouched by construction: neither ever gets the flag set to 1, so
+compaction is a no-op for them. Recovery-equivalent by construction: the
+events dropped from memory are exactly the events the durable checkpoint no
+longer carries, so the in-memory array after a live cutover equals what the
+next boot rebuilds from that checkpoint -- the merged invariant that a live
+operation's in-memory state must match recovery's (see `MVP_STATUS.md`).
+
+No persisted-format change. Tests (`pagestore_forkmeta_cutover_test.c`):
+`test_inert_markers_compacted_after_cutover` (12 live writes leave 11 inert
+markers in memory; after a reclaiming cutover the in-memory count drops to
+match the durable snapshot's, and a reopen's in-memory event/marker/inert
+counts match the post-compaction in-memory counts exactly -- the recovery
+equivalence check; fails before this PR, since the in-memory count stayed at
+11 forever in that process), `test_inert_markers_kept_when_retained` (no
+version reclaimed -> compaction is a no-op), `test_inert_markers_kept_on_preserve_survivors`
+(a deletion-forced generation with no provable operational cutoff -> every
+record re-emitted, compaction is a no-op), a `compact` phase added to the
+randomized index self-test (flags a random subset of a private fork's inert
+markers, runs the compaction routine, and cross-checks array order,
+`nlegacy_seq`, `def_idx`, and every surviving event's own fields including
+its `cached_*` triple against a pre-compaction copy), and
+`test_fork_event_index_periodic_cutover_bounded` (6 rounds of 30 WAL-less
+rewrites each to one fork's block 0, 180 writes total, each round ending in
+its own reclaiming cutover: the in-memory event count stays flat at 3 after
+every round with this PR; reverted, it grows round-by-round (31, 61, 91,
+121, 151, 181), tracking round * 30 + 1, unbounded in the number of rounds).
+`fev_bench K periodic` (same fixture and mechanism, K = 50,000 split into 10
+rounds instead) confirms the pattern at scale: max in-memory `nevents`
+across every round is 11 with this PR versus 50,001 (K + 1) reverted. `pagestore_forkmeta_crash_matrix_test` is the
+regression suite that matters most here: a crash between publish and the
+next open must see identical state with or without the in-memory compaction,
+and it does by construction (the durable side never changes), which that
+suite's 273 checks confirm stayed green.
+
+Remaining follow-ups, deliberately out of this PR: (1)
 `fork_meta_snapshot_marker_page_retained()`'s version-chain walk (design C,
-optional, only if a later profile shows it dominating); (3) `def_idx` for
+optional, only if a later profile shows it dominating); (2) `def_idx` for
 the remaining newest-first SET/DEAD linear scans
 (`fork_block_death_through()`, the walidx planner loops, the snapshot
 builder's per-entry loop) if they are ever shown to matter.
