@@ -18,6 +18,15 @@ PostgreSQL build -- starts a scratch cluster with the extension loaded, has
 ``pagestore_pgdata_artifact_check()`` load every artifact through the very
 loader a compute uses, and applies each declared mutation to a copy, requiring
 the loader to refuse it.  A ``legacy`` fixture must only still load.
+
+When ``--postgres-payload-identity``/``--postgres-payload-identity-tool`` is
+given, a ``current`` fixture that recorded a ``pg_identity`` for another
+PostgreSQL release (a different ``pg_control_version``/``xlog_page_magic``,
+e.g. a PG 19 capture checked on a PG 18 build) is skipped rather than failed,
+mirroring the store fixture's ``ForeignPayload`` rule; a fixture that
+predates this field is checked as before.  ``--require-build-match`` then
+turns "no current fixture matches this build" from a warning into a failure,
+the same switch the store checker has.
 """
 from __future__ import annotations
 
@@ -37,7 +46,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pagestore_harness as harness  # noqa: E402
-from pagestore_fixture import Daemon  # noqa: E402
+from pagestore_fixture import Daemon, build_payload_identity  # noqa: E402
 
 FIXTURE_JSON = "fixture.json"
 FORMAT_JSON = "format.json"
@@ -61,6 +70,17 @@ FOREIGN_TRAILER = struct.pack("<II", 0x41424344, 7)
 
 class FixtureError(Exception):
     pass
+
+
+# The two fields that identify "another PostgreSQL release" for these
+# artifacts: PG_CONTROL_VERSION and XLOG_PAGE_MAGIC are stable for the life of
+# a major and change only across majors; CATALOG_VERSION_NO moves on every
+# catalog bump within a major (including between betas of the same release),
+# so it is recorded for provenance but is not part of the foreign-payload
+# gate -- comparing it would make a same-major fixture "foreign" after every
+# minor catalog change.
+PG_IDENTITY_GATE_KEYS = ("pg_control_version", "xlog_page_magic")
+PG_IDENTITY_KEYS = PG_IDENTITY_GATE_KEYS + ("catalog_version_no",)
 
 
 def format_identities(tool: Path) -> list[dict[str, Any]]:
@@ -369,6 +389,12 @@ def capture(args: argparse.Namespace) -> int:
         "artifacts": {name: rel for name, (_, rel) in ARTIFACTS.items()},
         "files": names,
     }
+    build_identity = build_payload_identity(args)
+    if build_identity is not None:
+        metadata["pg_identity"] = {key: build_identity[key] for key in PG_IDENTITY_KEYS
+                                   if key in build_identity}
+    elif "pg_identity" in previous:
+        metadata["pg_identity"] = previous["pg_identity"]
     (fixture / FIXTURE_JSON).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"captured {fixture} ({len(names)} entries)")
     return 0
@@ -435,10 +461,23 @@ def run_mutation(cluster: Cluster, temp: Path, fixture: Path, case: dict[str, An
     return ACCEPTED if ok else REJECTED
 
 
-def check_one(args: argparse.Namespace, fixture: Path) -> int:
+def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
+    """Returns None for a current fixture whose recorded pg_identity is for
+    another PostgreSQL build: it is skipped (not broken, not checkable here),
+    exactly like the store fixture's ForeignPayload rule."""
     metadata = fixture_metadata(fixture)
     role = metadata["role"]
     print(f"--- fixture {fixture.name} ({role})")
+    build_identity = build_payload_identity(args)
+    recorded = metadata.get("pg_identity")
+    if build_identity is not None and isinstance(recorded, dict):
+        mismatch = [key for key in PG_IDENTITY_GATE_KEYS
+                   if key in recorded and int(recorded[key]) != int(build_identity[key])]
+        if mismatch:
+            building = {key: build_identity[key] for key in PG_IDENTITY_GATE_KEYS}
+            print(f"skip - fixture pg_identity {recorded} does not match this build's "
+                  f"{building} (a fixture for another PostgreSQL release)")
+            return None
     expected = json.loads((fixture / FORMAT_JSON).read_text(encoding="utf-8"))
     current = format_identities(args.format_tool)
     if role == "current":
@@ -494,8 +533,26 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int:
 
 def check(args: argparse.Namespace) -> int:
     status = 0
+    binds_build = (args.postgres_payload_identity is not None or
+                   args.postgres_payload_identity_tool is not None)
+    matched_current = 0
     for fixture in args.check:
-        status |= check_one(args, fixture)
+        result = check_one(args, fixture)
+        if result is None:
+            continue
+        status |= result
+        if fixture_metadata(fixture)["role"] == "current":
+            matched_current += 1
+    if binds_build and matched_current == 0:
+        # Every current fixture carries a pg_identity for another PostgreSQL
+        # release (or none records one to begin with) -- same shape as the
+        # store fixture's rule: warn unless the caller requires a match.
+        if args.require_build_match:
+            print("FAIL - no current fixture carries pgdata artifacts this PostgreSQL build "
+                  "loads; capture one under this build")
+            return 1
+        print("WARN - no current fixture carries pgdata artifacts this PostgreSQL build loads; "
+              "capture one under this build (required on pagestore)")
     return status
 
 
@@ -510,10 +567,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--build", type=Path,
                         help="a meson build directory with tmp_install; without it only "
                              "the identities are checked")
+    parser.add_argument("--postgres-payload-identity", type=Path,
+                        help="JSON from pagestore_control_restore --payload-identity; when "
+                             "given, a fixture recording a different pg_identity is skipped "
+                             "(--capture) or gates the build match (--check)")
+    parser.add_argument("--postgres-payload-identity-tool", type=Path,
+                        help="a pagestore_control_restore binary to ask for the same identity")
+    parser.add_argument("--require-build-match", action="store_true",
+                        help="fail, rather than warn, when no current fixture carries pgdata "
+                             "artifacts the checking build loads")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy a failed check's tree here")
     args = parser.parse_args(argv)
-    for name in ("format_tool", "build", "source", "capture", "keep_failures"):
+    for name in ("format_tool", "build", "source", "capture", "keep_failures",
+                 "postgres_payload_identity", "postgres_payload_identity_tool"):
         if getattr(args, name) is not None:
             setattr(args, name, getattr(args, name).resolve())
     if args.capture is not None and args.source is None:

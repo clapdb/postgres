@@ -674,12 +674,14 @@ if host_system != 'windows'
   test('pagestore_materializer_supervisor',
     pagestore_harness_python,
     args: [files('harness/tests/test_materializer_supervisor.py')],
+    env: ['PG_MAJORVERSION=' + pg_version_major.to_string()],
     suite: ['pagestore'],
     timeout: 30,
   )
   test('pagestore_branch_prepare',
     pagestore_harness_python,
     args: [files('harness/tests/test_branch_prepare.py')],
+    env: ['PG_MAJORVERSION=' + pg_version_major.to_string()],
     suite: ['pagestore'],
     timeout: 30,
   )
