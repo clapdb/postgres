@@ -392,6 +392,59 @@ close_store(void)
 }
 
 static int
+count_occurrences(const char *haystack, const char *needle)
+{
+	int			count = 0;
+	const char *p = haystack;
+
+	while (haystack != NULL && (p = strstr(p, needle)) != NULL)
+	{
+		count++;
+		p += strlen(needle);
+	}
+	return count;
+}
+
+/*
+ * Like pagestore_forkmeta_cutover_test.c's open_capture_stderr(), but wraps a
+ * run of ps_core_maintenance() turns instead of one ps_core_open() call: for
+ * asserting how many times a once-per-tuple diagnostic actually logs across
+ * many retries of a stalled operation.
+ */
+static int
+capture_stderr_maintenance(int turns, char *out, size_t out_cap)
+{
+	char		logpath[] = "/tmp/pstimelinemaintlogXXXXXX";
+	int			logfd = mkstemp(logpath);
+	int			saved_stderr;
+	ssize_t		n;
+
+	out[0] = 0;
+	if (logfd < 0)
+		return 0;
+	saved_stderr = dup(STDERR_FILENO);
+	if (saved_stderr < 0)
+	{
+		close(logfd);
+		unlink(logpath);
+		return 0;
+	}
+	fflush(stderr);
+	dup2(logfd, STDERR_FILENO);
+	for (int i = 0; i < turns; i++)
+		(void) ps_core_maintenance();
+	fflush(stderr);
+	dup2(saved_stderr, STDERR_FILENO);
+	close(saved_stderr);
+	if (lseek(logfd, 0, SEEK_SET) == 0 &&
+		(n = read(logfd, out, out_cap - 1)) > 0)
+		out[n] = 0;
+	close(logfd);
+	unlink(logpath);
+	return 1;
+}
+
+static int
 write_bytes(const char *path, const void *data, size_t len)
 {
 	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -3165,13 +3218,27 @@ test_deleting_timeline_page_cleanup(void)
 	remove_tree(store);
 }
 
+/*
+ * The contract guard, not a fail-before: a malformed record *inside* the
+ * reachable region (invariant I4) must still fail pass 1 closed, exactly as
+ * before L6 -- only bytes recover() never replayed (a torn/zero tail) get
+ * the new end-of-log treatment.  Corrupts the sibling's own magic word in
+ * place, below the append cursor, so pass 1 must reach and reject it rather
+ * than stop early.  Also covers L2: the "deletion blocked" diagnostic must
+ * log exactly once across many retried maintenance turns, not once per
+ * turn.
+ */
 static void
 test_deleting_timeline_page_cleanup_fail_closed(void)
 {
 	char store[] = "/tmp/pagestore-timeline-page-malformed-XXXXXX";
 	unsigned char page[8192];
-	uint32_t bad = 0xdeadbeefU;
+	uint32_t bad_magic = 0xdeadbeefU;
+	uint32_t magic_check = 0;
+	char captured[4096];
+	int64_t off1;
 	int64_t valid_size;
+	int64_t after;
 
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
@@ -3179,25 +3246,90 @@ test_deleting_timeline_page_cleanup_fail_closed(void)
 	check(mkdtemp(store) != NULL, "create malformed page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0,
+		  "write the target record before the sibling");
+	off1 = ps_storage->seg_size(0, 0);
+	check(off1 > 0 && write_timeline_layer(10, 1, 200) == 0,
+		  "write the sibling record whose magic will be corrupted");
+	valid_size = ps_storage->seg_size(0, 0);
+	check(valid_size > off1 &&
+			ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								 sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(1, 1, NULL),
+		  "corrupt the sibling's magic in place, inside the reachable "
+		  "region (below the cursor), after BEGIN_DELETE target");
+	check(capture_stderr_maintenance(16, captured, sizeof(captured)),
+		  "capture stderr across 16 maintenance turns");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid_size,
+		  "malformed segment cleanup stays fail-closed and retryable "
+		  "(segment size unchanged)");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 1,
+		  "failed cleanup retains the target until repair");
+	check(count_segment_holes(0, 0, off1) == 0,
+		  "the validate-only pass 1 rejection writes zero holes: pass 2 "
+		  "never runs on a malformed segment (checked up to the corrupted "
+		  "record, whose own magic count_segment_holes cannot parse)");
+	check(ps_storage->seg_read(0, 0, (uint64_t) off1, &magic_check,
+							   sizeof(magic_check)) == 0 &&
+			magic_check == bad_magic,
+		  "the corrupted magic itself is left exactly as this test left it");
+	check(count_occurrences(captured, "deletion blocked") == 1,
+		  "the once-per-tuple diagnostic logs exactly once across 16 "
+		  "retried maintenance turns, not once per turn");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before family, phase 2: flips the pre-fix expectation of the test
+ * above's original shape.  4 bytes of unknown-magic garbage installed
+ * exactly *at* the append cursor (never inside the reachable region) must
+ * not block the deletion at all -- it is beyond invariant I4's boundary R,
+ * bytes recover() never replayed and a later append is free to overwrite.
+ */
+static void
+test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-beyond-cursor-XXXXXX";
+	unsigned char page[8192];
+	uint32_t bad = 0xdeadbeefU;
+	int64_t valid_size;
+	int64_t after;
+	PsTimelineState state;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	check(mkdtemp(store) != NULL, "create beyond-cursor page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0 &&
 			write_timeline_layer(10, 1, 200) == 0,
-		  "write target and sibling before malformed tail");
+		  "write target and sibling before the garbage word");
 	valid_size = ps_storage->seg_size(0, 0);
 	check(valid_size > 0 &&
 			ps_storage->seg_write(0, 0, (uint64_t) valid_size, &bad,
 								 sizeof(bad)) == 0 && ps_storage->sync() == 0 &&
 			begin_delete(1, 1, NULL),
-		  "install a truncated record tail after BEGIN_DELETE target");
+		  "install 4 bytes of unknown-magic garbage exactly at the cursor, "
+		  "after BEGIN_DELETE target");
 	for (int i = 0; i < 16; i++)
 		(void) ps_core_maintenance();
-	check(ps_storage->seg_size(0, 0) == valid_size + (int64_t) sizeof(bad),
-		  "malformed segment cleanup stays fail-closed and retryable");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "garbage beyond the cursor no longer stalls the deletion (L6)");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid_size + (int64_t) sizeof(bad),
+		  "the 4 bytes of garbage beyond the cursor are untouched");
+	check(count_segment_holes(0, 0, valid_size) == 1,
+		  "exactly the target record below the cursor becomes a hole");
 	memset(page, 0, sizeof(page));
-	check(read_test_page(1, 0, page) == 1,
-		  "failed cleanup retains the target until repair");
-	check(count_segment_holes(0, 0, valid_size) == 0,
-		  "the validate-only pass 1 rejection writes zero holes: pass 2 "
-		  "never runs on a malformed segment");
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sibling still served with garbage past the cursor");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone with garbage past the cursor");
 	close_store();
 	remove_tree(store);
 }
@@ -3566,6 +3698,367 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 	remove_tree(store);
 }
 
+/*
+ * L6 fail-before: garbage after a torn tail, past the recovered append
+ * cursor, must not stall a timeline deletion forever (invariant I4, the
+ * reachable region).  A complete-looking SEG_ADMISSION header is appended
+ * after a clean close, followed by only 100 of its claimed page_size body
+ * bytes -- a torn record recover() already treats as end of log (it sets
+ * cur_off to the valid boundary and never replays past it), which pre-L6
+ * pass 1 failed closed on forever instead of also stopping there.
+ */
+static void
+test_deleting_timeline_page_cleanup_torn_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-torn-tail-XXXXXX";
+	unsigned char page[8192];
+	unsigned char tail_before[256];
+	unsigned char tail_after[256];
+	PsTimelineState state;
+	TestSegRecHdr hdr;
+	uint64_t admission_seq = 77;
+	unsigned char body[100];
+	char seg_path[1400];
+	size_t torn_len;
+	int fd;
+	int64_t valid;
+	int64_t after;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 1;
+	check(mkdtemp(store) != NULL, "create torn-tail page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0 &&
+			write_timeline_layer(1, 2, 300) == 0,
+		  "write target, sibling, target (each flushed)");
+	valid = ps_storage->seg_size(0, 0);
+	check(valid > 0, "torn-tail segment has bytes before the torn record");
+	close_store();
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = TEST_SEG_ADMISSION_MAGIC;
+	hdr.timeline = 10;
+	hdr.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	hdr.block = 7;
+	hdr.lsn = 900;
+	hdr.len = page_size;
+	memset(body, 0xEE, sizeof(body));
+	torn_len = sizeof(hdr) + sizeof(admission_seq) + sizeof(body);
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build torn-tail segment path");
+	fd = open(seg_path, O_WRONLY | O_APPEND);
+	check(fd >= 0 &&
+			write(fd, &hdr, sizeof(hdr)) == (ssize_t) sizeof(hdr) &&
+			write(fd, &admission_seq, sizeof(admission_seq)) ==
+				(ssize_t) sizeof(admission_seq) &&
+			write(fd, body, sizeof(body)) == (ssize_t) sizeof(body) &&
+			fsync(fd) == 0 && close(fd) == 0,
+		  "install a complete-looking header with a torn body past the "
+		  "valid boundary");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_before, torn_len, (off_t) valid) ==
+				(ssize_t) torn_len && close(fd) == 0,
+		  "snapshot the torn tail bytes before deletion");
+
+	check(ps_core_open(store) == 0,
+		  "reopen with the torn tail; recovery stops at it");
+	check(begin_delete(1, 1, NULL), "begin torn-tail target deletion");
+	for (int i = 0; i < 48; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "torn-tail garbage past the cursor does not stall the deletion");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid + (int64_t) torn_len,
+		  "torn-tail segment keeps its size, garbage untouched");
+	check(count_segment_holes(0, 0, valid) == 2,
+		  "exactly the two target records below the valid boundary become "
+		  "holes");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_after, torn_len, (off_t) valid) ==
+				(ssize_t) torn_len && close(fd) == 0 &&
+			memcmp(tail_before, tail_after, torn_len) == 0,
+		  "no hole write ever lands on the torn tail bytes");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sibling still served after torn-tail cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0, "target block 0 gone");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 2, page) == 0, "target block 2 gone");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before, sealed-segment shape: the torn tail lands in a segment
+ * that later rolls over to the next one, so it is no longer the *current*
+ * segment by the time cleanup runs and no cursor applies to it at all --
+ * the reachable-region boundary must come entirely from the same
+ * end-of-log parse recover() already trusts (I4), not just the cur_off
+ * clamp test (a) exercises.
+ */
+static void
+test_deleting_timeline_page_cleanup_sealed_torn_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-sealed-torn-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	TestSegRecHdr hdr;
+	uint64_t admission_seq = 55;
+	unsigned char body[100];
+	char seg_path[1400];
+	size_t torn_len;
+	int fd;
+	int64_t before_torn;
+	int64_t after_torn;
+	int64_t seg0_final;
+
+	configure_timeline_core();
+	segment_size = 20000;
+	flush_pages = 1;
+	check(mkdtemp(store) != NULL, "create sealed-torn-tail page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+		  "write target and sibling filling most of segment 0");
+	before_torn = ps_storage->seg_size(0, 0);
+	check(before_torn > 0 && before_torn < (int64_t) segment_size,
+		  "segment 0 has room left before the torn record");
+	close_store();
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = TEST_SEG_ADMISSION_MAGIC;
+	hdr.timeline = 10;
+	hdr.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	hdr.block = 9;
+	hdr.lsn = 900;
+	hdr.len = page_size;
+	memset(body, 0xEE, sizeof(body));
+	torn_len = sizeof(hdr) + sizeof(admission_seq) + sizeof(body);
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build sealed-segment path");
+	fd = open(seg_path, O_WRONLY | O_APPEND);
+	check(fd >= 0 &&
+			write(fd, &hdr, sizeof(hdr)) == (ssize_t) sizeof(hdr) &&
+			write(fd, &admission_seq, sizeof(admission_seq)) ==
+				(ssize_t) sizeof(admission_seq) &&
+			write(fd, body, sizeof(body)) == (ssize_t) sizeof(body) &&
+			fsync(fd) == 0 && close(fd) == 0,
+		  "append a torn record to segment 0 before it rolls over");
+	after_torn = before_torn + (int64_t) torn_len;
+
+	check(ps_core_open(store) == 0,
+		  "reopen with the torn tail; recovery's cursor stays at "
+		  "before_torn");
+	/* One more sibling page no longer fits segment 0 (before_torn + its own
+	 * record size > segment_size), so append_page_impl() rolls to segment 1
+	 * -- sealing segment 0 with the torn record physically past its own
+	 * (now-frozen) cursor. */
+	check(write_timeline_layer(10, 2, 300) == 0 &&
+			ps_storage->seg_size(0, 0) == after_torn &&
+			ps_storage->seg_size(0, 1) > 0,
+		  "the next sibling write rolls to segment 1, sealing segment 0");
+	check(begin_delete(1, 1, NULL), "begin sealed-segment target deletion");
+	for (int i = 0; i < 48; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "a sealed segment's torn tail does not stall the deletion");
+	seg0_final = ps_storage->seg_size(0, 0);
+	check(seg0_final == after_torn,
+		  "sealed segment 0 keeps its size, torn tail untouched");
+	check(count_segment_holes(0, 0, before_torn) == 1,
+		  "sealed segment 0 gets exactly the target's hole");
+	check(count_segment_holes(0, 1, ps_storage->seg_size(0, 1)) == 0,
+		  "segment 1 is untouched by cleanup of segment 0's target record");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sealed-segment sibling still served after cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 2, page) == 1 && page[100] == 0x5A,
+		  "rolled-over sibling in segment 1 still served after cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone after sealed-segment cleanup");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before, retired shape (use_layers=0): the same missing-marker
+ * retirement as test_deleting_timeline_page_cleanup_retired_short_segment()
+ * (recovery sets cur_off == segment_size even though the file is
+ * physically short), plus a torn record appended after close.  A retired
+ * segment's cur_off carries no boundary information about the segment
+ * itself (I4: "there is no cur_off bound for a retired/sealed segment"), so
+ * this exercises the reachable-region parser with no cursor clamp helping
+ * it at all -- unlike test (a), where the clamp alone would already be
+ * enough.
+ */
+static void
+test_deleting_timeline_page_cleanup_retired_torn_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-retired-torn-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	TestSegRecHdr hdr;
+	uint64_t admission_seq = 33;
+	unsigned char body[100];
+	char seg_path[1400];
+	size_t torn_len;
+	int fd;
+	int64_t before;
+	int64_t after;
+
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 100;
+	use_layers = 0; /* keep the recovery case on the physical segment path */
+	check(mkdtemp(store) != NULL, "create retired-torn page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(10, 1, 50) == 0 &&
+			write_timeline_layer(1, 0, 100) == 0,
+		  "write sibling and target into one short segment");
+	before = ps_storage->seg_size(0, 0);
+	check(before > 0 && before < (int64_t) segment_size &&
+			count_segment_holes(0, 0, before) == 0 &&
+			begin_delete(1, 1, NULL) && ps_storage->sync() == 0,
+		  "begin deletion before simulating a missing ordered marker and "
+		  "the torn tail, no holes yet");
+	close_store();
+	check(strip_ordered_markers(store, 10) == 0,
+		  "remove only the live sibling ordered forkmeta marker");
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = TEST_SEG_ADMISSION_MAGIC;
+	hdr.timeline = 10;
+	hdr.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	hdr.block = 9;
+	hdr.lsn = 900;
+	hdr.len = page_size;
+	memset(body, 0xEE, sizeof(body));
+	torn_len = sizeof(hdr) + sizeof(admission_seq) + sizeof(body);
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build retired-segment path");
+	fd = open(seg_path, O_WRONLY | O_APPEND);
+	check(fd >= 0 &&
+			write(fd, &hdr, sizeof(hdr)) == (ssize_t) sizeof(hdr) &&
+			write(fd, &admission_seq, sizeof(admission_seq)) ==
+				(ssize_t) sizeof(admission_seq) &&
+			write(fd, body, sizeof(body)) == (ssize_t) sizeof(body) &&
+			fsync(fd) == 0 && close(fd) == 0,
+		  "append a torn record after the retired segment's valid bytes");
+
+	check(ps_core_open(store) == 0,
+		  "restart accepts a short retired segment with a torn tail");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "a retired segment's torn tail does not stall the deletion");
+	after = ps_storage->seg_size(0, 0);
+	check(after == before + (int64_t) torn_len,
+		  "retired segment keeps its size, torn tail untouched");
+	check(count_segment_holes(0, 0, before) == 1,
+		  "retired-segment cleanup leaves exactly the target's hole");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone after retired-segment cleanup");
+
+	/* The sentinel must survive: a subsequent live write still rolls to
+	 * segment 1 instead of appending after the (still physically present)
+	 * torn tail. */
+	check(write_timeline_layer(10, 2, 300) == 0 &&
+			ps_storage->seg_size(0, 0) == after &&
+			ps_storage->seg_size(0, 1) > 0,
+		  "next write still rolls past the retired compacted segment");
+	close_store();
+	check(ps_core_open(store) == 0,
+		  "restart after retired-segment cleanup and rolled append");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 2, page) == 1 && page[100] == 0x5A,
+		  "rolled append survives retired-segment recovery");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before, SPDK shape on POSIX: an unwritten tail reads back as
+ * zeros (storage_spdk.c's every-segment-reports-g_segsize behavior).  Magic
+ * 0 was already recover()'s end-of-log rule (I4); pre-L6 pass 1 treated it
+ * as an unrecognized magic and failed closed forever instead.
+ */
+static void
+test_deleting_timeline_page_cleanup_zero_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-zero-tail-XXXXXX";
+	unsigned char page[8192];
+	unsigned char zeros[4096];
+	unsigned char tail_before[4096];
+	unsigned char tail_after[4096];
+	PsTimelineState state;
+	char seg_path[1400];
+	int fd;
+	int64_t valid;
+	int64_t after;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 1;
+	check(mkdtemp(store) != NULL, "create zero-tail page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+		  "write target and sibling before the zero-padded tail");
+	valid = ps_storage->seg_size(0, 0);
+	check(valid > 0, "zero-tail segment has bytes");
+	close_store();
+
+	memset(zeros, 0, sizeof(zeros));
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build zero-tail segment path");
+	check(append_bytes(seg_path, zeros, sizeof(zeros)) == 0,
+		  "append an SPDK-shaped zero-padded tail");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_before, sizeof(tail_before), (off_t) valid) ==
+				(ssize_t) sizeof(tail_before) && close(fd) == 0,
+		  "snapshot the zero tail before deletion");
+
+	check(ps_core_open(store) == 0,
+		  "reopen with the zero tail; recovery stops at magic 0");
+	check(begin_delete(1, 1, NULL), "begin zero-tail target deletion");
+	for (int i = 0; i < 48; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "a zero-padded tail does not stall the deletion");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid + (int64_t) sizeof(zeros),
+		  "zero-tail segment keeps its size");
+	check(count_segment_holes(0, 0, valid) == 1,
+		  "exactly the target record below the zeros becomes a hole");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_after, sizeof(tail_after), (off_t) valid) ==
+				(ssize_t) sizeof(tail_after) && close(fd) == 0 &&
+			memcmp(tail_before, tail_after, sizeof(tail_after)) == 0,
+		  "the zero tail itself is never written");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sibling still served after zero-tail cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone after zero-tail cleanup");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -3584,6 +4077,11 @@ main(void)
 	test_deleting_timeline_page_cleanup_oversized();
 	test_deleting_timeline_page_cleanup_prefix_hole();
 	test_deleting_timeline_page_cleanup_retired_short_segment();
+	test_deleting_timeline_page_cleanup_torn_tail();
+	test_deleting_timeline_page_cleanup_sealed_torn_tail();
+	test_deleting_timeline_page_cleanup_retired_torn_tail();
+	test_deleting_timeline_page_cleanup_zero_tail();
+	test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored();
 	test_v2_and_mixed_lifecycle();
 	test_relation_inspection_forkmeta_poison();
 	test_relation_inspection_rejects_non_live_timeline();
