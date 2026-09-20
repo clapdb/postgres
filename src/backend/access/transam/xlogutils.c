@@ -24,6 +24,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
+#include "postmaster/walredo.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
@@ -424,7 +425,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		 * redo routines that dirty init-fork buffers without restoring a
 		 * full-page image.
 		 */
-		if (forknum == INIT_FORKNUM)
+		if (forknum == INIT_FORKNUM && !am_walredo)
 			FlushOneBuffer(*buf);
 
 		return BLK_RESTORED;
@@ -489,6 +490,14 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	Buffer		buffer;
 	SMgrRelation smgr;
 
+	/*
+	 * In the wal-redo helper there is no on-disk relation to read: redo runs
+	 * against a single held page (plus a scratch page for other blocks), so
+	 * resolve the buffer from those instead of smgr.
+	 */
+	if (am_walredo)
+		return WalRedoReadBuffer(rlocator, forknum, blkno, mode);
+
 	Assert(blkno != P_NEW);
 
 	/* Do we have a clue where the buffer might be already? */
@@ -511,7 +520,7 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	 * filesystem loses an inode during a crash.  Better to write the data
 	 * until we are actually told to delete the file.)
 	 */
-	smgrcreate(smgr, forknum, true);
+	smgrcreate_ensure(smgr, forknum);
 
 	lastblock = smgrnblocks(smgr, forknum);
 
