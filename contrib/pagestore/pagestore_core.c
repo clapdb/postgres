@@ -4220,6 +4220,37 @@ static unsigned char timeline_wal_cleanup_done[MAX_TIMELINES];
 static unsigned char timeline_page_cleanup_done[MAX_TIMELINES];
 static uint32_t timeline_page_cleanup_cursor;
 
+/*
+ * Filled by page_cleanup_tombstone_segment() at the point it fails closed on
+ * a malformed record inside the reachable region (invariant I4), so
+ * timeline_delete_page_cleanup_one() can log which record is blocking a
+ * stalled deletion.  Set only for an actual parse failure (nonzero unknown
+ * magic, a hole with the wrong len, or an impossible timeline owner on an
+ * otherwise complete record) -- never for an allocation or storage I/O
+ * failure, which is not a data problem and gets no "malformed record"
+ * diagnostic.  Plain statics: page_cleanup_tombstone_segment() runs under
+ * every shard write lock and the map write lock, one maintenance turn at a
+ * time, matching the rest of this file's daemon-wide scheduling state.
+ */
+typedef struct PsCleanupFailure
+{
+	uint32_t	shard;
+	int			seg;
+	uint64_t	off;
+	uint32_t	magic;
+	uint32_t	len;
+} PsCleanupFailure;
+
+static PsCleanupFailure cleanup_last_failure;
+static int cleanup_last_failure_valid;
+
+/* Dedup state for the "deletion blocked" diagnostic: the last
+ * malformed-record tuple already printed for each timeline, so a stalled
+ * deletion logs once per distinct cause instead of once per maintenance
+ * turn. */
+static PsCleanupFailure timeline_cleanup_blocked_last[MAX_TIMELINES];
+static unsigned char timeline_cleanup_blocked_last_valid[MAX_TIMELINES];
+
 static void timeline_reset_reuse_runtime(uint32_t timeline);
 
 static inline void
@@ -4912,17 +4943,52 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  * record's boundary is unchanged either way, so recovery fails closed
  * (an unrecognized magic) rather than misparsing.
  *
- * Two passes.  Pass 1 walks and validates every record exactly as a
- * read-only scan would (no write), collecting the target's; a parse failure
- * here leaves the segment completely untouched, so a malformed segment
- * fails closed and stays retryable without ever writing a hole for data it
- * could not fully account for.  Pass 2 (only once pass 1 has validated the
- * whole segment) writes the collected holes; a failure here is a genuine
- * storage I/O failure, not a data problem, and leaves some records already
- * tombstoned and some not -- both states are safe per the write order
- * above, and the next maintenance turn resumes, since an already-holed
- * record is recognized by its magic and skipped, making the retry
- * idempotent.
+ * Two passes.  Pass 1 walks and validates only the *reachable region*
+ * (invariant I4): the prefix recover() would actually replay, bounded for
+ * the current segment by the append cursor (limit = min(bytes, cur_off)
+ * when cur_off < segment_size).  It stops -- exactly where recover() stops,
+ * not with a failure -- on the same end-of-log shapes recover() treats as
+ * "nothing more was ever indexed here": a short header, a zero magic, a
+ * torn (non-page_size) record header, a body that does not fit before
+ * limit, or a torn bound/admission trailer field.  Those bytes are never
+ * touched: a torn tail, sealed-segment garbage after a rollover, or an
+ * SPDK-style zero-padded tail is not corruption, it is unreached.
+ *
+ * The one wrinkle is the watermark segment.  recover() does not start that
+ * segment's scan at 0; it starts at flush_watermark.seg_off (segments are
+ * not synced before ps_manifest_set_flush_watermark() durably records that
+ * cursor), so an end-of-log shape *below* the watermark -- e.g. a header
+ * sector lost to a crash while the pages after it and the watermark itself
+ * survived -- says nothing about whether the bytes at/after the watermark
+ * are reachable: recover() never looks below the watermark on this segment
+ * in the first place.  Pass 1 mirrors that: on an end-of-log shape below
+ * the watermark it resumes the scan at the watermark (always a record
+ * boundary -- it is a previously recorded flush cursor) instead of
+ * stopping; only an end-of-log shape at or after the watermark ends the
+ * reachable region.  Below the watermark, unreachable-but-still-referenced
+ * bytes (the power-loss-reordering case: a record whose header page was
+ * lost while a later record's pages and the watermark survived) stay
+ * physically present until segment GC, same as any other bytes below R the
+ * scan does not touch -- deletion never needs to see them because they are
+ * not reachable from this segment's own scan, only from a layer.
+ *
+ * Only a nonzero *unknown* magic, a hole record with the wrong len, or a
+ * complete record naming an impossible timeline -- all inside the reachable
+ * region, i.e. bytes recover() actually replayed or would replay -- fail
+ * the whole pass closed; the segment is then left completely untouched, so
+ * a genuinely malformed segment fails closed and stays retryable without
+ * ever writing a hole for data it could not fully account for.  A seg_read()
+ * I/O failure (header or trailer) is a distinct case: it is not a parse
+ * decision at all, so it fails the pass closed the same way but without the
+ * "malformed record" diagnostic (PsCleanupFailure is reserved for an actual
+ * parse failure).  Pass 2 (only once pass 1 has validated the whole
+ * reachable region) writes the collected holes, every one of them at or
+ * below the same cursor pass 1 never scanned past (PS_ASSERT below); a
+ * failure here is a genuine storage I/O failure, not a data problem, and
+ * leaves some records already tombstoned and some not -- both states are
+ * safe per the write order above, and the next maintenance turn resumes,
+ * since an already-holed record is recognized by its magic and skipped,
+ * making the retry idempotent.
  *
  * Caller holds every shard write lock and map write lock.  Returns 1 when
  * this pass tombstoned at least one record, 0 when no target record remains
@@ -4943,6 +5009,8 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 	SegmentHole *holes = NULL;
 	uint32_t nholes = 0, hole_cap = 0;
 	uint64_t off = 0;
+	uint64_t limit;
+	uint64_t wm = 0;
 
 	errno = 0;
 	bytes = ps_storage->seg_size(s->id, seg);
@@ -4950,38 +5018,84 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		(uint64_t) bytes > SIZE_MAX ||
 		(uint64_t) bytes > (uint64_t) LLONG_MAX)
 		return -1;
-	/* Pass 1: validate, no writes. */
-	while (off < (uint64_t) bytes)
+	/*
+	 * Pass 1: validate the reachable region only, no writes.  'limit' is R
+	 * from invariant I4: the whole file for a sealed/retired segment (there
+	 * is no cursor to clamp it), min(bytes, cur_off) for the current
+	 * segment while its cursor is still inside this file.  An end-of-log
+	 * shape stops the scan (`break`, via the `end_of_log` label below),
+	 * exactly recover()'s rule for that same shape -- except below the
+	 * watermark ('wm'), where it resumes at the watermark instead, since
+	 * recover() replays the watermark segment starting there regardless of
+	 * what an unsynced sector below it looks like; only the bytes annotated
+	 * 'corruption' below fail the pass closed.
+	 */
 	{
-		SegRecHdr hdr;
-		uint64_t header_size, rec_len, end;
+		uint64_t limit_bytes = (uint64_t) bytes;
+
+		limit = limit_bytes;
+		if (seg == s->cur_seg && s->cur_off < segment_size &&
+			s->cur_off < limit_bytes)
+			limit = s->cur_off;
+	}
+	/*
+	 * I4/M1: recover() replays the watermark segment starting at
+	 * flush_watermark.seg_off, not at 0 (recover()'s start offset for this
+	 * segment) -- segments
+	 * are not synced before ps_manifest_set_flush_watermark(), so an
+	 * end-of-log shape below the watermark (e.g. a lost header sector after
+	 * a crash) does not mean the bytes at/after the watermark are
+	 * unreachable; recover() never even looks below the watermark on this
+	 * segment.  'wm' is 0 (a no-op resume point) for every segment other
+	 * than the one flush_watermark currently names.
+	 */
+	if (s->flush_watermark_valid && s->flush_watermark.seg_id == (uint32_t) seg)
+		wm = s->flush_watermark.seg_off;
+	while (off < limit)
+	{
+		SegRecHdr hdr = {0};	/* zeroed so a seg_read() I/O failure below
+								 * reports magic 0, not an uninitialized read */
+		uint64_t header_size, rec_len;
 		uint64_t order_id = 0, admission_seq = 0;
 		int wal_less, bound, admission, hole;
 
-		if ((uint64_t) bytes - off < sizeof(hdr) ||
-			ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0 ||
-			segment_record_shape(hdr.magic, &header_size, &wal_less,
-								 &bound, &admission, &hole) != 0 ||
-			hdr.len != page_size || header_size > UINT64_MAX - hdr.len)
-			goto fail;
+		if (limit - off < sizeof(hdr))
+			goto end_of_log;	/* end of log: short header (recover() short-read) */
+		if (ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0)
+			goto fail;			/* I/O error, not a parse decision: no malformed-record diagnostic */
+		if (hdr.magic == 0)
+			goto end_of_log;	/* end of log: zero padding / lost header (recover()'s zero-magic end-of-log check) */
+		if (segment_record_shape(hdr.magic, &header_size, &wal_less,
+								 &bound, &admission, &hole) != 0)
+			goto fail_malformed;	/* nonzero unknown magic: corruption inside the reachable region */
+		if (hole && hdr.len != page_size)
+			goto fail_malformed;	/* hole with the wrong len: corruption (recover()'s hole-length check) */
+		if (!hole && hdr.len != page_size)
+			goto end_of_log;	/* end of log: torn header (recover()'s torn-header check) */
 		rec_len = header_size + hdr.len;
-		if (rec_len > UINT32_MAX || rec_len > (uint64_t) bytes - off)
-			goto fail;
-		end = off + rec_len;
+		if (rec_len > limit - off)
+			goto end_of_log;	/* end of log: torn body (recover()'s torn-body check) */
 		if (!hole)
 		{
+			if (bound)
+			{
+				if (ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
+										 sizeof(order_id)) != 0)
+					goto fail;			/* I/O error, not a parse decision */
+				if (order_id == 0)
+					goto end_of_log;	/* end of log: torn bound trailer (recover()'s torn-bound-trailer check) */
+			}
+			if (admission)
+			{
+				if (ps_storage->seg_read(s->id, seg,
+										 off + header_size - sizeof(admission_seq),
+										 &admission_seq, sizeof(admission_seq)) != 0)
+					goto fail;			/* I/O error, not a parse decision */
+				if (admission_seq == 0)
+					goto end_of_log;	/* end of log: torn admission trailer (recover()'s torn-admission-trailer check) */
+			}
 			if (hdr.timeline >= MAX_TIMELINES)
-				goto fail;
-			if (bound &&
-				(ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
-								   sizeof(order_id)) != 0 || order_id == 0))
-				goto fail;
-			if (admission &&
-				(ps_storage->seg_read(s->id, seg,
-								 off + header_size - sizeof(admission_seq),
-								 &admission_seq, sizeof(admission_seq)) != 0 ||
-				 admission_seq == 0))
-				goto fail;
+				goto fail_malformed;	/* complete record, impossible owner: corruption */
 			if (hdr.timeline == target)
 			{
 				if (nholes == hole_cap)
@@ -5008,7 +5122,31 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 				nholes++;
 			}
 		}
-		off = end;
+		off += rec_len;
+		continue;
+
+end_of_log:
+		/* I4/M1: recover() replays [wm, ...) on this segment regardless of
+		 * what lies below wm -- an end-of-log shape below the flush
+		 * watermark must not hide the records recover() would still replay
+		 * starting at wm (wm is always a record boundary: it is a cursor
+		 * position recorded by a previous flush).  Only an end-of-log shape
+		 * at or after wm is a real end of the reachable region. */
+		if (off < wm && wm <= limit)
+		{
+			off = wm;
+			continue;
+		}
+		break;
+
+fail_malformed:
+		cleanup_last_failure.shard = s->id;
+		cleanup_last_failure.seg = seg;
+		cleanup_last_failure.off = off;
+		cleanup_last_failure.magic = hdr.magic;
+		cleanup_last_failure.len = hdr.len;
+		cleanup_last_failure_valid = 1;
+		goto fail;
 	}
 	if (nholes == 0)
 	{
@@ -5027,6 +5165,12 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		uint32_t hole_magic =
 			segment_hole_magic_for_header_size(holes[i].header_size);
 
+		/* I4: pass 1 never scanned past the cursor for the current segment,
+		 * so pass 2 must never write one there either.  Vacuously true for
+		 * any other segment (sealed/retired: no cursor bound applies). */
+		PS_ASSERT(seg != s->cur_seg || s->cur_off == segment_size ||
+				 holes[i].off + holes[i].header_size + holes[i].len <=
+					 s->cur_off);
 		if (ps_storage->seg_write(s->id, seg,
 								  holes[i].off + holes[i].header_size,
 								  zero_body, holes[i].len) != 0 ||
@@ -13942,6 +14086,11 @@ timeline_reset_reuse_runtime(uint32_t timeline)
 	ps_pgcache_invalidate_timeline(timeline);
 	wal_runtime_purge(timeline);
 	memset(page_prune_due[timeline], 0, sizeof(page_prune_due[timeline]));
+	/* L2: the reused incarnation starts with a clean "deletion blocked"
+	 * dedup history -- otherwise a torn-tail stall logged for incarnation N
+	 * could suppress the first log line for the same stall recurring on
+	 * incarnation N+1 if the tuple happens to coincide. */
+	timeline_cleanup_blocked_last_valid[timeline] = 0;
 	__atomic_store_n(&timeline_used[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_wal_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_page_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
@@ -14029,12 +14178,15 @@ timeline_delete_page_cleanup_one(void)
 	 * with seg_read/seg_size/seg_write/sync alone; it needs no same-id
 	 * whole-segment replacement primitive.  seg_read/seg_size are already
 	 * required elsewhere in this path, so the one capability worth gating on
-	 * here is seg_write.  SPDK does implement it, but its seg_size always
-	 * reports the fixed g_segsize for every segment rather than how much of
-	 * it actually holds records, so pass 1's validation scan runs into the
-	 * unwritten tail padding and fails closed as malformed: SPDK timeline
-	 * deletion still cannot complete, for that structural reason, not a
-	 * missing capability (out of MVP scope, see D6 in MVP_STATUS.md).
+	 * here is seg_write.  SPDK does implement it, and its seg_size always
+	 * reporting the fixed g_segsize for every segment is no longer a
+	 * structural blocker by itself: pass 1 now treats the zero-padded tail
+	 * as end of log exactly where recover() does (invariant I4).  SPDK
+	 * timeline deletion is still not validated -- there is no SPDK lane
+	 * exercising this path, and SPDK's seg_write goes through the buffered
+	 * curbuf/iobuf path with unverified sync semantics for an in-place hole
+	 * write -- so it stays out of the MVP boundary (D6 in MVP_STATUS.md),
+	 * but the reason has changed from "cannot complete" to "unvalidated."
 	 */
 	if (ps_storage->seg_write == NULL)
 		return 0;
@@ -14054,6 +14206,10 @@ timeline_delete_page_cleanup_one(void)
 			ps_lock_shard_wr(sh);
 		ps_lock_map_wr();
 		had_entries = page_cleanup_has_index_entries_locked(tl);
+		/* L1: a stale failure from a *different* timeline's earlier scan
+		 * must never be attributed to this timeline below -- reset before
+		 * the call so cleanup_last_failure_valid only survives this scan. */
+		cleanup_last_failure_valid = 0;
 		rc = page_cleanup_scan_timeline_locked(tl);
 		if (rc == 0 && __atomic_load_n(&fork_meta_deletion_cutover_done[tl],
 											__ATOMIC_ACQUIRE))
@@ -14070,6 +14226,26 @@ timeline_delete_page_cleanup_one(void)
 		for (uint32_t sh = core_shards(); sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
 		timeline_page_cleanup_cursor = (tl - 1) % (MAX_TIMELINES - 1);
+		if (rc < 0 && cleanup_last_failure_valid)
+		{
+			PsCleanupFailure f = cleanup_last_failure;
+
+			/* Once per distinct (timeline, shard, seg, off, magic, len):
+			 * a stalled deletion retries every maintenance turn, and this
+			 * diagnostic must not scale with turn count. */
+			if (!timeline_cleanup_blocked_last_valid[tl] ||
+				memcmp(&timeline_cleanup_blocked_last[tl], &f, sizeof(f)) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon: timeline %u deletion blocked: "
+						"shard %u segment %d malformed record at offset %llu "
+						"(magic %#x len %u) inside the reachable region; "
+						"retrying each maintenance turn\n",
+						tl, f.shard, f.seg, (unsigned long long) f.off,
+						f.magic, f.len);
+				timeline_cleanup_blocked_last[tl] = f;
+				timeline_cleanup_blocked_last_valid[tl] = 1;
+			}
+		}
 		if (rc > 0)
 			return 1;
 		/* A malformed target segment must not prevent another deleting timeline
@@ -14410,6 +14586,11 @@ timeline_delete_publish_one(void)
 			/* The deleted branch's cap no longer fences its ancestors' page
 			 * and control history; revisit their layers (map-wr is held). */
 			page_prune_mark_all_due_locked();
+			/* L2: DELETED is the durable proof this incarnation is fully
+			 * gone; a reuse of this slot must not have its own "deletion
+			 * blocked" diagnostic suppressed by a stale tuple left behind
+			 * by this incarnation's stall history. */
+			timeline_cleanup_blocked_last_valid[tl] = 0;
 			did = 1;
 		}
 		ps_unlock_map();

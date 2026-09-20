@@ -979,6 +979,14 @@ covered segment.  A store written entirely by the fixed daemon now exercises
 the adoption rule above **never**: no timeline deletion it performs can ever
 create a rescan region.  The rule stays, unchanged, purely as recovery for a
 store that deleted a timeline before this fix (see the T7 follow-up below).
+**Resolved** (L6, see `RELEASE_VALIDATION.md`'s "Resolved: torn-tail garbage
+stalled a timeline deletion (L6)"): tombstoning's pass 1 used to validate a
+segment's whole file and fail closed forever on any torn tail, sealed
+rollover garbage, or SPDK-style zero padding past the point `recover()`
+itself already treats as end of log; it now scans only that same
+`recover()`-derived reachable region (invariant I4), so a stalled deletion
+resumes, and a genuinely stuck one now logs a once-per-tuple "deletion
+blocked" diagnostic instead of retrying silently forever.
 `integration_test.sh`
 now stops every cluster it started, reopens its own retained store against a
 fresh daemon, and asserts the reopen succeeds, that no segment tail was

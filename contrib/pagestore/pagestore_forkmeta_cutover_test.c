@@ -4824,6 +4824,151 @@ test_timeline_delete_crash_matrix(void)
 	test_timeline_delete_crash_matrix_case("timeline_delete.after_segment_tombstone");
 }
 
+/*
+ * L6, the real-crash shape: a genuine torn tail from PAGESTORE_TEST_CRASH_
+ * AFTER_SEG_WRITES (storage_posix.c), not a synthetic one appended by hand.
+ * Lifetime 1 writes two target records and closes cleanly.  Lifetime 2 is
+ * armed to crash after exactly its first segment write -- a survivor's own
+ * record header -- so the header lands complete on disk but the body never
+ * does: a real torn tail past the two flushed target records, produced the
+ * same way recover()'s "torn record is always the last complete record of
+ * its segment" proof (see test_torn_commit_append_never_adopted()'s header
+ * comment) already assumes.  Lifetime 3 (the parent) reopens, reads the
+ * recovered cursor off the "recovered shard ... (off N)" log line, deletes
+ * the target timeline, and asserts it reaches DELETED with holes only
+ * below that cursor and the torn bytes at/after it byte-for-byte untouched
+ * -- invariant I4's reachable region, exercised against a real crash
+ * instead of a hand-crafted file.
+ */
+static void
+test_timeline_delete_torn_tail_crash_matrix(void)
+{
+	char		store[] = "/tmp/pstorntailcrashXXXXXX";
+	char		seg0[1200];
+	char		captured[16384];
+	PsKey		target_key = {23, 23, 1, 0, PS_KLASS_RELATION};
+	PsKey		survivor_key = {23, 23, 2, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	unsigned char tail_before[4096];
+	unsigned char tail_after[4096];
+	long long	recovered_off = -1;
+	off_t		seg0_size;
+	pid_t		pid;
+	int			status;
+	int			rc = -1;
+	int			fd;
+	int			n;
+
+	check(mkdtemp(store) != NULL, "create torn-tail crash-matrix store");
+	n = snprintf(seg0, sizeof(seg0), "%s/seg_00000000", store);
+	check(n > 0 && (size_t) n < sizeof(seg0), "build torn-tail crash seg0 path");
+	flush_pages = 1;
+
+	pid = fork();
+	if (pid == 0)
+	{
+		uint64_t	seq = 0;
+
+		setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+		if (ps_core_open(store) != 0)
+			_exit(1);
+		if (!create_branch_request(1, 0, 1) || !create_branch_request(2, 0, 1))
+			_exit(2);
+		if (append_relation_timeline(1, &target_key, 0, 100, page, &seq) != 0)
+			_exit(3);
+		if (append_relation_timeline(1, &target_key, 1, 101, page, &seq) != 0)
+			_exit(4);
+		close_runtime();
+		/* Lifetime 2: a fresh crash budget of 1 fires after this lifetime's
+		 * very first segment write, which is the survivor's own header --
+		 * its body never gets its turn. */
+		setenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES", "1", 1);
+		if (ps_core_open(store) != 0)
+			_exit(5);
+		(void) append_relation_timeline(2, &survivor_key, 0, 200, page, &seq);
+		_exit(10);		/* not reached: the crash hook exits 86 first */
+	}
+	check(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		  WEXITSTATUS(status) == 86,
+		  "child crashed after the survivor's torn header reached the segment");
+	unsetenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+
+	check(open_capture_stderr(store, captured, sizeof(captured), &rc) &&
+		  rc == 0, "lifetime 3 reopens after the real crash");
+	check(count_occurrences(captured, "retiring tail") == 0 &&
+		  count_occurrences(captured, "refusing unmatched") == 0 &&
+		  count_occurrences(captured, "adopting orphaned") == 0,
+		  "the torn survivor header is plain end of log: no "
+		  "retire/refuse/adopt handling applies to it");
+	{
+		const char *p = strstr(captured,
+								"recovered shard 0 through segment 0 (off ");
+
+		check(p != NULL && sscanf(p,
+								   "recovered shard 0 through segment 0 (off %lld)",
+								   &recovered_off) == 1 && recovered_off > 0,
+			  "capture the recovered append cursor from the reopen log");
+	}
+	seg0_size = file_size(seg0);
+	check(seg0_size > recovered_off,
+		  "the torn survivor header is physically present past the cursor");
+	check((size_t) (seg0_size - recovered_off) <= sizeof(tail_before),
+		  "torn tail fits the snapshot buffer");
+	fd = open(seg0, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_before, (size_t) (seg0_size - recovered_off),
+				  (off_t) recovered_off) ==
+				(ssize_t) (seg0_size - recovered_off) &&
+			close(fd) == 0,
+		  "snapshot the torn survivor header before deletion");
+
+	check(begin_delete_timeline(1), "begin torn-tail crash-matrix target deletion");
+	{
+		PsTimelineState state = (PsTimelineState) -1;
+		int			deleted = 0;
+
+		for (int i = 0; i < 400 && !deleted; i++)
+		{
+			(void) ps_core_maintenance();
+			if (ps_timeline_state(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+				deleted = 1;
+			else
+				usleep(20000);
+		}
+		check(deleted,
+			  "a real crash-produced torn tail does not stall the deletion");
+	}
+	check(file_size(seg0) == seg0_size,
+		  "segment 0 keeps its size after deletion completes");
+	{
+		int64_t		holes = 0;
+		int64_t		target_live = 0;
+
+		check(scan_segment_holes(0, 0, recovered_off, 1, &holes,
+								  &target_live) == 0 &&
+				holes == 2 && target_live == 0,
+			  "exactly the two target records below the recovered cursor "
+			  "become holes");
+	}
+	fd = open(seg0, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_after, (size_t) (seg0_size - recovered_off),
+				  (off_t) recovered_off) ==
+				(ssize_t) (seg0_size - recovered_off) &&
+			close(fd) == 0 &&
+			memcmp(tail_before, tail_after,
+				   (size_t) (seg0_size - recovered_off)) == 0,
+		  "the torn survivor header past the cursor is never written");
+	memset(page, 0, sizeof(page));
+	check(read_resolve_version(1, &target_key, 0, UINT64_MAX, 0, page, NULL,
+							   NULL) == 0,
+		  "target block 0 gone after torn-tail crash-matrix cleanup");
+	close_runtime();
+	remove_tree(store);
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+}
+
 int
 main(void)
 {
@@ -5418,6 +5563,7 @@ main(void)
 	test_timeline_delete_reclaims_by_segment_gc();
 	test_compaction_never_prunes_above_watermark();
 	test_timeline_delete_crash_matrix();
+	test_timeline_delete_torn_tail_crash_matrix();
 	if (!failed)
 		remove_tree(store);
 	else
