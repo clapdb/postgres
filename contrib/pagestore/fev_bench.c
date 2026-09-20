@@ -16,13 +16,22 @@
  *      pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c
  *      pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
  *
- * Usage: fev_bench K [future|past]
- *   future: the cutover cutoff stays below the markers (they are all "future"
- *           and kept in the tail part -- the builder never evaluates
- *           marker_page_retained for them)
- *   past:   a page-history pin above the markers moves the cutoff past them,
- *           so the builder evaluates marker_page_retained per marker and
- *           drops the ones whose version was pruned.
+ * Usage: fev_bench K [future|past|periodic]
+ *   future:   the cutover cutoff stays below the markers (they are all
+ *             "future" and kept in the tail part -- the builder never
+ *             evaluates marker_page_retained for them)
+ *   past:     a page-history pin above the markers moves the cutoff past
+ *             them, so the builder evaluates marker_page_retained per
+ *             marker and drops the ones whose version was pruned.
+ *   periodic: design B (per-lifetime bound).  K WAL-less rewrites of block 0
+ *             split into FEV_PERIODIC_ROUNDS (env, default 10) rounds; each
+ *             round advances one retention pin's admission_seq to that
+ *             round's newest write and forces a cutover, then reports the
+ *             in-memory event count (ps_test_fork_event_count()) after that
+ *             cutover.  Reports the max in-memory event count seen across
+ *             every round -- with fork_event_compact_dropped_markers() this
+ *             stays near one round's worth regardless of K; reverted, it
+ *             grows to roughly K.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -160,6 +169,115 @@ set_pin(uint64_t lsn, uint64_t seq, uint64_t generation)
 	return ps_retention_set(&pin) == PS_RETENTION_OK;
 }
 
+/*
+ * design B: K WAL-less rewrites of block 0 split into ROUNDS rounds.  The
+ * fork is created once at a fixed floor far above every round's pin (so
+ * `existed_before` stays false for the whole run -- every rewrite keeps
+ * generating an inert commit marker, not just round 0 -- and so later
+ * rounds' rewrites are never refused as not-future of an advancing
+ * operational cutoff); each round's retention pin targets that SAME floor
+ * lsn with an advancing admission_seq (a higher generation supersedes its
+ * own earlier pin), so every earlier round's versions become reclaimable,
+ * then forces a cutover and reports the in-memory event count.
+ */
+static int
+run_periodic(unsigned long K)
+{
+	char store[] = "/tmp/fevbenchperiodicXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 6, 1, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	unsigned long rounds = getenv("FEV_PERIODIC_ROUNDS") ?
+		strtoul(getenv("FEV_PERIODIC_ROUNDS"), NULL, 10) : 10;
+	unsigned long per_round = K / rounds ? K / rounds : 1;
+	const uint64_t floor = 100000;
+	uint32_t max_nevents = 0, first_nevents = 0;
+
+	if (mkdtemp(store) == NULL)
+		return 1;
+	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	flush_pages = getenv("FEV_FLUSH_PAGES") ? atoi(getenv("FEV_FLUSH_PAGES")) : 16;
+	compact_layers = getenv("FEV_COMPACT_LAYERS") ?
+		atoi(getenv("FEV_COMPACT_LAYERS")) : 2;
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+	if (ps_core_open(store) != 0)
+	{
+		fprintf(stderr, "periodic: open failed\n");
+		return 1;
+	}
+	if (!meta_request(PS_OP_CREATE, &key, floor, 0, 0, 0))
+	{
+		fprintf(stderr, "periodic: create failed\n");
+		return 1;
+	}
+
+	for (unsigned long round = 0; round < rounds; round++)
+	{
+		unsigned long lo = round * per_round;
+		unsigned long hi = (round + 1 == rounds) ? K : lo + per_round;
+		uint32_t nevents = 0, nmarkers = 0, ninert = 0;
+		double tr0 = now_s();
+
+		for (unsigned long i = lo; i < hi; i++)
+			if (append_relation(&key, 0, 50, page, (unsigned char) i, &seq) != 0)
+			{
+				fprintf(stderr, "periodic: write %lu failed (round %lu)\n", i, round);
+				return 1;
+			}
+		if (!set_pin(floor, seq, round + 1))
+		{
+			fprintf(stderr, "periodic: retention advance failed (round %lu)\n", round);
+			return 1;
+		}
+		if (round == 0)
+		{
+			if (!run_maintenance_until(frontier, 1))
+			{
+				fprintf(stderr, "periodic: first frontier failed\n");
+				return 1;
+			}
+		}
+		else
+			for (int tick = 0; tick < 60; tick++)
+			{
+				(void) ps_core_maintenance();
+				usleep(50000);
+			}
+		setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1);
+		if (!run_maintenance_until(manifest, 1))
+		{
+			fprintf(stderr, "periodic: cutover failed (round %lu)\n", round);
+			return 1;
+		}
+		setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1);
+		if (!ps_test_fork_event_count(0, &key, &nevents, &nmarkers, &ninert))
+		{
+			fprintf(stderr, "periodic: event count read failed (round %lu)\n", round);
+			return 1;
+		}
+		if (round == 0)
+			first_nevents = nevents;
+		if (nevents > max_nevents)
+			max_nevents = nevents;
+		printf("periodic round=%-3lu writes=%-7lu nevents=%-6u nmarkers=%-6u "
+			   "ninert=%-6u  %.3f s\n",
+			   round, hi - lo, nevents, nmarkers, ninert, now_s() - tr0);
+	}
+	printf("periodic K=%-7lu rounds=%-3lu max_nevents=%u (round0 alone left %u)\n",
+		   K, rounds, max_nevents, first_nevents);
+	close_runtime();
+	if (getenv("FEV_KEEP") == NULL)
+		remove_tree(store);
+	else
+		printf("periodic store kept at %s\n", store);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -175,6 +293,9 @@ main(int argc, char **argv)
 	int past = argc > 2 && strcmp(argv[2], "past") == 0;
 	double t0, t1;
 	int ok;
+
+	if (argc > 2 && strcmp(argv[2], "periodic") == 0)
+		return run_periodic(K);
 
 	if (mkdtemp(store) == NULL)
 		return 1;

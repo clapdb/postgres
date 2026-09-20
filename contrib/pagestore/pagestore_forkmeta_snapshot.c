@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "pagestore_forkmeta_snapshot.h"
+#include "pagestore_compat.h"
 #include "pagestore_format.h"
 
 #define FORKMETA_SNAPSHOT_MAGIC UINT32_C(0x4d534946) /* "FISM" */
@@ -187,7 +188,7 @@ forkmeta_gc_directory_cursor_prepare(const char *directory, int directory_fd,
 	{
 		forkmeta_gc_directory_cursor_reset(cursor);
 		scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-		if (scan_fd < 0 || (cursor->dir = fdopendir(scan_fd)) == NULL)
+		if (scan_fd < 0 || (cursor->dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		{
 			if (scan_fd >= 0)
 				(void) close(scan_fd);
@@ -1289,7 +1290,7 @@ ps_forkmeta_snapshot_next_generation(const char *directory,
 	if (intent_exists && durable_prepared.generation > highest)
 		highest = durable_prepared.generation;
 	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+	if (scan_fd < 0 || (dir = ps_fdopendir_scan(scan_fd)) == NULL)
 	{
 		if (scan_fd >= 0)
 			(void) close(scan_fd);
@@ -2250,7 +2251,7 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 	int gc_temp_gc_due = 0;
 
 	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+	if (scan_fd < 0 || (dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	errno = 0;

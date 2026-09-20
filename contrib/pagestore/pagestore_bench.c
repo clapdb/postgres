@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 #define PAGE	8192u
 #define SEGSZ	"4194304"		/* 4 MiB segments */
@@ -137,7 +138,7 @@ attach(const char *shm)
 {
 	for (int i = 0; i < 1000; i++)
 	{
-		int			fd = shm_open(shm, O_RDWR, 0600);
+		int			fd = ps_shm_open(shm, O_RDWR, 0600);
 
 		if (fd >= 0)
 		{
@@ -187,7 +188,7 @@ main(int argc, char **argv)
 				argv[0]);
 		return 2;
 	}
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn(daemon, shm, store);
 	attach(shm);
 

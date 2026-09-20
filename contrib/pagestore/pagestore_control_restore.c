@@ -60,6 +60,7 @@
 #include "storage/bufpage.h"
 #include "pagestore_artifact_format.h"
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 static void *shm = NULL;
 
@@ -108,7 +109,7 @@ release_channel(void)
 static void
 client_attach(const char *shm_name)
 {
-	int			fd = shm_open(shm_name, O_RDWR, 0600);
+	int			fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	PsShmHeader *hdr;
 
 	if (fd < 0)

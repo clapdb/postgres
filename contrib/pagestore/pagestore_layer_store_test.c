@@ -59,6 +59,7 @@ main(void)
 	char		saved_cwd[4096];
 	char		configured_object_dir[sizeof(object_dir) + 2];
 	char		expected_remote_uri[PS_LAYER_URI_MAX];
+	char	   *canonical_object_dir;
 	char		local_uri[PS_LAYER_URI_MAX];
 	char		remote_uri[PS_LAYER_URI_MAX];
 	const char *contents = "sealed layer object bytes";
@@ -438,8 +439,14 @@ main(void)
 	check(ps_layer_store->remote_uri(layer.layer_id, remote_uri,
 												 sizeof(remote_uri)) == 0,
 		  "derive remote object URI");
-	snprintf(expected_remote_uri, sizeof(expected_remote_uri),
-			 "%s/layer_3_0003000000000011", object_dir);
+	/* The store publishes realpath() spellings; /tmp is a symlink on macOS. */
+	canonical_object_dir = realpath(object_dir, NULL);
+	check(canonical_object_dir != NULL &&
+		  snprintf(expected_remote_uri, sizeof(expected_remote_uri),
+				   "%s/layer_3_0003000000000011", canonical_object_dir) <
+		  (int) sizeof(expected_remote_uri),
+		  "resolve the canonical object directory");
+	free(canonical_object_dir);
 	check(strcmp(remote_uri, expected_remote_uri) == 0,
 		  "derive canonical remote object URI");
 	layer.locations[0].size++;

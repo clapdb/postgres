@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 static int checks;
 static int failed;
@@ -115,8 +116,8 @@ open_fixture(char *name, size_t name_size, int *fd_out, PsShmHeader **hdr_out)
 	void *mapping;
 
 	snprintf(name, name_size, "/psinspect_mailbox_%ld", (long) getpid());
-	shm_unlink(name);
-	fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+	ps_shm_unlink(name);
+	fd = ps_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
 	if (fd < 0 || ftruncate(fd, PS_SHM_SIZE) != 0)
 	{
 		if (fd >= 0)
@@ -128,7 +129,7 @@ open_fixture(char *name, size_t name_size, int *fd_out, PsShmHeader **hdr_out)
 	if (mapping == MAP_FAILED)
 	{
 		close(fd);
-		shm_unlink(name);
+		ps_shm_unlink(name);
 		return -1;
 	}
 	*fd_out = fd;
@@ -141,7 +142,7 @@ close_fixture(const char *name, int fd, PsShmHeader *hdr)
 {
 	munmap(hdr, PS_SHM_SIZE);
 	close(fd);
-	shm_unlink(name);
+	ps_shm_unlink(name);
 }
 
 static pid_t
@@ -166,7 +167,7 @@ start_lease_holder(const char *name, int ready_fd)
 	if (pid == 0)
 	{
 		unsigned char ready = 1;
-		int fd = shm_open(name, O_RDWR, 0);
+		int fd = ps_shm_open(name, O_RDWR, 0);
 
 		if (fd < 0 || set_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE,
 										F_WRLCK) != 0)
@@ -333,7 +334,7 @@ test_initialization_lock_exclusion(void)
 	holder = fork();
 	if (holder == 0)
 	{
-		int child_fd = shm_open(name, O_RDWR, 0);
+		int child_fd = ps_shm_open(name, O_RDWR, 0);
 
 		if (child_fd < 0 || set_inspection_lock(child_fd,
 									PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0)

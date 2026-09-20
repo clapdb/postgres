@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_shm.h"
 
 /* ===================== tiny test framework ============================= */
 
@@ -376,8 +377,8 @@ check_inspector_seqlock(void)
 		  "inspection debt aggregation saturates instead of wrapping");
 
 	snprintf(name, sizeof(name), "/pstest_%d_inspection_seq", (int) getpid());
-	shm_unlink(name);
-	fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+	ps_shm_unlink(name);
+	fd = ps_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
 	check(fd >= 0 && ftruncate(fd, PS_SHM_SIZE) == 0,
 		  "create synthetic inspection seqlock shared memory");
 	if (fd < 0)
@@ -443,7 +444,7 @@ check_inspector_seqlock(void)
 		  strcmp(output, "pagestore_inspect: timeline 7 does not exist\n") == 0,
 		  "a clean timeline snapshot reports a genuinely absent timeline");
 	munmap(base, PS_SHM_SIZE);
-	shm_unlink(name);
+	ps_shm_unlink(name);
 }
 
 static int
@@ -487,7 +488,7 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 {
 	PsShmHeader *hdr;
 
-	cl_shm_fd = shm_open(shm_name, O_RDWR, 0600);
+	cl_shm_fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	if (cl_shm_fd < 0)
 	{
 		perror("client shm_open");
@@ -1916,7 +1917,7 @@ wait_ready(const char *shm, uint32_t page_size)
 {
 	for (int i = 0; i < 500; i++)	/* up to ~5s */
 	{
-		int			fd = shm_open(shm, O_RDWR, 0600);
+		int			fd = ps_shm_open(shm, O_RDWR, 0600);
 		struct stat st;
 
 		/* The daemon creates the object before sizing it; touching a mapping
@@ -1979,7 +1980,7 @@ expect_daemon_open_failure(pid_t pid, const char *shm, const char *message)
 	check(exited && WIFEXITED(status) && WEXITSTATUS(status) != 0,
 		  "%s", message);
 	{
-		int			fd = shm_open(shm, O_RDWR, 0600);
+		int			fd = ps_shm_open(shm, O_RDWR, 0600);
 		int			not_ready = fd < 0;
 
 		if (fd >= 0)
@@ -2216,7 +2217,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 				 (int) getpid(), fail_at);
 		snprintf(store, sizeof(store), "%s/store_migrate_%d", tmpbase, fail_at);
 		rm_rf(store);
-		shm_unlink(shm);
+		ps_shm_unlink(shm);
 		pid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
 									  test_nshards, fail_at);
 		snprintf(message, sizeof(message),
@@ -2229,7 +2230,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		wait_ready(shm, ps);
 		stop_daemon(pid);
 		rm_rf(store);
-		shm_unlink(shm);
+		ps_shm_unlink(shm);
 	}
 
 	/* A crash can leave a prefix shorter than one ForkMetaRec.  Startup must
@@ -2245,7 +2246,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		snprintf(shm, sizeof(shm), "/pstest_%d_migrate_torn", (int) getpid());
 		snprintf(store, sizeof(store), "%s/store_migrate_torn", tmpbase);
 		rm_rf(store);
-		shm_unlink(shm);
+		ps_shm_unlink(shm);
 		check(mkdir(store, 0700) == 0, "created torn forkmeta test store");
 		snprintf(path, sizeof(path), "%s/forkmeta", store);
 		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -2271,7 +2272,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		if (fd >= 0)
 			close(fd);
 		rm_rf(store);
-		shm_unlink(shm);
+		ps_shm_unlink(shm);
 	}
 }
 
@@ -2287,13 +2288,13 @@ run_worker_startup_failure_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_inspection_worker", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_inspection_worker", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_fail_inspection_worker(daemon_path, shm, store, ps,
 										  test_nshards);
 	expect_daemon_open_failure(pid, shm,
 							   "inspection worker startup failure aborts daemon");
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 }
 
 static void
@@ -2311,7 +2312,7 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_order_fail", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_order_fail", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	/* Fresh startup writes migration start/done (#1/#2), CREATE is #3, and
 	 * the ordered segment-growth marker is #4. */
@@ -2353,7 +2354,7 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 		waitpid(writer, NULL, 0);
 	}
 
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -2369,7 +2370,7 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 	op_write_one(rel, 0, 0, page);
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -2382,7 +2383,7 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 	stop_daemon(pid);
 
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -2401,7 +2402,7 @@ run_markerless_seg0_dedup_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_seg0_dedup", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_seg0_dedup", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -2423,7 +2424,7 @@ run_markerless_seg0_dedup_suite(const char *daemon_path, const char *tmpbase)
 		  "removed bound marker while preserving definitive fork history");
 	remove_lsm_metadata(store);
 
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -2433,7 +2434,7 @@ run_markerless_seg0_dedup_suite(const char *daemon_path, const char *tmpbase)
 	stop_daemon(pid);
 
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 }
 
@@ -2595,7 +2596,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_segment_gc", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_segment_gc", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -2744,7 +2745,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	kill(pid, SIGKILL);
 	waitpid(pid, NULL, 0);
 
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -2824,7 +2825,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	}
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -2848,7 +2849,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	stop_daemon(pid);
 
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -2875,7 +2876,7 @@ run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_prune_branch", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_prune_branch", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -2900,7 +2901,7 @@ run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "descendant-pinned history reaches a bounded compacted layer set");
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -2925,7 +2926,7 @@ run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "fork-capped history reaches a bounded compacted layer set");
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -2941,7 +2942,7 @@ run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -2961,7 +2962,7 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_prune_relation", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_prune_relation", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -3009,7 +3010,7 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	}
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -3067,7 +3068,7 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	}
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -3080,7 +3081,7 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -3108,7 +3109,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	rm_rf(store);
 	rm_rf(fault_dir);
 	check(mkdir(fault_dir, 0700) == 0, "create fault control directory %s", phase);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	fault_name = strcmp(phase, "after_publish") == 0 ?
 		"page_compaction.after_publish" :
@@ -3159,7 +3160,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	unlink(marker);
 	crashed_layer_count = local_layer_count(store);
 
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -3183,7 +3184,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	client_detach();
 	stop_daemon(pid);
 
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -3197,7 +3198,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	stop_daemon(pid);
 	rm_rf(store);
 	rm_rf(fault_dir);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -3234,7 +3235,7 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_prune_churn", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_prune_churn", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -3283,7 +3284,7 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -3339,7 +3340,7 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -3362,7 +3363,7 @@ run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_orphan_layer", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_orphan_layer", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
 	wait_ready(shm, ps);
@@ -3377,7 +3378,7 @@ run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(orphan, sizeof(orphan), "%s/layer_0_%016llx", store, 1ULL);
 	fd = open(orphan, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	check(fd >= 0 && close(fd) == 0, "created orphan layer ID 1");
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -3390,7 +3391,7 @@ run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 		  "recovery leaves the orphan ID untouched while allocating above it");
 
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -3418,7 +3419,7 @@ run_reshard_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_reshard_gc", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_reshard_gc", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
 	wait_ready(shm, ps);
@@ -3434,7 +3435,7 @@ run_reshard_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	check(segment_exists(store, 0, 0),
 		  "single-shard source segment remains while GC is disabled");
 
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, 4);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -3449,7 +3450,7 @@ run_reshard_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	stop_daemon(pid);
 
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 	free(readback);
 }
@@ -3470,7 +3471,7 @@ run_shard_count_change_rejection_suite(const char *daemon_path,
 	snprintf(shm, sizeof(shm), "/pstest_%d_shard_count", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_shard_count", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	check(rel != 0 && page != NULL, "prepare a two-shard relation");
 	pid = spawn_daemon(daemon_path, shm, store, ps, 2);
@@ -3481,7 +3482,7 @@ run_shard_count_change_rejection_suite(const char *daemon_path,
 	op_write_one(rel, 0, 0, page);
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	check(snprintf(marker, sizeof(marker), "%s/.pagestore-nshards", store) > 0,
 		  "build shard-count marker path");
@@ -3490,7 +3491,7 @@ run_shard_count_change_rejection_suite(const char *daemon_path,
 	expect_daemon_open_failure(pid, shm,
 							   "markerless multi-shard segment store rejects unsupported shard-count changes");
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(page);
 }
 
@@ -3512,7 +3513,7 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_legacy_widx", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_legacy_widx", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	check(rel != 0, "test harness can find a relation that moves to shard 1");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
@@ -3537,7 +3538,7 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 		  "single-shard store publishes a WAL-index snapshot before reshard");
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon(daemon_path, shm, store, ps, 4);
 	wait_ready(shm, ps);
@@ -3557,7 +3558,7 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 		  "reshard republishes the snapshot in the current shard layout");
 	client_detach();
 	stop_daemon(pid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pid = spawn_daemon(daemon_path, shm, store, ps, 4);
 	wait_ready(shm, ps);
@@ -3568,7 +3569,7 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 }
 
 /* ===================== the test suite ================================== */
@@ -3610,7 +3611,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	snprintf(shm, sizeof(shm), "/pstest_%d_%u", (int) getpid(), page_size);
 	snprintf(store, sizeof(store), "%s/store_%u", tmpbase, page_size);
 	rm_rf(store);				/* start from a clean store */
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	pa = malloc(page_size);
 	pb = malloc(page_size);
@@ -3970,7 +3971,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_create_at(REL_I, FORK0, 11000);
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon_crash_after_seg(daemon_path, shm, store, page_size,
 									 test_nshards, 2);
 	wait_ready(shm, page_size);
@@ -3996,7 +3997,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		kill(writer, SIGKILL);
 		waitpid(writer, NULL, 0);
 	}
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
@@ -4016,7 +4017,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(strip_forkmeta_markers(store, 1, 1) == 0,
 		  "synthesized a nonempty pre-marker fork-meta log");
 	remove_lsm_metadata(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
@@ -4109,7 +4110,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		unlink(fmpath);
 	}
 	remove_lsm_metadata(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
@@ -4133,7 +4134,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(strip_forkmeta_markers(store, 0, 1) == 0,
 		  "synthesized an interrupted migration with its start marker intact");
 	remove_lsm_metadata(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
@@ -4145,7 +4146,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	/* The resumed scan seals the migration; the following boot is normal. */
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
@@ -4156,7 +4157,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	stop_daemon(dpid);
 
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(pa);
 	free(pb);
 	free(rb);
@@ -4187,7 +4188,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(store, sizeof(store), "%s/store_retention", tmpbase);
 	snprintf(path, sizeof(path), "%s/retention.meta", store);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -4365,7 +4366,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -4400,7 +4401,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "synthesized a short retention-log tail");
 	if (fd >= 0)
 		close(fd);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -4421,13 +4422,13 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 			  "corrupted one byte in a complete retention record");
 		close(fd);
 	}
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	expect_daemon_open_failure(dpid, shm,
 						   "complete retention-record corruption fails closed");
 
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(note);
 	free(image);
 }
@@ -4453,7 +4454,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_br", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_br", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	p = malloc(ps);
 	rb = malloc(ps);
@@ -4586,7 +4587,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	 * every complete branch record and truncates the tail before new appends. */
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	{
 		off_t		committed_size = append_torn_timeline_tail(store);
 		char		path[512];
@@ -4627,7 +4628,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	 * growth may appear or mask the inherited size (8) on the next recovery. */
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon_fail_seg(daemon_path, shm, store, ps, test_nshards, 1);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -4638,7 +4639,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "failed first branch write leaves CREATE_BRANCH retry idempotent");
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -4653,7 +4654,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	 * retry of the still-event-free branch definition remains idempotent. */
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
 								   test_nshards, 1);
 	wait_ready(shm, ps);
@@ -4663,7 +4664,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "missing marker rejects the first branch-local ordered record");
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -4716,7 +4717,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(p);
 	free(rb);
 }
@@ -4757,7 +4758,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_wal", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_wal", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -4927,7 +4928,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	/* WAL end LSNs survive a daemon restart (recovered from the logs) */
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -4978,7 +4979,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	write_short_wal_payload(store, 4, 4000, bufa, 500, 100);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -4991,7 +4992,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(segment);
 }
 
@@ -5021,7 +5022,7 @@ run_wal_backpressure_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(store, sizeof(store), "%s/store_wal_bp", tmpbase);
 	snprintf(pause_file, sizeof(pause_file), "%s/wal_bp_pause", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	unlink(pause_file);
 	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
 	check(pause_fd >= 0, "WAL backpressure test arms maintenance pause");
@@ -5051,7 +5052,7 @@ run_wal_backpressure_suite(const char *daemon_path, const char *tmpbase)
 		  "real WAL setup ships three complete immutable segments");
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	/* Recovery with thresholds enabled must report debt from the actual WAL
 	 * store/proof state before any test request is submitted. */
@@ -5107,7 +5108,7 @@ run_wal_backpressure_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	unlink(pause_file);
 }
 
@@ -5139,7 +5140,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	rm_rf(fault_dir);
 	check(mkdir(fault_dir, 0700) == 0, "create WAL-index fault control directory");
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0 &&
@@ -5446,7 +5447,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	check(setenv("PAGESTORE_TEST_FAULT_NAME", "wal_index.after_frontier", 1) == 0 &&
 		  setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) == 0 &&
 		  setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) == 0 &&
@@ -5487,7 +5488,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  "WAL-index compaction crashes after durable frontier publication");
 		unlink(marker);
 	}
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
 		  "hold the crashed WAL-index generation pending for admission tests");
@@ -5515,7 +5516,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	}
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "2", 1) == 0,
 		  "enable immediate WAL-index publication retry after crash");
@@ -5546,7 +5547,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	}
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
@@ -5560,7 +5561,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	}
 	client_detach();
 	stop_daemon(dpid);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	{
 		char path[512];
 		unsigned char byte;
@@ -5632,7 +5633,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	}
 	rm_rf(store);
 	rm_rf(fault_dir);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 }
 
 /*
@@ -5655,7 +5656,7 @@ run_vectored_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_vec", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_vec", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	wbuf = malloc((size_t) nb * ps);
 	rbuf = malloc((size_t) nb * ps);
@@ -5684,7 +5685,7 @@ run_vectored_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 	free(wbuf);
 	free(rbuf);
 }
@@ -5735,7 +5736,7 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_conc", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_conc", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);		/* parent does not claim a channel */
@@ -5759,7 +5760,7 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 
 	stop_daemon(dpid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 #undef NKIDS
 }
 
@@ -5849,7 +5850,7 @@ run_stress_suite(const char *daemon_path, const char *tmpbase)
 	snprintf(shm, sizeof(shm), "/pstest_%d_stress", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_stress", tmpbase);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
@@ -5888,7 +5889,7 @@ run_stress_suite(const char *daemon_path, const char *tmpbase)
 
 	stop_daemon(dpid);
 	rm_rf(store);
-	shm_unlink(shm);
+	ps_shm_unlink(shm);
 #undef NWRITERS
 #undef NREADERS
 }

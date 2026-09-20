@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "pagestore_fault.h"
+#include "pagestore_compat.h"
 #include "pagestore_wal_store.h"
 #include "pagestore_format.h"
 
@@ -1233,7 +1234,7 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 	prefix_len = snprintf(prefix, sizeof(prefix), "walv1_%u_", timeline);
 	if (prefix_len < 0 || (size_t) prefix_len >= sizeof(prefix) ||
 		(scan_fd = dup(store->directory_fd)) < 0 ||
-		(dir = fdopendir(scan_fd)) == NULL)
+		(dir = ps_fdopendir_scan(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
 	while ((de = readdir(dir)) != NULL)
