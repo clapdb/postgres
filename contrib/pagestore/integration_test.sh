@@ -162,7 +162,8 @@ _dump_log() {  # $1=banner label $2=filename slug (for the stashed copy) $3=path
 # advancing-reader/bad-reader/unprepared-branch clusters this run created),
 # so a CI failure is diagnosable from the job output alone.  Also copies them
 # into $BUILD/pagestore-integration-logs for the workflow to upload as an
-# artifact.  Called only from the final fail-path, before the EXIT trap
+# artifact.  Also called on success when acceptance requests log export.
+# Called before the EXIT trap
 # removes the temporary directories.
 dump_failure_logs() {
 	FAILDUMP_DIR="$BUILD/pagestore-integration-logs"
@@ -2453,6 +2454,9 @@ kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 echo "----"
 if [ "$fail" = 0 ]; then
 	echo "integration test: PASS"
+	if [ "${PAGESTORE_INTEGRATION_EXPORT_LOGS:-0}" = 1 ]; then
+		dump_failure_logs
+	fi
 else
 	echo "integration test: FAIL"
 	dump_failure_logs

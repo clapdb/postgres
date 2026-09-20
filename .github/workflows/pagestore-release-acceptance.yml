@@ -1,78 +1,101 @@
-# Standalone CI for the contrib/pagestore module.
+# Release acceptance for contrib/pagestore: the V4 gate's "run the complete
+# relevant CI suites, golden/branch boot scenarios, multi-seed soak ...
+# against that candidate" (RELEASE_VALIDATION.md, "V4. Candidate and delivery
+# validation"; MVP_COMPLETION_PLAN.md V4/P4).
 #
-# The pagestore daemon and its test harness are freestanding C (they include
-# only pagestore_ipc.h and libc), so this runs WITHOUT building PostgreSQL --
-# it just compiles the two programs and runs the test, which exercises the
-# storage logic, COW versioning, segment rollover and crash recovery across
-# page sizes 4K/8K/16K.  Seconds, not minutes.
-name: pagestore
+# Unlike pagestore-test.yml (which runs on every push/PR and warns when a
+# release branch has no matching fixture) and pagestore-nightly.yml (which
+# soaks a moving branch head), this workflow runs against one frozen,
+# immutable ref -- a `pagestore-candidate-*` tag -- and requires the build
+# match unconditionally: an acceptance run against a candidate that carries
+# no matching store fixture FAILs rather than warns.  It exists so "the
+# candidate passed acceptance" always names an exact, reproducible commit
+# rather than whatever a branch happened to point at when someone looked.
+#
+# Jobs: `resolve` (tag -> SHA, refuses anything that is not an actual tag in
+# this repository), `standalone` (the no-PostgreSQL daemon/unit-test lane,
+# mirroring pagestore-test.yml's `standalone-test` job), `in-engine` (builds
+# PostgreSQL and runs the harness scenarios, integration test, redo demos,
+# golden scenario, branch-boot test and the fixture checks with
+# --require-build-match unconditional, mirroring `integration-test`), `soak`
+# (the nightly's long configuration, 3 seeds x 8000 rounds), and `bundle`
+# (collects every job's JSON reports, logs and identity dumps into one
+# evidence-<tag>.tar.gz, retained 90 days -- see
+# contrib/pagestore/RELEASE_ACCEPTANCE.md).
+name: pagestore release acceptance
 
 on:
   push:
-    branches:
-      - master
-      - pagestore
-      - 'branchdb_*'
-    paths:
-      - 'contrib/pagestore/**'
-      # core seams the pagestore module depends on: a core-only PR (e.g. the
-      # control-file write hook) must still run the in-engine tests
-      - 'src/backend/access/transam/xlog.c'
-      - 'src/backend/access/transam/xlogrecovery.c'
-      - 'src/include/access/xlogrecovery.h'
-      - 'src/backend/access/transam/slru.c'
-      - 'src/backend/access/transam/xlogutils.c'
-      - 'src/backend/access/heap/visibilitymap.c'
-      - 'src/backend/postmaster/walredo.c'
-      - 'src/backend/storage/smgr/**'
-      - 'src/backend/storage/ipc/procarray.c'
-      - 'src/backend/tcop/postgres.c'
-      - 'src/include/access/xlog.h'
-      - 'src/include/access/xlog_internal.h'
-      - 'src/include/catalog/pg_control.h'
-      - 'src/include/access/slru.h'
-      - 'src/include/postmaster/walredo.h'
-      - 'src/include/storage/smgr.h'
-      - 'src/include/storage/procarray.h'
-      - '.github/workflows/pagestore-test.yml'
-  pull_request:
-    paths:
-      - 'contrib/pagestore/**'
-      # core seams the pagestore module depends on: a core-only PR (e.g. the
-      # control-file write hook) must still run the in-engine tests
-      - 'src/backend/access/transam/xlog.c'
-      - 'src/backend/access/transam/xlogrecovery.c'
-      - 'src/include/access/xlogrecovery.h'
-      - 'src/backend/access/transam/slru.c'
-      - 'src/backend/access/transam/xlogutils.c'
-      - 'src/backend/access/heap/visibilitymap.c'
-      - 'src/backend/postmaster/walredo.c'
-      - 'src/backend/storage/smgr/**'
-      - 'src/backend/storage/ipc/procarray.c'
-      - 'src/backend/tcop/postgres.c'
-      - 'src/include/access/xlog.h'
-      - 'src/include/access/xlog_internal.h'
-      - 'src/include/catalog/pg_control.h'
-      - 'src/include/access/slru.h'
-      - 'src/include/postmaster/walredo.h'
-      - 'src/include/storage/smgr.h'
-      - 'src/include/storage/procarray.h'
-      - '.github/workflows/pagestore-test.yml'
+    tags:
+      - 'pagestore-candidate-*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "pagestore-candidate-* tag to run acceptance against"
+        required: true
 
-# A branch update fires both push and pull_request.  Keep only the newest run
-# for that branch so stacked-PR rebases do not consume the runner quota with
-# obsolete standalone/integration jobs.
+permissions:
+  contents: read
+
 concurrency:
-  group: pagestore-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  group: pagestore-release-acceptance-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  standalone-test:
+  resolve:
+    name: resolve candidate tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${INPUT_TAG:-$EVENT_REF_NAME}"
+          case "$tag" in
+            pagestore-candidate-*)
+              ;;
+            *)
+              echo "refusing '$tag': acceptance only runs against a pagestore-candidate-* tag" >&2
+              exit 1
+              ;;
+          esac
+          # Resolve through the tag ref explicitly (not `commits/<tag>`, which
+          # would also accept a same-named branch) so a dispatch input that
+          # names something other than an actual tag is refused rather than
+          # silently resolving to a moving branch.
+          object=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object') || {
+            echo "refusing '$tag': not a tag in ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          }
+          type=$(jq -r '.type' <<< "$object")
+          sha=$(jq -r '.sha' <<< "$object")
+          while [ "$type" = tag ]; do
+            object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$sha" --jq '.object')
+            type=$(jq -r '.type' <<< "$object")
+            sha=$(jq -r '.sha' <<< "$object")
+          done
+          if [ "$type" != commit ] || [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "could not resolve tag '$tag' to a commit: $type $sha" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "release acceptance for $tag at $sha" >> "$GITHUB_STEP_SUMMARY"
+
+  standalone:
     name: standalone daemon test (no PostgreSQL)
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - name: Compile daemon and test harness
         working-directory: contrib/pagestore
@@ -107,13 +130,6 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_spdk_super_test pagestore_spdk_super_test.c pagestore_spdk_super.c
 
       - name: Check fixture format identities against one pagestore_format_versions snapshot
-        # Cheap, single-step guard: every current fixture's format.json must
-        # agree with the same compiled-identity snapshot.  PR #262 bumped two
-        # identities and regenerated posix-artifact-lifecycle/format.json but
-        # not pgdata-artifacts/format.json; both are checked in separate,
-        # much slower steps below, so the mismatch was only caught on the
-        # base branch after merge (PR #263).  This runs first, so it fails
-        # before either of those steps' daemon work starts.
         working-directory: contrib/pagestore
         run: |
           python3 harness/pagestore_fixture_identities.py \
@@ -123,7 +139,8 @@ jobs:
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore
-        run: ./pagestore_test ./pagestore_daemon ./pagestore_inspect
+        run: |
+          ./pagestore_test ./pagestore_daemon ./pagestore_inspect | tee ../../standalone-test.log
 
       - name: Run store ownership and orphan recovery tests
         working-directory: contrib/pagestore
@@ -200,7 +217,10 @@ jobs:
               --inspect-binary ./pagestore_inspect
           done
 
-      - name: Check persisted-format fixtures
+      - name: Check persisted-format fixtures (standalone envelopes)
+        # The daemon build here has no PostgreSQL to link against, so this
+        # step (unlike the in-engine job's) only checks the envelopes, not
+        # the payload -- --require-build-match belongs on the in-engine job.
         working-directory: contrib/pagestore
         run: |
           python3 harness/pagestore_fixture.py \
@@ -209,14 +229,16 @@ jobs:
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \
-            --format-tool ./pagestore_format_versions
+            --format-tool ./pagestore_format_versions \
+            | tee ../../standalone-store-fixture-check.log
 
       - name: Check data-directory artifact identities against the fixture
         working-directory: contrib/pagestore
         run: |
           python3 harness/pagestore_pgdata_fixture.py \
             --check fixtures/pgdata-artifacts \
-            --format-tool ./pagestore_format_versions
+            --format-tool ./pagestore_format_versions \
+            | tee ../../standalone-pgdata-fixture-check.log
 
       - name: Check the controller and supervisor JSON artifact fixture
         working-directory: contrib/pagestore
@@ -293,76 +315,36 @@ jobs:
         run: ./pagestore_lifecycle_prune_test
 
       - name: Run WAL reclaim retention policy test
-        # meson runs it too, but this lane is what a pull request gates on
         working-directory: contrib/pagestore
         run: ./pagestore_wal_reclaim_core_test
 
-      # R6 bounded-space acceptance: a real daemon under the composed retention
-      # workload must keep every persisted category within its declared bound
-      # and reclaim after ingestion stops.  The report is the last stdout line.
-      - name: Run R6 bounded-space soak
+      - name: Run R6 bounded-space soak (CI-sized)
         working-directory: contrib/pagestore
         run: ./pagestore_soak_test ./pagestore_daemon
 
-  # In-engine test: build PostgreSQL and exercise the real path (smgr hijack,
-  # localsvc backend over the daemon, COW read_at, WAL shipping).  Heavier --
-  # it compiles PostgreSQL -- so it is a separate job.
-  integration-test:
-    name: in-engine integration test (PostgreSQL + daemon)
+      - name: Upload standalone evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-acceptance-standalone-${{ needs.resolve.outputs.tag }}
+          path: |
+            standalone-test.log
+            standalone-store-fixture-check.log
+            standalone-pgdata-fixture-check.log
+          if-no-files-found: warn
+          retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true
+
+  in-engine:
+    name: in-engine acceptance (build match required)
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Whether the store/pgdata fixture checks below must FAIL (rather than
-      # WARN) when this build carries no matching fixture.  `pagestore`
-      # always requires it; a `branchdb_<N>` release branch requires it only
-      # when release-branches.json does not mark major N unsupported (13 and
-      # 14 today -- they carry no release evidence and stay on the WARN
-      # path). This is a per-major decision, so it is read from the manifest
-      # via harness/pagestore_release_branches.py rather than hardcoded here
-      # a second time next to the existing branchdb_13/branchdb_14 skips
-      # below.
-      - name: Determine whether this ref's PostgreSQL major requires the build match
-        id: release-plan
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          # `target` is the ref whose major decides the per-branch policy:
-          # the PR's base branch for a pull_request event (a PR into
-          # `pagestore` or into a `branchdb_*` branch must satisfy that
-          # base's rule), the triggering ref otherwise (push, workflow_dispatch).
-          target="$REF_NAME"
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            target="$BASE_REF"
-          fi
-          python3 - "$target" <<'PY' >> "$GITHUB_OUTPUT"
-          import re
-          import sys
-
-          sys.path.insert(0, "contrib/pagestore/harness")
-          from pagestore_release_branches import ReleaseBranchesError, unsupported_majors
-
-          target = sys.argv[1]
-          match = re.match(r"branchdb_(\d+)", target)
-          if match is None:
-              # Not a branchdb_<N> ref (e.g. `pagestore`, `master`, a PR head
-              # branch name): the workflow's own ref_name/base_ref checks
-              # below decide whether the build match applies at all, so this
-              # only needs to answer "false" for a branchdb_* ref the
-              # manifest excludes -- default true is harmless here.
-              supported = True
-          else:
-              try:
-                  unsupported = set(unsupported_majors())
-              except ReleaseBranchesError as error:
-                  print(f"::error::release-branches.json is invalid: {error}", file=sys.stderr)
-                  raise SystemExit(1)
-              supported = int(match.group(1)) not in unsupported
-          print("supported=" + ("true" if supported else "false"))
-          PY
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
 
       - name: Install build dependencies
         run: |
@@ -398,7 +380,6 @@ jobs:
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
 
       - name: Run pagestore harness managed materializer smoke
-        if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \
@@ -410,13 +391,6 @@ jobs:
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
       - name: Run H1 materializer crash after relation sync
-        if: >
-          (github.event_name == 'pull_request' &&
-           github.base_ref != 'branchdb_13' &&
-           github.base_ref != 'branchdb_14') ||
-          (github.event_name != 'pull_request' &&
-           github.ref_name != 'branchdb_13' &&
-           github.ref_name != 'branchdb_14')
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \
@@ -429,13 +403,6 @@ jobs:
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
       - name: Run H1 materializer crash after marker sync
-        if: >
-          (github.event_name == 'pull_request' &&
-           github.base_ref != 'branchdb_13' &&
-           github.base_ref != 'branchdb_14') ||
-          (github.event_name != 'pull_request' &&
-           github.ref_name != 'branchdb_13' &&
-           github.ref_name != 'branchdb_14')
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \
@@ -448,13 +415,6 @@ jobs:
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
       - name: Run H1 store, writer, and materializer restart combinations
-        if: >
-          (github.event_name == 'pull_request' &&
-           github.base_ref != 'branchdb_13' &&
-           github.base_ref != 'branchdb_14') ||
-          (github.event_name != 'pull_request' &&
-           github.ref_name != 'branchdb_13' &&
-           github.ref_name != 'branchdb_14')
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \
@@ -466,26 +426,11 @@ jobs:
             --materializer-supervisor \
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
+      # Acceptance is always run against a candidate whose major is meant to
+      # be supported (nothing tags a pagestore-candidate-* for branchdb_13/14
+      # -- see contrib/pagestore/release-branches.json), so --require-build-match
+      # is unconditional here, unlike pagestore-test.yml's per-ref rule.
       - name: Check persisted-format fixtures against this PostgreSQL build
-        # the standalone lane checks the envelopes; only a lane with a
-        # PostgreSQL build can ask whether the fixture's payload (its WAL page
-        # magic and long-header layout) is one this build loads.  On
-        # `pagestore`, and on a `branchdb_<N>` release branch whose major
-        # release-branches.json does not mark unsupported, a fixture for this
-        # build is required, so an upstream XLOG_PAGE_MAGIC bump (or a
-        # release branch that has not yet captured its own PG-major fixture)
-        # demands a recapture instead of passing or warning silently; an
-        # unsupported release branch (branchdb_13, branchdb_14 today) and
-        # anything else (master, a plain feature push, a PR into neither)
-        # keep the WARN behavior.
-        #
-        # --require-build-match truth table (`ref` = github.base_ref for a
-        # pull_request event, github.ref_name otherwise; `supported` =
-        # steps.release-plan.outputs.supported, computed above):
-        #   ref == 'pagestore'                                -> require
-        #   startsWith(ref, 'branchdb_') && supported == true  -> require
-        #   startsWith(ref, 'branchdb_') && supported == false -> warn
-        #   anything else                                      -> warn
         run: |
           python3 contrib/pagestore/harness/pagestore_fixture.py \
             --check contrib/pagestore/fixtures/posix-mvp-baseline \
@@ -499,47 +444,35 @@ jobs:
             --inspect-binary build/contrib/pagestore/pagestore_inspect \
             --format-tool build/contrib/pagestore/pagestore_format_versions \
             --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
-            ${{ (github.ref_name == 'pagestore' || (startsWith(github.ref_name, 'branchdb_') && steps.release-plan.outputs.supported == 'true') || (github.event_name == 'pull_request' && (github.base_ref == 'pagestore' || (startsWith(github.base_ref, 'branchdb_') && steps.release-plan.outputs.supported == 'true')))) && '--require-build-match' || '' }}
+            --require-build-match \
+            | tee in-engine-store-fixture-check.log
 
+      # See pagestore-test.yml's equivalent step: --require-build-match is
+      # inert here too until the pgdata-artifacts fixture is recaptured with
+      # pg_identity (RELEASE_VALIDATION.md gap 6) -- passed now so acceptance
+      # starts enforcing it the day that recapture lands, no workflow change
+      # needed.
       - name: Check data-directory artifact fixture against this PostgreSQL build
-        # The backend's own loaders, in a scratch cluster of this build, must
-        # load every artifact an earlier build captured and refuse each
-        # declared mutation.
-        #
-        # --require-build-match is passed under the same rule as the store
-        # check above (see its truth table), but it is currently INERT here:
-        # pagestore_pgdata_fixture.py only applies the flag when it is also
-        # given --postgres-payload-identity[-tool], and that is deliberately
-        # not wired in yet -- the checked-in `pgdata-artifacts` fixture
-        # predates the pg_identity field, and turning the flag on for real
-        # before that fixture is recaptured would fail it unconditionally on
-        # `pagestore` itself (see RELEASE_VALIDATION.md gap 6 and
-        # PG_MAJOR_PORTABILITY.md).  Passing the flag now is forward-looking:
-        # once that recapture lands and --postgres-payload-identity-tool is
-        # added to this step, enforcement starts without touching this
-        # workflow again.
         run: |
           python3 contrib/pagestore/harness/pagestore_pgdata_fixture.py \
             --check contrib/pagestore/fixtures/pgdata-artifacts \
             --format-tool build/contrib/pagestore/pagestore_format_versions \
             --build build \
-            ${{ (github.ref_name == 'pagestore' || (startsWith(github.ref_name, 'branchdb_') && steps.release-plan.outputs.supported == 'true') || (github.event_name == 'pull_request' && (github.base_ref == 'pagestore' || (startsWith(github.base_ref, 'branchdb_') && steps.release-plan.outputs.supported == 'true')))) && '--require-build-match' || '' }}
+            --require-build-match \
+            | tee in-engine-pgdata-fixture-check.log
 
       - name: Run pagestore integration test
+        env:
+          PAGESTORE_INTEGRATION_EXPORT_LOGS: "1"
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
 
-      # On a FAIL, integration_test.sh has already stashed a tail of the
-      # daemon log and every cluster's server log it created under
-      # build/pagestore-integration-logs; upload them so the failing op can
-      # be identified without a local repro.
-      - name: Upload pagestore integration test logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pagestore-integration-logs
-          path: build/pagestore-integration-logs/*.log
-          if-no-files-found: warn
-          retention-days: 7
+      - name: Collect pagestore integration test logs
+        if: always()
+        run: |
+          mkdir -p evidence-integration-logs
+          if [ -d build/pagestore-integration-logs ]; then
+            cp build/pagestore-integration-logs/*.log evidence-integration-logs/ 2>/dev/null || true
+          fi
 
       - name: Run WAL-redo worker demo
         run: contrib/pagestore/redo_worker_demo.sh "$(pwd)/build"
@@ -558,3 +491,139 @@ jobs:
 
       - name: Run end-to-end branch boot test
         run: contrib/pagestore/branch_boot_test.sh "$(pwd)/build"
+
+      - name: Record the build's PostgreSQL payload identity and persisted-format identities
+        run: |
+          build/contrib/pagestore/pagestore_control_restore --payload-identity \
+            > pagestore-control-restore-payload-identity.json
+          build/contrib/pagestore/pagestore_format_versions \
+            > pagestore-format-versions.json
+
+      - name: Record git describe
+        run: git describe --tags --long > git-describe.txt
+
+      - name: Upload in-engine evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-acceptance-in-engine-${{ needs.resolve.outputs.tag }}
+          path: |
+            in-engine-store-fixture-check.log
+            in-engine-pgdata-fixture-check.log
+            evidence-integration-logs/*.log
+            pagestore-control-restore-payload-identity.json
+            pagestore-format-versions.json
+            git-describe.txt
+          if-no-files-found: warn
+          retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true
+
+  soak:
+    name: release soak seed ${{ matrix.seed }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Same fixed budget as the nightly default (8000 rounds -> 30 minutes;
+    # see pagestore-nightly.yml's `plan` job) -- acceptance does not take a
+    # rounds/seeds override, so the timeout does not need to be computed.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ["20260909", "7", "4242"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Compile daemon and soak harness
+        working-directory: contrib/pagestore
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
+
+      - name: Run the long bounded-space soak
+        working-directory: contrib/pagestore
+        env:
+          PAGESTORE_SOAK_ROUNDS: "8000"
+          PAGESTORE_SOAK_SEED: ${{ matrix.seed }}
+          PAGESTORE_SOAK_REPORT: soak-report-${{ matrix.seed }}.json
+        run: |
+          ./pagestore_soak_test ./pagestore_daemon
+          test -s "soak-report-${{ matrix.seed }}.json"
+
+      - name: Upload the soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-acceptance-soak-${{ needs.resolve.outputs.tag }}-seed-${{ matrix.seed }}
+          path: contrib/pagestore/soak-report-${{ matrix.seed }}.json
+          if-no-files-found: error
+          retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true
+
+  bundle:
+    name: bundle evidence
+    needs: [resolve, standalone, in-engine, soak]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Download standalone evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: release-acceptance-standalone-${{ needs.resolve.outputs.tag }}
+          path: evidence/standalone
+
+      - name: Download in-engine evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: release-acceptance-in-engine-${{ needs.resolve.outputs.tag }}
+          path: evidence/in-engine
+
+      - name: Download soak report (seed 20260909)
+        uses: actions/download-artifact@v4
+        with:
+          name: release-acceptance-soak-${{ needs.resolve.outputs.tag }}-seed-20260909
+          path: evidence/soak
+
+      - name: Download soak report (seed 7)
+        uses: actions/download-artifact@v4
+        with:
+          name: release-acceptance-soak-${{ needs.resolve.outputs.tag }}-seed-7
+          path: evidence/soak
+
+      - name: Download soak report (seed 4242)
+        uses: actions/download-artifact@v4
+        with:
+          name: release-acceptance-soak-${{ needs.resolve.outputs.tag }}-seed-4242
+          path: evidence/soak
+
+      - name: Assemble evidence-<tag>.tar.gz
+        run: |
+          tag="${{ needs.resolve.outputs.tag }}"
+          bundle="evidence-${tag}"
+          mkdir -p "$bundle"
+          cp -r evidence/standalone evidence/in-engine evidence/soak "$bundle"/
+          {
+            echo "tag: $tag"
+            echo "sha: ${{ needs.resolve.outputs.sha }}"
+            echo "workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "assembled: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$bundle/manifest.txt"
+          (cd "$bundle" && find . -type f ! -path ./sha256sums.txt -exec sha256sum {} + | sort -k2 > sha256sums.txt)
+          (cd "$bundle" && sha256sum -c sha256sums.txt)
+          tar czf "evidence-${tag}.tar.gz" "$bundle"
+
+      - name: Upload evidence bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ needs.resolve.outputs.tag }}
+          path: evidence-${{ needs.resolve.outputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+          # Replace this job's evidence on retry; successful jobs may not rerun.
+          overwrite: true

@@ -225,6 +225,35 @@ GA/RC tag yet and would produce disposable fixtures. `branchdb_13` and
 `branchdb_14` are excluded from the supported set and carry no release
 evidence; do not run or advertise V1–V4 against them.
 
+Release branches now get the same CI lanes `pagestore` gets, not a warned
+subset of them. `pagestore-test.yml`'s in-engine store- and pgdata-fixture
+checks pass `--require-build-match` whenever the ref (or, for a pull
+request, its base) is `pagestore`, or is a `branchdb_<N>` branch whose major
+`release-branches.json` does not list as unsupported — a small preparatory
+step (`Determine whether this ref's PostgreSQL major requires the build
+match`) reads the manifest via `harness/pagestore_release_branches.py` so
+that per-major decision is data, not a second hardcoded branch list next to
+the existing `branchdb_13`/`branchdb_14` scenario skips. (The pgdata step's
+flag is currently inert: `pagestore_pgdata_fixture.py` only enforces it once
+also given `--postgres-payload-identity[-tool]`, which is deliberately not
+wired in yet — see gap 6 below.) `pagestore-nightly.yml` gained a `ref`
+dispatch input (branch, tag or SHA) so an exact commit can be soaked on
+demand, and a weekly schedule that fans the same soak out over every branch
+`release-branches.json` currently marks `candidate` or `released` (empty
+today: no major has been promoted past `planned` yet).
+
+The new `pagestore-release-acceptance.yml` (`contrib/pagestore/RELEASE_ACCEPTANCE.md`)
+is what actually executes this gate: triggered by a `pagestore-candidate-*`
+tag, it runs both CI lanes against that exact commit with
+`--require-build-match` unconditional, the golden and branch-boot scenarios,
+a 3-seed x 8000-round soak, and bundles all of it — JSON reports, integration
+logs, fixture-check output, `pagestore_control_restore --payload-identity`,
+`pagestore_format_versions`, and `git describe` — into one
+`evidence-<tag>.tar.gz` retained 90 days. These workflow changes are staged
+to be cherry-picked onto `branchdb_18-rc` alongside the rest of its sync, so
+the release branch itself carries working CI rather than relying on
+`pagestore`'s copy.
+
 On a clean deployment, follow the published installation and branch-creation
 instructions. For production qualification, also rehearse the documented
 backup/restore and upgrade/recovery procedures and verify SQL contents after
