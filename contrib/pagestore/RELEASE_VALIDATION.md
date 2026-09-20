@@ -754,10 +754,12 @@ resume its scan at `W` (always a record boundary -- it is a previously
 recorded flush cursor) rather than stopping there, or it would leave live,
 `recover()`-replayable target records at/after `W` untouched while reporting
 the deletion complete. See the "Power-loss reordering caveat" below for what
-*is* still true about bytes below `W`. Every record `recover()` has ever
-replayed *directly from this segment* lies inside `[W, R)`; bytes at or
-beyond `R` are unreachable through any index and are exactly the bytes a
-later append is free to overwrite.
+*is* still true about bytes below `W`. Every record the next open's
+`recover()` replays *directly from this segment* lies inside `[W, R)`
+(an earlier open, before `W` last advanced, could have replayed records now
+below `W` from this same segment -- that history is exactly what the
+caveat below covers); bytes at or beyond `R` are unreachable through any
+index and are exactly the bytes a later append is free to overwrite.
 
 **Evidence before the fix** (regression tests, `pagestore_forkmeta_cutover_test.c`,
 against the unmodified `page_cleanup_rewrite_segment()`): `test_deletion_filtered_forkmeta`

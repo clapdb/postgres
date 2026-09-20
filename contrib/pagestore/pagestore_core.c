@@ -5040,7 +5040,8 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 	}
 	/*
 	 * I4/M1: recover() replays the watermark segment starting at
-	 * flush_watermark.seg_off, not at 0 (recover() ~19143-19148) -- segments
+	 * flush_watermark.seg_off, not at 0 (recover()'s start offset for this
+	 * segment) -- segments
 	 * are not synced before ps_manifest_set_flush_watermark(), so an
 	 * end-of-log shape below the watermark (e.g. a lost header sector after
 	 * a crash) does not mean the bytes at/after the watermark are
@@ -5063,17 +5064,17 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		if (ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0)
 			goto fail;			/* I/O error, not a parse decision: no malformed-record diagnostic */
 		if (hdr.magic == 0)
-			goto end_of_log;	/* end of log: zero padding / lost header (recover() 19096) */
+			goto end_of_log;	/* end of log: zero padding / lost header (recover()'s zero-magic end-of-log check) */
 		if (segment_record_shape(hdr.magic, &header_size, &wal_less,
 								 &bound, &admission, &hole) != 0)
 			goto fail_malformed;	/* nonzero unknown magic: corruption inside the reachable region */
 		if (hole && hdr.len != page_size)
-			goto fail_malformed;	/* hole with the wrong len: corruption (recover() 19140) */
+			goto fail_malformed;	/* hole with the wrong len: corruption (recover()'s hole-length check) */
 		if (!hole && hdr.len != page_size)
-			goto end_of_log;	/* end of log: torn header (recover() 19165) */
+			goto end_of_log;	/* end of log: torn header (recover()'s torn-header check) */
 		rec_len = header_size + hdr.len;
 		if (rec_len > limit - off)
-			goto end_of_log;	/* end of log: torn body (recover() 19181) */
+			goto end_of_log;	/* end of log: torn body (recover()'s torn-body check) */
 		if (!hole)
 		{
 			if (bound)
@@ -5082,7 +5083,7 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 										 sizeof(order_id)) != 0)
 					goto fail;			/* I/O error, not a parse decision */
 				if (order_id == 0)
-					goto end_of_log;	/* end of log: torn bound trailer (recover() 19173) */
+					goto end_of_log;	/* end of log: torn bound trailer (recover()'s torn-bound-trailer check) */
 			}
 			if (admission)
 			{
@@ -5091,7 +5092,7 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 										 &admission_seq, sizeof(admission_seq)) != 0)
 					goto fail;			/* I/O error, not a parse decision */
 				if (admission_seq == 0)
-					goto end_of_log;	/* end of log: torn admission trailer (recover() 19180) */
+					goto end_of_log;	/* end of log: torn admission trailer (recover()'s torn-admission-trailer check) */
 			}
 			if (hdr.timeline >= MAX_TIMELINES)
 				goto fail_malformed;	/* complete record, impossible owner: corruption */
