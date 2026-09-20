@@ -661,6 +661,15 @@ test('pagestore_harness_plan',
   suite: ['pagestore'],
   timeout: 30,
 )
+# Self-validates contrib/pagestore/release-branches.json, the supported-major
+# manifest scripts/branchdb-sync.sh's `status` and the release workflows (V4
+# plan, P4) read; no build or fixture inputs needed.
+test('pagestore_release_branches',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_release_branches.py')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
 if host_system != 'windows'
   test('pagestore_materializer_supervisor',
     pagestore_harness_python,
