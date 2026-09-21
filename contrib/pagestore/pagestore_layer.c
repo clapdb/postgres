@@ -5,6 +5,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -748,6 +749,168 @@ ps_delta_layer_verify_data(const PsLayerDesc *layer)
 	return rc;
 }
 
+/* ===================== image index cache =============================== */
+
+/*
+ * An image layer is immutable, so its index section needs to be read and
+ * checksummed once, not on every page lookup: the index of a layer holding a
+ * few hundred MB is several MB, and a single floor computation or read plan
+ * looks a page up in every candidate layer.  Entries are keyed by the layer id
+ * and the footer fields that certify the index bytes (a lookup still reads the
+ * footer), so a layer file replaced by different content misses.  Only the
+ * index is cached; whether the data section of the local copy was verified
+ * stays with the layer descriptor, whose owner resets it on a cache refill.
+ */
+#define PS_IMG_IDX_CACHE_SLOTS	128
+#define PS_IMG_IDX_CACHE_BYTES	((size_t) 256 << 20)
+
+typedef struct ImgIdxCacheEnt
+{
+	uint64_t	layer_id;
+	uint64_t	file_size;
+	PsImgFooter foot;
+	PsImgIndexEnt *idx;
+	size_t		bytes;
+	uint64_t	last_use;
+	uint32_t	refs;
+	int			sorted;			/* (key, block) ascending: binary search is valid */
+	int			cached;			/* in the table; else freed by the last release */
+} ImgIdxCacheEnt;
+
+static pthread_mutex_t img_idx_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static ImgIdxCacheEnt *img_idx_cache[PS_IMG_IDX_CACHE_SLOTS];
+static size_t img_idx_cache_bytes;
+static uint64_t img_idx_cache_clock;
+
+static int
+img_key_block_cmp(const PsKey *ka, uint32_t ba, const PsKey *kb, uint32_t bb)
+{
+	int			c = key_cmp(ka, kb);
+
+	if (c)
+		return c;
+	return ba < bb ? -1 : (ba > bb ? 1 : 0);
+}
+
+static int
+img_idx_cache_matches(const ImgIdxCacheEnt *e, const PsLayerDesc *layer,
+					  uint64_t file_size, const PsImgFooter *foot)
+{
+	return e->layer_id == layer->layer_id && e->file_size == file_size &&
+		memcmp(&e->foot, foot, sizeof(*foot)) == 0;
+}
+
+static void
+img_idx_cache_release(ImgIdxCacheEnt *e)
+{
+	int			drop;
+
+	pthread_mutex_lock(&img_idx_cache_lock);
+	drop = --e->refs == 0 && !e->cached;
+	pthread_mutex_unlock(&img_idx_cache_lock);
+	if (drop)
+	{
+		free(e->idx);
+		free(e);
+	}
+}
+
+/* Make room for 'bytes' more; entries in use are never evicted. */
+static int
+img_idx_cache_reserve_locked(size_t bytes)
+{
+	for (;;)
+	{
+		int			free_slot = -1;
+		int			victim = -1;
+
+		for (int i = 0; i < PS_IMG_IDX_CACHE_SLOTS; i++)
+		{
+			if (img_idx_cache[i] == NULL)
+				free_slot = i;
+			else if (img_idx_cache[i]->refs == 0 &&
+					 (victim < 0 ||
+					  img_idx_cache[i]->last_use < img_idx_cache[victim]->last_use))
+				victim = i;
+		}
+		if (free_slot >= 0 &&
+			img_idx_cache_bytes + bytes <= PS_IMG_IDX_CACHE_BYTES)
+			return free_slot;
+		if (victim < 0)
+			return -1;
+		img_idx_cache_bytes -= img_idx_cache[victim]->bytes;
+		free(img_idx_cache[victim]->idx);
+		free(img_idx_cache[victim]);
+		img_idx_cache[victim] = NULL;
+	}
+}
+
+/* Return the verified index of 'layer', whose footer the caller just read. */
+static ImgIdxCacheEnt *
+img_idx_cache_get(const PsLayerDesc *layer, uint64_t file_size,
+				  const PsImgFooter *foot)
+{
+	ImgIdxCacheEnt *e;
+	PsImgIndexEnt *idx;
+	uint32_t	nidx;
+	int			slot;
+
+	pthread_mutex_lock(&img_idx_cache_lock);
+	for (int i = 0; i < PS_IMG_IDX_CACHE_SLOTS; i++)
+		if (img_idx_cache[i] != NULL &&
+			img_idx_cache_matches(img_idx_cache[i], layer, file_size, foot))
+		{
+			e = img_idx_cache[i];
+			e->refs++;
+			e->last_use = ++img_idx_cache_clock;
+			pthread_mutex_unlock(&img_idx_cache_lock);
+			return e;
+		}
+	pthread_mutex_unlock(&img_idx_cache_lock);
+
+	/* read and checksum outside the lock; a racing loader only costs a copy */
+	if (ps_image_layer_read_index(layer, &idx, &nidx) != 0)
+		return NULL;
+	if (nidx != foot->nrecs || (e = calloc(1, sizeof(*e))) == NULL)
+	{
+		free(idx);
+		return NULL;
+	}
+	e->layer_id = layer->layer_id;
+	e->file_size = file_size;
+	e->foot = *foot;
+	e->idx = idx;
+	e->bytes = (size_t) nidx * sizeof(PsImgIndexEnt);
+	e->refs = 1;
+	e->sorted = 1;
+	for (uint32_t i = 1; i < nidx; i++)
+		if (img_key_block_cmp(&idx[i - 1].key, idx[i - 1].block,
+							  &idx[i].key, idx[i].block) > 0)
+		{
+			e->sorted = 0;
+			break;
+		}
+
+	pthread_mutex_lock(&img_idx_cache_lock);
+	for (int i = 0; i < PS_IMG_IDX_CACHE_SLOTS; i++)
+		if (img_idx_cache[i] != NULL &&
+			img_idx_cache_matches(img_idx_cache[i], layer, file_size, foot))
+		{
+			pthread_mutex_unlock(&img_idx_cache_lock);
+			return e;			/* lost the race: use ours uncached */
+		}
+	if (e->bytes <= PS_IMG_IDX_CACHE_BYTES &&
+		(slot = img_idx_cache_reserve_locked(e->bytes)) >= 0)
+	{
+		e->cached = 1;
+		e->last_use = ++img_idx_cache_clock;
+		img_idx_cache[slot] = e;
+		img_idx_cache_bytes += e->bytes;
+	}
+	pthread_mutex_unlock(&img_idx_cache_lock);
+	return e;
+}
+
 int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn, uint64_t read_seq,
@@ -756,8 +919,9 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
-	PsImgIndexEnt *idx = NULL;
-	uint32_t	nidx = 0;
+	ImgIdxCacheEnt *cached = NULL;
+	const PsImgIndexEnt *idx;
+	uint32_t	first = 0;
 	uint64_t	best_off = 0;
 	uint64_t	best_lsn = 0;
 	uint64_t	best_seq = 0;
@@ -781,8 +945,10 @@ retry:
 		 foot.version != PS_IMG_VERSION) ||
 		foot.page_size != page_size || foot.nrecs == 0)
 		goto refresh;
-	if (ps_image_layer_read_index(layer, &idx, &nidx) != 0 || nidx != foot.nrecs)
+	cached = img_idx_cache_get(layer, loc->size, &foot);
+	if (cached == NULL)
 		goto refresh;
+	idx = cached->idx;
 
 	/*
 	 * Verify the data section once (per process) before the first page is
@@ -798,11 +964,31 @@ retry:
 		}
 	}
 
+	/* the writer sorts by (key, block, ...): start at the first candidate */
+	if (cached->sorted)
+	{
+		uint32_t	hi = foot.nrecs;
+
+		while (first < hi)
+		{
+			uint32_t	mid = first + (hi - first) / 2;
+
+			if (img_key_block_cmp(&idx[mid].key, idx[mid].block, key, block) < 0)
+				first = mid + 1;
+			else
+				hi = mid;
+		}
+	}
+
 	/* newest version of (key, block) with lsn <= read_lsn */
-	for (uint32_t i = 0; i < foot.nrecs; i++)
+	for (uint32_t i = first; i < foot.nrecs; i++)
 	{
 		if (idx[i].block != block || key_cmp(&idx[i].key, key) != 0)
+		{
+			if (cached->sorted)
+				break;
 			continue;
+		}
 		if (idx[i].lsn <= read_lsn &&
 			(idx[i].lsn < read_lsn || read_seq == 0 ||
 			 idx[i].admission_seq == 0 ||
@@ -831,8 +1017,9 @@ retry:
 	goto out;
 
 refresh:
-	free(idx);
-	idx = NULL;
+	if (cached != NULL)
+		img_idx_cache_release(cached);
+	cached = NULL;
 	if (!retried && ps_layer_store->refresh_layer_cache != NULL &&
 		ps_layer_store->refresh_layer_cache(layer) == 0)
 	{
@@ -841,6 +1028,7 @@ refresh:
 	}
 
 out:
-	free(idx);
+	if (cached != NULL)
+		img_idx_cache_release(cached);
 	return rc;
 }

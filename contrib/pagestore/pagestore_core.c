@@ -3547,7 +3547,11 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 
 		if (read_image_index_refreshing(&old[k], &idx, &n) != 0)
 			goto cleanup;
-		if (verify_image_layer_refreshing(&old[k]) != 0)
+		/* materialize_compaction_inputs() checksummed this local copy just
+		 * before the locks were taken, and only an eviction -- excluded by
+		 * the map write lock held here -- clears the flag.  Checksumming every
+		 * input again would double the time all writers of this shard wait. */
+		if (!old[k].data_verified && verify_image_layer_refreshing(&old[k]) != 0)
 		{
 			free(idx);
 			goto cleanup;
@@ -17273,10 +17277,15 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				{
 					__atomic_sub_fetch(&ps_layer_map.layers[j].cache_readers, 1,
 								   __ATOMIC_ACQ_REL);
+					/* Not a residency hint: without it a caller that holds
+					 * the map lock checksums the layer's whole data section
+					 * again on every lookup.  Only eviction clears the flag,
+					 * under the write lock, which excludes this holder. */
+					if (layers[i].data_verified)
+						__atomic_store_n(&ps_layer_map.layers[j].data_verified,
+										 true, __ATOMIC_RELEASE);
 					if (map_locked)
 						break;
-					if (layers[i].data_verified)
-						ps_layer_map.layers[j].data_verified = true;
 					if (tier_local_location(&ps_layer_map.layers[j]) == NULL &&
 						ps_layer_store->layer_exists_local != NULL &&
 						ps_layer_store->layer_exists_local(layers[i].layer_id) == 1)
