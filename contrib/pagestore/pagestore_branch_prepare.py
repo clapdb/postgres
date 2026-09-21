@@ -25,6 +25,9 @@ from pagestore_branch_fault import BranchFaultProbe
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
+# pagestore_capture_slru_snapshot()'s report that its restartpoint was a no-op
+STALE_RESTARTPOINT = "restartpoint did not durably cover the paused WAL replay position"
+BASE_CAPTURE_ATTEMPTS = 5
 # the persisted layouts -- schema numbers, checksums, key sets -- are
 # pagestore_artifact_schema's, shared with the persisted-format fixture
 CONFIG_SCHEMA = artifact_schema.ARTIFACTS["branch_config"].schema
@@ -1088,8 +1091,35 @@ class BranchPreparer:
                 retention_set_attempted=False,
             )
 
+    def publish_base_checkpoint(self) -> None:
+        """Give the materializer a checkpoint record without a restartpoint.
+
+        pagestore_capture_slru_snapshot() makes the paused replay position
+        durable through a restartpoint, and PostgreSQL performs one only for
+        a replayed checkpoint record newer than the last restartpoint.  On a
+        writer that checkpoints normally the newest record usually has its
+        restartpoint already, so create the record instead of depending on
+        the operator to have left one.
+        """
+        self.writer_sql("CHECKPOINT")
+        self.wait_materializer(self.archive_checkpoint(private=False))
+
     def capture_and_pin_base(self) -> str:
-        base = self.pause_and_capture(keep_paused=True)
+        for attempt in range(BASE_CAPTURE_ATTEMPTS):
+            self.publish_base_checkpoint()
+            try:
+                base = self.pause_and_capture(keep_paused=True)
+                break
+            except BranchPrepareError as error:
+                # The materializer's own restartpoint can still take the new
+                # record between its replay and the pause.  The capture
+                # changed nothing; only another checkpoint record helps.
+                if (
+                    STALE_RESTARTPOINT not in str(error)
+                    or attempt == BASE_CAPTURE_ATTEMPTS - 1
+                ):
+                    raise
+                self.resume_materializer()
         try:
             self.install_branch_retention(base)
         except BaseException:
@@ -1193,12 +1223,12 @@ class BranchPreparer:
             raise BranchPrepareError("checkpoint redo follows its flushed record end")
         return redo, end
 
-    def archive_checkpoint(self) -> str:
+    def archive_checkpoint(self, private: bool = True) -> str:
         output = last_output_line(
             self.writer_sql(
                 "SELECT switch_lsn, pg_walfile_name(switch_lsn - 1)"
                 " FROM (SELECT pg_switch_wal() AS switch_lsn) switched",
-                private=True,
+                private=private,
             )
         )
         fields = output.split("|")
@@ -1212,7 +1242,12 @@ class BranchPreparer:
             / "archive_status"
             / f"{wal_file}.done"
         )
-        self.wait_until(f"archive completion for {wal_file}", archive_done.is_file)
+        # a checkpoint on a running public writer may already have recycled it
+        wal_segment = self.config.writer_data_dir / "pg_wal" / wal_file
+        self.wait_until(
+            f"archive completion for {wal_file}",
+            lambda: archive_done.is_file() or not wal_segment.exists(),
+        )
         self.wait_until(
             f"durable pagestore WAL through {switch_lsn}",
             lambda: last_output_line(
@@ -1224,7 +1259,7 @@ class BranchPreparer:
                     + " >= "
                     + sql_literal(switch_lsn)
                     + "::pg_lsn",
-                    private=True,
+                    private=private,
                 )
             )
             == "t",
