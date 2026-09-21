@@ -1186,6 +1186,131 @@ pagestore_retention_drop_with_incarnation(PG_FUNCTION_ARGS)
 		(uint32) generation, (uint64) incarnation));
 }
 
+PG_FUNCTION_INFO_V1(pagestore_timeline_state);
+PG_FUNCTION_INFO_V1(pagestore_delete_branch);
+
+static const char *
+pagestore_timeline_state_name(uint32 state)
+{
+	switch (state)
+	{
+		case PS_TIMELINE_LIVE:
+			return "live";
+		case PS_TIMELINE_DELETING:
+			return "deleting";
+		case PS_TIMELINE_DELETED:
+			return "deleted";
+	}
+	return NULL;
+}
+
+static void
+pagestore_require_timeline_control(int32 timeline)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to manage pagestore timelines")));
+	if (pagestore_backend_name == NULL ||
+		strcmp(pagestore_backend_name, "localsvc") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore timeline operations require the localsvc backend")));
+	if (timeline < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore timeline must be >= 0")));
+}
+
+/*
+ * Lifecycle state and incarnation of a store timeline; no row's worth of
+ * values (both NULL) for a timeline the store has never defined.  This is how
+ * an operator learns the incarnation pagestore_delete_branch() demands, and
+ * watches an accepted deletion finish.
+ */
+Datum
+pagestore_timeline_state(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {true, true};
+	uint32		state = 0;
+	uint64		incarnation = 0;
+	const char *name;
+
+	pagestore_require_timeline_control(timeline);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+	if (pagestore_localsvc_timeline_state((uint32) timeline, &state,
+										  &incarnation) &&
+		(name = pagestore_timeline_state_name(state)) != NULL)
+	{
+		values[0] = CStringGetTextDatum(name);
+		values[1] = Int64GetDatum((int64) incarnation);
+		nulls[0] = nulls[1] = false;
+	}
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * Durably begin deleting a branch timeline.  The store publishes LIVE ->
+ * DELETING before this returns; its maintenance then removes the branch's
+ * layers, WAL and metadata and publishes DELETED, which
+ * pagestore_timeline_state() reports.  Repeating the call for a timeline
+ * that is already deleting succeeds.
+ *
+ * The incarnation is the caller's fence: a retry that outlives the branch
+ * must not delete a later branch that reused the timeline id.
+ */
+Datum
+pagestore_delete_branch(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int64		incarnation = PG_GETARG_INT64(1);
+	uint32		state = 0;
+	uint64		current = 0;
+
+	pagestore_require_timeline_control(timeline);
+	if (timeline == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore timeline 0 is the main timeline and cannot be deleted")));
+	if ((uint32) timeline == pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("pagestore timeline %d is this server's own timeline", timeline),
+				 errhint("Stop the branch compute and delete its timeline from another compute of the same store.")));
+	if (incarnation <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore timeline incarnation must be > 0")));
+
+	/* Name the refusals the store's single status cannot tell apart. */
+	if (!pagestore_localsvc_timeline_state((uint32) timeline, &state, &current))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("pagestore timeline %d does not exist", timeline)));
+	if (current != (uint64) incarnation)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore timeline %d is at incarnation %llu, not %lld",
+						timeline, (unsigned long long) current,
+						(long long) incarnation)));
+	if (state == PS_TIMELINE_DELETED)
+		PG_RETURN_TEXT_P(cstring_to_text("deleted"));
+
+	if (pagestore_localsvc_begin_delete((uint32) timeline,
+										(uint64) incarnation) != PS_STATUS_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("pagestore refused to delete timeline %d", timeline),
+				 errdetail("A timeline with a live or deleting descendant branch, or with a registered retention owner (reader, materializer or branch-preparation pin), cannot be deleted."),
+				 errhint("Delete descendant branches first and release the timeline's retention owners; pagestore_inspect shows both.")));
+	PG_RETURN_TEXT_P(cstring_to_text("deleting"));
+}
+
 PG_FUNCTION_INFO_V1(pagestore_retention_owner_lsn);
 
 static bool
