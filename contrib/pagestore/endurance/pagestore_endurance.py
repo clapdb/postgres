@@ -706,9 +706,29 @@ recovery_target_action = 'promote'
             old.stop("fast")
             shutil.rmtree(old.datadir)
             shutil.rmtree(old_scratch)
-            # GAP: no operator tool issues PS_OP_BEGIN_DELETE, so the store
-            # keeps the retired timeline; see ENDURANCE.md.
-            self.event("branch_retired", timeline=old_tl)
+            self.delete_timeline(old_tl)
+
+    def store_kb(self) -> int:
+        out = subprocess.run(["du", "-sk", str(self.store)], capture_output=True, text=True, timeout=300).stdout
+        return int(out.split()[0]) if out else 0
+
+    def delete_timeline(self, tl: int) -> None:
+        """Delete a retired branch through the operator entry point (extension
+        1.3) and require the store to finish the deletion."""
+        if self.writer.sql("SELECT to_regprocedure('pagestore_ext.pagestore_delete_branch(integer,bigint)') "
+                           "IS NOT NULL;") != "t":
+            self.event("branch_retired", timeline=tl, deleted=False)
+            return
+        before = self.store_kb()
+        started = time.time()
+        state = self.writer.sql(f"SELECT pagestore_ext.pagestore_delete_branch({tl}, 1);")
+        if state not in ("deleting", "deleted"):
+            raise Failure("delete_branch", f"timeline {tl}: unexpected result {state!r}")
+        self.wait_for(f"timeline {tl} deletion", lambda: self.writer.sql(
+            f"SELECT state FROM pagestore_ext.pagestore_timeline_state({tl});") == "deleted",
+            self.args.sync_timeout)
+        self.event("branch_deleted", timeline=tl, seconds=round(time.time() - started, 1),
+                   store_kb_before=before, store_kb_after=self.store_kb())
 
     def exercise_branch(self, tl: int, b: Pg) -> None:
         """Diverge the branch, then prove its own writes survive a restart with

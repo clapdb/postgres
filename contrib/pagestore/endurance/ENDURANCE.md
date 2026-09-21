@@ -152,11 +152,11 @@ been measured on a production build yet.
 
 ## Not covered yet
 
-- **Branch deletion.**  No operator-facing tool or SQL function issues
-  `PS_OP_BEGIN_DELETE`; only the C test clients do.  Retired branch computes
-  are removed but their timelines stay in the store, so this driver cannot
-  yet check V1's bounded-space criterion, and timeline IDs only grow.  This is
-  a product gap as much as a test gap.
+- **Bounded space.**  Retired branches are deleted through
+  `pagestore_delete_branch()` (extension 1.3) and the driver requires the
+  store to reach `deleted`; the store size before and after is recorded in
+  `branch_deleted`, but no bound is asserted yet.  On a build without the
+  function the timeline stays in the store.
 - **Pinned and advancing readers.**  Their provisioning (reader base,
   prepare/install, retention owner) is only scripted inside
   `integration_test.sh`.
