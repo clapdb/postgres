@@ -45,8 +45,22 @@ mkdir -p "$S"
 "$BIN/initdb" -D "$D" -U postgres -A trust >/dev/null 2>&1
 "$DAEMON" --shm "$SHM" --store "$S" >/dev/null 2>&1 &
 DPID=$!
-sleep 0.5
-"$IMPORT" --shm "$SHM" --pgdata "$D" >/dev/null 2>&1   # base = empty cluster
+# Wait for the daemon's READY handshake instead of a fixed delay: an import
+# that races a slow start fails, and the compute then boots over an empty
+# store ("role "postgres" does not exist").
+INSPECT="$BUILD/contrib/pagestore/pagestore_inspect"
+daemon_ready=no
+for _ in $(seq 1 600); do
+	kill -0 "$DPID" 2>/dev/null || break
+	if "$INSPECT" --shm "$SHM" health >/dev/null 2>&1; then
+		daemon_ready=yes
+		break
+	fi
+	sleep 0.05
+done
+[ "$daemon_ready" = yes ] || { echo "FAIL - pagestore daemon did not become ready"; exit 1; }
+"$IMPORT" --shm "$SHM" --pgdata "$D" >/dev/null 2>&1 ||
+	{ echo "FAIL - could not import the base cluster"; exit 1; }   # base = empty cluster
 
 # writer: WAL-only.  route_all OFF -> relation pages stay local, only WAL ships.
 cat >> "$D/postgresql.conf" <<EOF
