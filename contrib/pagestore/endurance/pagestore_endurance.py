@@ -794,7 +794,7 @@ recovery_target_action = 'promote'
             except (OSError, subprocess.TimeoutExpired):
                 pass
 
-    def teardown(self, preserve_state: bool) -> None:
+    def teardown(self, preserve_state: bool, interrupted: bool = False) -> None:
         self.stop_sampler.set()
         for pg in self.computes():
             try:
@@ -803,7 +803,7 @@ recovery_target_action = 'promote'
                 pass
         if self.daemon and self.daemon.poll() is None:
             # after a finding, SIGKILL keeps the store exactly as it failed
-            self.daemon.send_signal(signal.SIGKILL if preserve_state else signal.SIGTERM)
+            self.daemon.send_signal(signal.SIGKILL if preserve_state or interrupted else signal.SIGTERM)
             try:
                 self.daemon.wait(timeout=600)
             except subprocess.TimeoutExpired:
@@ -854,7 +854,8 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
     except Failure as f:
         failure = f
     except KeyboardInterrupt:
-        run.teardown(preserve_state=False)
+        run.teardown(preserve_state=False, interrupted=True)
+        shutil.rmtree(root, ignore_errors=True)
         raise
     except Exception as e:                      # a driver bug is still worth a preserved root
         failure = Failure("driver_exception", repr(e))
@@ -902,6 +903,14 @@ def main() -> int:
     p.add_argument("--daemon-arg", action="append", default=[],
                    help="extra pagestore_daemon argument; repeat for each word (experiments)")
     args = p.parse_args()
+
+    # A driver started with "&" from a non-interactive shell inherits SIGINT
+    # ignored, and SIGTERM would skip the teardown and orphan every compute.
+    def interrupt(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, interrupt)
+    signal.signal(signal.SIGTERM, interrupt)
     args.root = args.root.resolve()
     args.root.mkdir(parents=True, exist_ok=True)
 
