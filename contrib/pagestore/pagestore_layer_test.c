@@ -118,9 +118,9 @@ main(void)
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, 0, out, psz, NULL, NULL);
 	check(r == 0, "absent key -> no version");
 
-	/* A lookup works on the caller's private descriptor copy; the verified
-	 * result must survive in the cache, and the owner's eviction hook must
-	 * be able to take it back. */
+	/* The cache holds indexes only: an unverified descriptor copy still
+	 * checksums the data section, and emptying the cache (the layer store's
+	 * close) makes the next lookup read the index from the file again. */
 	{
 		PsLayerDesc copy = d;
 		unsigned char bad = 0,
@@ -130,21 +130,17 @@ main(void)
 		copy.data_verified = false;
 		fd = open(d.locations[0].uri, O_WRONLY);
 		check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1 && close(fd) == 0,
-			  "corrupt image bytes behind a cached verification");
-		r = ps_image_layer_lookup(&copy, &k6, 0, 1000, 0, out, psz, NULL, NULL);
-		check(r == 1 && copy.data_verified,
-			  "an unverified descriptor copy reuses the cached verification");
-		copy.data_verified = false;
-		ps_image_layer_forget_verified(copy.layer_id);
+			  "corrupt image bytes behind a cached index");
 		r = ps_image_layer_lookup(&copy, &k6, 0, 1000, 0, out, psz, NULL, NULL);
 		check(r < 0 && !copy.data_verified,
-			  "after the owner forgets it, the lookup verifies again and fails");
+			  "a cached index does not vouch for the data section");
 		fd = open(d.locations[0].uri, O_WRONLY);
 		check(fd >= 0 && pwrite(fd, &good, 1, 0) == 1 && close(fd) == 0,
 			  "restore image bytes");
+		ps_image_layer_cache_reset();
 		r = ps_image_layer_lookup(&copy, &k6, 0, 1000, 0, out, psz, NULL, NULL);
 		check(r == 1 && copy.data_verified && out[0] == 0xC1,
-			  "the restored layer verifies and serves again");
+			  "after a cache reset the layer is read, verified and served again");
 	}
 
 	/* GC must force a fresh checksum even if an earlier lookup cached success. */

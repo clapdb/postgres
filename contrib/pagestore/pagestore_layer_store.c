@@ -259,6 +259,8 @@ fail:
 static void
 local_close(void)
 {
+	/* a reopened store must verify what it reads again */
+	ps_image_layer_cache_reset();
 	layer_dir[0] = '\0';
 	object_dir[0] = '\0';
 	if (layer_owner != NULL)

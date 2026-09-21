@@ -62,7 +62,6 @@ ps_layer_map_count(const PsLayerMap *map)
 
 /* ===================== image layer file format ========================= */
 
-static void img_idx_cache_set_verified(uint64_t layer_id, int verified);
 
 /* FNV-1a checksum for layer integrity (not cryptographic). */
 static uint32_t
@@ -687,7 +686,6 @@ ps_image_layer_verify_data(const PsLayerDesc *layer, uint32_t page_size)
 	int			rc = -1;
 
 	((PsLayerDesc *) layer)->data_verified = false;
-	img_idx_cache_set_verified(layer->layer_id, 0);
 	if (!loc || loc->size < sizeof(foot) ||
 		ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
 									 &foot, sizeof(foot)) != 0 ||
@@ -705,7 +703,6 @@ ps_image_layer_verify_data(const PsLayerDesc *layer, uint32_t page_size)
 		img_crc(data, (size_t) foot.index_off) == foot.data_crc)
 	{
 		((PsLayerDesc *) layer)->data_verified = true;
-		img_idx_cache_set_verified(layer->layer_id, 1);
 		rc = 0;
 	}
 	free(data);
@@ -761,16 +758,11 @@ ps_delta_layer_verify_data(const PsLayerDesc *layer)
  * few hundred MB is several MB, and a single floor computation or read plan
  * looks a page up in every candidate layer.  Entries are keyed by the layer id
  * and the footer fields that certify the index bytes (a lookup still reads the
- * footer), so a layer file replaced by different content misses.
- *
- * An entry also remembers that the local copy's data section was verified.
- * PsLayerDesc.data_verified records the same fact, but a lookup works on a
- * private copy of the descriptor and the result reaches the shared layer map
- * only when the caller can take the map write lock; a caller that already
- * holds the map lock cannot, and would checksum the whole data section on
- * every lookup.  The owner that clears the descriptor flag for an eviction
- * calls ps_image_layer_forget_verified(), and a forced
- * ps_image_layer_verify_data() resets it like the descriptor's.
+ * footer), so a layer file replaced by different content misses.  Only the
+ * index is cached: whether the data section of a local copy was verified is
+ * a fact about physical bytes that only the layer's owner can track.  The
+ * layer store empties the cache when it closes, so a reopened store verifies
+ * everything it reads again.
  */
 #define PS_IMG_IDX_CACHE_SLOTS	128
 #define PS_IMG_IDX_CACHE_BYTES	((size_t) 256 << 20)
@@ -785,7 +777,6 @@ typedef struct ImgIdxCacheEnt
 	uint64_t	last_use;
 	uint32_t	refs;
 	int			sorted;			/* (key, block) ascending: binary search is valid */
-	int			data_verified;	/* under img_idx_cache_lock */
 	int			cached;			/* in the table; else freed by the last release */
 } ImgIdxCacheEnt;
 
@@ -827,31 +818,27 @@ img_idx_cache_release(ImgIdxCacheEnt *e)
 	}
 }
 
-static void
-img_idx_cache_set_verified(uint64_t layer_id, int verified)
+/* Drop every entry; one still referenced is freed by its last release. */
+void
+ps_image_layer_cache_reset(void)
 {
 	pthread_mutex_lock(&img_idx_cache_lock);
 	for (int i = 0; i < PS_IMG_IDX_CACHE_SLOTS; i++)
-		if (img_idx_cache[i] != NULL && img_idx_cache[i]->layer_id == layer_id)
-			img_idx_cache[i]->data_verified = verified;
+	{
+		ImgIdxCacheEnt *e = img_idx_cache[i];
+
+		if (e == NULL)
+			continue;
+		img_idx_cache[i] = NULL;
+		e->cached = 0;
+		if (e->refs == 0)
+		{
+			free(e->idx);
+			free(e);
+		}
+	}
+	img_idx_cache_bytes = 0;
 	pthread_mutex_unlock(&img_idx_cache_lock);
-}
-
-static int
-img_idx_cache_verified(ImgIdxCacheEnt *e)
-{
-	int			verified;
-
-	pthread_mutex_lock(&img_idx_cache_lock);
-	verified = e->data_verified;
-	pthread_mutex_unlock(&img_idx_cache_lock);
-	return verified;
-}
-
-void
-ps_image_layer_forget_verified(uint64_t layer_id)
-{
-	img_idx_cache_set_verified(layer_id, 0);
 }
 
 /* Make room for 'bytes' more; entries in use are never evicted. */
@@ -974,6 +961,7 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		return 0;
 
 retry:
+	first = 0;					/* computed from the entry read below */
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
@@ -997,9 +985,7 @@ retry:
 	 */
 	if (!((PsLayerDesc *) layer)->data_verified)
 	{
-		if (img_idx_cache_verified(cached))
-			((PsLayerDesc *) layer)->data_verified = true;
-		else if (ps_image_layer_verify_data(layer, page_size) != 0)
+		if (ps_image_layer_verify_data(layer, page_size) != 0)
 		{
 			goto refresh;
 		}

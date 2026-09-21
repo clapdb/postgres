@@ -435,6 +435,10 @@ static PsBackpressureController forkmeta_backpressure;
 #define MAX_TIMELINES	1024
 _Static_assert(MAX_TIMELINES == PS_INSPECTION_MAX_TIMELINES,
 			   "inspection timeline capacity must match core capacity");
+
+/* parked data verifications; see layer_map_lookup_impl() */
+static void layer_verified_forget(uint64_t layer_id);
+static void layer_verified_reset(void);
 static unsigned char walidx_snapshot_force_due[MAX_TIMELINES];
 static unsigned char walidx_snapshot_gc_force_due[MAX_TIMELINES];
 /* Set by the WAL reclaimer (wal_segment_reclaim_one) when a complete segment
@@ -2664,6 +2668,7 @@ gc_resume(void)
 		if (tier_remote_location(&remote) != NULL &&
 			ps_layer_store->delete_remote_layer(&remote) != 0)
 			remote_failed = 1;
+		layer_verified_forget(dead[k].layer_id);
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0 || remote_failed)
 			continue;
 		if (map_locks_ready)
@@ -2759,6 +2764,7 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 	}
 	if (remote_done)
 		layer->remote_cleanup_done = true;
+	layer_verified_forget(layer_id);
 	if (ps_layer_store->delete_local_layer(layer) != 0 ||
 		ps_manifest_remove_layer(layer_id) != 0)
 	{
@@ -3756,6 +3762,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		/* The replacement is visible and this source is now durably retired. */
 		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
 			goto cleanup;
+		layer_verified_forget(old[k].layer_id);
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		/*
@@ -17180,6 +17187,115 @@ read_version(const PageVer *v, unsigned char *out)
 }
 
 /*
+ * Data verifications a map-lock holder could not record.
+ *
+ * layer_map_lookup_impl() looks pages up through private descriptor copies
+ * and writes a copy's data_verified back to the layer map under the map write
+ * lock.  A caller that already holds the map lock (the WAL floor computation,
+ * page-history floors) cannot take it, so without this every one of its
+ * lookups checksummed each layer's whole data section again.  Such a result
+ * is parked here, keyed by the identity of the local copy that was verified,
+ * and honoured by later lookups until a write-lock holder moves it into the
+ * map.  Only this function publishes entries, so a verification of some
+ * other physical copy (the remote object, before an eviction) never lands
+ * here.  Every site that removes or replaces a layer's local file, and every
+ * explicit (forced) verification, forgets the entry first, so a failed forced
+ * check is never overruled by an older parked success; close empties the set.
+ */
+#define LAYER_VERIFIED_PENDING_MAX	256
+
+typedef struct LayerVerifiedPending
+{
+	uint64_t	layer_id;
+	uint64_t	lsn_start;
+	uint64_t	lsn_end;
+	uint64_t	size;
+} LayerVerifiedPending;
+
+static pthread_mutex_t layer_verified_lock = PTHREAD_MUTEX_INITIALIZER;
+static LayerVerifiedPending layer_verified_pending[LAYER_VERIFIED_PENDING_MAX];
+static uint32_t layer_verified_npending;
+static uint32_t layer_verified_victim;
+
+static uint64_t
+layer_verified_size(const PsLayerDesc *d)
+{
+	return d->location_count > 0 ? d->locations[0].size : 0;
+}
+
+/* Is 'd' parked as verified?  With 'take', also remove it. */
+static int
+layer_verified_lookup(const PsLayerDesc *d, int take)
+{
+	int			found = 0;
+
+	pthread_mutex_lock(&layer_verified_lock);
+	for (uint32_t i = 0; i < layer_verified_npending; i++)
+	{
+		LayerVerifiedPending *p = &layer_verified_pending[i];
+
+		if (p->layer_id != d->layer_id)
+			continue;
+		found = p->lsn_start == d->lsn_start && p->lsn_end == d->lsn_end &&
+			p->size == layer_verified_size(d);
+		if (take || !found)
+			*p = layer_verified_pending[--layer_verified_npending];
+		break;
+	}
+	pthread_mutex_unlock(&layer_verified_lock);
+	return found;
+}
+
+static void
+layer_verified_park(const PsLayerDesc *d)
+{
+	pthread_mutex_lock(&layer_verified_lock);
+	for (uint32_t i = 0; i < layer_verified_npending; i++)
+		if (layer_verified_pending[i].layer_id == d->layer_id)
+		{
+			pthread_mutex_unlock(&layer_verified_lock);
+			return;
+		}
+	{
+		LayerVerifiedPending *p;
+
+		/* full: overwrite round-robin rather than stop parking for good */
+		if (layer_verified_npending < LAYER_VERIFIED_PENDING_MAX)
+			p = &layer_verified_pending[layer_verified_npending++];
+		else
+			p = &layer_verified_pending[layer_verified_victim++ %
+										LAYER_VERIFIED_PENDING_MAX];
+		p->layer_id = d->layer_id;
+		p->lsn_start = d->lsn_start;
+		p->lsn_end = d->lsn_end;
+		p->size = layer_verified_size(d);
+	}
+	pthread_mutex_unlock(&layer_verified_lock);
+}
+
+static void
+layer_verified_forget(uint64_t layer_id)
+{
+	pthread_mutex_lock(&layer_verified_lock);
+	for (uint32_t i = 0; i < layer_verified_npending; i++)
+		if (layer_verified_pending[i].layer_id == layer_id)
+		{
+			layer_verified_pending[i] =
+				layer_verified_pending[--layer_verified_npending];
+			break;
+		}
+	pthread_mutex_unlock(&layer_verified_lock);
+}
+
+static void
+layer_verified_reset(void)
+{
+	pthread_mutex_lock(&layer_verified_lock);
+	layer_verified_npending = 0;
+	pthread_mutex_unlock(&layer_verified_lock);
+}
+
+/*
  * Newest image-layer version of (timeline, key, block) with lsn <= read_lsn on
  * this exact timeline (ancestry is the caller's job).  Tries every image layer
  * of that timeline (key-range/bloom pruning is a later optimization).
@@ -17231,10 +17347,11 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	for (uint32_t i = 0; i < nlayers; i++)
 	{
-		const PsLayerDesc *d = &layers[i];
+		PsLayerDesc *d = &layers[i];
 		uint64_t	l,
 					a;
 		int			lookup;
+		bool		was_verified;
 
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline ||
 			!layer_matches_read_shard(d, shard) || d->deleting)
@@ -17242,9 +17359,16 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (expected_lsn != 0 &&
 			(expected_lsn < d->lsn_start || expected_lsn > d->lsn_end))
 			continue;
+		was_verified = d->data_verified;
+		if (!was_verified && layer_verified_lookup(d, 0))
+			d->data_verified = true;
 		lookup = ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
 									   page_size, &l, &a);
 
+		/* this caller cannot write the map: park what the lookup verified,
+		 * including a verification done while refilling the local cache */
+		if (map_locked && !was_verified && d->data_verified)
+			layer_verified_park(d);
 		if (lookup < 0)
 		{
 			error = 1;
@@ -17280,7 +17404,10 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 					if (map_locked)
 						break;
 					if (layers[i].data_verified)
+					{
 						ps_layer_map.layers[j].data_verified = true;
+						(void) layer_verified_lookup(&layers[i], 1);
+					}
 					if (tier_local_location(&ps_layer_map.layers[j]) == NULL &&
 						ps_layer_store->layer_exists_local != NULL &&
 						ps_layer_store->layer_exists_local(layers[i].layer_id) == 1)
@@ -21065,6 +21192,7 @@ ps_core_close_impl(void)
 	ps_manifest_close();
 	/* Release local provider leases after all core users have stopped.  SPDK
 	 * storage is still closed by its daemon; it is not an idempotent provider. */
+	layer_verified_reset();		/* with the files it describes */
 	if (ps_layer_store != NULL && ps_layer_store->close != NULL)
 		ps_layer_store->close();
 	core_close_posix_storage();
@@ -21184,7 +21312,10 @@ verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_la
 		{
 			found = 1;
 			/* Always re-read and checksum now: a prior read's cached verification
-			 * may predate corruption that occurred before this unlink. */
+			 * may predate corruption that occurred before this unlink.  That
+			 * includes one parked by a map-lock holder: a failure here must
+			 * not be overruled by it on the next lookup. */
+			layer_verified_forget(d->layer_id);
 			if (ps_image_layer_verify_data(d, page_size) != 0)
 				return -1;
 		}
@@ -21318,6 +21449,8 @@ read_layer_block_refreshing(const PsLayerDesc *layer, uint64_t off,
 static int
 verify_image_layer_refreshing(const PsLayerDesc *layer)
 {
+	/* an explicit verification supersedes whatever was parked */
+	layer_verified_forget(layer->layer_id);
 	if (ps_image_layer_verify_data(layer, page_size) == 0)
 		return 0;
 	if (refresh_remote_only_layer(layer) != 0)
@@ -21526,7 +21659,7 @@ finish_evict(const PsLayerDesc *candidate)
 			/* A later cache refill installs different physical bytes; require
 			 * the image data checksum to be verified again before serving it. */
 			layer->data_verified = false;
-			ps_image_layer_forget_verified(layer->layer_id);
+			layer_verified_forget(layer->layer_id);
 			layer->cache_resident = false;
 			layer->local_cleanup_pending = true;
 			found = 1;
@@ -22152,6 +22285,7 @@ ps_core_open(const char *store_dir)
 		save_errno = errno;
 		__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
 		ps_manifest_close();
+		layer_verified_reset();
 		if (ps_layer_store != NULL && ps_layer_store->close != NULL)
 			ps_layer_store->close();
 		/* A fully initialized provider may use its ordinary close, including
