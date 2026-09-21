@@ -105,31 +105,50 @@ unexplained failure stays open even if the rerun passes.
 
 ## Findings so far
 
-**E-1. Branch preparation fails whenever the newest replayed checkpoint
-record already has its restartpoint** (first run, seed 2; fails closed, no
-data affected).  `pagestore_capture_slru_snapshot()` requests a restartpoint
-and then requires the durable materializer watermark to equal the paused
-replay position.  `CreateRestartPoint()` is a no-op when no checkpoint record
-newer than the last restartpoint has been replayed, so the watermark stays
-where it was and the capture raises "restartpoint did not durably cover the
-paused WAL replay position".  The golden scenario never sees this because it
-issues `CHECKPOINT` on the writer just before the controller and the
-materializer's 5-minute timer has not consumed it.  On a system that
-checkpoints normally, the consumed state is the common one.  The controller
-owns the writer at that point and could create the checkpoint and wait for
-its replay itself; today the operator has to.  The driver works around it
-(`CHECKPOINT`, sync, up to three retries, each retry logged as
-`branch_prepare_retry`) so the rest of the branch path stays under test.
+**E-1. Branch preparation failed whenever the newest replayed checkpoint
+record already had its restartpoint** (fixed in the controller).
+`pagestore_capture_slru_snapshot()` requests a restartpoint and then requires
+the durable materializer watermark to equal the paused replay position.
+`CreateRestartPoint()` is a no-op when no checkpoint record newer than the
+last restartpoint has been replayed, so the capture raised "restartpoint did
+not durably cover the paused WAL replay position".  The golden scenario never
+saw it because the script issues `CHECKPOINT` just before the controller and
+the materializer's 5-minute timer has not consumed it; on a system that
+checkpoints normally the consumed state is the common one.  The controller
+now publishes its own checkpoint before the base capture (`CHECKPOINT`, WAL
+switch, wait for replay) and retries a bounded number of times when the
+materializer's own restartpoint still wins the race.  The fork capture uses
+the writer's shutdown checkpoint and can in principle lose the same race; the
+driver retries the whole controller and logs `branch_prepare_retry`, so its
+frequency is measured rather than assumed.
 
-**E-2. The materializer replays about an order of magnitude slower than a
-small writer produces WAL** (cassert, debug-optimized, `io_method = sync`,
-NVMe): 4 clients for 5 s produce ~200 MB of WAL that takes ~58 s to replay,
-roughly 3.5 MB/s against ~40 MB/s.  Not a correctness finding, and not yet
-measured on a production build, but it decides whether a sustained write
-workload is usable at all (lag grows without bound, or
-`pagestore.materializer_max_lag_mb` throttles the writer to the replay rate).
-It also shapes this driver: most wall-clock time is spent waiting for replay,
-so the default bursts are short.
+**E-2. Materializer replay is far slower than WAL production, and got slower
+as the store grew** (seed 1000: 16 MB segments went from 5 s to over 2 min
+each, and a 27 s burst was not replayed in 30 min).  Stack samples of the
+daemon showed the request worker almost always waiting for a lock held by the
+maintenance thread.  Three causes, in the order found:
+
+1. *Fixed.*  `ps_image_layer_lookup()` read and checksummed the layer's whole
+   index section on every page lookup, then scanned it linearly; one
+   `wal_retain_floor_level()` pass does that for every candidate layer while
+   holding the admission lock.  Image indexes are now cached per process,
+   keyed by layer id plus the footer that certifies them, and binary-searched.
+2. *Fixed.*  With the map lock already held, `layer_map_lookup_impl()` dropped
+   the `data_verified` result, so every such lookup checksummed the layer's
+   entire data section again.
+3. *Open (design).*  `compact_timeline()` merges every image layer of the
+   shard into one -- cost proportional to the store, once per eight flushes --
+   and does all of it (read, checksum, sort, write, fsync) under the shard and
+   map write locks that every page write needs.  The redundant second
+   checksum of inputs under the lock is gone, but building the replacement
+   outside the lock and tiered compaction (both already on the post-MVP list
+   in `MVP_COMPLETION_PLAN.md`) are what would change the order of magnitude.
+   Disabling segment GC (`--segment-gc 0`) made no measurable difference.
+
+Same seed, scale 1, 4 clients for 20 s (~800 MB of WAL), cassert build: replay
+288 s before, 238 s after (2.8 -> 3.5 MB/s).  The index cache matters more as
+layers grow; the long runs are the measurement for that.  None of this has
+been measured on a production build yet.
 
 ## Not covered yet
 

@@ -251,7 +251,7 @@ class Run:
     def start_daemon(self) -> None:
         log = open(self.root / "daemon.log", "a")
         self.daemon = subprocess.Popen(
-            [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store)],
+            [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store), *self.args.daemon_arg],
             stdout=log, stderr=subprocess.STDOUT, env=self.env)
         deadline = time.time() + 300
         while time.time() < deadline:
@@ -629,12 +629,9 @@ DO $$ DECLARE r record; BEGIN
             "command_timeout_seconds": 600}, indent=1))
         receipt = None
         for attempt in range(4):
-            # Finding E-1 (ENDURANCE.md): the controller's base capture needs a
-            # replayed checkpoint record that no restartpoint has consumed yet,
-            # and does not arrange one itself.  Supply it, as the golden
-            # scenario does, and count how often even that loses the race.
-            self.writer.sql("CHECKPOINT;")
-            self.sync_materializer()
+            # The controller publishes its own base checkpoint (finding E-1).
+            # The fork capture can still lose the same race against the
+            # materializer's own restartpoint; count how often it does.
             self.writer.expected_up = False      # the controller owns the writer for the window
             try:
                 receipt = json.loads(self.run_tool(
@@ -882,6 +879,8 @@ def main() -> int:
     p.add_argument("--sync-timeout", type=float, default=1800)
     p.add_argument("--sample-interval", type=float, default=15)
     p.add_argument("--max-store-gb", type=float, default=100)
+    p.add_argument("--daemon-arg", action="append", default=[],
+                   help="extra pagestore_daemon argument; repeat for each word (experiments)")
     args = p.parse_args()
     args.root = args.root.resolve()
     args.root.mkdir(parents=True, exist_ok=True)
