@@ -590,6 +590,65 @@ class BranchPrepareTests(unittest.TestCase):
             "complete",
         )
 
+    def test_base_capture_publishes_its_own_checkpoint_and_retries_a_consumed_one(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class RacingPreparer(MODULE.BranchPreparer):
+            def __init__(self, branch_config, failures, message):
+                super().__init__(branch_config)
+                self.events = []
+                self.failures = failures
+                self.message = message
+
+            def writer_sql(self, sql, private=False):
+                self.events.append(f"writer:{sql}:{private}")
+                return ""
+
+            def archive_checkpoint(self, private=True):
+                self.events.append(f"archive:{private}")
+                return "0/50"
+
+            def wait_materializer(self, target):
+                self.events.append(f"wait:{target}")
+
+            def pause_and_capture(self, keep_paused):
+                self.pause_owned = True
+                if self.failures:
+                    self.failures -= 1
+                    self.events.append("capture-failed")
+                    raise MODULE.BranchPrepareError(f"command failed (1): psql: ERROR:  {self.message}")
+                self.events.append("capture")
+                return "0/60"
+
+            def resume_materializer(self):
+                self.events.append("resume")
+                self.pause_owned = False
+
+            def install_branch_retention(self, base):
+                self.events.append(f"pin:{base}")
+
+        publish = ["writer:CHECKPOINT:False", "archive:False", "wait:0/50"]
+        preparer = RacingPreparer(config, 1, MODULE.STALE_RESTARTPOINT)
+        self.assertEqual(preparer.capture_and_pin_base(), "0/60")
+        self.assertEqual(
+            preparer.events,
+            publish + ["capture-failed", "resume"] + publish + ["capture", "pin:0/60", "resume"],
+        )
+
+        # the race is bounded, and the last failure stays paused for cleanup
+        preparer = RacingPreparer(config, MODULE.BASE_CAPTURE_ATTEMPTS, MODULE.STALE_RESTARTPOINT)
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "did not durably cover"):
+            preparer.capture_and_pin_base()
+        self.assertEqual(preparer.events.count("capture-failed"), MODULE.BASE_CAPTURE_ATTEMPTS)
+        self.assertEqual(preparer.events.count("resume"), MODULE.BASE_CAPTURE_ATTEMPTS - 1)
+        self.assertTrue(preparer.pause_owned)
+
+        # any other capture failure is not retried
+        preparer = RacingPreparer(config, 1, "WAL replay advanced during capture")
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "WAL replay advanced"):
+            preparer.capture_and_pin_base()
+        self.assertEqual(preparer.events, publish + ["capture-failed"])
+
     def test_execute_preserves_fence_after_prepare_unknown_result(self):
         config = MODULE.Config.load(self.write_config())
 
@@ -1046,6 +1105,9 @@ class BranchPrepareTests(unittest.TestCase):
                 self.resumed = False
 
             def preflight(self):
+                pass
+
+            def publish_base_checkpoint(self):
                 pass
 
             def materializer_sql(self, sql):
