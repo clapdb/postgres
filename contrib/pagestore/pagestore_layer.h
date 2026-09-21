@@ -186,6 +186,9 @@ extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
 /* Force a fresh data-section checksum verification (ignores cached state). */
+/* Forget that the local copy of this layer passed data verification: the
+ * owner calls it when it clears PsLayerDesc.data_verified for an eviction. */
+extern void ps_image_layer_forget_verified(uint64_t layer_id);
 extern int	ps_image_layer_verify_data(const PsLayerDesc *layer,
 								 uint32_t page_size);
 extern int	ps_delta_layer_verify_data(const PsLayerDesc *layer);
