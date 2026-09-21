@@ -172,6 +172,16 @@ typedef enum PsTimelineState
 	PS_TIMELINE_DELETED = 3,
 } PsTimelineState;
 
+/*
+ * PS_OP_TIMELINE_STATE fails for a timeline the store has never defined and
+ * when it cannot tell (poisoned timeline metadata, a refused request).  On
+ * PS_STATUS_ERROR 'result' separates the two: a caller that reports absence
+ * to an operator must not read an unhealthy store as "no such timeline".
+ * Zero is what a daemon predating the distinction leaves there.
+ */
+#define PS_TIMELINE_STATE_UNDEFINED		0
+#define PS_TIMELINE_STATE_UNAVAILABLE	UINT32_MAX
+
 /* Status codes */
 #define PS_STATUS_OK		0
 #define PS_STATUS_ERROR		1

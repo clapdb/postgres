@@ -736,6 +736,8 @@ assert_eq "$("${WP[@]}" -c "SELECT state || ':' || incarnation FROM pagestore_ex
 	"live:1" "the writer reports the branch timeline live at its incarnation"
 assert_eq "$("${WP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_ext.pagestore_timeline_state(99);")" \
 	"t" "an undefined timeline has no lifecycle state"
+assert_eq "$("${WP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_ext.pagestore_timeline_state(500000);")" \
+	"t" "a timeline id beyond the store's range is undefined, not an error"
 expect_delete_error()
 {
 	local port_array=$1 args=$2 pattern=$3 message=$4 output

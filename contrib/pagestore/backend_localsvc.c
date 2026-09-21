@@ -1852,12 +1852,29 @@ bool
 pagestore_localsvc_timeline_state(uint32 timeline, uint32 *state,
 								  uint64 *incarnation)
 {
+	return pagestore_localsvc_timeline_state_known(timeline, state,
+												   incarnation, NULL);
+}
+
+/*
+ * As above; on failure *undefined says whether the store positively has no
+ * such timeline, as opposed to being unable to tell.
+ */
+bool
+pagestore_localsvc_timeline_state_known(uint32 timeline, uint32 *state,
+										uint64 *incarnation, bool *undefined)
+{
 	PsChannel  *ch = ls_chan();
 
 	ch->opcode = PS_OP_TIMELINE_STATE;
 	ch->timeline = timeline;
+	ch->result = PS_TIMELINE_STATE_UNAVAILABLE;
 	if (ls_exec_wait(ch, 0) != PS_STATUS_OK)
+	{
+		if (undefined != NULL)
+			*undefined = ch->result == PS_TIMELINE_STATE_UNDEFINED;
 		return false;
+	}
 	if (state != NULL)
 		*state = ch->result;
 	if (incarnation != NULL)

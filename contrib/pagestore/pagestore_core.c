@@ -20455,7 +20455,13 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t incarnation;
 
 				if (!ps_timeline_state(tl, &state, &incarnation))
+				{
 					ch->status = PS_STATUS_ERROR;
+					/* an id beyond the table positively does not exist */
+					ch->result = timeline_meta_poisoned_load() ?
+						PS_TIMELINE_STATE_UNAVAILABLE :
+						PS_TIMELINE_STATE_UNDEFINED;
+				}
 				else
 				{
 					ch->result = state;

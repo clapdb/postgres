@@ -1223,6 +1223,28 @@ pagestore_require_timeline_control(int32 timeline)
 }
 
 /*
+ * False only when the store positively has no such timeline.  A store that
+ * cannot tell -- poisoned timeline metadata, a refused request -- is an
+ * error: an operator must not read an unhealthy store as "absent".
+ */
+static bool
+pagestore_lookup_timeline(int32 timeline, uint32 *state, uint64 *incarnation)
+{
+	bool		undefined = false;
+
+	if (pagestore_localsvc_timeline_state_known((uint32) timeline, state,
+												incarnation, &undefined))
+		return true;
+	if (!undefined)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYSTEM_ERROR),
+				 errmsg("pagestore could not determine the state of timeline %d",
+						timeline),
+				 errhint("The store's timeline metadata may be poisoned; check the daemon log and pagestore_inspect.")));
+	return false;
+}
+
+/*
  * Lifecycle state and incarnation of a store timeline; no row's worth of
  * values (both NULL) for a timeline the store has never defined.  This is how
  * an operator learns the incarnation pagestore_delete_branch() demands, and
@@ -1243,10 +1265,11 @@ pagestore_timeline_state(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
-	if (pagestore_localsvc_timeline_state((uint32) timeline, &state,
-										  &incarnation) &&
-		(name = pagestore_timeline_state_name(state)) != NULL)
+	if (pagestore_lookup_timeline(timeline, &state, &incarnation))
 	{
+		name = pagestore_timeline_state_name(state);
+		if (name == NULL)
+			elog(ERROR, "unexpected pagestore timeline state %u", state);
 		values[0] = CStringGetTextDatum(name);
 		values[1] = Int64GetDatum((int64) incarnation);
 		nulls[0] = nulls[1] = false;
@@ -1288,7 +1311,7 @@ pagestore_delete_branch(PG_FUNCTION_ARGS)
 				 errmsg("pagestore timeline incarnation must be > 0")));
 
 	/* Name the refusals the store's single status cannot tell apart. */
-	if (!pagestore_localsvc_timeline_state((uint32) timeline, &state, &current))
+	if (!pagestore_lookup_timeline(timeline, &state, &current))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("pagestore timeline %d does not exist", timeline)));
@@ -1303,11 +1326,19 @@ pagestore_delete_branch(PG_FUNCTION_ARGS)
 
 	if (pagestore_localsvc_begin_delete((uint32) timeline,
 										(uint64) incarnation) != PS_STATUS_OK)
+	{
+		/* Maintenance may have finished a deletion begun earlier between the
+		 * lookup above and this request; BEGIN_DELETE refuses a DELETED
+		 * timeline, but for the caller that retry succeeded. */
+		if (pagestore_lookup_timeline(timeline, &state, &current) &&
+			current == (uint64) incarnation && state == PS_TIMELINE_DELETED)
+			PG_RETURN_TEXT_P(cstring_to_text("deleted"));
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("pagestore refused to delete timeline %d", timeline),
 				 errdetail("A timeline with a live or deleting descendant branch, or with a registered retention owner (reader, materializer or branch-preparation pin), cannot be deleted."),
 				 errhint("Delete descendant branches first and release the timeline's retention owners; pagestore_inspect shows both.")));
+	}
 	PG_RETURN_TEXT_P(cstring_to_text("deleting"));
 }
 
