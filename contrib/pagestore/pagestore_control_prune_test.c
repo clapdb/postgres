@@ -1120,6 +1120,84 @@ test_independent_blocks_keep_their_newest(void)
 	remove_tree(store);
 }
 
+/* E-7: the shutdown-intent image and the completed checkpoint's exact-redo
+ * image can share one LSN but have different bytes/admission sequences.  A
+ * cutoff below them must retain the newest tuple at that LSN, rather than
+ * the first (oldest) same-LSN entry. Independent control blocks use the
+ * same tuple selection and must not regress either. */
+static void
+test_same_lsn_versions_above_floor(void)
+{
+	char store[] = "/tmp/pagestore-control-same-lsn-XXXXXX";
+	PsKey key = control_key();
+	const uint32_t blocks[] = {PS_CONTROL_IMAGE_BLOCK, PS_MATERIALIZER_MARKER_BLOCK};
+	uint64_t seqs[2][2] = {{0}};
+	unsigned char page[8192];
+	uint64_t value = 0;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "E7 open same-LSN control store");
+	check(write_control(0, 100, 90) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, 150),
+		  "E7 retain base below colliding control publications");
+	check(write_note(0, 200, 180), "E7 publish note for colliding images");
+	for (int b = 0; b < 2; b++)
+		for (int v = 0; v < 2; v++)
+		{
+			memset(page, 0, sizeof(page));
+			value = 180 + v * 20;
+			memcpy(page, &value, sizeof(value));
+			ps_lock_shard_wr(ps_shard_of(&key));
+			check(append_page(0, &key, blocks[b], page, 200, &seqs[b][v]) == 0,
+				  "E7 append distinct bytes at one control version LSN");
+			ps_unlock_shard(ps_shard_of(&key));
+		}
+	check(ps_storage->sync() == 0, "E7 sync control publications");
+	/* phase 0: live, phase 1: compacted, phase 2/3: repeated recovery. */
+	for (int phase = 0; phase < 4; phase++)
+	{
+		if (phase == 1)
+			run_maintenance(64);
+		if (phase >= 2)
+		{
+			close_store();
+			configure_core(1);
+			check(ps_core_open(store) == 0, "E7 reopen compacted same-LSN history");
+		}
+		for (int b = 0; b < 2; b++)
+		{
+			check(read_control_at(0, blocks[b], 200, &value) && value == 200,
+				  "E7 newest control bytes survive compaction and recovery");
+			for (int v = (phase == 0 ? 0 : 1); v < 2; v++)
+			{
+				uint64_t resolved_seq = 0;
+				int rc;
+
+				ps_lock_shard_rd(ps_shard_of(&key));
+				rc = read_resolve_version(0, &key, blocks[b], 200, seqs[b][v],
+										 page, NULL, &resolved_seq);
+				ps_unlock_shard(ps_shard_of(&key));
+				memcpy(&value, page, sizeof(value));
+				check(rc == 1 && value == (uint64_t) (180 + v * 20) &&
+					  resolved_seq == seqs[b][v],
+					  "E7 retained control tuple resolves its own bytes");
+			}
+		}
+	}
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 2,
+					  PS_RETENTION_RESOURCE_ALL, 250),
+		  "E7 move cutoff past colliding versions");
+	run_maintenance(64);
+	for (int b = 0; b < 2; b++)
+		check(ps_test_page_version_count(0, &key, blocks[b]) == 1 &&
+			  read_control_at(0, blocks[b], 250, &value) && value == 200,
+			  "E7 superseded tuples are reclaimed once the cutoff advances");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -1139,6 +1217,7 @@ main(void)
 	test_stale_artifacts_are_retired();
 	test_live_slru_mirror_follows_page_history();
 	test_independent_blocks_keep_their_newest();
+	test_same_lsn_versions_above_floor();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }
