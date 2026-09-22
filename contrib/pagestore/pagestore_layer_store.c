@@ -1204,6 +1204,7 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	const char *path = NULL;
 	int			fd;
 	ssize_t		n;
+	uint32_t	done = 0;
 	uint32_t	nlocs;
 
 	if (!local_owner_current())
@@ -1246,9 +1247,25 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	}
 	if (fd < 0)
 		return -1;
-	n = pread(fd, buf, len, (off_t) off);
+	/*
+	 * One read(2) transfers at most 0x7ffff000 bytes on Linux, and
+	 * ps_image_layer_verify_data() asks for a layer's whole data section at
+	 * once: without the loop an image layer over 2 GiB -- which full-merge
+	 * compaction produces from a few GiB of page history -- could never be
+	 * verified, so every lookup through it failed and it could never be
+	 * compacted away either.
+	 */
+	while (done < len)
+	{
+		n = pread(fd, (char *) buf + done, len - done, (off_t) (off + done));
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;				/* error, or the file ends before 'len' */
+		done += (uint32_t) n;
+	}
 	close(fd);
-	return n == (ssize_t) len ? 0 : -1;
+	return done == len ? 0 : -1;
 }
 
 static const PsLayerLocation *

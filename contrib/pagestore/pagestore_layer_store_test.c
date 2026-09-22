@@ -7,6 +7,7 @@
  */
 #include <fcntl.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -245,6 +246,44 @@ main(void)
 		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
 			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
 			  "forked provider rejects inherited-owner reads");
+	}
+	/*
+	 * One read(2) moves at most 0x7ffff000 bytes on Linux, and image data
+	 * verification reads a layer's whole data section in one call.  Opt-in:
+	 * it needs a 2 GiB buffer (the file itself is sparse).
+	 */
+	if (getenv("PAGESTORE_TEST_LARGE_LAYER") != NULL)
+	{
+		const uint32_t big_len = 0x80002000u;
+		const char	marker[] = "end-of-large-layer";
+		PsLayerDesc big = layer;
+		char	   *big_buf = malloc(big_len);
+		int			big_fd;
+		int			n;
+
+		n = snprintf(big.locations[0].uri, sizeof(big.locations[0].uri),
+					 "%s.large", local_uri);
+		big_fd = n > 0 && (size_t) n < sizeof(big.locations[0].uri) ?
+			open(big.locations[0].uri, O_CREAT | O_RDWR | O_TRUNC, 0600) : -1;
+		check(big_buf != NULL && big_fd >= 0 &&
+			  ftruncate(big_fd, (off_t) big_len) == 0 &&
+			  pwrite(big_fd, marker, sizeof(marker),
+					 (off_t) big_len - (off_t) sizeof(marker)) ==
+			  (ssize_t) sizeof(marker),
+			  "create a sparse layer file larger than one read can return");
+		big.locations[0].size = big_len;
+		check(big_buf != NULL &&
+			  ps_layer_store->read_layer_block(&big, 0, big_buf, big_len) == 0 &&
+			  memcmp(big_buf + big_len - sizeof(marker), marker,
+					 sizeof(marker)) == 0,
+			  "a read longer than 0x7ffff000 bytes is completed");
+		check(big_buf != NULL &&
+			  ps_layer_store->read_layer_block(&big, 4096, big_buf, big_len) != 0,
+			  "a read past the end of a large layer still fails");
+		if (big_fd >= 0)
+			close(big_fd);
+		unlink(big.locations[0].uri);
+		free(big_buf);
 	}
 	{
 		PsLayerMap legacy;
