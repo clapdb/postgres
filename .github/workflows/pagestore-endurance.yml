@@ -1,0 +1,119 @@
+# Real-PostgreSQL endurance run for contrib/pagestore.
+#
+# contrib/pagestore/endurance/pagestore_endurance.py drives the golden
+# topology (WAL-only writer, continuous materializer, controller-made branch
+# computes, one POSIX daemon) under seeded pgbench plus DDL chaos and injected
+# restarts, and stops at the first thing it cannot explain, preserving the run
+# root.  See contrib/pagestore/endurance/ENDURANCE.md.
+#
+# The pull-request lane does not run it: one run is minutes to hours long and
+# needs a full PostgreSQL build.  This workflow runs a bounded run on demand
+# (any ref, seed and duration) and a short one weekly, so the driver is
+# exercised on the current tree and its findings arrive as failed runs with
+# their evidence attached, not as silent rot.  A pull request that changes the
+# driver itself gets a five-minute run.  Long multi-hour runs stay on a
+# developer box; a hosted runner is not release evidence (RELEASE_VALIDATION.md).
+
+name: pagestore endurance
+
+on:
+  pull_request:
+    paths:
+      - "contrib/pagestore/endurance/**"
+      - ".github/workflows/pagestore-endurance.yml"
+  schedule:
+    # weekly, Saturday 04:17 UTC, from the default branch only
+    - cron: "17 4 * * 6"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "driver PRNG seed"
+        default: "1"
+      duration:
+        description: "seconds per run (one topology lifetime)"
+        default: "900"
+      scale:
+        description: "workload scale (20000 accounts per unit)"
+        default: "1"
+      ref:
+        description: "branch, tag or SHA to run; empty = the dispatching branch"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  endurance:
+    if: github.event_name != 'schedule' || github.repository == 'clapdb/postgres'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install build dependencies
+        run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*microsoft*' -o -name '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex meson ninja-build pkg-config perl python3
+
+      - name: Configure and build PostgreSQL (minimal)
+        run: |
+          meson setup build -Dcassert=true -Dauto_features=disabled
+          ninja -C build
+
+      - name: Prepare temporary install tree
+        run: meson test -C build --suite setup
+
+      - name: Run the endurance driver
+        env:
+          SEED: ${{ inputs.seed || '1' }}
+          DURATION: ${{ inputs.duration || (github.event_name == 'pull_request' && '300') || '900' }}
+          SCALE: ${{ inputs.scale || '1' }}
+        run: |
+          # $RUNNER_TEMP is a real filesystem on the hosted runners; the driver
+          # refuses nothing on tmpfs but its fsync evidence would mean nothing.
+          mkdir -p "$RUNNER_TEMP/endurance"
+          python3 contrib/pagestore/endurance/pagestore_endurance.py \
+            --build "$(pwd)/build" \
+            --root "$RUNNER_TEMP/endurance" \
+            --seed "$SEED" --duration "$DURATION" --scale "$SCALE" \
+            --clients 4 --burst-min 5 --burst-max 20 \
+            --branch-probability 0.5 --max-branches 1 \
+            --sample-interval 15 --max-store-gb 40
+
+      - name: Collect run evidence
+        if: always()
+        run: |
+          set -e
+          root="$RUNNER_TEMP/endurance"
+          out="$(pwd)/build/pagestore-endurance-evidence"
+          mkdir -p "$out"
+          cp "$root"/history.jsonl "$out"/ 2>/dev/null || true
+          # a pass leaves its summary, events and metrics under passed/<seed>/;
+          # a failure leaves the whole run root, of which the logs, events,
+          # metrics, diagnostics and the controller journals are the evidence
+          if [ -d "$root/passed" ]; then cp -r "$root/passed" "$out"/; fi
+          for run in "$root"/run-*; do
+            [ -d "$run" ] || continue
+            dest="$out/$(basename "$run")"
+            mkdir -p "$dest"
+            cp "$run"/FAILURE.json "$run"/PASS.json "$run"/*.jsonl "$run"/*.log "$dest"/ 2>/dev/null || true
+            [ -d "$run/diagnostics" ] && cp -r "$run/diagnostics" "$dest"/
+            for prepared in "$run"/prepared-*; do
+              [ -f "$prepared/pagestore_branch.prepare.json" ] || continue
+              mkdir -p "$dest/$(basename "$prepared")"
+              cp "$prepared/pagestore_branch.prepare.json" "$dest/$(basename "$prepared")/"
+            done
+          done
+          du -sh "$out"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pagestore-endurance-${{ inputs.seed || '1' }}
+          path: build/pagestore-endurance-evidence
+          if-no-files-found: warn
+          retention-days: 30
