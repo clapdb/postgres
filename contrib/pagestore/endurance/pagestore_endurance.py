@@ -258,6 +258,7 @@ class Pg:
         for line in chunk.splitlines():
             m = INJECTED_KILL.search(line)
             if m and int(m.group(1)) in self.run.killed_pids:
+                self.run.killed_pids.discard(int(m.group(1)))   # once: PIDs are reused
                 continue
             if BAD_LOG.search(line):
                 raise Failure("bad_log", f"{self.name}: {line[:400]}")
@@ -611,7 +612,7 @@ DO $$ DECLARE r record; BEGIN
         return subprocess.Popen(argv, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def ddl_chaos(self, stop: threading.Event, tolerate: threading.Event, rng: random.Random) -> None:
-        n = 0
+        n = ncol = 0
         while not stop.wait(rng.uniform(0.3, 2.0)):
             try:
                 scratch = [t for t in self.tables(self.writer) if t.startswith("scratch_")]
@@ -635,7 +636,8 @@ DO $$ DECLARE r record; BEGIN
                 elif op == "vacuum_full":
                     sql = f"VACUUM FULL {t};"
                 elif op == "add_column":
-                    sql = f"ALTER TABLE {t} ADD COLUMN c{rng.randint(1, 10**6)} int DEFAULT {rng.randint(1, 9)};"
+                    ncol += 1                  # unique per round and burst: a repeat would be a false finding
+                    sql = f"ALTER TABLE {t} ADD COLUMN c{self.round}_{ncol} int DEFAULT {rng.randint(1, 9)};"
                 elif op == "reindex":
                     sql = f"REINDEX TABLE {t};"
                 elif op == "cluster":
@@ -715,9 +717,12 @@ DO $$ DECLARE r record; BEGIN
             raise self.async_failure
         if bench.returncode != 0 and not tolerate.is_set():
             raise Failure("workload_failed", f"pgbench rc={bench.returncode}: {out[-1500:]}")
-        if bench.returncode != 0 and unexpected_errors(out or ""):
-            raise Failure("workload_failed", f"pgbench rc={bench.returncode} during a writer fault, with errors "
-                                             f"other than the crash: {unexpected_errors(out)[:5]}")
+        if bench.returncode != 0 and (bench.returncode != 2 or unexpected_errors(out or "")
+                                      or not FAULT_ERROR.search(out or "")):
+            # pgbench exits 2 for errors during the run; anything else, or no crash error, is unexplained
+            raise Failure("workload_failed", f"pgbench rc={bench.returncode} during a writer fault, without "
+                                             f"only the crash's errors: {unexpected_errors(out or '')[:5]} "
+                                             f"{(out or '')[-500:]}")
         if tolerate.is_set():
             # crash recovery may still be running after a backend SIGKILL
             self.wait_for("writer accepts connections after the injected crash",
@@ -926,7 +931,12 @@ recovery_target_action = 'promote'
         an empty buffer cache (every page comes back from the store)."""
         self.verify_branch_idle(tl, b)
         bench = self.pgbench(b, self.rng.randint(5, 15), max(2, self.args.clients // 2))
-        out, _ = bench.communicate(timeout=900)
+        try:
+            out, _ = bench.communicate(timeout=900)
+        except subprocess.TimeoutExpired:
+            bench.kill()
+            bench.wait()
+            raise Failure("timeout", f"branch {tl} pgbench still running after 900 s")
         if bench.returncode != 0:
             raise Failure("workload_failed", f"branch {tl} pgbench rc={bench.returncode}: {out[-1500:]}")
         self.resolve_prepared(b)
