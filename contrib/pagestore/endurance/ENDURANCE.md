@@ -17,6 +17,14 @@ contrib/pagestore/endurance/pagestore_endurance.py --build build \
 Put `--root` on a real filesystem.  On tmpfs every fsync is free and the run
 says nothing about the store's durability ordering.
 
+`.github/workflows/pagestore-endurance.yml` runs a bounded run on demand (any
+ref, seed, duration and scale) and a 15-minute one weekly, uploading the
+history, the passed runs' events and metrics, and a failed run's logs,
+diagnostics and controller journals as the `pagestore-endurance-<seed>`
+artifact.  It keeps the driver exercised on the current tree; multi-hour
+runs stay on a developer box, and neither is release evidence
+(`RELEASE_VALIDATION.md`).
+
 ## Topology
 
 The provisioning mirrors `mvp_golden_test.sh` step for step, so a failure here
