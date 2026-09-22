@@ -67,7 +67,7 @@ def quoted(value: Any) -> str:
 NACCTS_PER_SCALE = 20000
 NDOCS_PER_SCALE = 200
 INITIAL_BALANCE = 1000
-PROBE_TIMEOUT = 30          # one poll inside wait_for(); the wait's own deadline stays in charge
+PROBE_TIMEOUT = 30          # the longest single poll inside wait_for()
 
 WORKLOAD = {
     # weight, script
@@ -267,6 +267,7 @@ class Run:
         self.stop_sampler = threading.Event()
         self.sampler_thread: threading.Thread | None = None
         self.async_failure: Failure | None = None
+        self.wait_deadline = 0.0
         self.stats = {"rounds": 0, "verifies": 0, "branches": 0, "events": {}}
 
     # ---- bookkeeping ----------------------------------------------------
@@ -444,8 +445,12 @@ CREATE INDEX ev_k ON ev(k);
 
     # ---- WAL shipping and materialization waits --------------------------
 
+    def probe_timeout(self) -> float:
+        """One poll inside wait_for(): never past the wait's own deadline."""
+        return max(1.0, min(PROBE_TIMEOUT, self.wait_deadline - time.time()))
+
     def wait_for(self, what: str, fn, timeout: float) -> None:
-        deadline = time.time() + timeout
+        deadline = self.wait_deadline = time.time() + timeout
         last: Any = None
         while time.time() < deadline:
             self.check_health()
@@ -472,7 +477,7 @@ CREATE INDEX ev_k ON ev(k);
         self.timing = {"archive_s": round(time.time() - t0, 1)}
         t0 = time.time()
         self.wait_for(f"materializer replay through {lsn}", lambda: self.mat.sql(
-            f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;", timeout=PROBE_TIMEOUT) == "t", self.args.sync_timeout)
+            f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;", timeout=self.probe_timeout()) == "t", self.args.sync_timeout)
         self.timing["replay_s"] = round(time.time() - t0, 1)
         return lsn
 
@@ -675,7 +680,7 @@ DO $$ DECLARE r record; BEGIN
         if tolerate.is_set():
             # crash recovery may still be running after a backend SIGKILL
             self.wait_for("writer accepts connections after the injected crash",
-                          lambda: self.writer.sql("SELECT 1;", timeout=PROBE_TIMEOUT) == "1", 600)
+                          lambda: self.writer.sql("SELECT 1;", timeout=self.probe_timeout()) == "1", 600)
         m = re.search(r"number of transactions actually processed: (\d+)", out or "")
         self.event("burst_done", tx=int(m.group(1)) if m else None, rc=bench.returncode)
 
@@ -691,7 +696,7 @@ DO $$ DECLARE r record; BEGIN
             target = self.writer.sql(q)
             lsn = self.archive_current_wal()
             self.wait_for(f"materializer replay through {lsn}", lambda: self.mat.sql(
-                f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;", timeout=PROBE_TIMEOUT) == "t", self.args.sync_timeout)
+                f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;", timeout=self.probe_timeout()) == "t", self.args.sync_timeout)
             before = self.query_retry(self.mat, q)
             if self.query_retry(self.mat, f"SELECT '{before}'::pg_lsn >= '{target}'::pg_lsn;") == "t":
                 continue                           # already a restartpoint at the new checkpoint
@@ -826,7 +831,7 @@ recovery_target_action = 'promote'
         # tracked before it starts, so teardown stops it if validation fails
         self.branches.append((tl, b, scratch))
         b.start()
-        self.wait_for(f"branch {tl} promotion", lambda: b.sql("SELECT pg_is_in_recovery();", timeout=PROBE_TIMEOUT) == "f", 600)
+        self.wait_for(f"branch {tl} promotion", lambda: b.sql("SELECT pg_is_in_recovery();", timeout=self.probe_timeout()) == "f", 600)
         got = self.checksums(b)
         if got != fork_state:
             diff = {t: (fork_state.get(t), got.get(t)) for t in set(fork_state) | set(got)
@@ -856,7 +861,7 @@ recovery_target_action = 'promote'
         if state not in ("deleting", "deleted"):
             raise Failure("delete_branch", f"timeline {tl}: unexpected result {state!r}")
         self.wait_for(f"timeline {tl} deletion", lambda: self.writer.sql(
-            f"SELECT state FROM pagestore_ext.pagestore_timeline_state({tl});", timeout=PROBE_TIMEOUT) == "deleted",
+            f"SELECT state FROM pagestore_ext.pagestore_timeline_state({tl});", timeout=self.probe_timeout()) == "deleted",
             self.args.sync_timeout)
         self.event("branch_deleted", timeline=tl, seconds=round(time.time() - started, 1),
                    store_kb_before=before, store_kb_after=self.store_kb())
