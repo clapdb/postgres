@@ -2335,6 +2335,7 @@ test_ordered_parent_after_branch(int walless)
 	PsChannel reply;
 	unsigned char page[8192];
 	uint64_t seq = 0;
+	uint64_t reader_seq[2];
 	uint64_t lsn = walless ? 0 : 50;
 
 	check(mkdtemp(store) != NULL, "E6 branch create store");
@@ -2367,6 +2368,16 @@ test_ordered_parent_after_branch(int walless)
 	check(create_branch_request(1, 0, 300) &&
 		  create_branch_request(2, 0, 400) &&
 		  create_branch_request(3, 2, 500), "E6 branch fork at and beyond cutoff");
+	for (int reader = 0; reader < 2; reader++)
+	{
+		pin.owner_id = 96 + reader;
+		pin.lsn = 500 + reader * 100;
+		check(append_relation_timeline(0, &pin_key, 0, pin.lsn, page, &reader_seq[reader]) == 0,
+			  "E6 reader establish newer admission boundary");
+		pin.admission_seq = reader_seq[reader];
+		check(ps_retention_set(&pin) == PS_RETENTION_OK,
+			  "E6 reader pin above selected cutoff and branch caps");
+	}
 	for (int restart = 0; restart < 3; restart++)
 	{
 		check(append_relation_timeline_tag(0, &key, 0, lsn, page, 0x70 + restart, NULL) == 0 &&
@@ -2374,6 +2385,18 @@ test_ordered_parent_after_branch(int walless)
 			  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 			  page[128] == 0x70 + restart,
 			  "E6 parent accepts ordered writes after branch");
+		if (!walless)
+			for (int reader = 0; reader < 2; reader++)
+			{
+				uint64_t horizon = 500 + reader * 100;
+
+				check(read_resolve(0, &key, 0, horizon, reader_seq[reader], page, NULL) == 1 &&
+					  page[128] == 0x61 &&
+					  read_resolve(0, &key, 2, horizon, reader_seq[reader], page, NULL) == 0 &&
+					  meta_request(PS_OP_NBLOCKS, &key, horizon, reader_seq[reader], 0, 0, &reply) &&
+					  reply.result == 1,
+					  "E6 retained readers never see later clamped bytes or growth");
+			}
 		for (uint32_t child = 1; child <= 3; child++)
 		{
 			int rc = read_resolve(child, &key, 0, UINT64_MAX, 0, page, NULL);
@@ -2384,7 +2407,7 @@ test_ordered_parent_after_branch(int walless)
 				PageVer *v;
 				int status = read_through_checked(child, &key, 0, UINT64_MAX, 0, &v);
 
-				check(walless ? status == -2 && v == NULL :
+				check(walless ? status == -1 && v == NULL :
 					  status == 1 && v != NULL && v->lsn == 100,
 					  "E6 in-memory ancestry lookup obeys the same snapshot boundary");
 			}
@@ -2396,9 +2419,15 @@ test_ordered_parent_after_branch(int walless)
 		close_runtime();
 		check(ps_core_open(store) == 0, "E6 branch reopen ordered history");
 	}
+	for (int reader = 0; reader < 2; reader++)
+		check(ps_retention_drop(0, 1, 96 + reader, 1) == PS_RETENTION_OK,
+			  "E6 release newer reader horizons");
+	check(append_relation_timeline_tag(0, &key, 0, lsn, page, 0x74, NULL) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x74,
+		  "E6 ordered writes remain latest after higher reader pins disappear");
 	check(create_branch_request(4, 0, UINT64_MAX) &&
 		  append_relation_timeline_tag(0, &key, 0, lsn, page, 0x79, NULL) != 0 &&
-		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x72,
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x74,
 		  "E6 unrepresentable post-branch position refuses without replacing bytes");
 	close_runtime();
 	remove_tree(store);

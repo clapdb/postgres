@@ -7669,7 +7669,7 @@ read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * applies when a newest read becomes capped through ancestry. */
 			if (key->klass == PS_KLASS_RELATION && w.tl != timeline &&
 				v->lsn == 0)
-				return -2;
+				return -1;
 			*out = v;
 			return 1;
 		}
@@ -17049,31 +17049,49 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
 	if (ordered_record)
 	{
-		/* Branch reads cap ancestors at a bare LSN, not an admission tuple.
-		 * Put operational writes strictly beyond every existing child cap;
-		 * descendants are capped by that same first edge.  CREATE_BRANCH takes
-		 * every shard lock, so the caller's shard-write lock keeps this set
-		 * stable through publication.  Include deleting children until their
-		 * ancestry is retired.  No representable successor means fail closed. */
+		PsPruneFence *fences = NULL;
+		uint32_t nfences = 0;
+		uint64_t newest;
+		int rc;
+
+		/* An operational write must be newer than every protected snapshot,
+		 * not just the compaction cutoff.  Reuse pruning's ancestry projection
+		 * for branch caps and PAGE_HISTORY pins.  A tuple-capped reader can
+		 * exclude our fresh admission at the same LSN; a bare-LSN branch or
+		 * legacy pin requires its successor.  Admission-rd excludes pin SET,
+		 * and the caller's shard-write lock excludes CREATE_BRANCH through
+		 * publication, so neither fence set can change after this sample. */
 		ps_lock_map_rd();
-		for (uint32_t child = 1; child < MAX_TIMELINES; child++)
+		rc = page_prune_fences(timeline, &fences, &nfences);
+		/* A dropped pin/branch must not make a later ordered write sort
+		 * behind a version already admitted at that former horizon.  The
+		 * bound markers preserve this operational position across restart. */
+		newest = fork_newest_visible_lsn_through(timeline, key);
+		ps_unlock_map();
+		if (hdr.lsn < newest)
+			hdr.lsn = newest;
+		if (rc != 0)
 		{
-			if (!timeline_has_parent(child) ||
-				timelines[child].parent != (int) timeline ||
-				timelines[child].state == PS_TIMELINE_DELETED)
-				continue;
-			if (hdr.lsn <= timelines[child].branch_lsn)
+			*outcome = PS_APPEND_IO_FAILED;
+			return -1;
+		}
+		for (uint32_t i = 0; i < nfences; i++)
+		{
+			if (hdr.lsn < fences[i].lsn)
+				hdr.lsn = fences[i].lsn;
+			if (hdr.lsn == fences[i].lsn &&
+				admission_seq <= fences[i].admission_seq)
 			{
-				if (timelines[child].branch_lsn == UINT64_MAX)
+				if (hdr.lsn == UINT64_MAX)
 				{
-					ps_unlock_map();
+					free(fences);
 					*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
 					return -1;
 				}
-				hdr.lsn = timelines[child].branch_lsn + 1;
+				hdr.lsn++;
 			}
 		}
-		ps_unlock_map();
+		free(fences);
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
@@ -17645,10 +17663,11 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 
 			/* Frontends reject explicit capped reads of WAL-less bytes.  A
 			 * newest child read is capped here too, even though its original
-			 * request had no LSN/sequence cap.  Report unavailable history, not
-			 * an absent page or the parent's latest FSM/VM/unlogged contents. */
+			 * request had no LSN/sequence cap.  Return an error distinct from
+			 * reclaimed history (-2), which READ_AT reports as absent.  Never
+			 * substitute absence or the parent's latest WAL-less contents. */
 			if (key->klass == PS_KLASS_RELATION && tl != timeline && pv->lsn == 0)
-				return -2;
+				return -1;
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
@@ -18696,7 +18715,8 @@ artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
 	return 0;
 }
 
-/* Caller holds map-wr and the page-prune read fence. */
+/* Caller holds map-rd or map-wr.  Callers that act on the snapshot also
+ * fence pin mutations with admission-rd or the page-prune read fence. */
 static int
 page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 				  uint32_t *nfences_out)
