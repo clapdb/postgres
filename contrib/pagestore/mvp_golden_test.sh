@@ -285,16 +285,17 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 "${WP[@]}" -c "CREATE SCHEMA pagestore_ext;
 	CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.0';
 	ALTER EXTENSION pagestore UPDATE TO '1.1';
-	ALTER EXTENSION pagestore UPDATE TO '1.2';" >/dev/null ||
+	ALTER EXTENSION pagestore UPDATE TO '1.2';
+	ALTER EXTENSION pagestore UPDATE TO '1.3';" >/dev/null ||
 fail "could not install the extension upgrade chain"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.2" \
-	"extension upgrades from 1.0 through 1.1 to 1.2"
-api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure);")
-assert_eq "$api_count" "3" "1.2 exposes immutable branch and retention control APIs after upgrade"
-"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.2';" >/dev/null ||
-	fail "could not install a fresh 1.2 extension"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.2" \
-	"fresh extension install uses version 1.2"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.3" \
+	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.3"
+api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure);")
+assert_eq "$api_count" "5" "1.3 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
+"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.3';" >/dev/null ||
+	fail "could not install a fresh 1.3 extension"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.3" \
+	"fresh extension install uses version 1.3"
 "${WP[@]}" -c "CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
  AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
@@ -727,6 +728,65 @@ assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \
 	"0" "branch ancestry cutoff survives compute restart"
 assert_eq "$("${WP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=3;")" \
 	"0" "parent remains isolated from the branch write"
+
+# Operator-facing branch deletion.  The store already vetoes a timeline with
+# descendants or retention owners; the SQL entry point adds the refusals only
+# a compute can name, and the incarnation fence.
+assert_eq "$("${WP[@]}" -c "SELECT state || ':' || incarnation FROM pagestore_ext.pagestore_timeline_state(1);")" \
+	"live:1" "the writer reports the branch timeline live at its incarnation"
+assert_eq "$("${WP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_ext.pagestore_timeline_state(99);")" \
+	"t" "an undefined timeline has no lifecycle state"
+assert_eq "$("${WP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_ext.pagestore_timeline_state(500000);")" \
+	"t" "a timeline id beyond the store's range is undefined, not an error"
+expect_delete_error()
+{
+	local port_array=$1 args=$2 pattern=$3 message=$4 output
+
+	if [ "$port_array" = branch ]; then
+		output=$("${BP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch($args);" 2>&1) && fail "$message (accepted)"
+	else
+		output=$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch($args);" 2>&1) && fail "$message (accepted)"
+	fi
+	printf '%s\n' "$output" | grep -F "$pattern" >/dev/null ||
+		fail "$message (got: $output)"
+	echo "ok   - $message"
+}
+expect_delete_error branch "1, 1" "this server's own timeline" \
+	"a branch compute cannot delete its own timeline"
+expect_delete_error writer "0, 1" "main timeline" "the main timeline cannot be deleted"
+expect_delete_error writer "1, 2" "is at incarnation 1, not 2" \
+	"a stale or wrong incarnation does not delete the branch"
+expect_delete_error writer "99, 1" "does not exist" "an undefined timeline cannot be deleted"
+assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=3;")" \
+	"branch_local" "refused deletions leave the branch usable"
+
+"$BIN/pg_ctl" -D "$BRANCH" -m fast -w stop >/dev/null 2>&1 ||
+	fail "could not stop the branch compute before deleting its timeline"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(1, 1);")" \
+	"deleting" "the writer durably begins deleting the stopped branch"
+case "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(1, 1);")" in
+	deleting|deleted) echo "ok   - repeating an accepted deletion succeeds" ;;
+	*) fail "repeating an accepted deletion was refused" ;;
+esac
+timeline_deleted=no
+for _ in $(seq 1 600); do
+	if [ "$("${WP[@]}" -c "SELECT state FROM pagestore_ext.pagestore_timeline_state(1);")" = "deleted" ]; then
+		timeline_deleted=yes
+		break
+	fi
+	sleep 0.1
+done
+assert_eq "$timeline_deleted" "yes" "store maintenance finishes the deletion"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(1, 1);")" \
+	"deleted" "deleting an already deleted incarnation reports deleted"
+if "$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -w start >/dev/null 2>&1; then
+	fail "a compute booted on a deleted timeline"
+fi
+echo "ok   - the deleted branch's compute no longer starts"
+assert_eq "$("${WP[@]}" -c "SELECT string_agg(note, ',' ORDER BY id) FROM mvp_golden;")" \
+	"before_fork,after_fork" "the parent is untouched by the branch's deletion"
+assert_eq "$("${MP[@]}" -c "SELECT string_agg(note, ',' ORDER BY id) FROM mvp_golden;")" \
+	"before_fork,after_fork" "the materializer still serves the parent from the store"
 
 echo "----"
 echo "pagestore MVP golden scenario: PASS"

@@ -20113,12 +20113,14 @@ timeline_has_active_owner(uint32_t timeline)
 	return found;
 }
 
+/* On failure ch->result names the refusal (PsDeleteRefuseReason). */
 static int
 timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 {
 	uint32_t state;
 	uint64_t incarnation;
 
+	ch->result = PS_DELETE_REFUSE_INVALID;
 	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
 		timeline == 0)
 		return -1;
@@ -20127,8 +20129,10 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 																						__ATOMIC_ACQUIRE);
 	/* req_seq is the caller's fencing token.  An old retry may not turn a
 	 * different incarnation into an apparently idempotent success. */
-	if (ch->req_seq == 0 || ch->req_seq != incarnation ||
-		incarnation == 0 || state == PS_TIMELINE_DELETED)
+	if (ch->req_seq == 0 || incarnation == 0)
+		return -1;
+	ch->result = PS_DELETE_REFUSE_INCARNATION;
+	if (ch->req_seq != incarnation || state == PS_TIMELINE_DELETED)
 		return -1;
 	if (state == PS_TIMELINE_DELETING)
 	{
@@ -20136,11 +20140,18 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 		ch->req_seq = incarnation;
 		return 0;
 	}
-	if (state != PS_TIMELINE_LIVE || timeline_has_live_descendant(timeline) ||
-		timeline_has_active_owner(timeline))
+	ch->result = PS_DELETE_REFUSE_INVALID;
+	if (state != PS_TIMELINE_LIVE)
+		return -1;
+	ch->result = PS_DELETE_REFUSE_DESCENDANT;
+	if (timeline_has_live_descendant(timeline))
+		return -1;
+	ch->result = PS_DELETE_REFUSE_OWNER;
+	if (timeline_has_active_owner(timeline))
 		return -1;
 	/* The old-state side of the transition: nothing of the branch may have
 	 * changed while the request is not yet durable. */
+	ch->result = PS_DELETE_REFUSE_STORAGE;
 	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_BEFORE_DELETING) != 0)
 		return -1;
 	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
@@ -20229,6 +20240,12 @@ ps_handle_meta(PsChannel *ch)
 	if (!timeline_op_allowed(tl, (PsOpcode) ch->opcode, ch->incarnation))
 	{
 		ch->status = PS_STATUS_ERROR;
+		/* The lifecycle queries are refused here only for poisoned timeline
+		 * metadata; their callers must not read that as "no such timeline". */
+		if (ch->opcode == PS_OP_TIMELINE_STATE)
+			ch->result = PS_TIMELINE_STATE_UNAVAILABLE;
+		else if (ch->opcode == PS_OP_BEGIN_DELETE)
+			ch->result = PS_DELETE_REFUSE_UNAVAILABLE;
 		return 1;
 	}
 
@@ -20586,7 +20603,13 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t incarnation;
 
 				if (!ps_timeline_state(tl, &state, &incarnation))
+				{
 					ch->status = PS_STATUS_ERROR;
+					/* an id beyond the table positively does not exist */
+					ch->result = timeline_meta_poisoned_load() ?
+						PS_TIMELINE_STATE_UNAVAILABLE :
+						PS_TIMELINE_STATE_UNDEFINED;
+				}
 				else
 				{
 					ch->result = state;

@@ -445,7 +445,16 @@ consumers the gate still required at that point have since landed:
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
 - fork-metadata compaction/reclamation;
-- timeline deletion and its layer/WAL cleanup.  The first R5 lifecycle slice
+- timeline deletion and its layer/WAL cleanup.  Extension 1.3 gives the
+  operator its entry point: `pagestore_delete_branch(timeline, incarnation)`
+  issues BEGIN_DELETE from any compute of the store other than the branch's
+  own (stop that compute first; the store cannot see whether one is attached),
+  refuses timeline 0, an undefined timeline and a mismatched incarnation by
+  name, and reports the store's descendant/retention-owner veto;
+  `pagestore_timeline_state(timeline)` returns `live`/`deleting`/`deleted`
+  with the incarnation, which is how a caller learns the fence and watches
+  the asynchronous cleanup finish.  The golden scenario deletes its branch
+  this way.  The first R5 lifecycle slice
   now migrates legacy-only timeline logs to V2 and persists V2 create/event
   records, exposes LIVE/DELETING plus
   a reserved DELETED format value with incarnation, and vetoes BEGIN_DELETE

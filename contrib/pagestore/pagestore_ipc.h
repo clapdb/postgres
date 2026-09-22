@@ -172,6 +172,32 @@ typedef enum PsTimelineState
 	PS_TIMELINE_DELETED = 3,
 } PsTimelineState;
 
+/*
+ * PS_OP_TIMELINE_STATE fails for a timeline the store has never defined and
+ * when it cannot tell (poisoned timeline metadata, a refused request).  On
+ * PS_STATUS_ERROR 'result' separates the two: a caller that reports absence
+ * to an operator must not read an unhealthy store as "no such timeline".
+ * Zero is what a daemon predating the distinction leaves there.
+ */
+#define PS_TIMELINE_STATE_UNDEFINED		0
+#define PS_TIMELINE_STATE_UNAVAILABLE	UINT32_MAX
+
+/*
+ * PS_OP_BEGIN_DELETE on PS_STATUS_ERROR: 'result' says why, so a caller can
+ * tell an ownership veto the operator can act on from a store that needs
+ * repair.  Zero is what a daemon predating the distinction leaves there.
+ */
+typedef enum PsDeleteRefuseReason
+{
+	PS_DELETE_REFUSE_UNKNOWN = 0,
+	PS_DELETE_REFUSE_INVALID,		/* undefined timeline, timeline 0, bad token */
+	PS_DELETE_REFUSE_INCARNATION,	/* token names another incarnation, or DELETED */
+	PS_DELETE_REFUSE_DESCENDANT,	/* a live or deleting descendant exists */
+	PS_DELETE_REFUSE_OWNER,			/* a retention owner is registered */
+	PS_DELETE_REFUSE_STORAGE,		/* the transition could not be made durable */
+	PS_DELETE_REFUSE_UNAVAILABLE,	/* poisoned timeline metadata */
+} PsDeleteRefuseReason;
+
 /* Status codes */
 #define PS_STATUS_OK		0
 #define PS_STATUS_ERROR		1

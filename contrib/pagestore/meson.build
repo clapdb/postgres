@@ -36,6 +36,8 @@ install_data(
   'pagestore--1.1.sql',
   'pagestore--1.1--1.2.sql',
   'pagestore--1.2.sql',
+  'pagestore--1.2--1.3.sql',
+  'pagestore--1.3.sql',
   kwargs: contrib_data_args,
 )
 

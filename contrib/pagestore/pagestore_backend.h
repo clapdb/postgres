@@ -224,8 +224,15 @@ extern bool pagestore_localsvc_timeline_info(uint32 timeline,
 	uint64 *parent_incarnation, int timeout_ms);
 extern uint8 pagestore_localsvc_begin_delete(uint32 timeline,
 	uint64 expected_incarnation);
+extern uint8 pagestore_localsvc_begin_delete_reason(uint32 timeline,
+													uint64 expected_incarnation,
+													uint32 *reason);
 extern bool pagestore_localsvc_timeline_state(uint32 timeline,
 	uint32 *state, uint64 *incarnation);
+extern bool pagestore_localsvc_timeline_state_known(uint32 timeline,
+													uint32 *state,
+													uint64 *incarnation,
+													bool *undefined);
 extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 										uint32 len, void *out);
 extern uint32 pagestore_localsvc_timeline(void);

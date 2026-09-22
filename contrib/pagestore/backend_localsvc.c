@@ -1840,24 +1840,56 @@ pagestore_localsvc_timeline_info(uint32 timeline, uint32 *parent_timeline,
 uint8
 pagestore_localsvc_begin_delete(uint32 timeline, uint64 expected_incarnation)
 {
+	return pagestore_localsvc_begin_delete_reason(timeline,
+												  expected_incarnation, NULL);
+}
+
+/* As above; on failure *reason is the daemon's PsDeleteRefuseReason. */
+uint8
+pagestore_localsvc_begin_delete_reason(uint32 timeline,
+									   uint64 expected_incarnation,
+									   uint32 *reason)
+{
 	PsChannel  *ch = ls_chan();
+	uint8		status;
 
 	ch->opcode = PS_OP_BEGIN_DELETE;
 	ch->timeline = timeline;
 	ch->req_seq = expected_incarnation;
-	return ls_exec_wait(ch, 0);
+	ch->result = PS_DELETE_REFUSE_UNAVAILABLE;
+	status = ls_exec_wait(ch, 0);
+	if (reason != NULL)
+		*reason = status == PS_STATUS_OK ? 0 : ch->result;
+	return status;
 }
 
 bool
 pagestore_localsvc_timeline_state(uint32 timeline, uint32 *state,
 								  uint64 *incarnation)
 {
+	return pagestore_localsvc_timeline_state_known(timeline, state,
+												   incarnation, NULL);
+}
+
+/*
+ * As above; on failure *undefined says whether the store positively has no
+ * such timeline, as opposed to being unable to tell.
+ */
+bool
+pagestore_localsvc_timeline_state_known(uint32 timeline, uint32 *state,
+										uint64 *incarnation, bool *undefined)
+{
 	PsChannel  *ch = ls_chan();
 
 	ch->opcode = PS_OP_TIMELINE_STATE;
 	ch->timeline = timeline;
+	ch->result = PS_TIMELINE_STATE_UNAVAILABLE;
 	if (ls_exec_wait(ch, 0) != PS_STATUS_OK)
+	{
+		if (undefined != NULL)
+			*undefined = ch->result == PS_TIMELINE_STATE_UNDEFINED;
 		return false;
+	}
 	if (state != NULL)
 		*state = ch->result;
 	if (incarnation != NULL)
