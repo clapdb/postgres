@@ -1580,6 +1580,12 @@ class BranchPreparer:
                         "the prepared branch is already complete and its materializer "
                         "resumed; its SLRUs cannot be verified against the materializer now"
                     )
+                # a receipt an older controller completed may describe a
+                # branch forked inside a WAL segment, which cannot boot
+                fork_lsn = existing.get("fork_lsn")
+                if not isinstance(fork_lsn, str):
+                    raise BranchPrepareError("completed branch receipt has no fork LSN")
+                self.require_fork_on_segment_boundary(fork_lsn)
                 return existing
             self.journal = existing
             self.restore_ownership_from_journal()

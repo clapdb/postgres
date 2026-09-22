@@ -714,6 +714,23 @@ class BranchPrepareTests(unittest.TestCase):
 
         # an unpublished journal from an older controller is checked before
         # its fork is seeded or its receipt published
+        # a completed receipt an older controller left is refused too, and
+        # one at a boundary is still returned as is
+        for fork, ok in (("1/DD0000E0", False), ("1/DE000000", True)):
+            journal = MidSegmentFork(config, fork).new_journal()
+            journal.update(state="complete", intent=None, base_lsn="0/10",
+                           checkpoint_redo_lsn="1/DD000028", checkpoint_end_lsn="1/DD0000A8",
+                           switch_lsn="1/DD0000F8", fork_lsn=fork, archived_through_lsn="1/DD0000F8",
+                           seeded_slru_pages=1, materializer_resumed=True, writer_restored=True)
+            preparer = MidSegmentFork(config, fork)
+            preparer.write_journal(journal)
+            if ok:
+                self.assertEqual(preparer.execute()["fork_lsn"], fork)
+            else:
+                with self.assertRaisesRegex(MODULE.BranchPrepareError, "not a WAL segment boundary"):
+                    preparer.execute()
+            config.receipt_file.unlink()
+
         for state in ("fork_captured", "branch_prepared", "prepared", "materializer_resumed"):
             journal = MidSegmentFork(config, "1/DD0000E0").new_journal()
             journal.update(state=state, intent=None, base_lsn="0/10", checkpoint_redo_lsn="1/DD000028",
