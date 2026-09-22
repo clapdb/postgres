@@ -332,6 +332,8 @@ class Run:
             raise Failure("daemon_hang", f"daemon ignored signal {sig} for 600 s")
         if sig == signal.SIGTERM and rc != 0:
             raise Failure("daemon_exit", f"clean daemon shutdown returned {rc}")
+        if sig == signal.SIGKILL and rc != -signal.SIGKILL:
+            raise Failure("daemon_exit", f"the daemon exited with {rc} before the injected SIGKILL")
         self.daemon = None
 
     def inspect(self, *what: str) -> str:
@@ -602,7 +604,8 @@ DO $$ DECLARE r record; BEGIN
                     sql = "CHECKPOINT;"
                 self.writer.sql(sql, timeout=900)
             except (SqlError, subprocess.TimeoutExpired) as e:
-                if not tolerate.is_set() or (isinstance(e, SqlError) and unexpected_errors(e.stderr)):
+                # a writer fault excuses only the crash's own errors, never a hang
+                if not tolerate.is_set() or not isinstance(e, SqlError) or unexpected_errors(e.stderr):
                     self.async_failure = Failure("ddl_failed", str(e))
                     return
                 time.sleep(1)
@@ -638,10 +641,16 @@ DO $$ DECLARE r record; BEGIN
                 self.writer.stop("immediate"); self.writer.start()
             elif event == "writer_backend_kill9":
                 tolerate.set()
-                pid = self.writer.sql("SELECT pid FROM pg_stat_activity WHERE backend_type = 'client backend' "
-                                      "AND pid <> pg_backend_pid() ORDER BY random() LIMIT 1;", check=False)
-                if pid:
-                    os.kill(int(pid), signal.SIGKILL)
+                for _ in range(5):
+                    pid = self.writer.sql("SELECT pid FROM pg_stat_activity WHERE backend_type = 'client backend' "
+                                          "AND application_name = 'pgbench' ORDER BY random() LIMIT 1;", check=False)
+                    try:
+                        if pid:
+                            os.kill(int(pid), signal.SIGKILL)
+                            break
+                    except ProcessLookupError:
+                        pass                       # that client just finished; pick another
+                    time.sleep(0.2)
             out, _ = bench.communicate(timeout=seconds + 900)
         finally:
             stop.set()
@@ -716,6 +725,7 @@ DO $$ DECLARE r record; BEGIN
     def retire_branch(self) -> None:
         old_tl, old, old_scratch = self.branches[0]
         old.stop("fast")                           # still tracked if this fails
+        old.scan_log()                             # its shutdown is the last thing it logs
         self.branches.pop(0)
         shutil.rmtree(old.datadir)
         shutil.rmtree(old_scratch)
