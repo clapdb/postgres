@@ -85,12 +85,15 @@ path that does not touch the store.
 | Writer hash unchanged after only the branch was written | Writer before | Ancestry cutoff leaked a branch write into the parent |
 | Branch hash before vs after a fast or immediate restart following `CHECKPOINT` | The same compute with a warm cache | A branch write did not survive in the store |
 | Every live branch's hash before vs after a coordinated store restart (clean or `SIGKILL`) | The same compute before the restart | Branch-only pages were lost or changed when the store reopened |
+| Every `public` index definition and validity, alongside each row hash above | The same reference | Replay or bootstrap lost, invented or changed an index |
 | `sum(bal)` equals its initial value on every compute | Workload invariant | Torn or duplicated transaction effects (covers 2PC and aborts) |
 | Index scan vs sequential scan for one `ev.k` | Same compute | Index and heap disagree |
 | `bt_index_check(idx, heapallindexed => true)` on every btree | amcheck | Structural index corruption |
 | The controller's seeded SLRU pages vs the materializer's | PostgreSQL recovery | `clog`/`commit_ts`/`multixact` appliers diverge from redo |
 | Log scan: `PANIC`, `TRAP`, invalid page, unreadable block, signals 6/7/11 | -- | Assertion or crash anywhere |
 | Liveness: every wait has a deadline; daemon and postmasters must be alive when expected | -- | Hang or unexplained exit |
+| During a writer fault, pgbench and DDL errors must all be connection loss or recovery-in-progress | -- | A read or write error hidden behind the injected crash |
+| The run ends with a fast stop of every compute and a `SIGTERM` of the daemon, which must exit 0 | -- | The final flush or shutdown failed |
 
 Sequences are not compared: a sequence page legitimately differs between a
 primary's buffer and replayed WAL.
@@ -217,6 +220,23 @@ or admitted without a marker.  A growth below the cutoff is the harder case.
 Whatever the fix, a unit test that defines a fork, drives a fork-metadata
 cutover past it, and then rewrites an existing block with `pd_lsn = 0` is the
 fail-before evidence.
+
+**E-7. Branch preparation intermittently finds no control image for the
+shutdown checkpoint it forks from** (local seed 42, scale 1, `--max-branches
+1`, third branch; open).  The controller stops the writer and forks from its
+shutdown checkpoint (`lsn = redo = 0/40000028`, the first record of a fresh
+segment), restarts it on a private socket, and
+`pagestore_prepare_branch_from_control()` fails four seconds later -- well
+inside its 10 s horizon timeout -- with `branch checkpoint redo is not
+exactly mirrored`.  So the newest mirrored control image at or below
+`0/40000028` still carried an older redo: the shutdown checkpoint's image,
+written by the exiting checkpointer and shipped only by
+`ps_control_exit_drain()` with bounded waits, did not reach the store (or not
+at that LSN).  The two earlier branches of the same run took the identical
+path (`0/14000028`, `0/2F000028`) and passed; the second, like the third,
+directly followed the deletion of the retired branch.  The next step is to
+count `ps_control_dropped` and the exit drain's outcome, and to read the
+control object's versions on the preserved store.
 
 Also needed: the daemon should log one line for every refused or failed
 READV/WRITEV/BEGIN_DELETE (opcode, timeline, key, block, reason), as it

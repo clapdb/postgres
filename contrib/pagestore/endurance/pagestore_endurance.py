@@ -13,6 +13,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -40,6 +41,28 @@ BAD_LOG = re.compile(
     r"unexpected data beyond EOF|terminated by signal (6|7|11)\b|"
     r"AddressSanitizer|stack smashing"
 )
+
+# Errors a client may see while the writer crashes or restarts under it.
+# Anything else during a writer fault is still a finding.
+FAULT_ERROR = re.compile(
+    r"server closed the connection unexpectedly|terminating connection|"
+    r"connection to server .* failed|connection to server was lost|could not connect|"
+    r"could not create connection|aborted while establishing connection|no connection to the server|"
+    r"the database system is (in recovery mode|shutting down|starting up|not yet accepting connections)|"
+    r"could not (send|receive) data|perhaps the backend died|Run was aborted|"
+    r"This probably means the server terminated abnormally|before or while processing the request"
+)
+ERROR_LINE = re.compile(r"\b(ERROR|FATAL|PANIC):|error:")
+
+
+def unexpected_errors(output: str) -> list[str]:
+    return [l for l in output.splitlines() if ERROR_LINE.search(l) and not FAULT_ERROR.search(l)]
+
+
+def quoted(value: Any) -> str:
+    """A single-quoted postgresql.conf value or SQL literal."""
+    return "'" + str(value).replace("'", "''") + "'"
+
 
 NACCTS_PER_SCALE = 20000
 NDOCS_PER_SCALE = 200
@@ -277,8 +300,8 @@ class Run:
             raise Failure("daemon_exit", f"clean daemon shutdown returned {rc}")
         self.daemon = None
 
-    def inspect(self, what: str) -> str:
-        r = subprocess.run([str(self.inspect_bin), "--shm", self.shm, what],
+    def inspect(self, *what: str) -> str:
+        r = subprocess.run([str(self.inspect_bin), "--shm", self.shm, *what],
                            capture_output=True, text=True, env=self.env, timeout=60)
         return r.stdout.strip()
 
@@ -289,6 +312,10 @@ class Run:
         if r.returncode != 0:
             raise Failure("tool_failed", f"{what}: rc={r.returncode} {r.stderr[-1500:]}")
         return r.stdout
+
+    def restore_command(self, tl: int, segsize: int) -> str:
+        return (f"{shlex.quote(str(self.walrestore))} --shm {shlex.quote(self.shm)} --timeline {tl} "
+                f"--incarnation 1 --segsize {segsize} %f %p")
 
     def wal_segment_size(self, datadir: Path) -> int:
         out = self.run_tool([str(self.bin / "pg_controldata"), str(datadir)], "pg_controldata")
@@ -305,7 +332,7 @@ class Run:
             f.write(f"""
 shared_preload_libraries = 'pagestore'
 pagestore.backend = 'localsvc'
-pagestore.localsvc_shm = '{self.shm}'
+pagestore.localsvc_shm = {quoted(self.shm)}
 pagestore.route_all = off
 pagestore.timeline = 0
 io_method = sync
@@ -339,7 +366,7 @@ port = {self.mat.port}
 hot_standby = on
 shared_buffers = 32MB
 max_standby_archive_delay = 60s
-restore_command = '{self.walrestore} --shm {self.shm} --timeline 0 --incarnation 1 --segsize {segsize} %f %p'
+restore_command = {quoted(self.restore_command(0, segsize))}
 """)
         (self.mat.datadir / "standby.signal").touch()
         for seg in (self.mat.datadir / "pg_wal").glob("0000000*"):
@@ -426,7 +453,12 @@ CREATE INDEX ev_k ON ev(k);
         raise AssertionError
 
     def checksums(self, pg: Pg) -> dict[str, str]:
-        result = {}
+        # the index inventory: a lost or changed index definition hides from the row hashes
+        result = {"(indexes)": self.query_retry(pg, """
+SELECT count(*)::text || ':' || coalesce(md5(string_agg(
+         pg_get_indexdef(i.indexrelid) || ' valid=' || i.indisvalid::text, E'\\n' ORDER BY c.relname)), '')
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public';""")}
         for t in self.tables(pg):
             result[t] = self.query_retry(
                 pg, f'SELECT count(*)::text || \':\' || coalesce(sum(hashtextextended(t::text, 0)::numeric), 0)::text '
@@ -477,7 +509,7 @@ DO $$ DECLARE r record; BEGIN
     def resolve_prepared(self, pg: Pg) -> None:
         gids = pg.sql("SELECT gid FROM pg_prepared_xacts;")
         for gid in filter(None, gids.split("\n")):
-            pg.sql(f"ROLLBACK PREPARED '{gid}';")
+            pg.sql(f"ROLLBACK PREPARED {quoted(gid)};")
         if gids:
             self.event("resolved_prepared", target=pg.name, n=len(gids.split("\n")))
 
@@ -535,7 +567,7 @@ DO $$ DECLARE r record; BEGIN
                     sql = "CHECKPOINT;"
                 self.writer.sql(sql, timeout=900)
             except (SqlError, subprocess.TimeoutExpired) as e:
-                if not tolerate.is_set():
+                if not tolerate.is_set() or (isinstance(e, SqlError) and unexpected_errors(e.stderr)):
                     self.async_failure = Failure("ddl_failed", str(e))
                     return
                 time.sleep(1)
@@ -583,6 +615,9 @@ DO $$ DECLARE r record; BEGIN
                 bench.kill()
         if bench.returncode != 0 and not tolerate.is_set():
             raise Failure("workload_failed", f"pgbench rc={bench.returncode}: {out[-1500:]}")
+        if bench.returncode != 0 and unexpected_errors(out or ""):
+            raise Failure("workload_failed", f"pgbench rc={bench.returncode} during a writer fault, with errors "
+                                             f"other than the crash: {unexpected_errors(out)[:5]}")
         if tolerate.is_set():
             # crash recovery may still be running after a backend SIGKILL
             self.wait_for("writer accepts connections after the injected crash",
@@ -701,10 +736,10 @@ DO $$ DECLARE r record; BEGIN
             f.write(f"""
 shared_preload_libraries = 'pagestore'
 pagestore.backend = 'localsvc'
-pagestore.localsvc_shm = '{self.shm}'
+pagestore.localsvc_shm = {quoted(self.shm)}
 pagestore.route_all = on
 pagestore.timeline = {tl}
-pagestore.walredo_datadir = '{scratch}'
+pagestore.walredo_datadir = {quoted(scratch)}
 io_method = sync
 archive_mode = off
 listen_addresses = '127.0.0.1'
@@ -716,14 +751,14 @@ shared_buffers = 32MB
 checkpoint_timeout = 30s
 autovacuum_naptime = 5s
 log_line_prefix = '%m [%p] '
-restore_command = '{self.walrestore} --shm {self.shm} --timeline {tl} --incarnation 1 --segsize {segsize} %f %p'
+restore_command = {quoted(self.restore_command(tl, segsize))}
 recovery_target_lsn = '{ckpt}'
 recovery_target_inclusive = on
 recovery_target_action = 'promote'
 """)
         (b.datadir / "recovery.signal").touch()
         self.writer.sql(f"SELECT pagestore_ext.pagestore_install_prepared_branch_bootstrap("
-                        f"'{prepared}', '{b.datadir}', {tl}, 0, '{redo}', '{ckpt}', '{fork}');")
+                        f"{quoted(prepared)}, {quoted(b.datadir)}, {tl}, 0, '{redo}', '{ckpt}', '{fork}');")
         # tracked before it starts, so teardown stops it if validation fails
         self.branches.append((tl, b, scratch))
         b.start()
@@ -813,9 +848,10 @@ recovery_target_action = 'promote'
         d = self.root / "diagnostics"
         d.mkdir(exist_ok=True)
         stamp = time.strftime("%H%M%S")
-        for what in ("health", "backpressure", "gc", "owners", "timeline", "manifest"):
+        timelines = [("timeline", str(tl)) for tl in [0] + [b[0] for b in self.branches]]
+        for what in [("health",), ("backpressure",), ("gc",), ("owners",), ("manifest",)] + timelines:
             try:
-                (d / f"{stamp}-inspect-{what}.txt").write_text(self.inspect(what))
+                (d / f"{stamp}-inspect-{'-'.join(what)}.txt").write_text(self.inspect(*what))
             except (OSError, subprocess.TimeoutExpired):
                 pass
         for pg in self.computes():
@@ -874,6 +910,11 @@ recovery_target_action = 'promote'
         # a final coordinated restart proves the store reopens after the whole history
         self.restart_store(crash=False)
         self.verify_materializer("final, after clean store restart")
+        # and it shuts down cleanly, clients first
+        for pg in reversed(self.computes()):
+            pg.stop("fast")
+        self.stop_daemon(signal.SIGTERM)
+        self.event("clean_shutdown")
 
 
 def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
