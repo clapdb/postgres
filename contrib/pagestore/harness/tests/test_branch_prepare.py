@@ -552,6 +552,9 @@ class BranchPrepareTests(unittest.TestCase):
                 self.events.append("archive")
                 return "0/40"
 
+            def wal_segment_size(self):
+                return 0x40
+
             def wait_materializer(self, target):
                 self.events.append(f"wait:{target}")
 
@@ -576,7 +579,7 @@ class BranchPrepareTests(unittest.TestCase):
                 "start-restricted",
                 "checkpoint",
                 "archive",
-                "wait:0/30",
+                "wait:0/00000040",
                 "capture:True",
                 "prepare:0/10:0/20:0/40",
                 "restore",
@@ -607,6 +610,9 @@ class BranchPrepareTests(unittest.TestCase):
             def archive_checkpoint(self, private=True):
                 self.events.append(f"archive:{private}")
                 return "0/50"
+
+            def wal_segment_size(self):
+                return 0x40
 
             def wait_materializer(self, target):
                 self.events.append(f"wait:{target}")
@@ -649,6 +655,63 @@ class BranchPrepareTests(unittest.TestCase):
             preparer.capture_and_pin_base()
         self.assertEqual(preparer.events, publish + ["capture-failed"])
 
+    def test_fork_must_be_a_wal_segment_boundary(self):
+        boundary = MODULE.BranchPreparer.segment_boundary_after
+        self.assertEqual(boundary("1/DD0000F8", 16 * 1024 * 1024), "1/DE000000")
+        self.assertEqual(boundary("1/DE000000", 16 * 1024 * 1024), "1/DE000000")
+        self.assertEqual(boundary("0/FFFFFFF8", 16 * 1024 * 1024), "1/00000000")
+
+        config = MODULE.Config.load(self.write_config())
+
+        class MidSegmentFork(MODULE.BranchPreparer):
+            def __init__(self, branch_config, fork):
+                super().__init__(branch_config)
+                self.fork = fork
+                self.waits = []
+
+            def preflight(self):
+                pass
+
+            def capture_and_pin_base(self):
+                return "0/10"
+
+            def pause_and_capture(self, keep_paused):
+                self.pause_owned = True
+                return self.fork
+
+            def stop_writer(self):
+                pass
+
+            def start_restricted_writer(self):
+                pass
+
+            def select_checkpoint(self):
+                return "1/DD000028", "1/DD0000A8"
+
+            def archive_checkpoint(self):
+                return "1/DD0000F8"
+
+            def wal_segment_size(self):
+                return 16 * 1024 * 1024
+
+            def wait_materializer(self, target):
+                self.waits.append(target)
+
+            def prepare_branch(self, base, redo, fork):
+                return 1
+
+            def restore_services(self):
+                return []
+
+        # the seed-2105 shape: the materializer paused at the switch record
+        preparer = MidSegmentFork(config, "1/DD0000E0")
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "not a WAL segment boundary"):
+            preparer.execute()
+        self.assertEqual(preparer.waits, ["1/DE000000"])
+
+        preparer = MidSegmentFork(config, "1/DE000000")
+        self.assertEqual(preparer.execute()["fork_lsn"], "1/DE000000")
+
     def test_execute_preserves_fence_after_prepare_unknown_result(self):
         config = MODULE.Config.load(self.write_config())
 
@@ -677,6 +740,9 @@ class BranchPrepareTests(unittest.TestCase):
 
             def archive_checkpoint(self):
                 return "0/40"
+
+            def wal_segment_size(self):
+                return 0x40
 
             def wait_materializer(self, target):
                 pass
@@ -754,6 +820,9 @@ class BranchPrepareTests(unittest.TestCase):
 
             def archive_checkpoint(self):
                 return "0/40"
+
+            def wal_segment_size(self):
+                return 0x40
 
             def wait_materializer(self, target):
                 pass
@@ -873,6 +942,9 @@ class BranchPrepareTests(unittest.TestCase):
                     return "0/20", "0/30"
                 def archive_checkpoint(self):
                     return "0/40"
+                def wal_segment_size(self):
+                    return 0x40
+
                 def wait_materializer(self, target):
                     pass
                 def pause_and_capture(self, keep_paused):

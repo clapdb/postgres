@@ -1266,6 +1266,20 @@ class BranchPreparer:
         )
         return switch_lsn
 
+    def wal_segment_size(self) -> int:
+        size = int(last_output_line(self.materializer_sql(
+            "SELECT pg_size_bytes(current_setting('wal_segment_size'))")))
+        if size <= 0 or size & (size - 1):
+            raise BranchPrepareError(f"unexpected WAL segment size {size}")
+        return size
+
+    @staticmethod
+    def segment_boundary_after(lsn: str, segment_size: int) -> str:
+        """The first WAL segment boundary at or after lsn."""
+        value = parse_lsn(lsn)
+        value = (value + segment_size - 1) // segment_size * segment_size
+        return f"{value >> 32:X}/{value & 0xFFFFFFFF:08X}"
+
     def wait_materializer(self, target: str) -> None:
         self.wait_until(
             f"materializer replay through {target}",
@@ -1592,12 +1606,27 @@ class BranchPreparer:
                 raise BranchPrepareError("WAL switch did not cover the selected checkpoint")
             self.journal_update("checkpoint_archived", None, switch_lsn=switch_lsn)
             self.journal_update("checkpoint_archived", "wait_materializer")
-            self.wait_materializer(checkpoint_end)
+            # The branch inherits the parent's WAL up to the fork and owns it
+            # from there.  A fork inside a segment leaves that segment with
+            # no complete copy on either timeline, so the branch could never
+            # restore it and would fail to find its checkpoint.  The WAL
+            # switch above ends the parent's segment; the materializer's
+            # replay position after replaying the switch record is the next
+            # segment boundary, so wait for that, not just the checkpoint.
+            segment_size = self.wal_segment_size()
+            boundary = self.segment_boundary_after(switch_lsn, segment_size)
+            if parse_lsn(boundary) < parse_lsn(checkpoint_end):
+                raise BranchPrepareError("WAL switch did not end the checkpoint's segment")
+            self.wait_materializer(boundary)
             self.journal_update("checkpoint_archived", None)
             self.journal_update("checkpoint_archived", "capture_fork")
             fork = self.pause_and_capture(keep_paused=True)
             if parse_lsn(fork) < parse_lsn(checkpoint_end):
                 raise BranchPrepareError("materialized fork does not cover the checkpoint")
+            if parse_lsn(fork) % segment_size != 0:
+                raise BranchPrepareError(
+                    f"materialized fork {fork} is not a WAL segment boundary; "
+                    "a branch forked inside a segment cannot restore that segment")
             self.journal_update(
                 "fork_captured", None, fork_lsn=fork, pause_owned=self.pause_owned,
                 archived_through_lsn=switch_lsn, materializer_resumed=False,
