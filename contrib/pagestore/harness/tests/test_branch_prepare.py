@@ -552,6 +552,9 @@ class BranchPrepareTests(unittest.TestCase):
                 self.events.append("archive")
                 return "0/40"
 
+            def wal_segment_size(self):
+                return 0x40
+
             def wait_materializer(self, target):
                 self.events.append(f"wait:{target}")
 
@@ -576,7 +579,7 @@ class BranchPrepareTests(unittest.TestCase):
                 "start-restricted",
                 "checkpoint",
                 "archive",
-                "wait:0/30",
+                "wait:0/00000040",
                 "capture:True",
                 "prepare:0/10:0/20:0/40",
                 "restore",
@@ -607,6 +610,9 @@ class BranchPrepareTests(unittest.TestCase):
             def archive_checkpoint(self, private=True):
                 self.events.append(f"archive:{private}")
                 return "0/50"
+
+            def wal_segment_size(self):
+                return 0x40
 
             def wait_materializer(self, target):
                 self.events.append(f"wait:{target}")
@@ -649,6 +655,105 @@ class BranchPrepareTests(unittest.TestCase):
             preparer.capture_and_pin_base()
         self.assertEqual(preparer.events, publish + ["capture-failed"])
 
+    def test_fork_must_be_a_wal_segment_boundary(self):
+        boundary = MODULE.BranchPreparer.segment_boundary_after
+        self.assertEqual(boundary("1/DD0000F8", 16 * 1024 * 1024), "1/DE000000")
+        self.assertEqual(boundary("1/DE000000", 16 * 1024 * 1024), "1/DE000000")
+        self.assertEqual(boundary("0/FFFFFFF8", 16 * 1024 * 1024), "1/00000000")
+
+        config = MODULE.Config.load(self.write_config())
+
+        class MidSegmentFork(MODULE.BranchPreparer):
+            def __init__(self, branch_config, fork):
+                super().__init__(branch_config)
+                self.fork = fork
+                self.waits = []
+
+            def preflight(self):
+                pass
+
+            def capture_and_pin_base(self):
+                return "0/10"
+
+            def pause_and_capture(self, keep_paused):
+                self.pause_owned = True
+                return self.fork
+
+            def stop_writer(self):
+                pass
+
+            def start_restricted_writer(self):
+                pass
+
+            def select_checkpoint(self):
+                return "1/DD000028", "1/DD0000A8"
+
+            def archive_checkpoint(self):
+                return "1/DD0000F8"
+
+            def wal_segment_size(self):
+                return 16 * 1024 * 1024
+
+            def wait_materializer(self, target):
+                self.waits.append(target)
+
+            def prepare_branch(self, base, redo, fork):
+                return 1
+
+            def restore_services(self):
+                return []
+
+        # the seed-2105 shape: the materializer paused at the switch record
+        preparer = MidSegmentFork(config, "1/DD0000E0")
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "not a WAL segment boundary"):
+            preparer.execute()
+        self.assertEqual(preparer.waits, ["1/DE000000"])
+
+        preparer = MidSegmentFork(config, "1/DE000000")
+        self.assertEqual(preparer.execute()["fork_lsn"], "1/DE000000")
+
+        # an unpublished journal from an older controller is checked before
+        # its fork is seeded or its receipt published
+        # a completed receipt an older controller left is refused too, and
+        # one at a boundary is still returned as is
+        for fork, ok in (("1/DD0000E0", False), ("1/DE000000", True)):
+            journal = MidSegmentFork(config, fork).new_journal()
+            journal.update(state="complete", intent=None, base_lsn="0/10",
+                           checkpoint_redo_lsn="1/DD000028", checkpoint_end_lsn="1/DD0000A8",
+                           switch_lsn="1/DD0000F8", fork_lsn=fork, archived_through_lsn="1/DD0000F8",
+                           seeded_slru_pages=1, materializer_resumed=True, writer_restored=True)
+            preparer = MidSegmentFork(config, fork)
+            preparer.write_journal(journal)
+            if ok:
+                self.assertEqual(preparer.execute()["fork_lsn"], fork)
+            else:
+                with self.assertRaisesRegex(MODULE.BranchPrepareError, "not a WAL segment boundary"):
+                    preparer.execute()
+            config.receipt_file.unlink()
+
+        for state in ("fork_captured", "branch_prepared", "prepared", "materializer_resumed"):
+            journal = MidSegmentFork(config, "1/DD0000E0").new_journal()
+            journal.update(state=state, intent=None, base_lsn="0/10", checkpoint_redo_lsn="1/DD000028",
+                           checkpoint_end_lsn="1/DD0000A8", switch_lsn="1/DD0000F8",
+                           fork_lsn="1/DD0000E0", archived_through_lsn="1/DD0000F8",
+                           pause_owned=True, writer_owned=True,
+                           restricted_writer_running=True, materializer_resumed=False)
+            preparer = MidSegmentFork(config, "1/DD0000E0")
+            preparer.write_journal(journal)
+            preparer.restore_ownership_from_journal = lambda: None
+            preparer.discover_recovery_services = lambda: None
+            preparer.observe_recovery_ownership = lambda: "restricted"
+            preparer.success_restore = lambda run_faults=True: None
+            restored = []
+            preparer.restore_ambiguous_services = lambda mode: restored.append(mode)
+            with self.assertRaisesRegex(MODULE.BranchPrepareError, "not a WAL segment boundary"):
+                preparer.execute()
+            self.assertEqual(restored, ["restricted"], state)
+            persisted = json.loads(config.receipt_file.read_text(encoding="utf-8"))
+            self.assertEqual(persisted.get("intent"), "recovery_failed", state)
+            self.assertNotEqual(persisted.get("state"), "complete", state)
+            config.receipt_file.unlink()
+
     def test_execute_preserves_fence_after_prepare_unknown_result(self):
         config = MODULE.Config.load(self.write_config())
 
@@ -677,6 +782,9 @@ class BranchPrepareTests(unittest.TestCase):
 
             def archive_checkpoint(self):
                 return "0/40"
+
+            def wal_segment_size(self):
+                return 0x40
 
             def wait_materializer(self, target):
                 pass
@@ -754,6 +862,9 @@ class BranchPrepareTests(unittest.TestCase):
 
             def archive_checkpoint(self):
                 return "0/40"
+
+            def wal_segment_size(self):
+                return 0x40
 
             def wait_materializer(self, target):
                 pass
@@ -873,6 +984,9 @@ class BranchPrepareTests(unittest.TestCase):
                     return "0/20", "0/30"
                 def archive_checkpoint(self):
                     return "0/40"
+                def wal_segment_size(self):
+                    return 0x40
+
                 def wait_materializer(self, target):
                     pass
                 def pause_and_capture(self, keep_paused):
@@ -900,6 +1014,9 @@ class BranchPrepareTests(unittest.TestCase):
                     raise AssertionError(sql)
 
             class Recovery(m.BranchPreparer):
+                def wal_segment_size(self):
+                    return 0x40
+
                 def _state(self):
                     return json.loads((self.config.prepared_dir.parent / "service-state.json").read_text())
                 def _save(self, state):
