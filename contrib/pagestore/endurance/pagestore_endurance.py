@@ -697,6 +697,7 @@ DO $$ DECLARE r record; BEGIN
                 self.writer.stop("immediate"); self.writer.start()
             elif event == "writer_backend_kill9":
                 tolerate.set()
+                killed = False
                 for _ in range(5):
                     pid = self.writer.sql("SELECT pid FROM pg_stat_activity WHERE backend_type = 'client backend' "
                                           "AND application_name = 'pgbench' ORDER BY random() LIMIT 1;", check=False)
@@ -704,11 +705,16 @@ DO $$ DECLARE r record; BEGIN
                         if pid:
                             self.killed_pids.add(int(pid))
                             os.kill(int(pid), signal.SIGKILL)
+                            killed = True
                             break
                     except ProcessLookupError:
                         # that client just finished: no kill, so no log line to excuse; pick another
                         self.killed_pids.discard(int(pid))
                     time.sleep(0.2)
+                if not killed:
+                    # nothing was injected, so nothing is excused either
+                    tolerate.clear()
+                    self.event("inject_skipped", inject=event, reason="no pgbench backend left to kill")
             out, _ = bench.communicate(timeout=seconds + 900)
         finally:
             stop.set()
@@ -1005,10 +1011,15 @@ recovery_target_action = 'promote'
         stamp = time.strftime("%H%M%S")
         for pg in self.computes():
             try:
-                (d / f"{stamp}-{pg.name}-activity.txt").write_text(pg.sql(
-                    "SELECT pid, backend_type, state, wait_event_type, wait_event, left(query, 200) "
-                    "FROM pg_stat_activity;", timeout=20, check=False))
-            except (OSError, subprocess.TimeoutExpired):
+                text = pg.sql("SELECT pid, backend_type, state, wait_event_type, wait_event, left(query, 200) "
+                              "FROM pg_stat_activity;", timeout=20)
+            except SqlError as e:
+                text = f"[psql failed] {e}"             # why it could not be read is evidence too
+            except subprocess.TimeoutExpired:
+                text = "[psql timed out after 20 s]"
+            try:
+                (d / f"{stamp}-{pg.name}-activity.txt").write_text(text)
+            except OSError:
                 pass
         for pg in self.computes():
             pg.halt()
