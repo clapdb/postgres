@@ -1280,6 +1280,14 @@ class BranchPreparer:
         value = (value + segment_size - 1) // segment_size * segment_size
         return f"{value >> 32:X}/{value & 0xFFFFFFFF:08X}"
 
+    def require_fork_on_segment_boundary(self, fork: str) -> None:
+        """A branch forked inside a WAL segment cannot restore that segment
+        (neither timeline holds a complete copy), so it can never boot."""
+        if parse_lsn(fork) % self.wal_segment_size() != 0:
+            raise BranchPrepareError(
+                f"materialized fork {fork} is not a WAL segment boundary; "
+                "a branch forked inside a segment cannot restore that segment")
+
     def wait_materializer(self, target: str) -> None:
         self.wait_until(
             f"materializer replay through {target}",
@@ -1486,6 +1494,7 @@ class BranchPreparer:
                 self.journal["checkpoint_end_lsn"]
             ):
                 raise BranchPrepareError("branch journal fork does not cover checkpoint")
+            self.require_fork_on_segment_boundary(self.journal["fork_lsn"])
             seeded = self.prepare_branch(
                 self.journal["base_lsn"],
                 self.journal["checkpoint_redo_lsn"],
@@ -1522,6 +1531,10 @@ class BranchPreparer:
         if state == "branch_prepared":
             if self.journal.get("intent") not in (None, "publish_prepared_receipt"):
                 raise BranchPrepareError("branch journal has a contradictory prepared intent")
+            # a journal an older controller left here may hold a mid-segment
+            # fork; the receipt is what a boot trusts, so check before publishing
+            if entered_state == "branch_prepared":
+                self.require_fork_on_segment_boundary(self.journal["fork_lsn"])
             self.journal_update("prepared", None)
             state = "prepared"
         self.success_restore(run_faults=False)
@@ -1623,10 +1636,7 @@ class BranchPreparer:
             fork = self.pause_and_capture(keep_paused=True)
             if parse_lsn(fork) < parse_lsn(checkpoint_end):
                 raise BranchPrepareError("materialized fork does not cover the checkpoint")
-            if parse_lsn(fork) % segment_size != 0:
-                raise BranchPrepareError(
-                    f"materialized fork {fork} is not a WAL segment boundary; "
-                    "a branch forked inside a segment cannot restore that segment")
+            self.require_fork_on_segment_boundary(fork)
             self.journal_update(
                 "fork_captured", None, fork_lsn=fork, pause_owned=self.pause_owned,
                 archived_through_lsn=switch_lsn, materializer_resumed=False,

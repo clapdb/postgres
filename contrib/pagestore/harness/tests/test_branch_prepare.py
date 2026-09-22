@@ -712,6 +712,28 @@ class BranchPrepareTests(unittest.TestCase):
         preparer = MidSegmentFork(config, "1/DE000000")
         self.assertEqual(preparer.execute()["fork_lsn"], "1/DE000000")
 
+        # an unpublished journal from an older controller is checked before
+        # its fork is seeded or its receipt published
+        for state in ("fork_captured", "branch_prepared"):
+            journal = MidSegmentFork(config, "1/DD0000E0").new_journal()
+            journal.update(state=state, intent=None, base_lsn="0/10", checkpoint_redo_lsn="1/DD000028",
+                           checkpoint_end_lsn="1/DD0000A8", switch_lsn="1/DD0000F8",
+                           fork_lsn="1/DD0000E0", archived_through_lsn="1/DD0000F8",
+                           pause_owned=True, writer_owned=True,
+                           restricted_writer_running=True, materializer_resumed=False)
+            preparer = MidSegmentFork(config, "1/DD0000E0")
+            preparer.write_journal(journal)
+            preparer.restore_ownership_from_journal = lambda: None
+            preparer.discover_recovery_services = lambda: None
+            preparer.observe_recovery_ownership = lambda: "restricted"
+            preparer.success_restore = lambda run_faults=True: None
+            with self.assertRaisesRegex(MODULE.BranchPrepareError, "not a WAL segment boundary"):
+                preparer.execute()
+            self.assertNotEqual(
+                json.loads(config.receipt_file.read_text(encoding="utf-8")).get("state"),
+                "prepared", state)
+            config.receipt_file.unlink()
+
     def test_execute_preserves_fence_after_prepare_unknown_result(self):
         config = MODULE.Config.load(self.write_config())
 
@@ -972,6 +994,9 @@ class BranchPrepareTests(unittest.TestCase):
                     raise AssertionError(sql)
 
             class Recovery(m.BranchPreparer):
+                def wal_segment_size(self):
+                    return 0x40
+
                 def _state(self):
                     return json.loads((self.config.prepared_dir.parent / "service-state.json").read_text())
                 def _save(self, state):
