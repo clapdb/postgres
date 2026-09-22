@@ -172,6 +172,27 @@ class Pg:
         if check and r.returncode != 0:
             raise Failure("stop_failed", f"{self.name} ({mode}): {r.stdout[-300:]} {r.stderr[-300:]}")
 
+    def halt(self) -> None:
+        """Stop immediately whatever state the compute is in; SIGKILL the
+        postmaster's process group if pg_ctl cannot, and wait for it."""
+        pid = self.pid()
+        try:
+            self.stop("immediate", check=False)
+        except subprocess.TimeoutExpired:
+            pass
+        if pid is None or not Path(f"/proc/{pid}").exists():
+            return
+        try:
+            os.killpg(pid, signal.SIGKILL)        # pg_ctl starts the postmaster in its own session
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        deadline = time.time() + 60
+        while Path(f"/proc/{pid}").exists() and time.time() < deadline:
+            time.sleep(0.1)
+
     def pid(self) -> int | None:
         try:
             return int((self.datadir / "postmaster.pid").read_text().splitlines()[0])
@@ -220,7 +241,9 @@ class Run:
             sys.exit(f"no tmp_install under {build} (run: meson test -C {build} --suite setup)")
         self.bin = pgctl.parent
         prefix = self.bin.parent
-        self.env = dict(os.environ, LD_LIBRARY_PATH=f"{prefix}/lib:{prefix}/lib64", PGCONNECT_TIMEOUT="20")
+        # LC_ALL=C: the driver parses tool output and matches English messages
+        self.env = dict(os.environ, LD_LIBRARY_PATH=f"{prefix}/lib:{prefix}/lib64", PGCONNECT_TIMEOUT="20",
+                        LC_ALL="C", LANGUAGE="C")
         for k in [k for k in self.env if k.startswith("PAGESTORE_TEST_FAULT")]:
             del self.env[k]
         cb = build / "contrib/pagestore"
@@ -280,10 +303,13 @@ class Run:
         while time.time() < deadline:
             if self.daemon.poll() is not None:
                 raise Failure("daemon_start", f"daemon exited with {self.daemon.returncode} during recovery")
-            if subprocess.run([str(self.inspect_bin), "--shm", self.shm, "health"],
-                              capture_output=True, env=self.env).returncode == 0:
-                self.daemon_expected_up = True
-                return
+            try:
+                if subprocess.run([str(self.inspect_bin), "--shm", self.shm, "health"],
+                                  capture_output=True, env=self.env, timeout=10).returncode == 0:
+                    self.daemon_expected_up = True
+                    return
+            except subprocess.TimeoutExpired:
+                pass
             time.sleep(0.1)
         raise Failure("daemon_start", "daemon did not become ready in 300 s")
 
@@ -314,7 +340,9 @@ class Run:
         return r.stdout
 
     def restore_command(self, tl: int, segsize: int) -> str:
-        return (f"{shlex.quote(str(self.walrestore))} --shm {shlex.quote(self.shm)} --timeline {tl} "
+        def arg(v: Any) -> str:
+            return shlex.quote(str(v)).replace("%", "%%")    # a literal % is %% in restore_command
+        return (f"{arg(self.walrestore)} --shm {arg(self.shm)} --timeline {tl} "
                 f"--incarnation 1 --segsize {segsize} %f %p")
 
     def wal_segment_size(self, datadir: Path) -> int:
@@ -413,7 +441,6 @@ CREATE INDEX ev_k ON ev(k);
             except (SqlError, subprocess.TimeoutExpired) as e:
                 last = str(e)
             time.sleep(0.2)
-        self.dump_diagnostics()
         raise Failure("timeout", f"{what} not reached in {timeout:.0f} s (last: {str(last)[:300]})")
 
     def archive_current_wal(self) -> str:
@@ -845,15 +872,11 @@ recovery_target_action = 'promote'
             out.write(json.dumps(rec) + "\n")
 
     def dump_diagnostics(self) -> None:
+        """At a finding: snapshot the live sessions, stop every compute so the
+        preserved root stops changing, then read the store's state."""
         d = self.root / "diagnostics"
         d.mkdir(exist_ok=True)
         stamp = time.strftime("%H%M%S")
-        timelines = [("timeline", str(tl)) for tl in [0] + [b[0] for b in self.branches]]
-        for what in [("health",), ("backpressure",), ("gc",), ("owners",), ("manifest",)] + timelines:
-            try:
-                (d / f"{stamp}-inspect-{'-'.join(what)}.txt").write_text(self.inspect(*what))
-            except (OSError, subprocess.TimeoutExpired):
-                pass
         for pg in self.computes():
             try:
                 (d / f"{stamp}-{pg.name}-activity.txt").write_text(pg.sql(
@@ -861,14 +884,19 @@ recovery_target_action = 'promote'
                     "FROM pg_stat_activity;", timeout=20, check=False))
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        for pg in self.computes():
+            pg.halt()
+        timelines = [("timeline", str(tl)) for tl in [0] + [b[0] for b in self.branches]]
+        for what in [("health",), ("backpressure",), ("gc",), ("owners",), ("manifest",)] + timelines:
+            try:
+                (d / f"{stamp}-inspect-{'-'.join(what)}.txt").write_text(self.inspect(*what))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
     def teardown(self, preserve_state: bool, interrupted: bool = False) -> None:
         self.stop_sampler.set()
         for pg in self.computes():
-            try:
-                pg.stop("immediate", check=False)
-            except subprocess.TimeoutExpired:
-                pass
+            pg.halt()
         if self.daemon and self.daemon.poll() is None:
             # after a finding, SIGKILL keeps the store exactly as it failed
             self.daemon.send_signal(signal.SIGKILL if preserve_state or interrupted else signal.SIGTERM)
@@ -913,6 +941,8 @@ recovery_target_action = 'promote'
         # and it shuts down cleanly, clients first
         for pg in reversed(self.computes()):
             pg.stop("fast")
+        for pg in self.computes():
+            pg.scan_log()                          # shutdown checkpoints log too
         self.stop_daemon(signal.SIGTERM)
         self.event("clean_shutdown")
 
