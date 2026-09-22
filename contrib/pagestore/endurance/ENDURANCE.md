@@ -18,7 +18,8 @@ Put `--root` on a real filesystem.  On tmpfs every fsync is free and the run
 says nothing about the store's durability ordering.
 
 `.github/workflows/pagestore-endurance.yml` runs a bounded run on demand (any
-ref, seed, duration and scale) and a 15-minute one weekly, uploading the
+ref, seed, duration and scale), a 15-minute one weekly, and a five-minute
+one on a pull request that changes the driver, uploading the
 history, the passed runs' events and metrics, and a failed run's logs,
 diagnostics and controller journals as the `pagestore-endurance-<seed>`
 artifact.  It keeps the driver exercised on the current tree; multi-hour

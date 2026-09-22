@@ -10,12 +10,17 @@
 # needs a full PostgreSQL build.  This workflow runs a bounded run on demand
 # (any ref, seed and duration) and a short one weekly, so the driver is
 # exercised on the current tree and its findings arrive as failed runs with
-# their evidence attached, not as silent rot.  Long multi-hour runs stay on a
+# their evidence attached, not as silent rot.  A pull request that changes the
+# driver itself gets a five-minute run.  Long multi-hour runs stay on a
 # developer box; a hosted runner is not release evidence (RELEASE_VALIDATION.md).
 
 name: pagestore endurance
 
 on:
+  pull_request:
+    paths:
+      - "contrib/pagestore/endurance/**"
+      - ".github/workflows/pagestore-endurance.yml"
   schedule:
     # weekly, Saturday 04:17 UTC, from the default branch only
     - cron: "17 4 * * 6"
@@ -39,7 +44,7 @@ permissions:
 
 jobs:
   endurance:
-    if: github.event_name == 'workflow_dispatch' || github.repository == 'clapdb/postgres'
+    if: github.event_name != 'schedule' || github.repository == 'clapdb/postgres'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -65,7 +70,7 @@ jobs:
       - name: Run the endurance driver
         env:
           SEED: ${{ inputs.seed || '1' }}
-          DURATION: ${{ inputs.duration || '900' }}
+          DURATION: ${{ inputs.duration || (github.event_name == 'pull_request' && '300') || '900' }}
           SCALE: ${{ inputs.scale || '1' }}
         run: |
           # $RUNNER_TEMP is a real filesystem on the hosted runners; the driver
