@@ -118,6 +118,31 @@ main(void)
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, 0, out, psz, NULL, NULL);
 	check(r == 0, "absent key -> no version");
 
+	/* The cache holds indexes only: an unverified descriptor copy still
+	 * checksums the data section, and emptying the cache (the layer store's
+	 * close) makes the next lookup read the index from the file again. */
+	{
+		PsLayerDesc copy = d;
+		unsigned char bad = 0,
+					  good = 0xA1;
+		int			fd;
+
+		copy.data_verified = false;
+		fd = open(d.locations[0].uri, O_WRONLY);
+		check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1 && close(fd) == 0,
+			  "corrupt image bytes behind a cached index");
+		r = ps_image_layer_lookup(&copy, &k6, 0, 1000, 0, out, psz, NULL, NULL);
+		check(r < 0 && !copy.data_verified,
+			  "a cached index does not vouch for the data section");
+		fd = open(d.locations[0].uri, O_WRONLY);
+		check(fd >= 0 && pwrite(fd, &good, 1, 0) == 1 && close(fd) == 0,
+			  "restore image bytes");
+		ps_image_layer_cache_reset();
+		r = ps_image_layer_lookup(&copy, &k6, 0, 1000, 0, out, psz, NULL, NULL);
+		check(r == 1 && copy.data_verified && out[0] == 0xC1,
+			  "after a cache reset the layer is read, verified and served again");
+	}
+
 	/* GC must force a fresh checksum even if an earlier lookup cached success. */
 	{
 		unsigned char bad = 0,
@@ -133,6 +158,63 @@ main(void)
 		check(fd >= 0 && pwrite(fd, &good, 1, 0) == 1 && close(fd) == 0 &&
 			  ps_image_layer_verify_data(&d, psz) == 0,
 			  "restored image bytes pass forced verification");
+	}
+
+	/* Lookups go through a cached, binary-searched index: many keys written
+	 * in unsorted order must resolve exactly as a full scan would. */
+	{
+		enum { NK = 300 };
+		static unsigned char pages[NK][PSZ];
+		static PsImgRec many[NK * 2];
+		PsLayerDesc d2;
+		int			ok = 1;
+
+		for (uint32_t i = 0; i < NK; i++)
+		{
+			PsKey		k = k5;
+
+			k.relNumber = 1000 + (i * 7919) % NK;	/* unsorted input */
+			memset(pages[i], (int) (k.relNumber & 0xff), psz);
+			many[2 * i] = (PsImgRec) {.key = k, .block = i % 3, .lsn = 500, .page = pages[i]};
+			many[2 * i + 1] = (PsImgRec) {.key = k, .block = i % 3, .lsn = 400, .page = pg[0]};
+		}
+		check(ps_image_layer_write(77, 0, many, NK * 2, psz, &d2) == 0,
+			  "write a many-key image layer");
+		r = ps_image_layer_lookup(&d2, &k5, 0, 1000, 0, out, psz, NULL, NULL);
+		check(r == 0, "a key of another cached layer is absent from this one");
+		for (uint32_t i = 0; i < NK && ok; i++)
+		{
+			PsKey		k = k5;
+			uint64_t	l = 0;
+
+			k.relNumber = 1000 + i;
+			for (uint32_t b = 0; b < 3; b++)
+			{
+				r = ps_image_layer_lookup(&d2, &k, b, 450, 0, out, psz, &l, NULL);
+				if (r == 1 && (l != 400 || out[0] != 0xA1))
+					ok = 0;
+				r = ps_image_layer_lookup(&d2, &k, b, 1000, 0, out, psz, &l, NULL);
+				if (r == 1 && (l != 500 || out[0] != (unsigned char) (k.relNumber & 0xff)))
+					ok = 0;
+				if (r < 0)
+					ok = 0;
+			}
+		}
+		check(ok, "every key resolves to its newest version through the cached index");
+		{
+			int			hits = 0;
+
+			for (uint32_t i = 0; i < NK; i++)
+			{
+				PsKey		k = k5;
+
+				k.relNumber = 1000 + i;
+				for (uint32_t b = 0; b < 3; b++)
+					hits += ps_image_layer_lookup(&d2, &k, b, 1000, 0, out, psz,
+												  NULL, NULL) == 1;
+			}
+			check(hits == NK, "each written (key, block) is found exactly once");
+		}
 	}
 
 	/* --- delta layer: ordered collect in an LSN range --- */

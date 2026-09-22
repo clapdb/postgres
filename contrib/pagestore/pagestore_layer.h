@@ -186,6 +186,8 @@ extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
 /* Force a fresh data-section checksum verification (ignores cached state). */
+/* Empty the process-wide image index cache; the layer store calls it on close. */
+extern void ps_image_layer_cache_reset(void);
 extern int	ps_image_layer_verify_data(const PsLayerDesc *layer,
 								 uint32_t page_size);
 extern int	ps_delta_layer_verify_data(const PsLayerDesc *layer);
