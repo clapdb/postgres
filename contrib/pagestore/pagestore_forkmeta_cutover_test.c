@@ -2321,6 +2321,87 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 	remove_tree(store);
 }
 
+/* A late ordered parent write must not change an existing child's snapshot,
+ * including a branch newer than the selected forkmeta cutoff. */
+static void
+test_ordered_parent_after_branch(int walless)
+{
+	char store[] = "/tmp/psforkmetabranchXXXXXX";
+	char snapshots[1024], manifest[1200], frontier[1200];
+	PsKey key = {6, 6, 33, 1, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 34, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
+	TestSnapshotHeader hdr;
+	PsChannel reply;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	uint64_t lsn = walless ? 0 : 50;
+
+	check(mkdtemp(store) != NULL, "E6 branch create store");
+	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "E6 branch open store");
+	check(meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_timeline_tag(0, &key, 0, lsn, page, 0x61, NULL) == 0 &&
+		  meta_request(PS_OP_CREATE, &pin_key, 200, 0, 0, 0, NULL) &&
+		  append_relation_timeline(0, &pin_key, 0, 200, page, NULL) == 0 &&
+		  append_relation_timeline(0, &pin_key, 0, 300, page, &seq) == 0,
+		  "E6 branch seed parent history");
+	memset(&pin, 0, sizeof(pin));
+	pin.owner_kind = 1;
+	pin.owner_id = 95;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 300;
+	pin.admission_seq = seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1) &&
+		  append_growth_batch_timeline(0, 2800, 900) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1) &&
+		  read_selected_header(snapshots, &hdr) == 0 && hdr.cutoff_lsn == 300,
+		  "E6 branch select cutoff");
+	check(create_branch_request(1, 0, 300) &&
+		  create_branch_request(2, 0, 400) &&
+		  create_branch_request(3, 2, 500), "E6 branch fork at and beyond cutoff");
+	for (int restart = 0; restart < 3; restart++)
+	{
+		check(append_relation_timeline_tag(0, &key, 0, lsn, page, 0x70 + restart, NULL) == 0 &&
+			  append_relation_timeline_tag(0, &key, 2, lsn, page, 0x73, NULL) == 0 &&
+			  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x70 + restart,
+			  "E6 parent accepts ordered writes after branch");
+		for (uint32_t child = 1; child <= 3; child++)
+		{
+			int rc = read_resolve(child, &key, 0, UINT64_MAX, 0, page, NULL);
+
+			check(walless ? rc < 0 : rc == 1 && page[128] == 0x61,
+				  "E6 child never serves later ordered parent bytes");
+			{
+				PageVer *v = read_through(child, &key, 0, UINT64_MAX, 0);
+
+				check(walless ? v == NULL : v != NULL && v->lsn == 100,
+					  "E6 in-memory ancestry lookup obeys the same snapshot boundary");
+			}
+			check(meta_request_timeline(child, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+				  reply.result == 1 &&
+				  read_resolve(child, &key, 2, UINT64_MAX, 0, page, NULL) <= 0,
+				  "E6 child never inherits later ordered parent growth");
+		}
+		close_runtime();
+		check(ps_core_open(store) == 0, "E6 branch reopen ordered history");
+	}
+	check(create_branch_request(4, 0, UINT64_MAX) &&
+		  append_relation_timeline_tag(0, &key, 0, lsn, page, 0x79, NULL) != 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x72,
+		  "E6 unrepresentable post-branch position refuses without replacing bytes");
+	close_runtime();
+	remove_tree(store);
+}
+
 /*
  * F5: randomized cross-check of the (lsn, admission_seq) position index
  * (fork_event_lower_bound()/upper_bound()/identity_range()/insert_pos())
@@ -5686,6 +5767,8 @@ main(void)
 	for (uint32_t timeline = 0; timeline <= 1; timeline++)
 		for (int walless = 0; walless <= 1; walless++)
 			test_ordered_write_after_cutoff(timeline, walless);
+	for (int walless = 0; walless <= 1; walless++)
+		test_ordered_parent_after_branch(walless);
 	test_fork_event_index_scaling();
 	test_orphaned_ordered_marker_adopted();
 	test_orphaned_ordered_marker_not_adopted_on_mismatch();

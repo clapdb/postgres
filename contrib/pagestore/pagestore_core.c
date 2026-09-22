@@ -7659,6 +7659,11 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (v)
 		{
+			/* LSN-0 bytes have no historical visibility proof.  This also
+			 * applies when a newest read becomes capped through ancestry. */
+			if (key->klass == PS_KLASS_RELATION && w.tl != timeline &&
+				v->lsn == 0)
+				return NULL;
 			if (!fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
 				return v;
 			return NULL;
@@ -17026,6 +17031,34 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (ordered_record && fork_meta_snapshot_generation != 0 &&
 		hdr.lsn < fork_meta_snapshot_cutoff_lsn)
 		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
+	if (ordered_record)
+	{
+		/* Branch reads cap ancestors at a bare LSN, not an admission tuple.
+		 * Put operational writes strictly beyond every existing child cap;
+		 * descendants are capped by that same first edge.  CREATE_BRANCH takes
+		 * every shard lock, so the caller's shard-write lock keeps this set
+		 * stable through publication.  Include deleting children until their
+		 * ancestry is retired.  No representable successor means fail closed. */
+		ps_lock_map_rd();
+		for (uint32_t child = 1; child < MAX_TIMELINES; child++)
+		{
+			if (!timeline_has_parent(child) ||
+				timelines[child].parent != (int) timeline ||
+				timelines[child].state == PS_TIMELINE_DELETED)
+				continue;
+			if (hdr.lsn <= timelines[child].branch_lsn)
+			{
+				if (timelines[child].branch_lsn == UINT64_MAX)
+				{
+					ps_unlock_map();
+					*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
+					return -1;
+				}
+				hdr.lsn = timelines[child].branch_lsn + 1;
+			}
+		}
+		ps_unlock_map();
+	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
 	segment_grows = (!fe ||
@@ -17593,6 +17626,13 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 
 			if (fork_page_invalidated(fe, block, pv, rl, seq_cap))
 				return 0;
+
+			/* Frontends reject explicit capped reads of WAL-less bytes.  A
+			 * newest child read is capped here too, even though its original
+			 * request had no LSN/sequence cap.  Report unavailable history, not
+			 * an absent page or the parent's latest FSM/VM/unlogged contents. */
+			if (key->klass == PS_KLASS_RELATION && tl != timeline && pv->lsn == 0)
+				return -2;
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
