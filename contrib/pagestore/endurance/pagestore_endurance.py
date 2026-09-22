@@ -135,6 +135,31 @@ COMMIT;
 }
 
 
+def pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def unlink_shm(name: str) -> None:
+    try:
+        import _posixshmem                       # shm_unlink(3), wherever the object lives
+        _posixshmem.shm_unlink(name)
+    except ImportError:
+        try:
+            os.unlink(f"/dev/shm{name}")
+        except FileNotFoundError:
+            pass
+    except FileNotFoundError:
+        pass
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -181,7 +206,7 @@ class Pg:
             self.stop("immediate", check=False)
         except subprocess.TimeoutExpired:
             pass
-        if pid is None or not Path(f"/proc/{pid}").exists():
+        if not pid_alive(pid):
             return
         try:
             os.killpg(pid, signal.SIGKILL)        # pg_ctl starts the postmaster in its own session
@@ -191,7 +216,7 @@ class Pg:
             except OSError:
                 pass
         deadline = time.time() + 60
-        while Path(f"/proc/{pid}").exists() and time.time() < deadline:
+        while pid_alive(pid) and time.time() < deadline:
             time.sleep(0.1)
 
     def pid(self) -> int | None:
@@ -259,6 +284,7 @@ class Run:
         self.writer = Pg(self, "writer", root / "writer")
         self.mat = Pg(self, "materializer", root / "materializer")
         self.branches: list[tuple[int, Pg, Path]] = []   # (timeline, compute, scratch)
+        self.branch_sums: dict[int, dict[str, str]] = {}  # last verified contents of each branch
         self.next_timeline = 1
         self.round = 0
         self.naccts = NACCTS_PER_SCALE * args.scale
@@ -292,7 +318,7 @@ class Run:
             pg.scan_log()
             if pg.expected_up:
                 pid = pg.pid()
-                if pid is None or not Path(f"/proc/{pid}").exists():
+                if not pid_alive(pid):
                     raise Failure("compute_died", f"{pg.name} postmaster is gone")
 
     # ---- daemon ---------------------------------------------------------
@@ -302,10 +328,7 @@ class Run:
         # health" does not check the daemon lease, so the probe below would
         # pass before the new daemon re-initializes it (finding E-8).  The
         # previous daemon has exited, so the stale object can go.
-        try:
-            os.unlink(f"/dev/shm{self.shm}")
-        except FileNotFoundError:
-            pass
+        unlink_shm(self.shm)
         log = open(self.root / "daemon.log", "a")
         self.daemon = subprocess.Popen(
             [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store), *self.args.daemon_arg],
@@ -715,7 +738,7 @@ DO $$ DECLARE r record; BEGIN
         """The MVP contract: every attached client stops before the daemon does."""
         self.event("store_restart", crash=crash)
         # branches are idle between rounds; their writes must survive the store reopening
-        before = {tl: self.checksums(b) for tl, b, _ in self.branches}
+        before = {tl: self.verify_branch_idle(tl, b) for tl, b, _ in self.branches}
         for _, b, _ in self.branches:
             b.stop("fast")
         self.mat.stop("fast")
@@ -734,6 +757,7 @@ DO $$ DECLARE r record; BEGIN
                 raise Failure("branch_store_restart_mismatch",
                               f"timeline {tl} changed across a {'crash' if crash else 'clean'} store restart: {diff}")
             self.check_invariants(b, amcheck=False)
+            self.branch_sums[tl] = after
 
     # ---- branches --------------------------------------------------------
 
@@ -742,6 +766,7 @@ DO $$ DECLARE r record; BEGIN
         old.stop("fast")                           # still tracked if this fails
         old.scan_log()                             # its shutdown is the last thing it logs
         self.branches.pop(0)
+        self.branch_sums.pop(old_tl, None)
         shutil.rmtree(old.datadir)
         shutil.rmtree(old_scratch)
         shutil.rmtree(self.root / f"prepared-{old_tl}")    # a full SLRU snapshot per branch
@@ -868,9 +893,20 @@ recovery_target_action = 'promote'
         self.event("branch_deleted", timeline=tl, seconds=round(time.time() - started, 1),
                    store_kb_before=before, store_kb_after=self.store_kb())
 
+    def verify_branch_idle(self, tl: int, b: Pg) -> dict[str, str]:
+        """An idle branch must still hold what it was last verified to hold:
+        compaction or reclamation in between must not change it."""
+        cur = self.checksums(b)
+        saved = self.branch_sums.get(tl)
+        if saved is not None and cur != saved:
+            diff = {t: (saved.get(t), cur.get(t)) for t in set(saved) | set(cur) if saved.get(t) != cur.get(t)}
+            raise Failure("branch_idle_mismatch", f"timeline {tl} changed while idle: {diff}")
+        return cur
+
     def exercise_branch(self, tl: int, b: Pg) -> None:
         """Diverge the branch, then prove its own writes survive a restart with
         an empty buffer cache (every page comes back from the store)."""
+        self.verify_branch_idle(tl, b)
         bench = self.pgbench(b, self.rng.randint(5, 15), max(2, self.args.clients // 2))
         out, _ = bench.communicate(timeout=900)
         if bench.returncode != 0:
@@ -886,6 +922,7 @@ recovery_target_action = 'promote'
             diff = {t: (before.get(t), after.get(t)) for t in set(before) | set(after) if before.get(t) != after.get(t)}
             raise Failure("branch_restart_mismatch", f"timeline {tl} changed across a {mode} restart: {diff}")
         self.check_invariants(b, amcheck=self.rng.random() < 0.5)
+        self.branch_sums[tl] = after
         self.event("branch_exercised", timeline=tl, restart=mode)
 
     # ---- sampling and diagnostics ---------------------------------------
@@ -960,7 +997,7 @@ recovery_target_action = 'promote'
             except subprocess.TimeoutExpired:
                 self.daemon.kill()
         try:
-            os.unlink(f"/dev/shm{self.shm}")
+            unlink_shm(self.shm)
         except OSError:
             pass
         self.events.close()
@@ -1044,9 +1081,8 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
         if failure is None and run.async_failure:
             failure = run.async_failure         # a finding the main thread had not picked up yet
         run.teardown(preserve_state=failure is not None, interrupted=interrupted)
-    if interrupted:
-        if failure is None:
-            shutil.rmtree(root, ignore_errors=True)
+    if interrupted and failure is None:
+        shutil.rmtree(root, ignore_errors=True)
         raise KeyboardInterrupt
     summary = {"seed": seed, "pass": failure is None, "seconds": round(time.time() - started),
                "stats": run.stats, "root": str(root),
@@ -1058,6 +1094,8 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
     with open(args.root / "history.jsonl", "a") as h:
         h.write(json.dumps(summary) + "\n")
     print(json.dumps(summary), flush=True)
+    if interrupted:
+        raise KeyboardInterrupt                 # the finding is on disk; now stop
     return failure is None
 
 
