@@ -295,6 +295,14 @@ class Run:
     # ---- daemon ---------------------------------------------------------
 
     def start_daemon(self) -> None:
+        # A SIGKILLed daemon leaves its segment READY, and "pagestore_inspect
+        # health" does not check the daemon lease, so the probe below would
+        # pass before the new daemon re-initializes it (finding E-8).  The
+        # previous daemon has exited, so the stale object can go.
+        try:
+            os.unlink(f"/dev/shm{self.shm}")
+        except FileNotFoundError:
+            pass
         log = open(self.root / "daemon.log", "a")
         self.daemon = subprocess.Popen(
             [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store), *self.args.daemon_arg],
@@ -655,19 +663,27 @@ DO $$ DECLARE r record; BEGIN
     def force_restartpoint(self) -> None:
         """CHECKPOINT on a standby is a no-op unless a checkpoint record newer
         than the last restartpoint has been replayed, so give it one and
-        require the restartpoint to advance."""
+        require the command itself to advance the restartpoint.  The
+        materializer's own timed restartpoint may consume that checkpoint
+        first; then try again with a newer one."""
         q = "SELECT checkpoint_lsn FROM pg_control_checkpoint();"
-        before = self.query_retry(self.mat, q)
-        self.writer.sql("CHECKPOINT;", timeout=900)
-        lsn = self.archive_current_wal()
-        self.wait_for(f"materializer replay through {lsn}", lambda: self.mat.sql(
-            f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;") == "t", self.args.sync_timeout)
-        self.mat.sql("CHECKPOINT;", timeout=900)
-        after = self.query_retry(self.mat, q)
-        if self.query_retry(self.mat, f"SELECT '{after}'::pg_lsn > '{before}'::pg_lsn;") != "t":
-            raise Failure("restartpoint", f"materializer restartpoint stayed at {after} after replaying "
-                                          f"a newer writer checkpoint (through {lsn})")
-        self.event("restartpoint", before=before, after=after)
+        for attempt in range(3):
+            self.writer.sql("CHECKPOINT;", timeout=900)
+            target = self.writer.sql(q)
+            lsn = self.archive_current_wal()
+            self.wait_for(f"materializer replay through {lsn}", lambda: self.mat.sql(
+                f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;") == "t", self.args.sync_timeout)
+            before = self.query_retry(self.mat, q)
+            if self.query_retry(self.mat, f"SELECT '{before}'::pg_lsn >= '{target}'::pg_lsn;") == "t":
+                continue                           # already a restartpoint at the new checkpoint
+            self.mat.sql("CHECKPOINT;", timeout=900)
+            after = self.query_retry(self.mat, q)
+            if self.query_retry(self.mat, f"SELECT '{after}'::pg_lsn >= '{target}'::pg_lsn;") != "t":
+                raise Failure("restartpoint", f"materializer CHECKPOINT left the restartpoint at {after} after "
+                                              f"replaying the writer checkpoint at {target}")
+            self.event("restartpoint", before=before, after=after, attempt=attempt + 1)
+            return
+        self.event("restartpoint_preempted", attempts=3)
 
     # ---- store restart ---------------------------------------------------
 
@@ -698,8 +714,9 @@ DO $$ DECLARE r record; BEGIN
     # ---- branches --------------------------------------------------------
 
     def retire_branch(self) -> None:
-        old_tl, old, old_scratch = self.branches.pop(0)
-        old.stop("fast")
+        old_tl, old, old_scratch = self.branches[0]
+        old.stop("fast")                           # still tracked if this fails
+        self.branches.pop(0)
         shutil.rmtree(old.datadir)
         shutil.rmtree(old_scratch)
         self.delete_timeline(old_tl)
@@ -913,11 +930,12 @@ recovery_target_action = 'promote'
     # ---- main loop -------------------------------------------------------
 
     def execute(self) -> None:
-        deadline = time.time() + self.args.duration
         self.provision()
         threading.Thread(target=self.sampler, daemon=True).start()
         self.verify_materializer("initial load")
-        while time.time() < deadline:
+        # the duration counts rounds, not provisioning, and a run has at least one
+        deadline = time.time() + self.args.duration
+        while self.round == 0 or time.time() < deadline:
             self.round += 1
             self.burst()
             if self.rng.random() < 0.3:
@@ -957,31 +975,39 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
     run = Run(args, seed, root)
     started = time.time()
     failure: Failure | None = None
+    torn_down = False
     try:
-        run.execute()
-    except Failure as f:
-        failure = f
-    except KeyboardInterrupt:
-        run.teardown(preserve_state=False, interrupted=True)
-        shutil.rmtree(root, ignore_errors=True)
-        raise
-    except Exception as e:                      # a driver bug is still worth a preserved root
-        failure = Failure("driver_exception", repr(e))
-        import traceback
-        traceback.print_exc()
-    if failure:
         try:
-            run.dump_diagnostics()
-        except Exception:
-            pass
-    summary = {"seed": seed, "pass": failure is None, "seconds": round(time.time() - started),
-               "stats": run.stats, "root": str(root),
-               "git": subprocess.run(["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
-                                     capture_output=True, text=True).stdout.strip()}
-    if failure:
-        summary.update(kind=failure.kind, detail=failure.detail, round=run.round)
-        run.event("FAILURE", failure=failure.kind, detail=failure.detail)
-    run.teardown(preserve_state=failure is not None)
+            run.execute()
+        except Failure as f:
+            failure = f
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:                  # a driver bug is still worth a preserved root
+            failure = Failure("driver_exception", repr(e))
+            import traceback
+            traceback.print_exc()
+        if failure:
+            try:
+                run.dump_diagnostics()
+            except Exception:
+                pass
+        summary = {"seed": seed, "pass": failure is None, "seconds": round(time.time() - started),
+                   "stats": run.stats, "root": str(root),
+                   "git": subprocess.run(["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
+                                         capture_output=True, text=True).stdout.strip()}
+        if failure:
+            summary.update(kind=failure.kind, detail=failure.detail, round=run.round)
+            run.event("FAILURE", failure=failure.kind, detail=failure.detail)
+        run.teardown(preserve_state=failure is not None)
+        torn_down = True
+    except KeyboardInterrupt:
+        # also when the signal lands in failure handling: never leave processes behind
+        if not torn_down:
+            run.teardown(preserve_state=failure is not None, interrupted=True)
+        if failure is None:
+            shutil.rmtree(root, ignore_errors=True)
+        raise
     (root / ("FAILURE.json" if failure else "PASS.json")).write_text(json.dumps(summary, indent=1) + "\n")
     with open(args.root / "history.jsonl", "a") as h:
         h.write(json.dumps(summary) + "\n")
