@@ -34,13 +34,16 @@ class Failure(Exception):
         self.detail = detail
 
 
-# Log lines that are never legitimate, whatever event the driver injected.
-# "terminated by signal 9" is deliberately absent: the driver sends SIGKILL.
+# Log lines that are never legitimate, whatever event the driver injected --
+# except "terminated by signal 9" for a backend the driver killed itself
+# (Run.killed_pids).  A postmaster logs no child exits during an immediate
+# shutdown or after the first crash, so no other signal-9 line is expected.
 BAD_LOG = re.compile(
     r"PANIC:|TRAP:|invalid page in block|could not read block|"
-    r"unexpected data beyond EOF|terminated by signal (6|7|11)\b|"
+    r"unexpected data beyond EOF|terminated by signal (6|7|9|11)\b|"
     r"AddressSanitizer|stack smashing"
 )
+INJECTED_KILL = re.compile(r"\(PID (\d+)\) was terminated by signal 9\b")
 
 # Errors a client may see while the writer crashes or restarts under it.
 # Anything else during a writer fault is still a finding.
@@ -147,6 +150,16 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def unlink_shm(name: str) -> None:
     try:
         import _posixshmem                       # shm_unlink(3), wherever the object lives
@@ -183,13 +196,11 @@ class Pg:
             [str(self.run.bin / "pg_ctl"), "-D", str(self.datadir), *args],
             env=env or self.run.env, capture_output=True, text=True, timeout=timeout)
 
-    def start(self, tries: int = 1) -> None:
-        for attempt in range(tries):
-            r = self.ctl("-l", str(self.log), "-w", "-t", "300", "start")
-            if r.returncode == 0:
-                self.expected_up = True
-                return
-            time.sleep(1)
+    def start(self) -> None:
+        r = self.ctl("-l", str(self.log), "-w", "-t", "300", "start")
+        if r.returncode == 0:
+            self.expected_up = True
+            return
         raise Failure("start_failed", f"{self.name} did not start: {r.stdout[-400:]} {r.stderr[-400:]}")
 
     def stop(self, mode: str = "fast", check: bool = True) -> None:
@@ -245,6 +256,9 @@ class Pg:
         except OSError:
             return
         for line in chunk.splitlines():
+            m = INJECTED_KILL.search(line)
+            if m and int(m.group(1)) in self.run.killed_pids:
+                continue
             if BAD_LOG.search(line):
                 raise Failure("bad_log", f"{self.name}: {line[:400]}")
 
@@ -285,6 +299,7 @@ class Run:
         self.mat = Pg(self, "materializer", root / "materializer")
         self.branches: list[tuple[int, Pg, Path]] = []   # (timeline, compute, scratch)
         self.branch_sums: dict[int, dict[str, str]] = {}  # last verified contents of each branch
+        self.killed_pids: set[int] = set()                 # backends the driver SIGKILLed
         self.next_timeline = 1
         self.round = 0
         self.naccts = NACCTS_PER_SCALE * args.scale
@@ -667,9 +682,11 @@ DO $$ DECLARE r record; BEGIN
                 self.mat.stop("immediate"); self.mat.start()
             elif event == "mat_kill9":
                 self.mat.expected_up = False
-                os.kill(self.mat.pid(), signal.SIGKILL)
-                time.sleep(2)
-                self.mat.start(tries=60)
+                pid = self.mat.pid()
+                os.kill(pid, signal.SIGKILL)
+                # its children notice and exit, which frees the shared memory a new postmaster needs
+                self.wait_for("materializer processes exit after SIGKILL", lambda: not group_alive(pid), 300)
+                self.mat.start()
             elif event == "mat_checkpoint":
                 self.force_restartpoint()
             elif event == "writer_immediate":
@@ -682,6 +699,7 @@ DO $$ DECLARE r record; BEGIN
                                           "AND application_name = 'pgbench' ORDER BY random() LIMIT 1;", check=False)
                     try:
                         if pid:
+                            self.killed_pids.add(int(pid))
                             os.kill(int(pid), signal.SIGKILL)
                             break
                     except ProcessLookupError:
@@ -935,6 +953,7 @@ recovery_target_action = 'promote'
 
     def sample_loop(self) -> None:
         out = open(self.root / "metrics.jsonl", "a", buffering=1)
+        unmeasured = 0
         while not self.stop_sampler.wait(self.args.sample_interval):
             rec: dict[str, Any] = {"t": round(time.time(), 1), "round": self.round, "procs": {}}
             pids = {"daemon": self.daemon.pid if self.daemon else None}
@@ -949,13 +968,21 @@ recovery_target_action = 'promote'
                     pass
             try:
                 du = subprocess.run(["du", "-sk", "--", *[str(p) for p in sorted(self.store.iterdir())]],
-                                    capture_output=True, text=True, timeout=120).stdout
-                rec["store_kb"] = {Path(l.split("\t")[1]).name: int(l.split("\t")[0]) for l in du.splitlines() if "\t" in l}
+                                    capture_output=True, text=True, timeout=120)
+                if du.returncode != 0 or not du.stdout:
+                    raise ValueError(f"du exited {du.returncode}: {du.stderr.strip()[:200]}")
+                rec["store_kb"] = {Path(l.split("\t")[1]).name: int(l.split("\t")[0])
+                                   for l in du.stdout.splitlines() if "\t" in l}
                 total_gb = sum(rec["store_kb"].values()) / 1048576
                 if total_gb > self.args.max_store_gb:
                     self.async_failure = Failure("store_size", f"store is {total_gb:.1f} GiB > --max-store-gb")
-            except (OSError, subprocess.TimeoutExpired, ValueError):
-                pass
+                unmeasured = 0
+            except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+                # --max-store-gb is only a bound while the store can be measured
+                unmeasured += 1
+                if unmeasured >= 3:
+                    self.async_failure = self.async_failure or Failure(
+                        "store_size", f"store size unmeasurable {unmeasured} times in a row: {e!r}")
             out.write(json.dumps(rec) + "\n")
 
     def dump_diagnostics(self) -> None:
@@ -1139,6 +1166,9 @@ def main() -> int:
         print(f"stopping: {failures} preserved failure roots under {args.root} already", flush=True)
         return 1
     while True:
+        if args.forever and shutil.disk_usage(args.root).free / 2**30 < args.min_free_gb:
+            print("stopping: free space below --min-free-gb", flush=True)
+            return 1
         root = args.root / f"run-{seed}"
         ok = one_run(args, seed, root)
         if ok:
@@ -1155,9 +1185,6 @@ def main() -> int:
             return 0 if ok else 1
         if failures >= args.max_failures:
             print(f"stopping: {failures} preserved failure roots under {args.root}", flush=True)
-            return 1
-        if shutil.disk_usage(args.root).free / 2**30 < args.min_free_gb:
-            print("stopping: free space below --min-free-gb", flush=True)
             return 1
         seed += 1
 

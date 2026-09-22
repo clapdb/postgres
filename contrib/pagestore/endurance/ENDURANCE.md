@@ -93,7 +93,7 @@ path that does not touch the store.
 | Index scan vs sequential scan for one `ev.k` | Same compute | Index and heap disagree |
 | `bt_index_check(idx, heapallindexed => true)` on every btree | amcheck | Structural index corruption |
 | The controller's seeded SLRU pages vs the materializer's | PostgreSQL recovery | `clog`/`commit_ts`/`multixact` appliers diverge from redo |
-| Log scan: `PANIC`, `TRAP`, invalid page, unreadable block, signals 6/7/11 | -- | Assertion or crash anywhere |
+| Log scan: `PANIC`, `TRAP`, invalid page, unreadable block, signals 6/7/9/11 (9 only for a backend the driver did not kill itself) | -- | Assertion or crash anywhere |
 | Liveness: every wait has a deadline; daemon and postmasters must be alive when expected | -- | Hang or unexplained exit |
 | During a writer fault, pgbench and DDL errors must all be connection loss or recovery-in-progress | -- | A read or write error hidden behind the injected crash |
 | The run ends with a fast stop of every compute and a `SIGTERM` of the daemon, which must exit 0 | -- | The final flush or shutdown failed |
