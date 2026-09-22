@@ -1840,12 +1840,27 @@ pagestore_localsvc_timeline_info(uint32 timeline, uint32 *parent_timeline,
 uint8
 pagestore_localsvc_begin_delete(uint32 timeline, uint64 expected_incarnation)
 {
+	return pagestore_localsvc_begin_delete_reason(timeline,
+												  expected_incarnation, NULL);
+}
+
+/* As above; on failure *reason is the daemon's PsDeleteRefuseReason. */
+uint8
+pagestore_localsvc_begin_delete_reason(uint32 timeline,
+									   uint64 expected_incarnation,
+									   uint32 *reason)
+{
 	PsChannel  *ch = ls_chan();
+	uint8		status;
 
 	ch->opcode = PS_OP_BEGIN_DELETE;
 	ch->timeline = timeline;
 	ch->req_seq = expected_incarnation;
-	return ls_exec_wait(ch, 0);
+	ch->result = PS_DELETE_REFUSE_UNAVAILABLE;
+	status = ls_exec_wait(ch, 0);
+	if (reason != NULL)
+		*reason = status == PS_STATUS_OK ? 0 : ch->result;
+	return status;
 }
 
 bool

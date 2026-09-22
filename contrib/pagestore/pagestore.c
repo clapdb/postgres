@@ -1294,6 +1294,7 @@ pagestore_delete_branch(PG_FUNCTION_ARGS)
 	int64		incarnation = PG_GETARG_INT64(1);
 	uint32		state = 0;
 	uint64		current = 0;
+	uint32		refusal = 0;
 
 	pagestore_require_timeline_control(timeline);
 	if (timeline == 0)
@@ -1324,20 +1325,52 @@ pagestore_delete_branch(PG_FUNCTION_ARGS)
 	if (state == PS_TIMELINE_DELETED)
 		PG_RETURN_TEXT_P(cstring_to_text("deleted"));
 
-	if (pagestore_localsvc_begin_delete((uint32) timeline,
-										(uint64) incarnation) != PS_STATUS_OK)
+	if (pagestore_localsvc_begin_delete_reason((uint32) timeline,
+											   (uint64) incarnation,
+											   &refusal) != PS_STATUS_OK)
 	{
 		/* Maintenance may have finished a deletion begun earlier between the
 		 * lookup above and this request; BEGIN_DELETE refuses a DELETED
 		 * timeline, but for the caller that retry succeeded. */
-		if (pagestore_lookup_timeline(timeline, &state, &current) &&
+		if (refusal == PS_DELETE_REFUSE_INCARNATION &&
+			pagestore_lookup_timeline(timeline, &state, &current) &&
 			current == (uint64) incarnation && state == PS_TIMELINE_DELETED)
 			PG_RETURN_TEXT_P(cstring_to_text("deleted"));
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("pagestore refused to delete timeline %d", timeline),
-				 errdetail("A timeline with a live or deleting descendant branch, or with a registered retention owner (reader, materializer or branch-preparation pin), cannot be deleted."),
-				 errhint("Delete descendant branches first and release the timeline's retention owners; pagestore_inspect shows both.")));
+		switch (refusal)
+		{
+			case PS_DELETE_REFUSE_DESCENDANT:
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_IN_USE),
+						 errmsg("pagestore timeline %d has a live or deleting descendant branch", timeline),
+						 errhint("Delete descendant branches first; pagestore_inspect lists them.")));
+			case PS_DELETE_REFUSE_OWNER:
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_IN_USE),
+						 errmsg("pagestore timeline %d has a registered retention owner", timeline),
+						 errdetail("A reader, materializer or branch-preparation pin still holds the timeline."),
+						 errhint("Release the timeline's retention owners first; pagestore_inspect owners lists them.")));
+			case PS_DELETE_REFUSE_INCARNATION:
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("pagestore timeline %d is no longer at incarnation %lld",
+								timeline, (long long) incarnation)));
+			case PS_DELETE_REFUSE_STORAGE:
+				ereport(ERROR,
+						(errcode(ERRCODE_IO_ERROR),
+						 errmsg("pagestore could not make the deletion of timeline %d durable", timeline),
+						 errhint("The store's timeline log could not be written or synced; check the daemon log.")));
+			case PS_DELETE_REFUSE_UNAVAILABLE:
+				ereport(ERROR,
+						(errcode(ERRCODE_SYSTEM_ERROR),
+						 errmsg("pagestore cannot delete timeline %d: timeline metadata is unavailable", timeline),
+						 errhint("The store's timeline metadata may be poisoned; check the daemon log and pagestore_inspect.")));
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_SYSTEM_ERROR),
+						 errmsg("pagestore refused to delete timeline %d (reason %u)",
+								timeline, refusal),
+						 errhint("Check the daemon log.")));
+		}
 	}
 	PG_RETURN_TEXT_P(cstring_to_text("deleting"));
 }
