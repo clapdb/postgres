@@ -7630,16 +7630,18 @@ branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
  * (key, block) visible at read_lsn on 'timeline'; if the timeline never wrote
  * the page (or only after read_lsn), descend to the parent, capping read_lsn at
  * the branch LSN so the branch sees a frozen snapshot of the parent.  Returns
- * the chosen PageVer, or NULL if no ancestor has the page.
+ * 1 with the chosen PageVer, 0 for an unwritten page, or a negative
+ * status for unavailable history.  Byte-serving frontends must propagate errors.
  */
-PageVer *
-read_through(uint32_t timeline, const PsKey *key, uint32_t block,
-			 uint64_t read_lsn, uint64_t read_seq)
+int
+read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, uint64_t read_seq, PageVer **out)
 {
 	TlWalk		w;
 
+	*out = NULL;
 	if (!core_process_valid())
-		return NULL;
+		return -1;
 	w = tl_walk_first(timeline, read_lsn);
 	do
 	{
@@ -7653,24 +7655,43 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (artifact_data_key(key))
 		{
 			int state = artifact_visible(w.tl, key, block, w.lsn, seq_cap, &v, 1);
-			if (state < 0 || state == 2)
-				return NULL;
+			if (state < 0)
+				return -1;
+			if (state == 2)
+				return 0;
 		}
 
 		if (v)
 		{
-			if (!fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
-				return v;
-			return NULL;
+			if (fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
+				return 0;
+			/* LSN-0 bytes have no historical visibility proof.  This also
+			 * applies when a newest read becomes capped through ancestry. */
+			if (key->klass == PS_KLASS_RELATION && w.tl != timeline &&
+				v->lsn == 0)
+				return -1;
+			*out = v;
+			return 1;
 		}
 		if (fork_state == FORK_HOP_DEAD ||
 			(fork_state == FORK_HOP_DEF && block >= nb))
-			return NULL;
+			return 0;
 		if (fork_state == FORK_HOP_DEF &&
 			fork_inheritance_fenced(fe, block, w.lsn, seq_cap))
-			return NULL;
+			return 0;
 	} while (tl_walk_next(&w));
-	return NULL;
+	return 0;
+}
+
+/* Index-only callers that do not serve bytes can treat unavailable as absent. */
+PageVer *
+read_through(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, uint64_t read_seq)
+{
+	PageVer *v;
+
+	(void) read_through_checked(timeline, key, block, read_lsn, read_seq, &v);
+	return v;
 }
 
 /*
@@ -17009,9 +17030,71 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = growth_floor;
 		zero_version = 1;
 	}
+	ordered_record = zero_version || clamped;
+	/*
+	 * An ordered write has no historical WAL position to preserve: its LSN
+	 * already represents the fork/branch floor, not the page's pd_lsn.  Once
+	 * forkmeta compaction passes that floor, place the new marker at the
+	 * selected cutoff instead.  The fresh admission sequence puts it strictly
+	 * in the source suffix (the caller holds admission-rd across this append).
+	 * This is the same operational ordering used by unstamped fork metadata
+	 * mutations.  It applies to growth as well as rewrites: persist the exact
+	 * position used for size/visibility so recovery cannot grow an old horizon.
+	 * WAL-less pages keep version zero and remain unavailable to capped reads;
+	 * clamped copies use the promoted position for both version and growth.
+	 * Ordinary WAL-versioned pages and explicit metadata LSNs are unchanged.
+	 */
+	if (ordered_record && fork_meta_snapshot_generation != 0 &&
+		hdr.lsn < fork_meta_snapshot_cutoff_lsn)
+		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
+	if (ordered_record)
+	{
+		PsPruneFence *fences = NULL;
+		uint32_t nfences = 0;
+		uint64_t newest;
+		int rc;
+
+		/* An operational write must be newer than every protected snapshot,
+		 * not just the compaction cutoff.  Reuse pruning's ancestry projection
+		 * for branch caps and PAGE_HISTORY pins.  A tuple-capped reader can
+		 * exclude our fresh admission at the same LSN; a bare-LSN branch or
+		 * legacy pin requires its successor.  Admission-rd excludes pin SET,
+		 * and the caller's shard-write lock excludes CREATE_BRANCH through
+		 * publication, so neither fence set can change after this sample. */
+		ps_lock_map_rd();
+		rc = page_prune_fences(timeline, &fences, &nfences);
+		/* A dropped pin/branch must not make a later ordered write sort
+		 * behind a version already admitted at that former horizon.  The
+		 * bound markers preserve this operational position across restart. */
+		newest = fork_newest_visible_lsn_through(timeline, key);
+		ps_unlock_map();
+		if (hdr.lsn < newest)
+			hdr.lsn = newest;
+		if (rc != 0)
+		{
+			*outcome = PS_APPEND_IO_FAILED;
+			return -1;
+		}
+		for (uint32_t i = 0; i < nfences; i++)
+		{
+			if (hdr.lsn < fences[i].lsn)
+				hdr.lsn = fences[i].lsn;
+			if (hdr.lsn == fences[i].lsn &&
+				admission_seq <= fences[i].admission_seq)
+			{
+				if (hdr.lsn == UINT64_MAX)
+				{
+					free(fences);
+					*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
+					return -1;
+				}
+				hdr.lsn++;
+			}
+		}
+		free(fences);
+	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
-	ordered_record = zero_version || clamped;
 	segment_grows = (!fe ||
 		fork_size_asof_hop(fe, hdr_grow_lsn, admission_seq) < block + 1);
 	/* An ordered body is acknowledged only together with its bound marker.
@@ -17577,6 +17660,14 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 
 			if (fork_page_invalidated(fe, block, pv, rl, seq_cap))
 				return 0;
+
+			/* Frontends reject explicit capped reads of WAL-less bytes.  A
+			 * newest child read is capped here too, even though its original
+			 * request had no LSN/sequence cap.  Return an error distinct from
+			 * reclaimed history (-2), which READ_AT reports as absent.  Never
+			 * substitute absence or the parent's latest WAL-less contents. */
+			if (key->klass == PS_KLASS_RELATION && tl != timeline && pv->lsn == 0)
+				return -1;
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
@@ -18624,7 +18715,8 @@ artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
 	return 0;
 }
 
-/* Caller holds map-wr and the page-prune read fence. */
+/* Caller holds map-rd or map-wr.  Callers that act on the snapshot also
+ * fence pin mutations with admission-rd or the page-prune read fence. */
 static int
 page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 				  uint32_t *nfences_out)

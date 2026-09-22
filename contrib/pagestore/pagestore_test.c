@@ -4467,6 +4467,9 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	fill_page(p, ps, 1000, 11);
 	op_write_tl(0, REL_B, FORK0, 0, p);
 
+	fill_page(p, ps, 0, 61);
+	op_write_tl(0, REL_B, 1, 0, p);
+
 	/* branch T1 off main at LSN 1500 -- instant, no data copied */
 	op_create_branch(1, 0, 1500);
 	{
@@ -4481,6 +4484,23 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	}
 	op_read_tl(1, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11), "branch sees parent page via read-through (no copy)");
+
+	/* A diagnostic READ_AT must not turn unavailable WAL-less ancestry
+	 * into the successful "not found" response used for reclaimed history. */
+	for (int read_at = 0; read_at <= 1; read_at++)
+	{
+		PsChannel *ch = ps_channel(cl_shm, cl_chan);
+
+		cl_setkey(ch, REL_B, 1);
+		ch->timeline = 1;
+		ch->opcode = read_at ? PS_OP_READ_AT : PS_OP_READV;
+		ch->blocknum = 0;
+		ch->nblocks = 1;
+		ch->req_lsn = read_at ? 1500 : 0;
+		check(cl_exec()->status == PS_STATUS_ERROR,
+			  "child %s rejects unavailable WAL-less ancestor bytes",
+			  read_at ? "READ_AT" : "READV");
+	}
 
 	/* writing on T1 diverges it (copy-on-write) */
 	fill_page(p, ps, 2000, 22);

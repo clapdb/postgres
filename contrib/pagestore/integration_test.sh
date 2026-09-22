@@ -1643,6 +1643,12 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 # imported pages and the already-routed user-tablespace pages behind R's
 # admission fence.
 $P -c "CREATE DATABASE reader_aux;" >/dev/null
+# Automatic snapshot publication is asynchronous.  Retain the current WAL
+# position before enabling it: pinning only the later WAL insertion
+# point can reclaim an older checkpoint while its worker is still publishing.
+readerPinStart=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerPinStart');")" "0" \
+	"controller pins page history before automatic reader snapshot work"
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 "$BUILD/contrib/pagestore/pagestore_import" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
 cat >> "$DATA/postgresql.conf" <<EOF
@@ -1698,13 +1704,8 @@ READER_SUBXID_SQL=$(mktemp)
 } > "$READER_SUBXID_SQL"
 $P -f "$READER_SUBXID_SQL" >/dev/null
 rm -f "$READER_SUBXID_SQL"
-# The controller must establish authority before creating a horizon: otherwise
-# compaction is allowed to discard the SLRU/page base that prepare_reader will
-# consume after the checkpoint.  The fixed reader later takes over this exact
-# owner key and generation.
-readerPinStart=$($P -c "SELECT pg_current_wal_lsn();")
-assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerPinStart');")" "0" \
-	"controller pins page history before creating reader checkpoint R"
+# Keep the initial authority through the stopped copy below.  Background
+# workers may still be publishing checkpoints older than the selected R.
 # A restore point emits WAL without changing relation/catalog contents or the
 # reader-visible transaction state.  It makes the subsequent checkpoint redo
 # pointer strictly newer than the controller's initial pin even when both
@@ -1721,8 +1722,6 @@ read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerO
 	FROM pg_control_checkpoint();")"
 assert "$($P -c "SELECT pg_wal_lsn_diff('$readerR', '$readerPinStart') > 0;")" "t" \
 	"prepared reader checkpoint R is strictly newer than its initial pin"
-assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
-	"controller advances the prepared reader owner to exact checkpoint R"
 # This test has no concurrent catalog-changing workload across the checkpoint,
 # so its stopped copy is the control-plane catalog artifact for R.  The
 # prepared reader bundle replaces its SLRUs; pg_control is restored
@@ -1731,6 +1730,10 @@ assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0"
 READERDATA=$(mktemp -d)/reader
 cp -a "$DATA" "$READERDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+# The stop drained/terminated the old publication workers.  No queued
+# pre-R snapshot can now race this retention advance on the fresh writer.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
+	"controller advances the prepared reader owner to exact checkpoint R"
 $P -c "COMMIT PREPARED 'reader_running_at_r';" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \

@@ -11,7 +11,7 @@
  * through the PsStorage interface.
  *
  * Seam: ps_handle_meta() handles every request that is not page byte I/O; the
- * four byte-I/O ops are done by each frontend using read_through()/read_version()
+ * four byte-I/O ops are done by each frontend using read_through_checked()/read_version()
  * (reads) and append_page()/fork_grow() (writes).
  *
  *-------------------------------------------------------------------------
@@ -339,6 +339,10 @@ extern int	ps_handle_meta(PsChannel *ch);
 extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 						const unsigned char *page, uint64_t version,
 						uint64_t *out_admission_seq);
+/* Checked index lookup: 1 found, 0 absent, -1 error (including WAL-less ancestry).
+ * Byte-serving frontends must use this form rather than zero-fill on NULL. */
+extern int read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
+							   uint64_t read_lsn, uint64_t read_seq, PageVer **out);
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn, uint64_t read_seq);
 extern int	read_version(const PageVer *v, unsigned char *out);
@@ -348,7 +352,8 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
  * Resolve a read into out (page_size bytes), serving from memtable / image
  * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
  * page is unwritten, -1 if an authoritative stored version cannot be read, and
- * -2 when the requested capped horizon has been reclaimed.
+ * -2 when the requested capped horizon has been reclaimed.  WAL-less ancestry
+ * is an error (-1), not a reclaimed-history miss.
  */
 extern int	read_resolve_version(uint32_t timeline, const PsKey *key,
 								 uint32_t block, uint64_t read_lsn,
