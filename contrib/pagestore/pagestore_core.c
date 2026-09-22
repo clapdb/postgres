@@ -17009,9 +17009,25 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = growth_floor;
 		zero_version = 1;
 	}
+	ordered_record = zero_version || clamped;
+	/*
+	 * An ordered write has no historical WAL position to preserve: its LSN
+	 * already represents the fork/branch floor, not the page's pd_lsn.  Once
+	 * forkmeta compaction passes that floor, place the new marker at the
+	 * selected cutoff instead.  The fresh admission sequence puts it strictly
+	 * in the source suffix (the caller holds admission-rd across this append).
+	 * This is the same operational ordering used by unstamped fork metadata
+	 * mutations.  It applies to growth as well as rewrites: persist the exact
+	 * position used for size/visibility so recovery cannot grow an old horizon.
+	 * WAL-less pages keep version zero and remain unavailable to capped reads;
+	 * clamped copies use the promoted position for both version and growth.
+	 * Ordinary WAL-versioned pages and explicit metadata LSNs are unchanged.
+	 */
+	if (ordered_record && fork_meta_snapshot_generation != 0 &&
+		hdr.lsn < fork_meta_snapshot_cutoff_lsn)
+		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
-	ordered_record = zero_version || clamped;
 	segment_grows = (!fe ||
 		fork_size_asof_hop(fe, hdr_grow_lsn, admission_seq) < block + 1);
 	/* An ordered body is acknowledged only together with its bound marker.

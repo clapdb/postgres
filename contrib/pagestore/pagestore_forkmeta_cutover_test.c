@@ -317,8 +317,9 @@ append_relation(const PsKey *key, uint32_t block, uint64_t lsn,
 }
 
 static int
-append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
-						 uint64_t lsn, unsigned char *page, uint64_t *seq)
+append_relation_timeline_tag(uint32_t timeline, const PsKey *key, uint32_t block,
+							 uint64_t lsn, unsigned char *page, unsigned char tag,
+							 uint64_t *seq)
 {
 	uint32_t hi = (uint32_t) (lsn >> 32);
 	uint32_t lo = (uint32_t) lsn;
@@ -327,13 +328,21 @@ append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
 	memset(page, 0, page_size);
 	memcpy(page, &hi, sizeof(hi));
 	memcpy(page + sizeof(hi), &lo, sizeof(lo));
-	page[128] = (unsigned char) (timeline + 0x20);
+	page[128] = tag;
 	ps_admission_read_lock();
 	ps_lock_shard_wr(ps_shard_of(key));
 	rc = append_page(timeline, key, block, page, 0, seq);
 	ps_unlock_shard(ps_shard_of(key));
 	ps_admission_read_unlock();
 	return rc;
+}
+
+static int
+append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t lsn, unsigned char *page, uint64_t *seq)
+{
+	return append_relation_timeline_tag(timeline, key, block, lsn, page,
+									   (unsigned char) (timeline + 0x20), seq);
 }
 
 static off_t
@@ -615,7 +624,7 @@ restore_marker_only(const char *path, size_t marker_size)
 }
 
 static int
-append_growth_batch(uint32_t rel_base, uint64_t lsn_base)
+append_growth_batch_timeline(uint32_t timeline, uint32_t rel_base, uint64_t lsn_base)
 {
 	for (uint32_t i = 0; i < 20; i++)
 	{
@@ -624,13 +633,19 @@ append_growth_batch(uint32_t rel_base, uint64_t lsn_base)
 
 		ps_admission_read_lock();
 		ps_lock_shard_wr(ps_shard_of(&key));
-		rc = fork_grow(0, &key, 1, lsn_base + i);
+		rc = fork_grow(timeline, &key, 1, lsn_base + i);
 		ps_unlock_shard(ps_shard_of(&key));
 		ps_admission_read_unlock();
 		if (rc != 0)
 			return 0;
 	}
 	return 1;
+}
+
+static int
+append_growth_batch(uint32_t rel_base, uint64_t lsn_base)
+{
+	return append_growth_batch_timeline(0, rel_base, lsn_base);
 }
 
 static void
@@ -2178,6 +2193,130 @@ test_live_ordered_marker_walless_survives_two_cutovers(void)
 		  "store reopens after two cutovers following a live WAL-less ordered write");
 	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 		  page[128] == 0x50, "WAL-less ordered page readable after reopen");
+	close_runtime();
+	remove_tree(store);
+}
+
+/* E-6: a long-lived FSM/VM fork must stay writable after the selected
+ * forkmeta cutoff passes its definition (or a child's branch floor). */
+static void
+test_ordered_write_after_cutoff(uint32_t timeline, int walless)
+{
+	char store[] = "/tmp/psforkmetaaftercutXXXXXX";
+	char snapshots[1024], manifest[1200], frontier[1200];
+	PsKey key = {6, 6, 31, 1, PS_KLASS_RELATION};
+	PsKey pin_key = {6, 6, 32, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
+	TestSnapshotHeader hdr;
+	PsChannel reply;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	uint64_t lsn = walless ? 0 : 50;
+
+	check(mkdtemp(store) != NULL, "E6 create store");
+	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0, "E6 open store");
+	if (timeline)
+		check(create_branch_request(timeline, 0, 100), "E6 create child");
+	check(meta_request_timeline(timeline, PS_OP_CREATE, &key,
+								 100 + timeline, 0, 0, 0, NULL) &&
+		  append_relation_timeline(timeline, &key, 0, lsn, page, NULL) == 0,
+		  "E6 initial ordered local write");
+	memset(&pin, 0, sizeof(pin));
+	pin.owner_kind = 1;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 300;
+	{
+		uint32_t tl = timeline;
+
+		check(meta_request_timeline(tl, PS_OP_CREATE, &pin_key, 200, 0, 0, 0, NULL) &&
+			  append_relation_timeline(tl, &pin_key, 0, 200, page, NULL) == 0 &&
+			  append_relation_timeline(tl, &pin_key, 0, 300, page, &seq) == 0,
+			  "E6 write history to advance each timeline frontier");
+		pin.timeline = tl;
+		pin.owner_id = 90 + tl;
+		pin.admission_seq = seq;
+		check(ps_retention_set(&pin) == PS_RETENTION_OK, "E6 retain current history");
+	}
+	check(run_maintenance_until(frontier, 1) &&
+		  append_growth_batch_timeline(timeline, 2800, 900) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1) &&
+		  read_selected_header(snapshots, &hdr) == 0 && hdr.cutoff_lsn == 300,
+		  "E6 compact past fork definition and branch floor");
+	check(append_relation_timeline_tag(timeline, &key, 0, lsn, page, 0x70, &seq) == 0 &&
+		  seq > hdr.freeze_admission_seq,
+		  "E6 existing ordered block remains writable after cutoff");
+	check(read_resolve(timeline, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x70, "E6 rewrite replaces existing bytes");
+	check(append_relation_timeline(timeline, &key, 2, lsn, page, NULL) == 0 &&
+		  meta_request_timeline(timeline, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 3,
+		  "E6 ordered growth remains writable after cutoff");
+	if (!walless)
+		check(read_resolve(timeline, &key, 2, hdr.cutoff_lsn,
+						   hdr.cutoff_admission_seq, page, NULL) == 0,
+			  "E6 new growth is invisible at the retained cutoff tuple");
+	check(append_relation_timeline(timeline, &key, 5, 150, page, NULL) != 0 &&
+		  meta_request_timeline(timeline, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 3,
+		  "E6 explicit historical WAL growth is still refused without changing size");
+	/* Recover the promoted source-tail markers without a clean close/flush.
+	 * Both a commit-class rewrite and a growth-class append must survive. */
+	close_runtime();
+	{
+		pid_t pid = fork();
+		int status = 0;
+
+		if (pid == 0)
+		{
+			flush_pages = 100000;
+			_exit(ps_core_open(store) == 0 &&
+				  append_relation_timeline_tag(timeline, &key, 0, lsn, page, 0x71, NULL) == 0 &&
+				  append_relation_timeline_tag(timeline, &key, 4, lsn, page, 0x72, NULL) == 0 ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			  "E6 append post-cutoff records then exit without flushing layers");
+	}
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(timeline, &key, 0, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x71 &&
+		  read_resolve(timeline, &key, 4, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x72,
+		  "E6 source-tail recovery preserves promoted commit and growth markers");
+	check(meta_request_timeline(timeline, PS_OP_TRUNCATE, &key,
+								 hdr.cutoff_lsn, 0, 1, 0, NULL) &&
+		  read_resolve(timeline, &key, 2, UINT64_MAX, 0, page, NULL) == 0,
+		  "E6 later same-LSN truncate hides the grown page");
+	check(append_relation_timeline(timeline, &key, 2, lsn, page, NULL) == 0,
+		  "E6 ordered growth after same-LSN truncate succeeds");
+	check(append_growth_batch_timeline(timeline, 2900, 1000) &&
+		  generation_advances_past(snapshots, hdr.generation) &&
+		  read_selected_header(snapshots, &hdr) == 0 &&
+		  append_growth_batch_timeline(timeline, 3000, 1100) &&
+		  generation_advances_past(snapshots, hdr.generation),
+		  "E6 two more cutovers preserve admitted markers");
+	for (int restart = 0; restart < 2; restart++)
+	{
+		close_runtime();
+		check(ps_core_open(store) == 0 &&
+			  read_resolve(timeline, &key, 2, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == (unsigned char) (timeline + 0x20) &&
+			  meta_request_timeline(timeline, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+			  reply.result == 3 &&
+			  read_resolve(timeline, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x71 &&
+			  read_resolve(timeline, &key, 4, UINT64_MAX, 0, page, NULL) == 0,
+			  "E6 ordered bytes and size survive repeated reopen");
+		if (timeline)
+			check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 0 &&
+				  meta_request(PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) && reply.result == 0,
+				  "E6 child writes leave the parent empty");
+	}
 	close_runtime();
 	remove_tree(store);
 }
@@ -5289,9 +5428,9 @@ main(void)
 		before = n > 0 && (size_t) n < sizeof(segment_path) ?
 			file_size(segment_path) : -1;
 		check(before >= 0 &&
-			  append_relation(&page_key, 0, 50, page, NULL) != 0 &&
-			  file_size(segment_path) == before,
-			  "ordered non-growth rewrite below cutoff is rejected before segment write");
+			  append_relation(&page_key, 0, 50, page, NULL) == 0 &&
+			  file_size(segment_path) > before,
+			  "ordered non-growth rewrite advances its operational floor to the cutoff");
 	}
 	check(append_relation(&boundary_key, 0, 199, page, NULL) == 0 &&
 		  append_relation(&boundary_key, 0, 199, page, NULL) == 0,
@@ -5544,6 +5683,9 @@ main(void)
 	test_live_ordered_marker_survives_two_cutovers();
 	test_live_ordered_commit_marker_survives_two_cutovers();
 	test_live_ordered_marker_walless_survives_two_cutovers();
+	for (uint32_t timeline = 0; timeline <= 1; timeline++)
+		for (int walless = 0; walless <= 1; walless++)
+			test_ordered_write_after_cutoff(timeline, walless);
 	test_fork_event_index_scaling();
 	test_orphaned_ordered_marker_adopted();
 	test_orphaned_ordered_marker_not_adopted_on_mismatch();

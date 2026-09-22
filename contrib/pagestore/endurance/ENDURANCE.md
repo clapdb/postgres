@@ -179,7 +179,7 @@ materializer died with `daemon reported error for op 9` (READV).
 
 **E-6. Writes of WAL-less pages are refused once the fork-metadata
 compaction cutoff passes the fork's definition** (seeds 2101, 2103, 2104;
-open, the dominant failure).  Symptom: a `route_all` compute logs
+fixed by promoting ordered writes to the selected cutoff).  Symptom: a `route_all` compute logs
 `daemon reported error for op 8` (WRITEV) for the same block again and again
 -- `base/5/2840_vm` block 0 on a branch, `base/5/37249_fsm` block 2 on the
 materializer -- until the checkpointer cannot write it and the compute dies
@@ -213,16 +213,22 @@ store is a matter of an hour.  The soak test never sees it because its
 workload writes every page with a real LSN; the integration scripts are too
 short for a compaction cutover.
 
-Fix direction (not done here -- it touches the ordered-record and recovery
-partition invariants of R4b and needs the design owner): the marker of an
-ordered record that does not grow the fork carries no size information, only
-ordering against same-LSN definitive events; once the cutoff is above the
-floor no same-LSN event can be admitted after it, so such a record could be
-stamped at `max(floor, cutoff_lsn)` (making it "future" by construction)
-or admitted without a marker.  A growth below the cutoff is the harder case.
-Whatever the fix, a unit test that defines a fork, drives a fork-metadata
-cutover past it, and then rewrites an existing block with `pd_lsn = 0` is the
-fail-before evidence.
+The fix gives a newly admitted ordered record the operational position
+`max(growth_floor, selected_cutoff_lsn)`. Its fresh admission sequence orders
+it strictly after the selected cutoff. Both the segment header and the bound
+marker carry that position; clamped copies use it as their version as well,
+while WAL-less pages keep version zero and remain unavailable to capped reads.
+Growth is recorded at the same position, so it cannot change an older retained
+size. Real WAL-versioned writes and explicit historical metadata mutations
+retain their rejection rules. No persisted format changes.
+
+`pagestore_forkmeta_cutover_test` covers root and child timelines, WAL-less and
+clamped writes, rewrites and growth after cutoff, same-LSN truncate/regrowth,
+refusal of real historical WAL growth, source-tail recovery after an unclean
+process exit, and two subsequent cutovers/reopens. The regression fails on the
+old admission rule. Local cassert validation: 6,220 cutover checks, 77/77
+pagestore Meson tests, and `integration_test.sh` including retained-store reopen.
+These are focused regression results, not multi-day release qualification.
 
 **E-7. Branch preparation intermittently finds no control image for the
 shutdown checkpoint it forks from** (local seed 42, scale 1, `--max-branches
