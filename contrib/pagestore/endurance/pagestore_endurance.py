@@ -9,6 +9,7 @@ tmp_install) as --build.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
@@ -705,7 +706,8 @@ DO $$ DECLARE r record; BEGIN
                             os.kill(int(pid), signal.SIGKILL)
                             break
                     except ProcessLookupError:
-                        pass                       # that client just finished; pick another
+                        # that client just finished: no kill, so no log line to excuse; pick another
+                        self.killed_pids.discard(int(pid))
                     time.sleep(0.2)
             out, _ = bench.communicate(timeout=seconds + 900)
         finally:
@@ -1078,6 +1080,19 @@ recovery_target_action = 'promote'
         self.event("clean_shutdown")
 
 
+@contextlib.contextmanager
+def deferred_signals():
+    """Record SIGINT/SIGTERM instead of raising them inside the block."""
+    signalled: list[int] = []
+    saved = {sig: signal.signal(sig, lambda signum, _f: signalled.append(signum))
+             for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield signalled
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+
 def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
     if root.exists():
         # a preserved failure of the same seed: keep it, replay beside it
@@ -1117,9 +1132,13 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
         # whatever happened above -- a signal, a full disk -- never leave processes behind
         if failure is None and run.async_failure:
             failure = run.async_failure         # a finding the main thread had not picked up yet
-        run.teardown(preserve_state=failure is not None, interrupted=interrupted)
+        # a signal during cleanup is remembered, not raised half-way through it
+        with deferred_signals() as signalled:
+            run.teardown(preserve_state=failure is not None, interrupted=interrupted or bool(signalled))
+            interrupted = interrupted or bool(signalled)
+            if interrupted and failure is None:
+                shutil.rmtree(root, ignore_errors=True)
     if interrupted and failure is None:
-        shutil.rmtree(root, ignore_errors=True)
         raise KeyboardInterrupt
     summary = {"seed": seed, "pass": failure is None, "seconds": round(time.time() - started),
                "stats": run.stats, "root": str(root),
