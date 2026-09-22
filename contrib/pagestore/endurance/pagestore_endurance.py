@@ -67,6 +67,7 @@ def quoted(value: Any) -> str:
 NACCTS_PER_SCALE = 20000
 NDOCS_PER_SCALE = 200
 INITIAL_BALANCE = 1000
+PROBE_TIMEOUT = 30          # one poll inside wait_for(); the wait's own deadline stays in charge
 
 WORKLOAD = {
     # weight, script
@@ -264,6 +265,7 @@ class Run:
         self.ndocs = NDOCS_PER_SCALE * args.scale
         self.events = open(root / "events.jsonl", "a", buffering=1)
         self.stop_sampler = threading.Event()
+        self.sampler_thread: threading.Thread | None = None
         self.async_failure: Failure | None = None
         self.stats = {"rounds": 0, "verifies": 0, "branches": 0, "events": {}}
 
@@ -339,7 +341,10 @@ class Run:
     def inspect(self, *what: str) -> str:
         r = subprocess.run([str(self.inspect_bin), "--shm", self.shm, *what],
                            capture_output=True, text=True, env=self.env, timeout=60)
-        return r.stdout.strip()
+        out = r.stdout.strip()
+        if r.returncode != 0 or r.stderr.strip():
+            out += f"\n[pagestore_inspect exited {r.returncode}] {r.stderr.strip()}"
+        return out
 
     # ---- provisioning (mirrors mvp_golden_test.sh) ------------------------
 
@@ -467,7 +472,7 @@ CREATE INDEX ev_k ON ev(k);
         self.timing = {"archive_s": round(time.time() - t0, 1)}
         t0 = time.time()
         self.wait_for(f"materializer replay through {lsn}", lambda: self.mat.sql(
-            f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;") == "t", self.args.sync_timeout)
+            f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;", timeout=PROBE_TIMEOUT) == "t", self.args.sync_timeout)
         self.timing["replay_s"] = round(time.time() - t0, 1)
         return lsn
 
@@ -603,7 +608,10 @@ DO $$ DECLARE r record; BEGIN
                 else:
                     sql = "CHECKPOINT;"
                 self.writer.sql(sql, timeout=900)
-            except (SqlError, subprocess.TimeoutExpired) as e:
+            except Exception as e:
+                if not isinstance(e, (SqlError, subprocess.TimeoutExpired)):
+                    self.async_failure = Failure("driver_exception", f"DDL worker: {e!r}")
+                    return
                 # a writer fault excuses only the crash's own errors, never a hang
                 if not tolerate.is_set() or not isinstance(e, SqlError) or unexpected_errors(e.stderr):
                     self.async_failure = Failure("ddl_failed", str(e))
@@ -657,6 +665,8 @@ DO $$ DECLARE r record; BEGIN
             chaos.join()
             if bench.poll() is None:
                 bench.kill()
+        if self.async_failure:
+            raise self.async_failure
         if bench.returncode != 0 and not tolerate.is_set():
             raise Failure("workload_failed", f"pgbench rc={bench.returncode}: {out[-1500:]}")
         if bench.returncode != 0 and unexpected_errors(out or ""):
@@ -665,7 +675,7 @@ DO $$ DECLARE r record; BEGIN
         if tolerate.is_set():
             # crash recovery may still be running after a backend SIGKILL
             self.wait_for("writer accepts connections after the injected crash",
-                          lambda: self.writer.sql("SELECT 1;") == "1", 600)
+                          lambda: self.writer.sql("SELECT 1;", timeout=PROBE_TIMEOUT) == "1", 600)
         m = re.search(r"number of transactions actually processed: (\d+)", out or "")
         self.event("burst_done", tx=int(m.group(1)) if m else None, rc=bench.returncode)
 
@@ -681,7 +691,7 @@ DO $$ DECLARE r record; BEGIN
             target = self.writer.sql(q)
             lsn = self.archive_current_wal()
             self.wait_for(f"materializer replay through {lsn}", lambda: self.mat.sql(
-                f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;") == "t", self.args.sync_timeout)
+                f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;", timeout=PROBE_TIMEOUT) == "t", self.args.sync_timeout)
             before = self.query_retry(self.mat, q)
             if self.query_retry(self.mat, f"SELECT '{before}'::pg_lsn >= '{target}'::pg_lsn;") == "t":
                 continue                           # already a restartpoint at the new checkpoint
@@ -816,7 +826,7 @@ recovery_target_action = 'promote'
         # tracked before it starts, so teardown stops it if validation fails
         self.branches.append((tl, b, scratch))
         b.start()
-        self.wait_for(f"branch {tl} promotion", lambda: b.sql("SELECT pg_is_in_recovery();") == "f", 600)
+        self.wait_for(f"branch {tl} promotion", lambda: b.sql("SELECT pg_is_in_recovery();", timeout=PROBE_TIMEOUT) == "f", 600)
         got = self.checksums(b)
         if got != fork_state:
             diff = {t: (fork_state.get(t), got.get(t)) for t in set(fork_state) | set(got)
@@ -846,7 +856,7 @@ recovery_target_action = 'promote'
         if state not in ("deleting", "deleted"):
             raise Failure("delete_branch", f"timeline {tl}: unexpected result {state!r}")
         self.wait_for(f"timeline {tl} deletion", lambda: self.writer.sql(
-            f"SELECT state FROM pagestore_ext.pagestore_timeline_state({tl});") == "deleted",
+            f"SELECT state FROM pagestore_ext.pagestore_timeline_state({tl});", timeout=PROBE_TIMEOUT) == "deleted",
             self.args.sync_timeout)
         self.event("branch_deleted", timeline=tl, seconds=round(time.time() - started, 1),
                    store_kb_before=before, store_kb_after=self.store_kb())
@@ -920,8 +930,13 @@ recovery_target_action = 'promote'
             except (OSError, subprocess.TimeoutExpired):
                 pass
 
-    def teardown(self, preserve_state: bool, interrupted: bool = False) -> None:
+    def stop_sampling(self) -> None:
         self.stop_sampler.set()
+        if self.sampler_thread:
+            self.sampler_thread.join(timeout=300)
+
+    def teardown(self, preserve_state: bool, interrupted: bool = False) -> None:
+        self.stop_sampling()
         for pg in self.computes():
             pg.halt()
         if self.daemon and self.daemon.poll() is None:
@@ -941,7 +956,8 @@ recovery_target_action = 'promote'
 
     def execute(self) -> None:
         self.provision()
-        threading.Thread(target=self.sampler, daemon=True).start()
+        self.sampler_thread = threading.Thread(target=self.sampler, daemon=True)
+        self.sampler_thread.start()
         self.verify_materializer("initial load")
         # the duration counts rounds, not provisioning, and a run has at least one
         deadline = time.time() + self.args.duration
@@ -997,6 +1013,10 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
             failure = Failure("driver_exception", repr(e))
             import traceback
             traceback.print_exc()
+        # a sample still in flight may yet report a breach
+        run.stop_sampling()
+        if failure is None and run.async_failure:
+            failure = run.async_failure
         if failure:
             try:
                 run.dump_diagnostics()
@@ -1058,7 +1078,12 @@ def main() -> int:
     args.root = args.root.resolve()
     args.root.mkdir(parents=True, exist_ok=True)
 
-    seed, failures = args.seed, 0
+    # preserved failure roots (including renamed reruns) count toward --max-failures
+    seed = args.seed
+    failures = sum(1 for d in args.root.glob("run-*") if (d / "FAILURE.json").exists())
+    if args.forever and failures >= args.max_failures:
+        print(f"stopping: {failures} preserved failure roots under {args.root} already", flush=True)
+        return 1
     while True:
         root = args.root / f"run-{seed}"
         ok = one_run(args, seed, root)
