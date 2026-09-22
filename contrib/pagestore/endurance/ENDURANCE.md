@@ -150,6 +150,65 @@ Same seed, scale 1, 4 clients for 20 s (~800 MB of WAL), cassert build: replay
 layers grow; the long runs are the measurement for that.  None of this has
 been measured on a production build yet.
 
+**E-3. Image layers over 2 GiB cannot be read** (seed 2100; fixed in #286).
+`local_read_layer_block()` issued one `pread()` and required the full
+length; Linux returns at most `0x7ffff000` bytes per read and data
+verification reads a layer's whole data section at once, so a layer past
+2 GiB failed every lookup and could never be compacted away.  The
+materializer died with `daemon reported error for op 9` (READV).
+
+**E-6. Writes of WAL-less pages are refused once the fork-metadata
+compaction cutoff passes the fork's definition** (seeds 2101, 2103, 2104;
+open, the dominant failure).  Symptom: a `route_all` compute logs
+`daemon reported error for op 8` (WRITEV) for the same block again and again
+-- `base/5/2840_vm` block 0 on a branch, `base/5/37249_fsm` block 2 on the
+materializer -- until the checkpointer cannot write it and the compute dies
+(FATAL on the materializer, aborted transactions on the branch).  The
+daemon logs nothing.
+
+Root cause, established on the preserved seed-2104 store:
+
+- The relation's FSM fork was defined (`SET`, `GROW` to 3 blocks) at
+  `0/FA14F078`; those events sit in the compacted fork-metadata checkpoint
+  of generation 4, whose cutoff is `0/FFA58DB0` (seq 890109).
+- FSM pages are never WAL-logged, so their `pd_lsn` is 0.  In
+  `append_page_impl()` a zero-LSN relation page becomes a *WAL-less ordered
+  record* whose header LSN is the fork's growth floor
+  (`fe->last_def_lsn` = `0/FA14F078`), and every ordered record must satisfy
+  `fork_meta_mutation_future(hdr_grow_lsn, admission_seq)`, i.e. be
+  lexicographically above the cutoff -- which `0/FA14F078 < 0/FFA58DB0`
+  never is, whatever the admission sequence.  The write is refused with
+  `PS_APPEND_REFUSED_FORKMETA_CUTOFF` even though block 2 already exists
+  (no growth) and the segment could hold it.
+- On the branch the floor is `branch_lsn + 1` (a visibility-map page
+  inherited from the parent keeps a pre-fork `pd_lsn`, so it is *clamped*
+  to that floor); the branch is exempt from the cutoff only while it has no
+  durable page frontier, so after enough branch writes the same refusal
+  appears there.
+
+So every relation's FSM (and any VM page that is dirtied without a WAL
+record) stops being writable on a `route_all` compute as soon as one
+fork-metadata compaction has run past the fork's definition, which on a busy
+store is a matter of an hour.  The soak test never sees it because its
+workload writes every page with a real LSN; the integration scripts are too
+short for a compaction cutover.
+
+Fix direction (not done here -- it touches the ordered-record and recovery
+partition invariants of R4b and needs the design owner): the marker of an
+ordered record that does not grow the fork carries no size information, only
+ordering against same-LSN definitive events; once the cutoff is above the
+floor no same-LSN event can be admitted after it, so such a record could be
+stamped at `max(floor, cutoff_lsn)` (making it "future" by construction)
+or admitted without a marker.  A growth below the cutoff is the harder case.
+Whatever the fix, a unit test that defines a fork, drives a fork-metadata
+cutover past it, and then rewrites an existing block with `pd_lsn = 0` is the
+fail-before evidence.
+
+Also needed: the daemon should log one line for every refused or failed
+READV/WRITEV/BEGIN_DELETE (opcode, timeline, key, block, reason), as it
+already does for artifact refusals.  E-3 and E-6 each took a preserved store
+and a debugger session to explain what one log line would have said.
+
 ## Not covered yet
 
 - **Bounded space.**  Retired branches are deleted through
