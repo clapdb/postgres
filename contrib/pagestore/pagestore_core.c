@@ -7630,16 +7630,18 @@ branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
  * (key, block) visible at read_lsn on 'timeline'; if the timeline never wrote
  * the page (or only after read_lsn), descend to the parent, capping read_lsn at
  * the branch LSN so the branch sees a frozen snapshot of the parent.  Returns
- * the chosen PageVer, or NULL if no ancestor has the page.
+ * 1 with the chosen PageVer, 0 for an unwritten page, or a negative
+ * status for unavailable history.  Byte-serving frontends must propagate errors.
  */
-PageVer *
-read_through(uint32_t timeline, const PsKey *key, uint32_t block,
-			 uint64_t read_lsn, uint64_t read_seq)
+int
+read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, uint64_t read_seq, PageVer **out)
 {
 	TlWalk		w;
 
+	*out = NULL;
 	if (!core_process_valid())
-		return NULL;
+		return -1;
 	w = tl_walk_first(timeline, read_lsn);
 	do
 	{
@@ -7653,29 +7655,43 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (artifact_data_key(key))
 		{
 			int state = artifact_visible(w.tl, key, block, w.lsn, seq_cap, &v, 1);
-			if (state < 0 || state == 2)
-				return NULL;
+			if (state < 0)
+				return -1;
+			if (state == 2)
+				return 0;
 		}
 
 		if (v)
 		{
+			if (fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
+				return 0;
 			/* LSN-0 bytes have no historical visibility proof.  This also
 			 * applies when a newest read becomes capped through ancestry. */
 			if (key->klass == PS_KLASS_RELATION && w.tl != timeline &&
 				v->lsn == 0)
-				return NULL;
-			if (!fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
-				return v;
-			return NULL;
+				return -2;
+			*out = v;
+			return 1;
 		}
 		if (fork_state == FORK_HOP_DEAD ||
 			(fork_state == FORK_HOP_DEF && block >= nb))
-			return NULL;
+			return 0;
 		if (fork_state == FORK_HOP_DEF &&
 			fork_inheritance_fenced(fe, block, w.lsn, seq_cap))
-			return NULL;
+			return 0;
 	} while (tl_walk_next(&w));
-	return NULL;
+	return 0;
+}
+
+/* Index-only callers that do not serve bytes can treat unavailable as absent. */
+PageVer *
+read_through(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, uint64_t read_seq)
+{
+	PageVer *v;
+
+	(void) read_through_checked(timeline, key, block, read_lsn, read_seq, &v);
+	return v;
 }
 
 /*

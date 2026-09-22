@@ -2381,9 +2381,11 @@ test_ordered_parent_after_branch(int walless)
 			check(walless ? rc < 0 : rc == 1 && page[128] == 0x61,
 				  "E6 child never serves later ordered parent bytes");
 			{
-				PageVer *v = read_through(child, &key, 0, UINT64_MAX, 0);
+				PageVer *v;
+				int status = read_through_checked(child, &key, 0, UINT64_MAX, 0, &v);
 
-				check(walless ? v == NULL : v != NULL && v->lsn == 100,
+				check(walless ? status == -2 && v == NULL :
+					  status == 1 && v != NULL && v->lsn == 100,
 					  "E6 in-memory ancestry lookup obeys the same snapshot boundary");
 			}
 			check(meta_request_timeline(child, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&

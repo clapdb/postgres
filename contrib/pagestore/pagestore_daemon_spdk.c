@@ -239,7 +239,7 @@ inspection_completion_required(PsOpcode opcode)
  * writes) normally finish and publish DONE here; inspection-affecting metadata
  * callers pass defer_done so run_request() can publish after the post-lock
  * inspection hook.  Read ops submit their page reads and return, leaving DONE
- * to read_done().  Index pointers from read_through() are dereferenced
+ * to read_done().  Index pointers from read_through_checked() are dereferenced
  * (seg/off taken) synchronously here, never held across the async wait, so a
  * concurrent write reallocating a version array cannot dangle them.
  */
@@ -310,12 +310,18 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 					uint32_t	blk = ch->blocknum + b;
 					/* req_lsn nonzero = a pinned reader's horizon cap;
 					 * 0 keeps the newest (writer) semantics */
-					PageVer    *v = read_through(tl, &ch->key, blk,
+					PageVer    *v;
+					int			result = read_through_checked(tl, &ch->key, blk,
 											 ch->req_lsn ? ch->req_lsn
 											 : UINT64_MAX,
-											 ch->req_seq);
+											 ch->req_seq, &v);
 					BlkCtx	   *bc;
 
+					if (result < 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
 					if (!v)
 					{
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
@@ -350,11 +356,18 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 		case PS_OP_READ_AT:
 			{
 				uint64_t	read_lsn = ch->req_lsn;
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-										 read_lsn, ch->req_seq);
+				PageVer    *v;
+				int			result = read_through_checked(tl, &ch->key, ch->blocknum,
+										 read_lsn, ch->req_seq, &v);
 				ReqState   *rs = &reqstate[i];
 				BlkCtx	   *bc;
 
+				if (result < 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					ps_store_release(&ch->state, PS_STATE_DONE);
+					return;
+				}
 				if (!v)
 				{
 					memset(ch->data, 0, page_size);		/* not found: result 0 */
