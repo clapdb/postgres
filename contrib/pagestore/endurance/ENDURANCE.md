@@ -35,7 +35,8 @@ interleaving, not by a different setup:
 - a WAL-only **writer** (`route_all = off`, `archive_library = 'pagestore'`);
 - a continuous **materializer** (hot standby, `route_all = on`, 32 MB of shared
   buffers so that most reads come from the store);
-- up to `--max-branches` **branch computes**, each created by the installed
+- up to `--max-branches` **branch computes** (0 disables branching; the
+  oldest is retired before a new one is created), each created by the installed
   `pagestore_branch_prepare` controller with
   `--verify-seed-against-materializer`, booted the portable way
   (`pagestore_control_restore --archive-bootstrap`, then
@@ -59,7 +60,9 @@ Each round is a seeded choice of:
    `ADD COLUMN`, bulk churn, `VACUUM (FREEZE)`, `CHECKPOINT`.  Autovacuum runs
    with a 5 s naptime and checkpoints every 30 s / 128 MB.
 2. **One injected event during the burst:** materializer fast restart,
-   immediate stop, `SIGKILL` of its postmaster, a forced restartpoint; writer
+   immediate stop, `SIGKILL` of its postmaster, a forced restartpoint (a
+   writer `CHECKPOINT` is replayed first and the materializer's
+   `pg_control_checkpoint()` must advance); writer
    immediate stop, or `SIGKILL` of one writer backend (crash-restart cycle).
    Orphaned prepared transactions are rolled back afterwards.
 3. **Verify** (below), sometimes after restarting the materializer so that its
@@ -81,6 +84,7 @@ path that does not touch the store.
 | The same hash, new branch vs the writer's state in the quiescent branch window | Writer | Fork-point visibility, SLRU seeding, relation-map/bootstrap install |
 | Writer hash unchanged after only the branch was written | Writer before | Ancestry cutoff leaked a branch write into the parent |
 | Branch hash before vs after a fast or immediate restart following `CHECKPOINT` | The same compute with a warm cache | A branch write did not survive in the store |
+| Every live branch's hash before vs after a coordinated store restart (clean or `SIGKILL`) | The same compute before the restart | Branch-only pages were lost or changed when the store reopened |
 | `sum(bal)` equals its initial value on every compute | Workload invariant | Torn or duplicated transaction effects (covers 2PC and aborts) |
 | Index scan vs sequential scan for one `ev.k` | Same compute | Index and heap disagree |
 | `bt_index_check(idx, heapallindexed => true)` on every btree | amcheck | Structural index corruption |
@@ -109,7 +113,8 @@ each postmaster, store size by top-level directory) and `diagnostics/`
 
 A seed fixes every driver choice (burst lengths, events, DDL, pgbench seeds)
 but not the interleaving of concurrent sessions, so a rerun repeats the
-schedule, not necessarily the failure.  Rule from `RELEASE_VALIDATION.md`: an
+schedule, not necessarily the failure.  Rerunning a seed whose failure root
+is still under `--root` renames that root to `run-<seed>.<mtime>` first.  Rule from `RELEASE_VALIDATION.md`: an
 unexplained failure stays open even if the rerun passes.
 
 ## Findings so far

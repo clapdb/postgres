@@ -565,7 +565,7 @@ DO $$ DECLARE r record; BEGIN
                 time.sleep(2)
                 self.mat.start(tries=60)
             elif event == "mat_checkpoint":
-                self.mat.sql("CHECKPOINT;", check=False)
+                self.force_restartpoint()
             elif event == "writer_immediate":
                 tolerate.set()
                 self.writer.stop("immediate"); self.writer.start()
@@ -590,11 +590,30 @@ DO $$ DECLARE r record; BEGIN
         m = re.search(r"number of transactions actually processed: (\d+)", out or "")
         self.event("burst_done", tx=int(m.group(1)) if m else None, rc=bench.returncode)
 
+    def force_restartpoint(self) -> None:
+        """CHECKPOINT on a standby is a no-op unless a checkpoint record newer
+        than the last restartpoint has been replayed, so give it one and
+        require the restartpoint to advance."""
+        q = "SELECT checkpoint_lsn FROM pg_control_checkpoint();"
+        before = self.query_retry(self.mat, q)
+        self.writer.sql("CHECKPOINT;", timeout=900)
+        lsn = self.archive_current_wal()
+        self.wait_for(f"materializer replay through {lsn}", lambda: self.mat.sql(
+            f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn;") == "t", self.args.sync_timeout)
+        self.mat.sql("CHECKPOINT;", timeout=900)
+        after = self.query_retry(self.mat, q)
+        if self.query_retry(self.mat, f"SELECT '{after}'::pg_lsn > '{before}'::pg_lsn;") != "t":
+            raise Failure("restartpoint", f"materializer restartpoint stayed at {after} after replaying "
+                                          f"a newer writer checkpoint (through {lsn})")
+        self.event("restartpoint", before=before, after=after)
+
     # ---- store restart ---------------------------------------------------
 
     def restart_store(self, crash: bool) -> None:
         """The MVP contract: every attached client stops before the daemon does."""
         self.event("store_restart", crash=crash)
+        # branches are idle between rounds; their writes must survive the store reopening
+        before = {tl: self.checksums(b) for tl, b, _ in self.branches}
         for _, b, _ in self.branches:
             b.stop("fast")
         self.mat.stop("fast")
@@ -605,10 +624,28 @@ DO $$ DECLARE r record; BEGIN
         self.mat.start()
         for _, b, _ in self.branches:
             b.start()
+        for tl, b, _ in self.branches:
+            after = self.checksums(b)
+            if after != before[tl]:
+                diff = {t: (before[tl].get(t), after.get(t)) for t in set(before[tl]) | set(after)
+                        if before[tl].get(t) != after.get(t)}
+                raise Failure("branch_store_restart_mismatch",
+                              f"timeline {tl} changed across a {'crash' if crash else 'clean'} store restart: {diff}")
+            self.check_invariants(b, amcheck=False)
 
     # ---- branches --------------------------------------------------------
 
+    def retire_branch(self) -> None:
+        old_tl, old, old_scratch = self.branches.pop(0)
+        old.stop("fast")
+        shutil.rmtree(old.datadir)
+        shutil.rmtree(old_scratch)
+        self.delete_timeline(old_tl)
+
     def create_branch(self, fork_state: dict[str, str]) -> None:
+        # stay within --max-branches computes, the new one included
+        while self.branches and len(self.branches) >= self.args.max_branches:
+            self.retire_branch()
         tl = self.next_timeline
         self.next_timeline += 1
         prepared = self.root / f"prepared-{tl}"
@@ -687,6 +724,8 @@ recovery_target_action = 'promote'
         (b.datadir / "recovery.signal").touch()
         self.writer.sql(f"SELECT pagestore_ext.pagestore_install_prepared_branch_bootstrap("
                         f"'{prepared}', '{b.datadir}', {tl}, 0, '{redo}', '{ckpt}', '{fork}');")
+        # tracked before it starts, so teardown stops it if validation fails
+        self.branches.append((tl, b, scratch))
         b.start()
         self.wait_for(f"branch {tl} promotion", lambda: b.sql("SELECT pg_is_in_recovery();") == "f", 600)
         got = self.checksums(b)
@@ -695,18 +734,11 @@ recovery_target_action = 'promote'
                     if fork_state.get(t) != got.get(t)}
             raise Failure("branch_mismatch", f"timeline {tl} at fork {fork} != writer's fork state: {diff}")
         self.check_invariants(b, amcheck=True)
-        self.branches.append((tl, b, scratch))
         self.stats["branches"] += 1
         self.event("branch_created", timeline=tl, fork=fork, redo=redo)
         self.exercise_branch(tl, b)
         if self.checksums(self.writer) != fork_state:
             raise Failure("isolation", f"parent contents changed while only branch {tl} was written")
-        while len(self.branches) > self.args.max_branches:
-            old_tl, old, old_scratch = self.branches.pop(0)
-            old.stop("fast")
-            shutil.rmtree(old.datadir)
-            shutil.rmtree(old_scratch)
-            self.delete_timeline(old_tl)
 
     def store_kb(self) -> int:
         out = subprocess.run(["du", "-sk", str(self.store)], capture_output=True, text=True, timeout=300).stdout
@@ -829,7 +861,7 @@ recovery_target_action = 'promote'
                 self.mat.stop("fast"); self.mat.start()
             state = self.verify_materializer("after burst")
             roll = self.rng.random()
-            if roll < self.args.branch_probability:
+            if roll < self.args.branch_probability and self.args.max_branches > 0:
                 self.create_branch(state)
             elif roll < self.args.branch_probability + 0.15:
                 self.restart_store(crash=self.rng.random() < 0.5)
@@ -845,6 +877,11 @@ recovery_target_action = 'promote'
 
 
 def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
+    if root.exists():
+        # a preserved failure of the same seed: keep it, replay beside it
+        old = root.with_name(f"{root.name}.{time.strftime('%Y%m%d-%H%M%S', time.localtime(root.stat().st_mtime))}")
+        root.rename(old)
+        print(f"moved the existing {root.name} to {old.name}", flush=True)
     root.mkdir(parents=True)
     run = Run(args, seed, root)
     started = time.time()
