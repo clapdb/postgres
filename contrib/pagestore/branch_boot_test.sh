@@ -81,11 +81,25 @@ trap cleanup EXIT
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
 "$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &
 DPID=$!
-sleep 0.5
+# Wait for the daemon's READY handshake instead of a fixed delay: an import
+# that races a slow start fails, and the compute then boots over an empty
+# store ("role "postgres" does not exist").
+INSPECT="$BUILD/contrib/pagestore/pagestore_inspect"
+daemon_ready=no
+for _ in $(seq 1 600); do
+	kill -0 "$DPID" 2>/dev/null || break
+	if "$INSPECT" --shm "$SHM" health >/dev/null 2>&1; then
+		daemon_ready=yes
+		break
+	fi
+	sleep 0.05
+done
+[ "$daemon_ready" = yes ] || { echo "FAIL - pagestore daemon did not become ready"; exit 1; }
 
 # The whole database -- catalogs included -- must live on the store for a
 # branch compute to be viable, so import the initdb'd cluster first.
-"$IMPORT" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
+"$IMPORT" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1 ||
+	{ echo "FAIL - could not import the base cluster"; exit 1; }
 
 cat >> "$DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pagestore'
