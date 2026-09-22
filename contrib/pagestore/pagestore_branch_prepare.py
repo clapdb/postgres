@@ -1436,6 +1436,21 @@ class BranchPreparer:
             return dict(self.journal)
         self.discover_recovery_services()
         mode = self.observe_recovery_ownership()
+        # A journal an older controller left with a fork inside a WAL segment
+        # describes a branch that can never boot, whether or not its receipt
+        # was already published.  Refuse to seed, publish or complete it;
+        # restore the services as for any other unrecoverable journal.
+        fork_lsn = self.journal.get("fork_lsn")
+        if isinstance(fork_lsn, str):
+            parse_lsn(fork_lsn)
+            try:
+                self.require_fork_on_segment_boundary(fork_lsn)
+            except BranchPrepareError:
+                try:
+                    self.restore_ambiguous_services(mode)
+                finally:
+                    self.journal_update(self.journal["state"], "recovery_failed")
+                raise
         if state in {
             "started", "preflight_complete", "base_captured", "writer_stopped",
             "writer_restricted", "checkpoint_selected", "checkpoint_archived",
@@ -1494,7 +1509,6 @@ class BranchPreparer:
                 self.journal["checkpoint_end_lsn"]
             ):
                 raise BranchPrepareError("branch journal fork does not cover checkpoint")
-            self.require_fork_on_segment_boundary(self.journal["fork_lsn"])
             seeded = self.prepare_branch(
                 self.journal["base_lsn"],
                 self.journal["checkpoint_redo_lsn"],
@@ -1531,10 +1545,6 @@ class BranchPreparer:
         if state == "branch_prepared":
             if self.journal.get("intent") not in (None, "publish_prepared_receipt"):
                 raise BranchPrepareError("branch journal has a contradictory prepared intent")
-            # a journal an older controller left here may hold a mid-segment
-            # fork; the receipt is what a boot trusts, so check before publishing
-            if entered_state == "branch_prepared":
-                self.require_fork_on_segment_boundary(self.journal["fork_lsn"])
             self.journal_update("prepared", None)
             state = "prepared"
         self.success_restore(run_faults=False)

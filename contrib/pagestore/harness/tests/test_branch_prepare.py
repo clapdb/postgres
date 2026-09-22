@@ -714,7 +714,7 @@ class BranchPrepareTests(unittest.TestCase):
 
         # an unpublished journal from an older controller is checked before
         # its fork is seeded or its receipt published
-        for state in ("fork_captured", "branch_prepared"):
+        for state in ("fork_captured", "branch_prepared", "prepared", "materializer_resumed"):
             journal = MidSegmentFork(config, "1/DD0000E0").new_journal()
             journal.update(state=state, intent=None, base_lsn="0/10", checkpoint_redo_lsn="1/DD000028",
                            checkpoint_end_lsn="1/DD0000A8", switch_lsn="1/DD0000F8",
@@ -727,11 +727,14 @@ class BranchPrepareTests(unittest.TestCase):
             preparer.discover_recovery_services = lambda: None
             preparer.observe_recovery_ownership = lambda: "restricted"
             preparer.success_restore = lambda run_faults=True: None
+            restored = []
+            preparer.restore_ambiguous_services = lambda mode: restored.append(mode)
             with self.assertRaisesRegex(MODULE.BranchPrepareError, "not a WAL segment boundary"):
                 preparer.execute()
-            self.assertNotEqual(
-                json.loads(config.receipt_file.read_text(encoding="utf-8")).get("state"),
-                "prepared", state)
+            self.assertEqual(restored, ["restricted"], state)
+            persisted = json.loads(config.receipt_file.read_text(encoding="utf-8"))
+            self.assertEqual(persisted.get("intent"), "recovery_failed", state)
+            self.assertNotEqual(persisted.get("state"), "complete", state)
             config.receipt_file.unlink()
 
     def test_execute_preserves_fence_after_prepare_unknown_result(self):
