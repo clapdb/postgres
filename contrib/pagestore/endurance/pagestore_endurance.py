@@ -744,6 +744,8 @@ DO $$ DECLARE r record; BEGIN
         self.branches.pop(0)
         shutil.rmtree(old.datadir)
         shutil.rmtree(old_scratch)
+        shutil.rmtree(self.root / f"prepared-{old_tl}")    # a full SLRU snapshot per branch
+        shutil.rmtree(self.root / f"psock-{old_tl}", ignore_errors=True)
         self.delete_timeline(old_tl)
 
     def create_branch(self, fork_state: dict[str, str]) -> None:
@@ -889,6 +891,12 @@ recovery_target_action = 'promote'
     # ---- sampling and diagnostics ---------------------------------------
 
     def sampler(self) -> None:
+        try:
+            self.sample_loop()
+        except Exception as e:                   # sampling stopped: size bounds are no longer enforced
+            self.async_failure = self.async_failure or Failure("driver_exception", f"sampler: {e!r}")
+
+    def sample_loop(self) -> None:
         out = open(self.root / "metrics.jsonl", "a", buffering=1)
         while not self.stop_sampler.wait(self.args.sample_interval):
             rec: dict[str, Any] = {"t": round(time.time(), 1), "round": self.round, "procs": {}}
@@ -1006,14 +1014,12 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
     run = Run(args, seed, root)
     started = time.time()
     failure: Failure | None = None
-    torn_down = False
+    interrupted = False
     try:
         try:
             run.execute()
         except Failure as f:
             failure = f
-        except KeyboardInterrupt:
-            raise
         except Exception as e:                  # a driver bug is still worth a preserved root
             failure = Failure("driver_exception", repr(e))
             import traceback
@@ -1027,22 +1033,27 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
                 run.dump_diagnostics()
             except Exception:
                 pass
-        summary = {"seed": seed, "pass": failure is None, "seconds": round(time.time() - started),
-                   "stats": run.stats, "root": str(root),
-                   "git": subprocess.run(["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
-                                         capture_output=True, text=True).stdout.strip()}
-        if failure:
-            summary.update(kind=failure.kind, detail=failure.detail, round=run.round)
-            run.event("FAILURE", failure=failure.kind, detail=failure.detail)
-        run.teardown(preserve_state=failure is not None)
-        torn_down = True
+            try:
+                run.event("FAILURE", failure=failure.kind, detail=failure.detail)
+            except OSError:
+                pass                            # FAILURE.json below still records it
     except KeyboardInterrupt:
-        # also when the signal lands in failure handling: never leave processes behind
-        if not torn_down:
-            run.teardown(preserve_state=failure is not None, interrupted=True)
+        interrupted = True
+    finally:
+        # whatever happened above -- a signal, a full disk -- never leave processes behind
+        if failure is None and run.async_failure:
+            failure = run.async_failure         # a finding the main thread had not picked up yet
+        run.teardown(preserve_state=failure is not None, interrupted=interrupted)
+    if interrupted:
         if failure is None:
             shutil.rmtree(root, ignore_errors=True)
-        raise
+        raise KeyboardInterrupt
+    summary = {"seed": seed, "pass": failure is None, "seconds": round(time.time() - started),
+               "stats": run.stats, "root": str(root),
+               "git": subprocess.run(["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
+                                     capture_output=True, text=True).stdout.strip()}
+    if failure:
+        summary.update(kind=failure.kind, detail=failure.detail, round=run.round)
     (root / ("FAILURE.json" if failure else "PASS.json")).write_text(json.dumps(summary, indent=1) + "\n")
     with open(args.root / "history.jsonl", "a") as h:
         h.write(json.dumps(summary) + "\n")
