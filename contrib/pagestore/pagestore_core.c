@@ -18260,6 +18260,27 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 		return 0;
 	}
 	qsort(plan->chain, n, sizeof(*plan->chain), prune_version_cmp);
+	/*
+	 * Control consumers use LSN-only horizons, so every retained LSN names
+	 * its newest durable admission.  Collapse retries and successive images
+	 * at that LSN BEFORE applying the generic page plan: above the floor that
+	 * plan retains every tuple, whereas control_chain_keeps() expects one
+	 * authoritative tuple per LSN.  Letting several through made its first
+	 * match keep the oldest image and discard a completed checkpoint's later
+	 * exact-redo image.  Pending copies cannot displace a durable one yet.
+	 */
+	{
+		uint32_t distinct = 0;
+
+		for (uint32_t i = 0; i < n; i++)
+		{
+			if (distinct > 0 && plan->chain[distinct - 1].lsn == plan->chain[i].lsn)
+				plan->chain[distinct - 1] = plan->chain[i];
+			else
+				plan->chain[distinct++] = plan->chain[i];
+		}
+		n = distinct;
+	}
 	plan->nchain = n;
 	if (ps_page_prune_plan(plan->chain, n, (PsPruneFence) {floor, UINT64_MAX},
 						   fences, nfences, keep) < 0)

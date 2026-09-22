@@ -230,22 +230,40 @@ old admission rule. Local cassert validation: 6,220 cutover checks, 77/77
 pagestore Meson tests, and `integration_test.sh` including retained-store reopen.
 These are focused regression results, not multi-day release qualification.
 
-**E-7. Branch preparation intermittently finds no control image for the
-shutdown checkpoint it forks from** (local seed 42, scale 1, `--max-branches
-1`, third branch; open).  The controller stops the writer and forks from its
-shutdown checkpoint (`lsn = redo = 0/40000028`, the first record of a fresh
-segment), restarts it on a private socket, and
-`pagestore_prepare_branch_from_control()` fails four seconds later -- well
-inside its 10 s horizon timeout -- with `branch checkpoint redo is not
-exactly mirrored`.  So the newest mirrored control image at or below
-`0/40000028` still carried an older redo: the shutdown checkpoint's image,
-written by the exiting checkpointer and shipped only by
-`ps_control_exit_drain()` with bounded waits, did not reach the store (or not
-at that LSN).  The two earlier branches of the same run took the identical
-path (`0/14000028`, `0/2F000028`) and passed; the second, like the third,
-directly followed the deletion of the retired branch.  The next step is to
-count `ps_control_dropped` and the exit drain's outcome, and to read the
-control object's versions on the preserved store.
+**E-7. Compaction discards newer control images sharing an LSN** (local
+seed 42, scale 1, `--max-branches 1`, third branch; fixed). The controller
+successfully selected the shutdown checkpoint at `0/40000028`, including its
+exact mirrored image and admission fence, but preparation four seconds later
+failed with `branch checkpoint redo is not exactly mirrored`.
+
+Read-only inspection of the preserved seed-42 segment and image-layer records
+established that this was not an exit-drain loss. At version `0/40000028`,
+segment 201 held both the shutdown-intent image (admission 228245, checkpoint
+redo `0/3F009EE8`) and the completed shutdown checkpoint (admission 228248,
+redo `0/40000028`). Layers 480 and 481 retained only admission 228245.
+
+`control_chain_plan()` passed both tuples above the retained base
+`0/40000000` through the generic page plan. But `control_chain_keeps()` assumed
+one authoritative tuple per LSN and returned false as soon as the first
+same-LSN tuple had a different admission sequence. Thus the newer image was
+dropped and reads reverted to its predecessor. The same path also applies to
+independently versioned control blocks, including the materializer marker.
+
+Control consumers use LSN-only horizons, and mirror retries must remain
+bounded. The fix therefore canonicalizes the plan to the newest **durably
+covered** admission at each LSN before applying retention. Merely keeping all
+same-LSN tuples would avoid this loss but break the existing retry-collapse
+contract. Pending segment-only copies still cannot displace a durable layer
+copy. Paired notes/fences keep their existing rules.
+
+`pagestore_control_prune_test` reproduces the regression with different bytes
+at the same LSN in the image and materializer-marker blocks. It checks latest reads and the resolved admission identity before/after
+compaction and two reopens, then moves
+the retention floor and verifies that superseded versions are reclaimed.
+The old planner fails 14 assertions; the fix passes all 182 checks, the
+77-test pagestore suite, and the PostgreSQL integration test including retained
+store reopen. No format change or controller retry is involved; already-pruned
+versions in an affected store are not repaired.
 
 **E-8. `pagestore_inspect health` reports a dead daemon's segment as
 ready** (CI seed 1, round 5; worked around in the driver).  A daemon killed
