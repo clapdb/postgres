@@ -49,4 +49,11 @@ extern void ps_fuzz_global_init(void);
 extern void ps_fuzz_run_one(const char *target_name,
 							 const uint8_t *data, size_t size);
 
+/* Look up a store-relative path's pristine bytes in the in-memory template
+ * cache built by ps_fuzz_global_init() (e.g. to read another file's real
+ * captured field values for a cross-file checksum fixup -- see
+ * fuzz_crc_fixup.c). Returns NULL if the path is not part of the template. */
+extern const uint8_t *ps_fuzz_template_lookup(const char *relpath,
+											   size_t *len_out);
+
 #endif							/* PS_FUZZ_COMMON_H */

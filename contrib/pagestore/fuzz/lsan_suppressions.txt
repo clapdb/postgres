@@ -1,0 +1,18 @@
+# LeakSanitizer suppressions for the pagestore persisted-format fuzz targets.
+#
+# Round-1 finding (see known-crashes/manifest/
+# leak_memtable_on_post_alloc_open_failure.txt): ps_core_open_impl()
+# (pagestore_core.c) allocates a per-shard memtable via ps_memtable_create()
+# -- and, when cache_pages != 0, a page cache via ps_pgcache_init() -- before
+# several later validation/replay steps that can still fail and return -1.
+# ps_core_open()'s failure-unwind path never frees either allocation, so a
+# store that fails validation after that point leaks a small, bounded amount
+# of memory on every retried open. Real, already-documented, out of scope
+# to fix here (product code is not modified by this harness). Suppressed by
+# function name so any leak whose allocation stack passes through it is
+# ignored, while a leak from anywhere else in the product is still reported
+# and fails the run (round 2, item 3: detect_leaks stays ON during
+# exploration; this is what makes that possible without every single
+# exploration run stopping on run #1's already-known leak).
+leak:ps_memtable_create
+leak:ps_pgcache_init

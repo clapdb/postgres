@@ -64,14 +64,20 @@ COMMON_ARGS=(
 )
 
 echo "== building instrumented fuzz binary (clang -fsanitize=fuzzer,address,undefined) =="
+# --wrap=fsync et al.: round-2 throughput fix, this binary only -- see
+# fuzz_nosync.c's header comment for why and for the "never touches
+# product code" scoping (the replay driver below links real fsync).
 "$CC" "${COMMON_ARGS[@]}" \
   -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
-  "${SRCS[@]}" "$FUZZ_DIR/fuzz_common.c" "$FUZZ_DIR/fuzz_target.c" \
+  -Wl,--wrap=fsync -Wl,--wrap=fdatasync -Wl,--wrap=sync_file_range \
+  "${SRCS[@]}" "$FUZZ_DIR/fuzz_common.c" "$FUZZ_DIR/fuzz_crc_fixup.c" \
+  "$FUZZ_DIR/fuzz_nosync.c" "$FUZZ_DIR/fuzz_target.c" \
   -o "$OUT_DIR/pagestore_format_fuzz"
 
 echo "== building non-instrumented replay driver (plain $CC, no libFuzzer/ASan/UBSan) =="
 "$CC" "${COMMON_ARGS[@]}" \
-  "${SRCS[@]}" "$FUZZ_DIR/fuzz_common.c" "$FUZZ_DIR/fuzz_standalone_driver.c" \
+  "${SRCS[@]}" "$FUZZ_DIR/fuzz_common.c" "$FUZZ_DIR/fuzz_crc_fixup.c" \
+  "$FUZZ_DIR/fuzz_standalone_driver.c" \
   -o "$OUT_DIR/pagestore_format_fuzz_replay"
 
 echo "built: $OUT_DIR/pagestore_format_fuzz"

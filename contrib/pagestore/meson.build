@@ -887,7 +887,8 @@ pagestore_format_fuzz_replay = executable('pagestore_format_fuzz_replay',
         'pagestore_retention.c', 'pagestore_wal_store.c', 'pagestore_wal_segment.c',
         'pagestore_walidx_prune.c', 'pagestore_walidx_snapshot.c',
         'pagestore_forkmeta_prune.c', 'pagestore_forkmeta_snapshot.c',
-        'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_standalone_driver.c'),
+        'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_crc_fixup.c',
+        'fuzz/fuzz_standalone_driver.c'),
   include_directories: include_directories('.'),
   c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
            (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +

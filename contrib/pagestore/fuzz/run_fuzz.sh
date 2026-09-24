@@ -13,18 +13,31 @@
 # Each target's working corpus starts as a copy of fuzz/corpus/<target>
 # (never mutated in place) and any crash/leak/timeout artifact lands in
 # <out-dir>/<target>/crashes/, named by libFuzzer's own content hash.
+#
+# Round 2 (coordinator review) changes from round 1:
+#  - Leak detection is back ON (detect_leaks=1) with
+#    lsan_suppressions.txt silencing only the one already-documented,
+#    already-triaged leak (known-crashes/manifest/
+#    leak_memtable_on_post_alloc_open_failure.txt) so a *new* leak still
+#    stops the run and gets caught, instead of every run stopping on run #1.
+#  - PS_FUZZ_CRC_FIXUP=1 by default (half of iterations get a structure-
+#    aware checksum fixup after mutation -- see fuzz_crc_fixup.c -- the
+#    other half stay pure mutation); pass -f 0 to disable for an apples-
+#    to-apples round-1-style comparison run.
 set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$FUZZ_DIR/build/pagestore_format_fuzz"
 DURATION=720
 OUT_DIR="$FUZZ_DIR/run"
+CRC_FIXUP="${PS_FUZZ_CRC_FIXUP:-1}"
 
-while getopts "d:o:" opt; do
+while getopts "d:o:f:" opt; do
   case "$opt" in
     d) DURATION="$OPTARG" ;;
     o) OUT_DIR="$OPTARG" ;;
-    *) echo "usage: $0 [-d seconds] [-o out-dir] [target ...]" >&2; exit 2 ;;
+    f) CRC_FIXUP="$OPTARG" ;;
+    *) echo "usage: $0 [-d seconds] [-o out-dir] [-f 0|1] [target ...]" >&2; exit 2 ;;
   esac
 done
 shift $((OPTIND - 1))
@@ -71,9 +84,11 @@ for tgt in "${TARGETS[@]}"; do
   (
     cd "$work"
     PS_FUZZ_TARGET="$tgt" \
+    PS_FUZZ_CRC_FIXUP="$CRC_FIXUP" \
     TMPDIR="${TMPDIR:-/tmp}" \
-    ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1:allocator_may_return_null=1:log_path=crashes/asan_report" \
-    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:log_path=crashes/ubsan_report" \
+    ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:allocator_may_return_null=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    LSAN_OPTIONS="suppressions=$FUZZ_DIR/lsan_suppressions.txt" \
     "$BIN" -max_total_time="$DURATION" -max_len="$(max_len_for "$tgt")" \
       -rss_limit_mb=4096 -artifact_prefix=crashes/ \
       corpus/ > run.log 2>&1
