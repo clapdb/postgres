@@ -426,7 +426,9 @@ typedef struct PsChannel
 	uint32_t	nblocks;		/* WAL_INDEX_GET: optional result-page limit */
 	uint32_t	old_nblocks;		/* RETENTION_PIN_{SET,DROP}: generation */
 	uint32_t	timeline;		/* timeline this op targets (0 = main) */
-	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor timeline */
+	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor
+								 * timeline; artifact BEGIN/COMMIT/DROP/WRITE:
+								 * PS_ARTIFACT_REQ_SUPERSEDABLE or 0 */
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
 	uint32_t	pad1;			/* WAL_INDEX_GET: cursor is present */
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
@@ -448,6 +450,17 @@ typedef struct PsChannel
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];
 } PsChannel;
+
+/*
+ * An automatic generation (the checkpoint-driven reader snapshot) marks its
+ * artifact requests with this value in parent_timeline.  A refusal because
+ * the generation's LSN is below the page-reclaimed frontier and unfenced then
+ * means a newer checkpoint already superseded it -- no reader can pin that
+ * generation any more -- so the daemon logs it as superseded rather than as
+ * a refused artifact operation.  The client still receives the refusal and
+ * its reason; every other refusal and every unmarked request is unchanged.
+ */
+#define PS_ARTIFACT_REQ_SUPERSEDABLE	0x53555044u	/* "SUPD" */
 
 /* The generation is written before the release that publishes REQUEST and is
  * never reset when a channel is reclaimed.  A zero value is the initial

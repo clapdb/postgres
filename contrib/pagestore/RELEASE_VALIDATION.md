@@ -664,6 +664,53 @@ and are now resolved.
   admission gate -- specifically to exercise the theoretical gap) in
   `pagestore_forkmeta_cutover_test.c`.
 
+## Resolved: a superseded automatic reader snapshot tripped the R5-2 refusal check
+
+`integration_test.sh` failed intermittently (four CI occurrences, one local)
+on its final R5-2 assertion with one daemon line of the form `artifact BEGIN
+refused: reason=generation LSN below the page-reclaimed frontier and unfenced
+timeline=0 key=(klass=6,spc=0,db=0,rel=1,...)`: the DATA object of the
+*automatic* checkpoint reader snapshot, at a checkpoint's redo.
+
+Mechanism: the control ship enqueues the automatic job for checkpoint B after
+B's note is durable and B's admission fence has ended; the reader snapshot
+worker builds it asynchronously (XID scan, WAL scan to `scan_end`) and only
+then BEGINs.  If checkpoint C's note becomes durable meanwhile, the
+direct-write compute's page-history cutoff (`control_checkpoint_cutoff()`)
+moves to C's redo, maintenance publishes a page-reclaimed frontier past B's
+redo, and B's BEGIN is -- correctly -- refused as unfenced: nothing pins B,
+so no reader could ever pin that generation either.  Section 28 (two
+back-to-back `CHECKPOINT`s with no page-history pin) hit the window by
+timing.
+
+Fix: the refusal is right; reporting it as a refused operation was not.  The
+worker publishes in an automatic-generation mode
+(`pagestore_localsvc_artifact_supersedable()`): its artifact requests carry
+`PS_ARTIFACT_REQ_SUPERSEDABLE` in `parent_timeline`, the daemon logs an
+unfenced refusal of such a request as `artifact ... superseded` instead of
+`refused`, and the worker skips the job with a LOG line rather than a
+WARNING.  Every other refusal, and every refusal of an unmarked (for example
+controller-published exact-R) request, is reported exactly as before; no
+persisted format changes and no `PS_SHM_VERSION` bump (the field is unused
+for artifact operations, and an unmarked request keeps the old behaviour).
+Liveness: the newest job's redo is the newest durable note's redo, which is
+the cutoff, so the newest job is never unfenced; a superseded job is always
+followed by the newer job that superseded it.  Only a sustained checkpoint
+rate faster than one build can keep every job superseded -- and a generation
+built in that regime could not be pinned by any reader anyway.  Fencing each
+queued job until it commits was considered and rejected for that reason: it
+would add a leak-prone in-memory hold (crashed worker, restarted daemon,
+overwritten pending job) only to publish generations whose page history is
+reclaimed the moment the hold is released.  Consumers that need the history
+pin it first, as section 31 does.
+
+Test: section 28c holds the worker before its first BEGIN
+(`PAGESTORE_TEST_READER_SNAPSHOT_HOLD`), checkpoints until the store's durable
+timeline-0 page frontier (`page-prune.frontiers`) passes the held redo, then
+releases it and requires the `superseded` outcome, no new refusal line, and
+publication of the newest checkpoint's snapshot.  Before the fix it fails
+deterministically (`got 'failed'` and one new refusal line).
+
 ## Resolved: pruned ordered marker rescanned after a timeline-delete rewrite (F3)
 
 **Root cause.** The deletion rewrite moved bytes and retreated (rebased) the
