@@ -5067,6 +5067,21 @@ op_create_at_status(uint32_t rel, int32_t fork, uint64_t lsn)
 	return ch->status;
 }
 
+/* Like op_create_at_status() but on an explicit timeline (for a CREATE
+ * retry issued directly on a branch whose own CREATE is only inherited). */
+static int
+op_create_at_tl_status(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = lsn;
+	cl_exec();
+	return ch->status;
+}
+
 /* Read the pg_control image as-of 'lsn' on 'timeline'.  Mirrors
  * check_bugb_control_image()'s careful reset of every request field (the
  * channel is reused across op kinds, and PS_OP_READ_AT echoes its own
@@ -5588,6 +5603,55 @@ run_bugb_ancestry_suite(const char *daemon_path, const char *tmpbase)
 			  "fork event: timeline 2 still sees rel500 at its inherited CREATE size (got %u; timeline 1's stale TRUNCATE, colliding with an inherited CREATE, did not leak through)",
 			  ch->result);
 	}
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	/*
+	 * Codex round-3 review finding 4098831601: root CREATEs rel700 at
+	 * L=1500 and writes a page to it; timeline 1 forks from root at 2000
+	 * (inherits the CREATE and the page, no local fork-meta history);
+	 * timeline 2 forks from timeline 1 at 1800 (a live descendant of
+	 * timeline 1, the fence that drives promotion).  Timeline 1 then
+	 * RETRIES the SAME CREATE at L=1500 -- an idempotent retry, not a new
+	 * mutation.  Once fork_meta_lsn_promote() became ancestry-aware
+	 * (finding 4098328776, round 2), it finds timeline 1's INHERITED
+	 * CREATE and can promote the retry above timeline 2's cap; a
+	 * local-only idempotence check then also misses the duplicate at the
+	 * promoted position and persists a fresh zero-block FEV_SET, hiding
+	 * every inherited page.  The retry must instead succeed idempotently,
+	 * with timeline 1 (and timeline 2) still seeing the inherited page.
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbanc3", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbanc3", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	op_create_at(700, 0, 1500);
+	fill_page(p, ps, 1500, 0x66);
+	op_write_tl(0, 700, 0, 0, p);
+	op_create_branch(1, 0, 2000);
+	op_create_branch(2, 1, 1800);
+
+	check(op_create_at_tl_status(1, 700, 0, 1500) == PS_STATUS_OK,
+		  "fork event: a CREATE retry on timeline 1 for its inherited CREATE at L is idempotent");
+	check(op_nblocks_tl(1, 700, 0) == 1,
+		  "fork event: timeline 1 still sees the inherited page after the CREATE retry (got %u)",
+		  op_nblocks_tl(1, 700, 0));
+	op_read_tl(1, 700, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x66),
+		  "fork event: timeline 1's inherited page bytes survive the CREATE retry");
+	check(op_nblocks_tl(2, 700, 0) == 1,
+		  "fork event: timeline 2 still sees the inherited page after timeline 1's CREATE retry (got %u)",
+		  op_nblocks_tl(2, 700, 0));
+	op_read_tl(2, 700, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x66),
+		  "fork event: timeline 2's inherited page bytes survive timeline 1's CREATE retry");
 
 	client_detach();
 	stop_daemon(dpid);

@@ -8024,6 +8024,69 @@ fork_newest_visible_lsn_through(uint32_t timeline, const PsKey *key)
 }
 
 /*
+ * Find the newest DEFINITIVE (SET/DEAD) fork-meta event visible through
+ * 'timeline's ancestry (tl_walk, each level capped by branch_lsn exactly
+ * like fork_newest_visible_lsn_through() above), skipping ordinary FEV_GROW
+ * page-growth bookkeeping via each level's own e->def_idx -- the "is this
+ * genuinely the fork's current terminal state" notion the CREATE-retry
+ * idempotence check needs (Codex review finding 4098831601): for a retry on
+ * a non-root timeline whose original CREATE is only INHERITED (never
+ * stored locally on that timeline), a local-only check sees no definitive
+ * event at all, so fork_meta_lsn_promote() -- now ancestry-aware -- can bump
+ * the retry above a descendant fence or the key's newest inherited page,
+ * after which the (still local-only) idempotence check misses the
+ * duplicate at the promoted position too and a fresh zero-block FEV_SET
+ * gets persisted on top of the real one, hiding every inherited page.
+ * *found_out is 0 (with the other outputs left at their zero default) when
+ * nothing definitive is visible anywhere in the ancestry.  Caller holds
+ * this shard's write lock; takes map_rd internally.
+ */
+static void
+fork_newest_definitive_event_through(uint32_t timeline, const PsKey *key,
+									 uint64_t *lsn_out, uint8_t *kind_out,
+									 uint32_t *nblocks_out, int *found_out)
+{
+	TlWalk		w;
+	uint64_t	newest_lsn = 0;
+	uint8_t		newest_kind = 0;
+	uint32_t	newest_nblocks = 0;
+	int			found = 0;
+
+	ps_lock_map_rd();
+	w = tl_walk_first(timeline, UINT64_MAX);
+	do
+	{
+		ForkEnt    *e = fork_find(w.tl, key);
+
+		if (e == NULL)
+			continue;
+		for (int i = (int) e->ndef - 1; i >= 0; i--)
+		{
+			const ForkEvent *v = &e->ev[e->def_idx[i]];
+
+			if (v->lsn > w.lsn)
+				continue;
+			if (!found || v->lsn > newest_lsn)
+			{
+				newest_lsn = v->lsn;
+				newest_kind = v->kind;
+				newest_nblocks = v->nblocks;
+				found = 1;
+			}
+			break;
+		}
+	} while (tl_walk_next(&w));
+	ps_unlock_map();
+	*lsn_out = newest_lsn;
+	if (kind_out != NULL)
+		*kind_out = newest_kind;
+	if (nblocks_out != NULL)
+		*nblocks_out = newest_nblocks;
+	if (found_out != NULL)
+		*found_out = found;
+}
+
+/*
  * Timeline metadata is persisted as an append-only log of fixed records in
  * "<store>/timelines", so branches survive a daemon restart.  (The page data
  * itself is already durable in the segments.)
@@ -17261,19 +17324,40 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 					has_fence = 1;
 					break;
 				}
-		if (has_fence)
-			pthread_mutex_lock(&artifact_fence_lock);
+		/*
+		 * Codex review finding 4098831587: take artifact_fence_lock for
+		 * EVERY colliding control admission, not only when has_fence is
+		 * already true from THIS sample.  An empty (or fence-free) sample
+		 * is exactly as exposed to the race as a non-empty one: another
+		 * shard's SLRU/reader-snapshot append can still register a NEW
+		 * artifact fence at or above hdr.lsn, under only
+		 * artifact_fence_lock, in the window between releasing map-wr here
+		 * and this record's eventual page_add_version() below -- an empty
+		 * sample proves nothing about what gets registered immediately
+		 * after it.  Locking unconditionally on any collision (still while
+		 * map-wr is held, so no other thread can even reach
+		 * artifact_fence_reserve()'s map_rd in the gap -- same reasoning
+		 * and same page_prune_lock -> map -> artifact_fence_lock order as
+		 * before) closes that window whether or not this sample found a
+		 * fence.  When it did not, hdr.lsn is deliberately left unchanged
+		 * below (no promotion) -- the lock is what protects an honest
+		 * unpromoted position, not a change to it.
+		 */
+		pthread_mutex_lock(&artifact_fence_lock);
 		ps_unlock_map();
 		pthread_rwlock_unlock(&page_prune_lock);
+		artifact_fence_locked = 1;
+		control_fence_done = 1;
 		if (rc != 0)
 		{
 			free(cfences);
+			pthread_mutex_unlock(&artifact_fence_lock);
+			artifact_fence_locked = 0;
 			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
 		}
 		if (has_fence)
 		{
-			artifact_fence_locked = 1;
 			if (hdr.lsn < newest)
 				hdr.lsn = newest;
 			for (uint32_t i = 0; i < ncfences; i++)
@@ -17295,7 +17379,6 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				}
 			}
 			clamped = 1;
-			control_fence_done = 1;
 		}
 		free(cfences);
 	}
@@ -21069,19 +21152,54 @@ ps_handle_meta(PsChannel *ch)
 				 * another CREATE, something that actually changed the
 				 * fork's lifecycle state since -- makes this not a pure
 				 * retry.
+				 *
+				 * Codex review finding 4098831601: 'e' alone is not enough
+				 * either, once fork_meta_lsn_promote() became ancestry-aware
+				 * (page_has_version_at_ancestry()/fork_event_exists_at_ancestry(),
+				 * this file).  A CREATE retry on a non-root timeline whose
+				 * ORIGINAL CREATE is only INHERITED -- never stored locally
+				 * on 'tl' -- has e->ndef == 0 here regardless, so a
+				 * local-only check never finds it; promotion, however, DOES
+				 * now find the inherited CREATE through ancestry and can
+				 * bump the retry's lsn past a descendant fence or the key's
+				 * newest inherited page, and the local-only check then also
+				 * misses the duplicate at the promoted position, persisting
+				 * a fresh zero-block FEV_SET that hides every inherited
+				 * page.  fork_newest_definitive_event_through() applies the
+				 * same "newest DEFINITIVE event, skipping GROW" rule through
+				 * the same ancestry tl_walk() promotion itself now uses.
 				 */
 				{
-					const ForkEvent *newest_def = e->ndef != 0 ?
-						&e->ev[e->def_idx[e->ndef - 1]] : NULL;
+					uint64_t	def_lsn;
+					uint8_t		def_kind;
+					uint32_t	def_nblocks;
+					int			def_found;
 
-					if (newest_def != NULL && newest_def->lsn == lsn &&
-						newest_def->kind == FEV_SET &&
-						newest_def->nblocks == 0)
+					fork_newest_definitive_event_through(tl, &ch->key,
+														 &def_lsn, &def_kind,
+														 &def_nblocks,
+														 &def_found);
+					if (def_found && def_lsn == lsn &&
+						def_kind == FEV_SET && def_nblocks == 0)
 						break;
 				}
 
 				seq = admission_seq_alloc();
 				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
+				/*
+				 * Codex review finding 4098831579: validate the caller's
+				 * ORIGINAL (req_lsn, seq) tuple against the forkmeta
+				 * snapshot cutover before trusting the (possibly promoted)
+				 * 'lsn' -- promotion can push an explicit, below-cutoff
+				 * mutation above a live descendant/pin fence, after which
+				 * fork_meta_persist() below would see only the promoted lsn
+				 * and accept a tuple the cutover requires rejecting.  Same
+				 * check the nearby ZEROEXTEND case already applies to
+				 * ch->req_lsn before fork_grow_with_seq().
+				 */
+				if (seq != 0 && ch->req_lsn != 0 &&
+					!fork_meta_mutation_future(ch->req_lsn, seq))
 					seq = 0;
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -21172,6 +21290,13 @@ ps_handle_meta(PsChannel *ch)
 
 				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
 					seq = 0;
+				/* Codex review finding 4098831579: validate the ORIGINAL
+				 * (req_lsn, seq) tuple against the forkmeta snapshot
+				 * cutover before trusting the possibly-promoted 'lsn' --
+				 * see the identical check in the CREATE case above. */
+				if (seq != 0 && ch->req_lsn != 0 &&
+					!fork_meta_mutation_future(ch->req_lsn, seq))
+					seq = 0;
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
@@ -21240,6 +21365,13 @@ ps_handle_meta(PsChannel *ch)
 				int			delayed;
 
 				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
+				/* Codex review finding 4098831579: validate the ORIGINAL
+				 * (req_lsn, seq) tuple against the forkmeta snapshot
+				 * cutover before trusting the possibly-promoted 'lsn' --
+				 * see the identical check in the CREATE case above. */
+				if (seq != 0 && ch->req_lsn != 0 &&
+					!fork_meta_mutation_future(ch->req_lsn, seq))
 					seq = 0;
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
 

@@ -5235,6 +5235,7 @@ main(void)
 	PsKey lazy_fsm_key = {1, 1, 1, 2, PS_KLASS_RELATION};
 	PsKey delayed_create_key = {1, 1, 5, 0, PS_KLASS_RELATION};
 	PsKey ancestry_key = {1, 1, 6, 0, PS_KLASS_RELATION};
+	PsKey round3_reject_key = {1, 1, 7, 0, PS_KLASS_RELATION};
 	PsKey invalid_marker_key = {3, 3, 333, 0, PS_KLASS_RELATION};
 	PsKey invalid_unbound_key = {3, 3, 334, 0, PS_KLASS_RELATION};
 	PsKey torn_tail_key = {3, 3, 335, 0, PS_KLASS_RELATION};
@@ -5270,6 +5271,18 @@ main(void)
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
 		  "arm conservative forkmeta trigger");
 	check(ps_core_open(store) == 0, "open runtime cutover store");
+	/*
+	 * Codex round-3 review finding 4098831579: created early, well before
+	 * any cutover is ever selected, so its CREATE becomes real retained
+	 * pre-cutover history (nothing else ever touches this key, so
+	 * forkmeta compaction has no later event to consolidate it into).
+	 * Reused much further below, once a cutover and a descendant fence are
+	 * both in place, to prove an explicit mutation below the cutoff that
+	 * collides with this retained event is rejected, not rescued by
+	 * promotion.
+	 */
+	check(meta_request(PS_OP_CREATE, &round3_reject_key, 50, 0, 0, 0, NULL),
+		  "round 3: create key with real pre-cutover history for the later below-cutoff-collision rejection check");
 	check(meta_request(PS_OP_CREATE, &page_key, 100, 0, 0, 0, NULL),
 		  "create fork before page history");
 	check(append_relation(&page_key, 0, 100, page, &first_seq) == 0,
@@ -5779,6 +5792,32 @@ main(void)
 			  meta_request_timeline(1, PS_OP_NBLOCKS, &ancestry_key,
 								   page_lsn + 1, 0, 0, 0, &reply) && reply.result == 2,
 			  "child operational truncate preserves inherited pre-mutation history");
+	}
+	{
+		/*
+		 * Codex round-3 review finding 4098831579: an explicit UNLINK or
+		 * TRUNCATE below the durable forkmeta snapshot cutoff, colliding
+		 * with a retained event (round3_reject_key's real CREATE@50,
+		 * created at the very top of this test, well before this cutover
+		 * was ever selected), must be REJECTED -- not rescued into
+		 * acceptance by fork_meta_lsn_promote() bumping it above a live
+		 * descendant fence.  A descendant branch with a cap at/above the
+		 * cutoff supplies that fence: without the fix,
+		 * fence_promote_lsn() promotes the mutation's lsn comfortably
+		 * above the cutoff (to sort after the branch's own frozen view),
+		 * and fork_meta_persist() then validates only that PROMOTED
+		 * position -- never the caller's real, below-cutoff request.
+		 */
+		uint64_t	fence_branch_lsn = header.cutoff_lsn + 500;
+
+		check(create_branch_request(9, 0, fence_branch_lsn),
+			  "round 3: create a descendant fence at/above the cutoff");
+		check(!meta_request(PS_OP_TRUNCATE, &round3_reject_key,
+							 50, 0, 3, 0, NULL),
+			  "round 3: an explicit TRUNCATE below the cutoff colliding with a retained event is rejected, not rescued by promotion above the descendant fence");
+		check(!meta_request(PS_OP_UNLINK, &round3_reject_key,
+							 50, 0, 0, 0, NULL),
+			  "round 3: an explicit UNLINK below the cutoff colliding with the same retained event is also rejected");
 	}
 	close_runtime();
 	test_legacy_only_deletion_filtered_forkmeta();
