@@ -74,3 +74,11 @@ PAGESTORE_FAULT_POINT(RETENTION_APPEND_AFTER_WRITE, "retention_append.after_writ
 // after the durable pending intent (old_nrecords == new_nrecords) is
 // installed and before retention.state is written for the first time.
 PAGESTORE_FAULT_POINT(RETENTION_BOOTSTRAP_AFTER_PENDING, "retention_bootstrap.after_pending", "store", "process_abort", "crash", 1, 1)
+// retention_begin_pending()'s own atomic publish of retention.pending.tmp:
+// after the tmp file is created and before it is written (a crash here
+// leaves a 0-byte tmp), and after the tmp file is fully written and
+// fsync'd and before it is renamed into place (a crash here leaves a
+// complete but not-yet-visible tmp).  Neither window has touched
+// retention.pending or the log itself.
+PAGESTORE_FAULT_POINT(RETENTION_PENDING_AFTER_CREATE, "retention_pending.after_create", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(RETENTION_PENDING_AFTER_TMP_SYNC, "retention_pending.after_tmp_sync", "store", "process_abort", "crash", 1, 1)

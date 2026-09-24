@@ -466,6 +466,81 @@ setup_state_stripped_store(const char *store)
 	return unlink(state_path) == 0;
 }
 
+/*
+ * Round-2 finding #1: the log a state-only bootstrap installs state over
+ * predates crash-safe mutation and can carry the same kind of harmless torn
+ * tail (a short, incomplete final record) the ordinary committed-prefix
+ * replay path has always tolerated (see the "short final record is
+ * recoverable" contract in pagestore_retention_test.c).  Before the fix,
+ * bootstrap's own committed-prefix check demanded an exact size match, so a
+ * crash at retention_bootstrap.after_pending -- before the non-crashed path's
+ * own truncation of that same tail -- made recovery reject the store
+ * forever.
+ */
+static int
+run_bootstrap_torn_tail_case(void)
+{
+	char		store[] = "/tmp/psretentioncrashbstornXXXXXX";
+	char		meta_path[1700];
+	char		fault_dir[1600];
+	pid_t		pid;
+	int			status;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	if (!setup_state_stripped_store(store))
+	{
+		remove_tree(store);
+		return 0;
+	}
+	if (snprintf(meta_path, sizeof(meta_path), "%s/retention.meta",
+				 store) < 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	{
+		int			fd = open(meta_path, O_WRONLY | O_APPEND);
+		int			wrote = fd >= 0 &&
+			write(fd, "short", 5) == 5 && fsync(fd) == 0;
+
+		if (fd >= 0 && close(fd) != 0)
+			wrote = 0;
+		check(wrote, "append an incomplete tail before the bootstrap crash "
+			  "(test setup)");
+		if (!wrote)
+		{
+			remove_tree(store);
+			return 0;
+		}
+	}
+	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
+		mkdir(fault_dir, 0700) != 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	pid = fork();
+	if (pid == 0)
+		run_bootstrap_child(store, fault_dir);
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid &&
+		WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT;
+	check(ok, "state bootstrap after_pending on a store with a torn tail");
+	if (ok)
+	{
+		check(snapshot_matches_expected(store, 0),
+			  "first reopen recovers the expected pin set after an "
+			  "interrupted torn-tail bootstrap");
+		check(snapshot_matches_expected(store, 0),
+			  "second restart after an interrupted torn-tail bootstrap is "
+			  "idempotent");
+	}
+	remove_tree(fault_dir);
+	remove_tree(store);
+	return ok;
+}
+
 static int
 run_bootstrap_case(void)
 {
@@ -517,6 +592,11 @@ run_bootstrap_case(void)
  * through the pending-intent protocol), but it is exactly the
  * "unrecognized intent" class retention_read_pending()/verify_v2_prefix()
  * exist to catch, so it is exercised directly here.
+ *
+ * The corruption must land *inside* the committed prefix (flip a byte of an
+ * existing record), not merely extend the file: appending fewer than
+ * sizeof(PsRetentionRecord) bytes is now the tolerated torn-tail case (see
+ * run_bootstrap_torn_tail_case()), so it would no longer prove a mismatch.
  */
 static int
 run_bootstrap_mismatch_case(void)
@@ -556,11 +636,21 @@ run_bootstrap_mismatch_case(void)
 	if (ok)
 	{
 		/* Simulate the log changing out from under the interrupted
-		 * bootstrap: the pending intent's recorded (old_nrecords, old_hash)
-		 * no longer matches what is on disk. */
-		int			fd = open(meta_path, O_WRONLY | O_APPEND);
-		int			wrote = fd >= 0 &&
-			write(fd, "\0", 1) == 1 && close(fd) == 0;
+		 * bootstrap: flip a byte inside the first committed record so the
+		 * pending intent's recorded (old_nrecords, old_hash) no longer
+		 * matches what is on disk, without changing retention.meta's size
+		 * (a size change alone is the tolerated torn-tail case). */
+		int			fd = open(meta_path, O_RDWR);
+		unsigned char byte = 0;
+		int			wrote = fd >= 0 && pread(fd, &byte, 1, 0) == 1;
+
+		if (wrote)
+		{
+			byte ^= 0x40;
+			wrote = pwrite(fd, &byte, 1, 0) == 1 && fsync(fd) == 0;
+		}
+		if (fd >= 0 && close(fd) != 0)
+			wrote = 0;
 
 		check(wrote, "corrupting retention.meta under the pending bootstrap "
 			  "succeeds (test setup)");
@@ -643,6 +733,146 @@ run_pending_trailing_bytes_case(void)
 	return ok;
 }
 
+/*
+ * Round-2 finding #3: retention_begin_pending() now publishes
+ * retention.pending atomically via a private retention.pending.tmp, fsync,
+ * rename.  A crash before the rename can leave that tmp file behind, with
+ * either partial contents (a crash right after O_CREAT, before any bytes
+ * are written -- retention_pending.after_create) or complete contents (a
+ * crash after the tmp is fully written and fsync'd, before the rename --
+ * retention_pending.after_tmp_sync).  Neither window has touched
+ * retention.pending or the log itself, so the next open must remove the
+ * leftover tmp and proceed as if nothing had been attempted.
+ */
+static void
+run_pending_tmp_leftover_child(const char *store, const char *fault_dir,
+							   const char *fault_name)
+{
+	PsRetentionPin pin;
+
+	if (!configure_fault(store, fault_dir, fault_name))
+		_exit(2);
+	if (ps_retention_open(store) != 0)
+		_exit(2);
+	if (!arm_fault(fault_dir))
+		_exit(2);
+	make_pin(&pin, PS_RETENTION_OWNER_READER, PIN_A_OWNER,
+			 PS_RETENTION_RESOURCE_PAGE_HISTORY, 1000, 1, 1);
+	(void) ps_retention_set(&pin);
+	_exit(3);					/* the fault should have fired already */
+}
+
+static int
+run_pending_tmp_leftover_case(const char *fault_name, const char *label)
+{
+	char		store[] = "/tmp/psretentioncrashtmpleftoverXXXXXX";
+	char		fault_dir[1600];
+	char		tmp_path[1700];
+	pid_t		pid;
+	int			status;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
+		mkdir(fault_dir, 0700) != 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	pid = fork();
+	if (pid == 0)
+		run_pending_tmp_leftover_child(store, fault_dir, fault_name);
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid &&
+		WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT;
+	check(ok, label);
+	if (ok)
+	{
+		PsRetentionPin *pins = NULL;
+		uint32_t	count = 0;
+		int			path_ok = snprintf(tmp_path, sizeof(tmp_path),
+										"%s/retention.pending.tmp", store) > 0;
+
+		check(path_ok, "retention.pending.tmp path fits (test setup)");
+		check(ps_retention_open(store) == 0,
+			  "reopen after a leftover retention.pending.tmp succeeds");
+		check(ps_retention_snapshot_alloc(&pins, &count) == 0 && count == 0,
+			  "the never-begun mutation left no pin behind");
+		free(pins);
+		pins = NULL;
+		if (path_ok)
+			check(access(tmp_path, F_OK) != 0 && errno == ENOENT,
+				  "the leftover retention.pending.tmp is removed on open");
+		ps_retention_close();
+		check(ps_retention_open(store) == 0,
+			  "second restart after a leftover retention.pending.tmp is "
+			  "idempotent");
+		check(ps_retention_snapshot_alloc(&pins, &count) == 0 && count == 0,
+			  "still no pin after the second restart");
+		free(pins);
+		ps_retention_close();
+	}
+	remove_tree(fault_dir);
+	remove_tree(store);
+	return ok;
+}
+
+/*
+ * Addendum: the continuous op-sequence fuzzer independently reproduced this
+ * exact bug in production against an unpatched (pre-atomic-publish) daemon:
+ * a SIGKILL landed after retention_begin_pending()'s open(O_CREAT|O_EXCL)
+ * succeeded but before its write() ran, leaving a 0-byte retention.pending
+ * (failure root 20260925T042327-w2-seed1211994399 in the fuzz corpus).  The
+ * atomic tmp+rename publish above makes the *new* code structurally unable
+ * to reproduce this again (retention.pending itself is only ever created by
+ * a rename, which is atomic), but a store still carrying that leftover
+ * artifact -- from an older build, or from this exact fuzz run -- must open
+ * cleanly with a patched daemon rather than being refused forever.
+ */
+static int
+run_short_pending_compat_case(void)
+{
+	char		store[] = "/tmp/psretentioncrashshortpendXXXXXX";
+	char		pending_path[1700];
+	int			fd;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	ok = populate_store(store);
+	check(ok, "populate a store for the short-pending compatibility case");
+	ps_retention_close();
+	if (ok)
+	{
+		ok = snprintf(pending_path, sizeof(pending_path),
+					  "%s/retention.pending", store) > 0;
+		check(ok, "retention.pending path fits (test setup)");
+	}
+	if (ok)
+	{
+		/* Reproduce the fuzzer's exact artifact: a 0-byte retention.pending,
+		 * exactly what the old in-place O_CREAT|O_EXCL write left behind by
+		 * a crash between the create and the write. */
+		fd = open(pending_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		ok = fd >= 0 && close(fd) == 0;
+		check(ok, "create a 0-byte retention.pending (test setup)");
+	}
+	if (ok)
+	{
+		check(snapshot_matches_expected(store, 0),
+			  "a 0-byte leftover retention.pending from an old build opens "
+			  "cleanly and recovers the expected pin set instead of being "
+			  "permanently refused");
+		check(access(pending_path, F_OK) != 0 && errno == ENOENT,
+			  "the 0-byte retention.pending is removed on open");
+		check(snapshot_matches_expected(store, 0),
+			  "second restart after the 0-byte leftover marker is "
+			  "idempotent");
+	}
+	remove_tree(store);
+	return ok;
+}
+
 int
 main(void)
 {
@@ -661,9 +891,23 @@ main(void)
 		ok = 0;
 	if (!run_bootstrap_case())
 		ok = 0;
+	if (!run_bootstrap_torn_tail_case())
+		ok = 0;
 	if (!run_bootstrap_mismatch_case())
 		ok = 0;
 	if (!run_pending_trailing_bytes_case())
+		ok = 0;
+	if (!run_pending_tmp_leftover_case("retention_pending.after_create",
+									   "pending-tmp leftover with partial "
+									   "contents (crash after create, "
+									   "before write)"))
+		ok = 0;
+	if (!run_pending_tmp_leftover_case("retention_pending.after_tmp_sync",
+									   "pending-tmp leftover with complete "
+									   "contents (crash after tmp fsync, "
+									   "before rename)"))
+		ok = 0;
+	if (!run_short_pending_compat_case())
 		ok = 0;
 	printf("pagestore_retention_crash_test: %d checks, %d failed\n",
 		   checks, failures);
