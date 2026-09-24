@@ -1427,17 +1427,50 @@ main(int argc, char **argv)
 		perror("shm_open");
 		return 1;
 	}
-	/* Acquire byte zero before byte one.  Byte zero gates the destructive
+	/*
+	 * Acquire byte zero before byte one.  Byte zero gates the destructive
 	 * initialization and is retained until READY; byte one is the daemon
-	 * process-lifetime lease. */
-	if (set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0)
+	 * process-lifetime lease.
+	 *
+	 * Clients now briefly take a *shared* lock on byte zero while checking
+	 * whether the segment is ready (ps_shm_hold_init_shared(), see
+	 * pagestore_shm.h) -- an orchestrator polling health across a daemon
+	 * restart can legitimately hold it for the length of one health probe.
+	 * An exclusive F_WRLCK acquisition here would then collide with that
+	 * transient shared hold and fail immediately, so retry byte zero with a
+	 * bounded wait (~10ms steps, ~10s total) before giving up.  Byte one
+	 * (the lease) is still refused immediately: another *daemon* already
+	 * holding it is a real ownership conflict, not a transient inspector,
+	 * and waiting out a live daemon's whole lifetime would make no sense.
+	 */
 	{
-		if (errno == EACCES || errno == EAGAIN)
-			fprintf(stderr, "pagestore_daemon: shm initialization is busy\n");
-		else
-			perror("pagestore_daemon: fcntl client initialization lock");
-		close(fd);
-		return 1;
+		int			attempt;
+		int			acquired = 0;
+
+		for (attempt = 0; attempt < 1000; attempt++)
+		{
+			if (set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) == 0)
+			{
+				acquired = 1;
+				break;
+			}
+			if (errno != EACCES && errno != EAGAIN)
+				break;
+			{
+				struct timespec ts = {0, 10000000};	/* 10ms */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		if (!acquired)
+		{
+			if (errno == EACCES || errno == EAGAIN)
+				fprintf(stderr, "pagestore_daemon: shm initialization is busy\n");
+			else
+				perror("pagestore_daemon: fcntl client initialization lock");
+			close(fd);
+			return 1;
+		}
 	}
 	client_lock_held = 1;
 	if (set_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0)

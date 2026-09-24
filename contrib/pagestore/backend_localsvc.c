@@ -198,33 +198,52 @@ ls_attach(void)
 	}
 
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
-		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY ||
-		hdr->page_size != BLCKSZ)
-	{
-		uint32		got_magic = hdr->magic;
-		uint32		got_version = hdr->version;
-		uint32		got_page_size = hdr->page_size;
 
-		munmap(shm, PS_SHM_SIZE);
-		close(fd);
-		ereport(ERROR,
-				(errmsg("pagestore localsvc shared memory incompatible"),
-				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
-						   got_page_size, BLCKSZ, got_magic, got_version)));
-	}
-	/* A daemon that died leaves its header READY, and its successor rewrites
-	 * the segment only after taking the locks; attach only to a live,
-	 * initialized daemon. */
-	if (ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
-							PS_INSPECTION_DAEMON_LOCK_BYTE) != 1)
+	/*
+	 * A daemon that died leaves its header READY, and its successor
+	 * rewrites the segment only after taking its locks; attach only to a
+	 * live, initialized daemon.  Take the shared init lock first (so no
+	 * daemon can be mid-initialization for as long as we hold it -- see
+	 * pagestore_shm.h), then validate the header and the lease, then
+	 * release the lock on every path.  ls_shm_fd is the only fd this
+	 * backend ever opens on the segment, so there is no risk of a second,
+	 * conflicting fcntl lock owner within this process.
+	 */
 	{
-		munmap(shm, PS_SHM_SIZE);
-		close(fd);
-		ereport(ERROR,
-				(errmsg("pagestore localsvc shared memory \"%s\" has no running, initialized daemon",
-						localsvc_shm_name),
-				 errhint("Is the pagestore daemon running?")));
+		int			held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		int			ready = -1;
+		uint32		got_magic = 0;
+		uint32		got_version = 0;
+		uint32		got_page_size = 0;
+		bool		header_ok = false;
+
+		if (held == 1)
+		{
+			got_magic = hdr->magic;
+			got_version = hdr->version;
+			got_page_size = hdr->page_size;
+			header_ok = (got_magic == PS_SHM_MAGIC && got_version == PS_SHM_VERSION &&
+						 __atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) == PS_SHM_READY &&
+						 got_page_size == BLCKSZ);
+			if (header_ok)
+				ready = ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+			ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		}
+
+		if (held != 1 || !header_ok || ready != 1)
+		{
+			munmap(shm, PS_SHM_SIZE);
+			close(fd);
+			if (held == 1 && !header_ok)
+				ereport(ERROR,
+						(errmsg("pagestore localsvc shared memory incompatible"),
+						 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
+								   got_page_size, BLCKSZ, got_magic, got_version)));
+			ereport(ERROR,
+					(errmsg("pagestore localsvc shared memory \"%s\" has no running, initialized daemon",
+							localsvc_shm_name),
+					 errhint("Is the pagestore daemon running?")));
+		}
 	}
 	ls_shm = shm;
 	ls_shm_fd = fd;

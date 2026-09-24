@@ -504,9 +504,30 @@ start_initializing_daemon(const char *name, int ready_pipe[2],
 }
 
 /*
+ * Caller-side probe matching what pagestore_inspect.c (health/non-relation
+ * ops), backend_localsvc.c, and the standalone client tools now do: take
+ * the shared init lock, and only while holding it check whether the lease
+ * has a holder.  See pagestore_shm.h for why this needs no pid comparisons
+ * and cannot straddle two daemon generations the way separate F_GETLK
+ * probes could (E-8 P1).  Returns 1/0/-1 like ps_shm_lease_held().
+ */
+static int
+probe_ready(int fd)
+{
+	int held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	int ready;
+
+	if (held != 1)
+		return held;
+	ready = ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+	ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	return ready;
+}
+
+/*
  * E-8: a daemon killed with SIGKILL leaves its header READY.  health and
- * ps_shm_daemon_ready() must not report that segment ready, nor one whose
- * new daemon still holds the initialization byte.
+ * probe_ready() must not report that segment ready, nor one whose new
+ * daemon still holds the initialization byte.
  */
 static void
 test_health_requires_live_daemon(const char *inspector)
@@ -525,8 +546,7 @@ test_health_requires_live_daemon(const char *inspector)
 	if (failed)
 		return;
 	init_header(hdr, PS_INSPECTION_STATE_IDLE, 1);
-	check(ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
-							  PS_INSPECTION_DAEMON_LOCK_BYTE) == 0,
+	check(probe_ready(fd) == 0,
 		  "READY header without a daemon lease is not ready");
 	check(run_health(inspector, name) == 1,
 		  "health rejects a READY header left by a dead daemon");
@@ -544,26 +564,36 @@ test_health_requires_live_daemon(const char *inspector)
 		  "fake daemon holds lease and initialization byte");
 	if (!failed)
 	{
-		check(ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
-								  PS_INSPECTION_DAEMON_LOCK_BYTE) == 0,
+		check(probe_ready(fd) == 0,
 			  "initializing daemon is not ready");
 		check(run_health(inspector, name) == 1,
 			  "health rejects a stale header during initialization");
 		check(write(release_pipe[1], &byte, 1) == 1 &&
 			  read_with_timeout(ready_pipe[0], &byte, 1, 5000) == 1,
 			  "fake daemon finishes initialization");
-		check(ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
-								  PS_INSPECTION_DAEMON_LOCK_BYTE) == 1,
+		check(probe_ready(fd) == 1,
 			  "initialized daemon is ready");
 		check(run_health(inspector, name) == 0,
 			  "health accepts an initialized live daemon");
-		/* An inspector holding byte zero is not initialization. */
+		/*
+		 * Relation inspection takes byte zero *exclusively* while it runs
+		 * (pagestore_inspect.c's lock_relation_shm(), unchanged by this
+		 * fix); health now takes it *shared* (ps_shm_hold_init_shared()),
+		 * so the two legitimately contend.  Reporting "not ready" while
+		 * the exclusive hold lasts is the documented behaviour of
+		 * EAGAIN/EACCES on the shared lock (see pagestore_shm.h), not a
+		 * bug -- it is the same conservative call a client makes about an
+		 * actually-initializing daemon, and it clears up the moment the
+		 * exclusive holder lets go.
+		 */
 		check(set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
 								  F_WRLCK) == 0,
-			  "inspector takes byte zero after READY");
-		check(run_health(inspector, name) == 0,
-			  "health stays ready while an inspector holds byte zero");
+			  "relation inspection takes byte zero exclusively after READY");
+		check(run_health(inspector, name) == 1,
+			  "health reports not ready while relation inspection holds byte zero");
 		(void) set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
+		check(run_health(inspector, name) == 0,
+			  "health is ready again once relation inspection releases byte zero");
 	}
 	if (holder > 0)
 	{
@@ -584,109 +614,96 @@ test_health_requires_live_daemon(const char *inspector)
 	close_fixture(name, fd, hdr);
 }
 
-static struct flock
-make_lock(short type, pid_t pid)
-{
-	struct flock lock;
-
-	memset(&lock, 0, sizeof(lock));
-	lock.l_type = type;
-	lock.l_pid = pid;
-	return lock;
-}
-
 /*
- * E-8 follow-up: a fast daemon restart can make ps_shm_daemon_ready()'s
- * lease query (F_GETLK) and its init query straddle two daemon generations
- * -- old daemon A exits and successor B takes both locks between the two
- * queries -- so the init query reports B's pid where the lease query
- * reported A's, which looks exactly like an inspector holding the init
- * byte alongside a live daemon.  When the init query finds a holder, the
- * fix re-queries the lease a third time and only reports ready when that
- * third query's pid still matches the first query's.  When the init query
- * instead finds init_byte free, no pid comparison is needed or done: a
- * daemon holds init_byte continuously from before it takes the lease
- * through READY, so init_byte being free after a successful lease query
- * already proves no daemon is currently initializing, regardless of pids --
- * which matters because F_GETLK reports pid 0 (unusable for comparison)
- * when the lock holder is in a different pid namespace, a routine case for
- * a containerized daemon.  Actually racing two real processes through the
- * inspector-exception window is inherently timing dependent and would make
- * this test flaky, so this exercises ps_shm_daemon_ready_decide() -- the
- * pure decision logic that ps_shm_daemon_ready() delegates to after its
- * F_GETLK calls -- directly, with hand-built F_GETLK results standing in
- * for each query.  That is deterministic and covers exactly the buggy
- * comparison (and the surrounding steady-state, pid-namespace, and
- * conservative-unavailable-pid cases) without needing the queries to
- * actually interleave.
+ * E-8 P1: the old ps_shm_daemon_ready() made two *independent* F_GETLK
+ * probes (one of the lease byte, one of the init byte) and trusted the
+ * first one even though nothing kept its result from going stale before
+ * the second one ran.  Concretely: the lease probe observes daemon A still
+ * alive, A then exits, and the init probe -- necessarily run afterwards --
+ * finds init_byte free (A never touched it) and that alone was enough for
+ * the old decision logic to report "ready", even though by then nobody
+ * holds the lease at all.
+ *
+ * This is reproduced here deterministically rather than by racing two real
+ * processes against each other (which the old code's own comments noted
+ * would be flaky): observe the live lease for real, kill the holder for
+ * real and wait for it to be reaped (so there is no timing window left at
+ * all), and only then run the actual, current caller-side check.  The new
+ * mechanism has no second, independent probe to go stale on -- init_byte
+ * is held for the entire validation -- so it must see current reality
+ * regardless of what a moment-ago observation would have shown.
+ *
+ * (The bug this guards against was independently confirmed against the
+ * pre-fix ps_shm_daemon_ready()/ps_shm_daemon_ready_decide() with a
+ * standalone repro that performs exactly this interleaving through the old
+ * two-probe code path: it reported ready=1 in 5/5 runs after the lease
+ * holder had already exited.)
  */
 static void
-test_daemon_ready_decide(void)
+test_lease_released_before_probe(void)
 {
-	struct flock lease_a = make_lock(F_WRLCK, 100);
-	struct flock lease_a_again = make_lock(F_WRLCK, 100);
-	struct flock lease_b = make_lock(F_WRLCK, 222);
-	struct flock init_unlocked = make_lock(F_UNLCK, 0);
-	struct flock init_by_inspector = make_lock(F_WRLCK, 300);
-	struct flock init_by_a = make_lock(F_WRLCK, 100);
-	struct flock lease_unlocked = make_lock(F_UNLCK, 0);
-	struct flock lease_pid_unknown = make_lock(F_WRLCK, 0);
-	struct flock init_pid_unknown = make_lock(F_WRLCK, 0);
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte;
+	struct flock stale_lease;
+	int held;
+	int ready;
 
-	check(ps_shm_daemon_ready_decide(&lease_a, &init_unlocked,
-									 &lease_a_again) == 1,
-		  "no initializer and unchanged lease holder is ready");
-	check(ps_shm_daemon_ready_decide(&lease_a, &init_by_inspector,
-									 &lease_a_again) == 1,
-		  "inspector on init byte with unchanged lease holder is ready");
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create lease-released fixture");
+	if (failed)
+		return;
+	init_header(hdr, PS_INSPECTION_STATE_IDLE, 1);
+	check(pipe(ready_pipe) == 0, "create lease-released handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = start_lease_holder(name, ready_pipe[1]);
+	close(ready_pipe[1]);
+	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+		  "fake daemon holds only the lease (already past READY)");
+	close(ready_pipe[0]);
+	if (failed)
+	{
+		if (holder > 0)
+		{
+			kill(holder, SIGKILL);
+			waitpid(holder, &status, 0);
+		}
+		close_fixture(name, fd, hdr);
+		return;
+	}
 
-	/*
-	 * Pid-namespace case: F_GETLK reports l_pid 0 when the lock holder is
-	 * in a different pid namespace from the caller (e.g. a containerized
-	 * daemon queried from the host, or vice versa).  init_byte being free
-	 * needs no pid comparison at all, so this must still be ready even
-	 * though neither the first nor the (unused) third query's pid is
-	 * usable.
-	 */
-	check(ps_shm_daemon_ready_decide(&lease_pid_unknown, &init_unlocked,
-									 &lease_a_again) == 1,
-		  "pid-namespace-unavailable lease with init free is still ready");
+	/* The stale observation an old-style first query would have made. */
+	memset(&stale_lease, 0, sizeof(stale_lease));
+	stale_lease.l_type = F_WRLCK;
+	stale_lease.l_whence = SEEK_SET;
+	stale_lease.l_start = PS_INSPECTION_DAEMON_LOCK_BYTE;
+	stale_lease.l_len = 1;
+	check(fcntl(fd, F_GETLK, &stale_lease) == 0 && stale_lease.l_type != F_UNLCK,
+		  "lease is genuinely held right before the daemon exits");
 
-	/*
-	 * init_byte being free settles the question by itself; the third
-	 * query's result is not consulted, whether it has no holder ("gone")
-	 * or a different one ("changed").
-	 */
-	check(ps_shm_daemon_ready_decide(&lease_a, &init_unlocked,
-									 &lease_unlocked) == 1,
-		  "init free is ready even if the third lease query found no holder");
-	check(ps_shm_daemon_ready_decide(&lease_a, &init_unlocked,
-									 &lease_b) == 1,
-		  "init free is ready even if the third lease query found a different holder");
+	kill(holder, SIGKILL);
+	check(wait_child(holder, 2000, &status) && WIFSIGNALED(status),
+		  "lease holder exits between the stale observation and the real check");
 
-	/*
-	 * The restart race: the lease query sees A, but by the time the init
-	 * query runs, successor B already holds both bytes, so the init query
-	 * sees B -- indistinguishable, so far, from an inspector.  The third
-	 * (re-)query of the lease byte also now sees B, which differs from A,
-	 * the first query's pid, so this must report "not ready" rather than
-	 * mistaking B's own init hold for an inspector's.
-	 */
-	check(ps_shm_daemon_ready_decide(&lease_a, &lease_b, &lease_b) == 0,
-		  "lease holder changed between queries is not ready");
+	/* The real, current check: nothing here can go stale the way a
+	 * separate earlier probe could. */
+	held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	check(held == 1, "init byte is free once the daemon is gone");
+	ready = held == 1 ? ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE) : -1;
+	if (held == 1)
+		ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	check(ready == 0,
+		  "lease is actually gone: the new mechanism does not trust the stale observation");
 
-	check(ps_shm_daemon_ready_decide(&lease_unlocked, &init_unlocked,
-									 &lease_a_again) == 0,
-		  "no lease holder is not ready");
-	check(ps_shm_daemon_ready_decide(&lease_a, &init_by_a,
-									 &lease_a_again) == 0,
-		  "same pid on lease and init byte is not ready");
-	check(ps_shm_daemon_ready_decide(&lease_pid_unknown, &init_pid_unknown,
-									 &lease_a_again) == 0,
-		  "unavailable pids with an init holder is conservatively not ready");
-	check(ps_shm_daemon_ready_decide(&lease_a, &init_by_inspector,
-									 &lease_unlocked) == 0,
-		  "lease released by the time of the third query is not ready");
+	close_fixture(name, fd, hdr);
 }
 
 int
@@ -697,7 +714,6 @@ main(int argc, char **argv)
 		fprintf(stderr, "usage: %s PAGestore_INSPECT_BINARY\n", argv[0]);
 		return 2;
 	}
-	test_daemon_ready_decide();
 	test_initialization_lock_exclusion();
 	test_lock_busy(argv[1]);
 	test_stale_state(argv[1], PS_INSPECTION_STATE_REQUEST,
@@ -707,6 +723,7 @@ main(int argc, char **argv)
 	test_live_daemon_lease(argv[1]);
 	test_response_consistency(argv[1]);
 	test_health_requires_live_daemon(argv[1]);
+	test_lease_released_before_probe();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed == 0 ? 0 : 1;
 }

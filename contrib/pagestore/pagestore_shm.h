@@ -188,125 +188,115 @@ ps_shm_unlink(const char *name)
 #endif							/* __APPLE__ */
 
 /*
- * Return 1 when a live daemon owns the segment and has finished initializing
- * it, 0 when it does not, and -1 (errno set) when the locks cannot be probed.
+ * A READY header alone is not proof a live daemon owns the segment: a
+ * daemon killed with SIGKILL leaves its header READY, and its successor
+ * only invalidates that header after taking its own locks.  An earlier
+ * version of this file tried to tell a live daemon from a dead one with
+ * two independent F_GETLK probes (one of the lease byte, one of the init
+ * byte) plus pid comparisons to rule out a fast restart landing between
+ * them.  That scheme had a real gap (E-8 P1): the lease probe can observe
+ * daemon A still alive, A can then exit, and the init probe -- run
+ * strictly afterwards, so it necessarily sees init_byte free -- was
+ * treated as proof the segment is ready, even though by then nobody holds
+ * the lease at all.  F_GETLK never blocks and never takes anything, so
+ * nothing stops that exact interleaving from landing between the two
+ * probes; no amount of extra pid bookkeeping closes it, because the two
+ * probes are simply not atomic with each other.
  *
- * A READY header alone is not proof: a daemon killed with SIGKILL leaves its
- * header READY, and the next daemon only invalidates it after it has taken
- * its locks.  The daemon holds lease_byte for its whole lifetime and holds
- * init_byte from before it invalidates the header until it publishes READY,
- * so the segment is ready only while lease_byte has a holder that does not
- * also hold init_byte.  Inspectors take init_byte briefly as well; when the
- * holders' pids cannot be compared (another pid namespace reports 0), any
- * init_byte holder counts as initialization, which a caller only sees as a
- * transient "not ready".  F_GETLK needs no write access, so read-only
- * mappings can use this too.  Callers check the header's own fields as well;
- * probing the locks after reading it closes the window where a stale header
- * is read just before a new daemon takes over.
+ * The fix is to stop probing and instead take a real, non-blocking lock
+ * that serializes with the daemon's own initialization protocol:
  *
- * The lease and init bytes are queried with two separate F_GETLK calls, so a
- * fast daemon restart between them can straddle two generations: the lease
- * query sees old daemon A (about to exit), A exits, successor B takes both
- * locks, and the init query then sees B holding init_byte.  A's and B's pids
- * differ, which looks exactly like an inspector holding init_byte alongside
- * a live daemon, so without more the segment would be reported ready while
- * B is still initializing.
+ *   ps_shm_hold_init_shared() takes a *shared* (F_RDLCK) lock on init_byte.
+ *   The daemon takes init_byte *exclusively* (F_WRLCK) from before it
+ *   invalidates the header until it publishes READY (see pagestore_daemon.c
+ *   / pagestore_daemon_spdk.c), and holds lease_byte exclusively for its
+ *   entire lifetime after that.  A shared lock on init_byte therefore
+ *   cannot be acquired while any daemon is between invalidating the header
+ *   and publishing READY, and while our shared lock is held, no daemon can
+ *   begin that window either (F_RDLCK excludes a concurrent F_WRLCK).  So:
+ *   for as long as we hold init_byte shared, no daemon is initializing and
+ *   none can start.  If ps_shm_lease_held() then finds a holder of
+ *   lease_byte, that holder must already be past READY -- there is no
+ *   other way to be holding the lease while init_byte cannot be taken
+ *   exclusively -- and the header we validate while still holding the lock
+ *   is that live daemon's own, stable, already-published header.  No pids
+ *   are compared anywhere in this protocol, so pid namespaces (which made
+ *   F_GETLK report l_pid=0 for a containerized daemon) are simply not a
+ *   concern any more.
  *
- * That ambiguity only arises when the init query finds a holder: if the init
- * query instead finds init_byte free, no pid comparison is needed at all.
- * The daemon holds init_byte continuously from before it invalidates the
- * header until it publishes READY, and the init query runs strictly after
- * the (successful) first lease query, so init_byte being free at that later
- * instant already proves that whoever currently holds the lease has passed
- * READY -- there is no live daemon still initializing right now, regardless
- * of whether it is the same daemon the first query saw.  A stale first-query
- * pid is harmless here, including the pid=0 that F_GETLK reports when the
- * lock holder is in a different pid namespace (a routine case for a
- * containerized daemon vs. an inspector on the host, or vice versa): pid
- * comparison is simply not needed to reach this conclusion.
+ * This only reasons about daemons that are still alive when we take the
+ * lock.  A daemon that dies after we've released it (i.e. after we've
+ * already decided "ready" and gone on to use the segment) cannot be
+ * detected by any probe taken before that -- per the MVP contract,
+ * clients must be stopped across a daemon restart; this mechanism answers
+ * "is a daemon alive and ready right now", not "will it stay so".
  *
- * When the init query does find a holder, that holder's pid decides between
- * "a new daemon is still initializing" and "an inspector took init_byte
- * alongside an already-live daemon", and here the pids do have to be
- * compared, so a pid of 0 (or of the same process) is conservatively treated
- * as not ready.  Even a differing, known pid is not proof enough on its own,
- * because it is exactly what the fast-restart race above also produces: to
- * tell the two apart we query the lease byte a third time, after the init
- * query, and only accept the inspector explanation -- and report ready --
- * when that third query still finds the same holder (by pid) as the first
- * query.  If the restart happened, the third query now sees B, which
- * differs from A's first-query pid (or the lease is briefly unheld between
- * A's exit and B's acquisition), so we correctly fall through to "not
- * ready"; if no restart happened, the same daemon still holds the lease
- * throughout and the pids match.
+ * F_RDLCK/F_GETLK need no write access, so a read-only fd (O_RDONLY) can
+ * use all three of these.  A caller must always pair a successful
+ * ps_shm_hold_init_shared() with ps_shm_release_init_shared(), on every
+ * exit path, including error paths -- these are ordinary process-owned
+ * POSIX record locks, so closing every fd on the segment also drops them,
+ * but a long-lived process (e.g. a backend that keeps its shm fd open)
+ * must not leave the shared lock held past the check that needs it, or it
+ * would make a future daemon restart's exclusive init_byte acquisition
+ * wait for that process's entire lifetime instead of ~10s.
  *
- * The decision itself lives in ps_shm_daemon_ready_decide() below, taking
- * the three F_GETLK results as plain data, so it can be unit tested with
- * hand-built results (including a changed pid between the first and third)
- * without needing to actually race two processes through the real window.
+ * The relation-inspection path (pagestore_inspect.c) is a client of
+ * init_byte too, but it needs *exclusive* ownership of the mailbox it
+ * shares with the daemon while it runs, not just a readiness check; it
+ * takes F_WRLCK on init_byte directly (via its own lock_relation_shm(),
+ * unchanged by this) rather than going through
+ * ps_shm_hold_init_shared().
  */
 static inline int
-ps_shm_daemon_ready_decide(const struct flock *first_lease,
-							const struct flock *init,
-							const struct flock *third_lease)
+ps_shm_hold_init_shared(int fd, off_t init_byte)
 {
-	if (first_lease->l_type == F_UNLCK)
-		return 0;
-	if (init->l_type == F_UNLCK)
+	struct flock lock;
+
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = F_RDLCK;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = init_byte;
+	lock.l_len = 1;
+	if (fcntl(fd, F_SETLK, &lock) == 0)
 		return 1;
-	if (init->l_pid <= 0 || first_lease->l_pid <= 0 ||
-		init->l_pid == first_lease->l_pid)
+	if (errno == EACCES || errno == EAGAIN)
 		return 0;
-	/* The inspector exception: confirm the lease holder hasn't changed. */
-	if (third_lease->l_type == F_UNLCK)
-		return 0;
-	if (third_lease->l_pid <= 0 || third_lease->l_pid != first_lease->l_pid)
-		return 0;
-	return 1;
+	return -1;
 }
 
 static inline int
-ps_shm_daemon_ready(int fd, off_t init_byte, off_t lease_byte)
+ps_shm_release_init_shared(int fd, off_t init_byte)
 {
-	struct flock first_lease;
-	struct flock init;
-	struct flock third_lease;
+	struct flock lock;
 
-	memset(&first_lease, 0, sizeof(first_lease));
-	first_lease.l_type = F_WRLCK;
-	first_lease.l_whence = SEEK_SET;
-	first_lease.l_start = lease_byte;
-	first_lease.l_len = 1;
-	if (fcntl(fd, F_GETLK, &first_lease) != 0)
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = F_UNLCK;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = init_byte;
+	lock.l_len = 1;
+	return fcntl(fd, F_SETLK, &lock);
+}
+
+/*
+ * Return 1 when lease_byte has a holder, 0 when it does not, and -1 (errno
+ * set) when the lock cannot be probed.  Only meaningful for deciding
+ * daemon readiness while the caller holds init_byte (shared or exclusive);
+ * see the block comment above.
+ */
+static inline int
+ps_shm_lease_held(int fd, off_t lease_byte)
+{
+	struct flock lock;
+
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = F_WRLCK;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = lease_byte;
+	lock.l_len = 1;
+	if (fcntl(fd, F_GETLK, &lock) != 0)
 		return -1;
-	if (first_lease.l_type == F_UNLCK)
-		return 0;
-
-	memset(&init, 0, sizeof(init));
-	init.l_type = F_WRLCK;
-	init.l_whence = SEEK_SET;
-	init.l_start = init_byte;
-	init.l_len = 1;
-	if (fcntl(fd, F_GETLK, &init) != 0)
-		return -1;
-
-	/*
-	 * The third lease query is only needed for the inspector exception
-	 * (see the comment above); when init_byte is free, skip it, since
-	 * ps_shm_daemon_ready_decide() does not look at it in that case.
-	 */
-	memset(&third_lease, 0, sizeof(third_lease));
-	if (init.l_type != F_UNLCK)
-	{
-		third_lease.l_type = F_WRLCK;
-		third_lease.l_whence = SEEK_SET;
-		third_lease.l_start = lease_byte;
-		third_lease.l_len = 1;
-		if (fcntl(fd, F_GETLK, &third_lease) != 0)
-			return -1;
-	}
-
-	return ps_shm_daemon_ready_decide(&first_lease, &init, &third_lease);
+	return lock.l_type != F_UNLCK;
 }
 
 #endif							/* PAGESTORE_SHM_H */

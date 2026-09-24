@@ -796,17 +796,54 @@ main(int argc, char **argv)
 		perror("shm_open");
 		return 1;
 	}
-	/* Same ownership protocol as the POSIX daemon: byte zero is held through
+	/*
+	 * Same ownership protocol as the POSIX daemon: byte zero is held through
 	 * initialization until READY, byte one for the process lifetime.  Clients
 	 * treat a READY header as live only under that lease, so fd stays open
-	 * (closing it would drop both locks). */
-	if (set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0 ||
-		set_shm_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0)
+	 * (closing it would drop both locks).
+	 *
+	 * Clients now briefly take a *shared* lock on byte zero while checking
+	 * readiness (ps_shm_hold_init_shared(), see pagestore_shm.h), so retry
+	 * byte zero with a bounded wait (~10ms steps, ~10s total) instead of
+	 * failing on the first collision with such a transient hold.  Byte one
+	 * (the lease) is still refused immediately: another daemon already
+	 * holding it is a real conflict.
+	 */
+	{
+		int			attempt;
+		int			acquired = 0;
+
+		for (attempt = 0; attempt < 1000; attempt++)
+		{
+			if (set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) == 0)
+			{
+				acquired = 1;
+				break;
+			}
+			if (errno != EACCES && errno != EAGAIN)
+				break;
+			{
+				struct timespec ts = {0, 10000000};	/* 10ms */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		if (!acquired)
+		{
+			if (errno == EACCES || errno == EAGAIN)
+				fprintf(stderr, "pagestore_daemon_spdk: another process owns the shm lease\n");
+			else
+				perror("pagestore_daemon_spdk: fcntl shm lease");
+			return 1;
+		}
+	}
+	if (set_shm_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0)
 	{
 		if (errno == EACCES || errno == EAGAIN)
 			fprintf(stderr, "pagestore_daemon_spdk: another process owns the shm lease\n");
 		else
 			perror("pagestore_daemon_spdk: fcntl shm lease");
+		(void) set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
 		return 1;
 	}
 	if (ftruncate(fd, PS_SHM_SIZE) != 0)
