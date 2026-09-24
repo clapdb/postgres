@@ -68,12 +68,18 @@
 #define PS_RETENTION_PENDING_VERSION 1
 
 /* What a durable retention.pending marker is in the middle of doing: extend
- * the log in place by one record, or replace it wholesale (compaction, and
- * the identical v1 -> v2 migration rewrite). */
+ * the log in place by one record, replace it wholesale (compaction, and the
+ * identical v1 -> v2 migration rewrite), or install retention.state for the
+ * first time over an unchanged log (the one-time bootstrap of a v2-format
+ * store that predates the committed-prefix state file).  Bootstrap is not
+ * an APPEND: it never grows the log (new_nrecords == old_nrecords), which
+ * would otherwise be indistinguishable from a truncated/corrupt intent
+ * under APPEND's "always grows by exactly one" rule. */
 typedef enum PsRetentionPendingOp
 {
 	PS_RETENTION_PENDING_APPEND = 1,
 	PS_RETENTION_PENDING_COMPACT = 2,
+	PS_RETENTION_PENDING_BOOTSTRAP_STATE = 3,
 } PsRetentionPendingOp;
 
 /* The intent behind an in-flight mutation: the committed (nrecords, hash)
@@ -194,6 +200,7 @@ retention_new_incarnation(uint64_t *epoch)
 /* Standalone-test fault injection; ordinary deployments leave these zero. */
 static int test_fail_append_after_write;
 static int test_fail_rollback;
+static int test_fail_clear_pending_dir_fsync;
 
 static int retention_identity_matches(const struct stat *st);
 
@@ -582,15 +589,34 @@ retention_mark_failed(void)
 				retention_dir, strerror(errno));
 }
 
-/* Once unlink succeeds, either the guard removal reaches disk or recovery
- * sees the still-durable guard and fails closed.  Directory fsync is still
- * attempted, but its failure cannot make the committed state unsafe. */
+/* The mutation the marker guarded is about to be acknowledged as committed
+ * to a caller outside this process, so its removal must be durable, not
+ * merely attempted: if the directory fsync fails and the marker's directory
+ * entry later reappears after a machine crash (unlink() without a durable
+ * directory is not itself durable), the next open would reconcile against a
+ * pending intent whose mutation the caller was already told succeeded --
+ * rolling back or otherwise second-guessing an acknowledged commit.  Every
+ * caller that clears a marker on its success path must therefore treat a
+ * nonzero return here exactly like a failed rename/write: install
+ * retention.failed and refuse to acknowledge success.
+ *
+ * PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC lets the standalone tests
+ * simulate a directory fsync that fails after a real, successful unlink --
+ * the exact window this function exists to make safe -- without requiring a
+ * genuinely faulty filesystem. */
 static int
 retention_clear_pending(void)
 {
 	if (unlink(retention_pending_path) != 0)
 		return -1;
-	(void) retention_fsync_dir();
+	if (retention_fsync_dir() != 0)
+		return -1;
+	if (test_fail_clear_pending_dir_fsync > 0 &&
+		--test_fail_clear_pending_dir_fsync == 0)
+	{
+		errno = EIO;
+		return -1;
+	}
 	return 0;
 }
 
@@ -713,7 +739,18 @@ retention_abort_append(int fd, off_t old_size, int created)
 		retention_mark_failed();
 	}
 	else
+	{
+		/* This is the abort path: the caller always gets -1 here, never an
+		 * acknowledged commit, so a clear_pending() failure cannot let a
+		 * resurrected marker roll back something already promised durable.
+		 * The rollback above already put the log back to old_nrecords/
+		 * old_hash, so even if the marker survives (unlink failed) or
+		 * reappears after a crash (the directory fsync failed), the next
+		 * open's reconciliation finds the log already matching "old" and
+		 * performs a safe no-op rollback.  Best effort is enough; nothing
+		 * downstream depends on this call succeeding. */
 		(void) retention_clear_pending();
+	}
 	return -1;
 }
 
@@ -748,6 +785,11 @@ retention_append(const PsRetentionRecord *rec)
 	}
 	if (fd < 0)
 	{
+		/* No log byte has been touched yet, so the pending intent's "old"
+		 * state is still exactly what is on disk: a resurrected marker
+		 * reconciles to a safe no-op rollback regardless of whether this
+		 * clear succeeds, and this function always reports the append as
+		 * failed either way.  Best effort is enough here. */
 		(void) retention_clear_pending();
 		return -1;
 	}
@@ -755,6 +797,7 @@ retention_append(const PsRetentionRecord *rec)
 	if (old_size < 0)
 	{
 		close(fd);
+		/* Same reasoning as above: nothing has been written yet. */
 		(void) retention_clear_pending();
 		return -1;
 	}
@@ -932,9 +975,9 @@ retention_republish(void)
 		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
 			goto done;
 	}
-	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_COMPACT_AFTER_TMP_SYNC) != 0)
-		goto done;
 	if (fsync(fd) != 0)
+		goto done;
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_COMPACT_AFTER_TMP_SYNC) != 0)
 		goto done;
 	if (close(fd) != 0)
 	{
@@ -990,6 +1033,12 @@ done:
 	if (rc != 0 && tmp[0] != '\0')
 		unlink(tmp);
 	if (rc != 0 && pending && !published)
+		/* The rename into place never happened, so retention.meta (if it
+		 * even exists) is still exactly the pre-mutation "old" state, and
+		 * this function is already about to report failure (rc != 0) to
+		 * its own caller: nobody was told the compaction committed.  A
+		 * resurrected marker reconciles to a safe no-op rollback either
+		 * way, so best effort is enough here too. */
 		(void) retention_clear_pending();
 	if (rc != 0 && pending && published)
 	{
@@ -1007,35 +1056,49 @@ retention_rewrite_current(void)
 	return retention_republish();
 }
 
-/* Read and validate a durable pending intent.  A file of the wrong size, bad
- * magic/version, bad CRC, or an internally inconsistent op is exactly what
- * the pre-intent format's empty guard file (or disk corruption) looks like:
- * reject it the same way that format always failed closed. */
+/* Read and validate a durable pending intent.  A file of the wrong size
+ * (short, or carrying trailing bytes past the fixed-size record -- fstat
+ * catches what an exact-sized read alone cannot), bad magic/version, bad
+ * CRC, or an internally inconsistent op is exactly what the pre-intent
+ * format's empty guard file (or disk corruption) looks like: reject it the
+ * same way that format always failed closed. */
 static int
 retention_read_pending(PsRetentionPending *out)
 {
 	int			fd;
 	ssize_t		r;
+	struct stat	st;
 
 	fd = open(retention_pending_path, O_RDONLY);
 	if (fd < 0)
 		return -1;
+	if (fstat(fd, &st) != 0)
+	{
+		close(fd);
+		return -1;
+	}
 	r = read(fd, out, sizeof(*out));
 	if (close(fd) != 0)
 		return -1;
-	if (r != (ssize_t) sizeof(*out) ||
+	if (st.st_size != (off_t) sizeof(*out) ||
+		r != (ssize_t) sizeof(*out) ||
 		out->magic != PS_RETENTION_PENDING_MAGIC ||
 		out->version != PS_RETENTION_PENDING_VERSION ||
 		retention_pending_crc(out) != out->crc ||
 		(out->op != PS_RETENTION_PENDING_APPEND &&
-		 out->op != PS_RETENTION_PENDING_COMPACT) ||
+		 out->op != PS_RETENTION_PENDING_COMPACT &&
+		 out->op != PS_RETENTION_PENDING_BOOTSTRAP_STATE) ||
 		/* An append always grows the log by exactly one record; a
 		 * compaction (or the identical v1 -> v2 migration rewrite) rewrites
 		 * the whole log down to one record per live pin/tombstone plus an
 		 * optional admission record, so new_nrecords is typically *smaller*
-		 * than old_nrecords and neither direction is a corruption signal. */
+		 * than old_nrecords and neither direction is a corruption signal;
+		 * a bootstrap never touches the log at all (new_nrecords ==
+		 * old_nrecords), so it must be told apart from both. */
 		(out->op == PS_RETENTION_PENDING_APPEND &&
-		 out->new_nrecords != out->old_nrecords + 1))
+		 out->new_nrecords != out->old_nrecords + 1) ||
+		(out->op == PS_RETENTION_PENDING_BOOTSTRAP_STATE &&
+		 out->new_nrecords != out->old_nrecords))
 	{
 		errno = EILSEQ;
 		return -1;
@@ -1131,8 +1194,9 @@ retention_verify_v2_prefix(uint64_t n, uint32_t hash, off_t *size_out)
 
 /* Caller holds retention_lock and has already populated every retention_*
  * path global; retention.pending is known to exist.  Reconciles a durable
- * pending intent left behind by a crash during retention_append() or
- * retention_republish(): classifies whatever retention.meta actually holds
+ * pending intent left behind by a crash during retention_append(),
+ * retention_republish(), or the one-time PS_RETENTION_PENDING_BOOTSTRAP_STATE
+ * install in ps_retention_open(): classifies whatever retention.meta actually holds
  * against the intent's recorded pre- and post-mutation (nrecords, hash), and
  * either rolls the mutation back, rolls it forward, or fails closed.  Every
  * step below is safe to redo verbatim after a second crash mid-recovery: it
@@ -1208,6 +1272,27 @@ retention_recover_pending(void)
 			}
 		}
 	}
+	else if (pending.op == PS_RETENTION_PENDING_BOOTSTRAP_STATE)
+	{
+		/* Bootstrap never touches the log (new_nrecords == old_nrecords): it
+		 * only installs retention.state for the first time over an
+		 * unchanged log.  There is no separate "old" to roll back to --
+		 * either the log on disk still matches the exact (nrecords, hash)
+		 * the intent recorded, in which case the roll-forward branch below
+		 * finishes installing the state, or it does not, in which case
+		 * something changed the log out from under an in-flight bootstrap
+		 * and recovery fails closed rather than guess. */
+		new_ok = retention_verify_v2_prefix(pending.old_nrecords,
+											pending.old_hash, &size);
+		if (new_ok < 0)
+		{
+			fprintf(stderr, "pagestore_retention: %s: %s\n", retention_path,
+					strerror(errno));
+			return -1;
+		}
+		new_ok = new_ok && size ==
+			(off_t) (pending.old_nrecords * sizeof(PsRetentionRecord));
+	}
 	else
 	{
 		off_t		min_size = (off_t) (pending.old_nrecords *
@@ -1233,8 +1318,40 @@ retention_recover_pending(void)
 
 	if (new_ok)
 	{
-		if (retention_fsync_dir() != 0 ||
-			retention_write_state(pending.new_nrecords, pending.new_hash) != 0)
+		int			skip_state = 0;
+
+		if (pending.op == PS_RETENTION_PENDING_COMPACT &&
+			pending.old_nrecords == 0 && pending.new_nrecords == 0)
+		{
+			struct stat mst;
+
+			if (stat(retention_path, &mst) != 0)
+			{
+				if (errno != ENOENT)
+				{
+					fprintf(stderr, "pagestore_retention: %s: %s\n",
+							retention_path, strerror(errno));
+					return -1;
+				}
+				/* Compacting an already-empty registry down to zero records
+				 * is a no-op that retention_republish() still tries to
+				 * publish (an empty tmp file renamed into place); a crash
+				 * after the intent but before that rename can leave
+				 * retention.meta genuinely absent, exactly as if the store
+				 * had never been mutated at all (retention_verify_v2_prefix
+				 * reports a missing file as a trivial match for zero
+				 * records, which is what routed this case here).  Writing
+				 * retention.state now would leave a store with state but no
+				 * meta, which the ordinary open path below permanently
+				 * refuses.  Treat it exactly like a store that was never
+				 * durably created: no state, no meta, just clear the
+				 * pending marker below. */
+				skip_state = 1;
+			}
+		}
+		if (!skip_state &&
+			(retention_fsync_dir() != 0 ||
+			 retention_write_state(pending.new_nrecords, pending.new_hash) != 0))
 		{
 			fprintf(stderr,
 					"pagestore_retention: could not roll %s forward to the "
@@ -1315,7 +1432,8 @@ retention_recover_pending(void)
 				(unsigned long long) pending.old_nrecords,
 				(unsigned long long) pending.new_nrecords,
 				pending.op == PS_RETENTION_PENDING_APPEND ? "append" :
-				"compaction");
+				pending.op == PS_RETENTION_PENDING_BOOTSTRAP_STATE ?
+				"state bootstrap" : "compaction");
 		errno = EILSEQ;
 		return -1;
 	}
@@ -1356,6 +1474,7 @@ ps_retention_open(const char *store_dir)
 	retention_ino = 0;
 	test_fail_append_after_write = 0;
 	test_fail_rollback = 0;
+	test_fail_clear_pending_dir_fsync = 0;
 	n = snprintf(retention_dir, sizeof(retention_dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_dir))
 	{
@@ -1442,9 +1561,13 @@ ps_retention_open(const char *store_dir)
 	{
 		const char *fail_append = getenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE");
 		const char *fail_rollback = getenv("PS_TEST_FAIL_RETENTION_ROLLBACK");
+		const char *fail_clear_dir_fsync =
+			getenv("PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC");
 
 		test_fail_append_after_write = fail_append ? atoi(fail_append) : 0;
 		test_fail_rollback = fail_rollback ? atoi(fail_rollback) : 0;
+		test_fail_clear_pending_dir_fsync =
+			fail_clear_dir_fsync ? atoi(fail_clear_dir_fsync) : 0;
 	}
 	fd = open(retention_path, O_RDWR);
 	if (fd < 0)
@@ -1578,8 +1701,13 @@ ps_retention_open(const char *store_dir)
 	{
 		/* One-time migration from the pre-committed-prefix format: no log
 		 * content changes (old == new), only retention.state is installed
-		 * for the first time. */
-		if (retention_begin_pending(PS_RETENTION_PENDING_APPEND,
+		 * for the first time.  This is PS_RETENTION_PENDING_BOOTSTRAP_STATE,
+		 * not an APPEND: an APPEND intent always requires new_nrecords ==
+		 * old_nrecords + 1 (see retention_read_pending()), so recording this
+		 * old-equals-new mutation as an APPEND would make an interrupted
+		 * bootstrap permanently unrecoverable -- the very next open would
+		 * read back its own pending marker and reject it as corrupt. */
+		if (retention_begin_pending(PS_RETENTION_PENDING_BOOTSTRAP_STATE,
 									retention_nrecords, retention_log_hash,
 									retention_nrecords,
 									retention_log_hash) != 0)
@@ -1591,6 +1719,8 @@ ps_retention_open(const char *store_dir)
 					strerror(errno));
 			goto done;
 		}
+		if (ps_fault_probe(PS_FAULT_POINT_RETENTION_BOOTSTRAP_AFTER_PENDING) != 0)
+			goto done;
 		if ((off != st.st_size &&
 			 (ftruncate(fd, off) != 0 || fsync(fd) != 0)) ||
 			retention_write_state(retention_nrecords, retention_log_hash) != 0 ||

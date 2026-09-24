@@ -361,6 +361,288 @@ run_fresh_case(const RetentionCrashCase *tc)
 	return ok;
 }
 
+/*
+ * Bug finding #6: compacting an already-empty, never-created registry
+ * (retention.meta was never written because nothing was ever appended) must
+ * survive a crash right after the durable pending intent (old_nrecords ==
+ * new_nrecords == 0) even though there is no retention.meta to roll forward
+ * or back to.  Before the fix, recovery's roll-forward branch unconditionally
+ * installed retention.state, leaving a store with state but no meta that the
+ * ordinary open path then permanently refused.
+ */
+static void
+run_empty_compact_child(const char *store, const char *fault_dir)
+{
+	if (!configure_fault(store, fault_dir, "retention_compact.after_pending"))
+		_exit(2);
+	if (ps_retention_open(store) != 0)
+		_exit(2);
+	if (!arm_fault(fault_dir))
+		_exit(2);
+	(void) ps_retention_compact();
+	_exit(3);					/* the fault should have fired already */
+}
+
+static int
+run_empty_compact_case(void)
+{
+	char		store[] = "/tmp/psretentioncrashemptyXXXXXX";
+	char		fault_dir[1600];
+	pid_t		pid;
+	int			status;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
+		mkdir(fault_dir, 0700) != 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	pid = fork();
+	if (pid == 0)
+		run_empty_compact_child(store, fault_dir);
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid &&
+		WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT;
+	check(ok, "compact after_pending on an already-empty, never-created registry");
+	if (ok)
+	{
+		PsRetentionPin *pins = NULL;
+		uint32_t	count = 0;
+
+		check(ps_retention_open(store) == 0,
+			  "reopen after an empty-registry compact crash succeeds");
+		check(ps_retention_snapshot_alloc(&pins, &count) == 0 && count == 0,
+			  "no pins after recovering from an empty-registry compact crash");
+		free(pins);
+		pins = NULL;
+		ps_retention_close();
+		check(ps_retention_open(store) == 0,
+			  "second restart after an empty-registry compact crash is idempotent");
+		check(ps_retention_snapshot_alloc(&pins, &count) == 0 && count == 0,
+			  "still no pins after the second restart");
+		free(pins);
+		ps_retention_close();
+	}
+	remove_tree(fault_dir);
+	remove_tree(store);
+	return ok;
+}
+
+/*
+ * Bug finding #1: a v2-format store that predates the committed-prefix
+ * retention.state file records a state-only bootstrap intent (old_nrecords
+ * == new_nrecords) the first time it is opened.  A crash between installing
+ * that intent and writing retention.state must still be recoverable on the
+ * next open.
+ */
+static void
+run_bootstrap_child(const char *store, const char *fault_dir)
+{
+	if (!configure_fault(store, fault_dir, "retention_bootstrap.after_pending"))
+		_exit(2);
+	if (!arm_fault(fault_dir))
+		_exit(2);
+	(void) ps_retention_open(store);
+	_exit(3);					/* the fault should have fired already */
+}
+
+/* Populate a v2 store the ordinary way, then strip its committed-prefix
+ * state file to reproduce "a v2 prefix store without retention.state" --
+ * the exact precondition the state-only bootstrap path in
+ * ps_retention_open() reconciles. */
+static int
+setup_state_stripped_store(const char *store)
+{
+	char		state_path[1700];
+
+	if (!populate_store(store))
+		return 0;
+	ps_retention_close();
+	if (snprintf(state_path, sizeof(state_path), "%s/retention.state",
+				 store) < 0)
+		return 0;
+	return unlink(state_path) == 0;
+}
+
+static int
+run_bootstrap_case(void)
+{
+	char		store[] = "/tmp/psretentioncrashbootstrapXXXXXX";
+	char		fault_dir[1600];
+	pid_t		pid;
+	int			status;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	if (!setup_state_stripped_store(store))
+	{
+		remove_tree(store);
+		return 0;
+	}
+	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
+		mkdir(fault_dir, 0700) != 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	pid = fork();
+	if (pid == 0)
+		run_bootstrap_child(store, fault_dir);
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid &&
+		WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT;
+	check(ok, "state bootstrap after_pending on a v2 store missing retention.state");
+	if (ok)
+	{
+		check(snapshot_matches_expected(store, 0),
+			  "first reopen recovers the expected pin set after an "
+			  "interrupted state bootstrap");
+		check(snapshot_matches_expected(store, 0),
+			  "second restart after an interrupted state bootstrap is "
+			  "idempotent");
+	}
+	remove_tree(fault_dir);
+	remove_tree(store);
+	return ok;
+}
+
+/*
+ * The other half of finding #1: if the on-disk log no longer matches the
+ * bootstrap intent's recorded (old_nrecords, old_hash) -- something changed
+ * retention.meta out from under the interrupted bootstrap -- recovery must
+ * fail closed instead of guessing.  This is not itself a fresh-crash
+ * scenario (nothing in this codebase mutates retention.meta without going
+ * through the pending-intent protocol), but it is exactly the
+ * "unrecognized intent" class retention_read_pending()/verify_v2_prefix()
+ * exist to catch, so it is exercised directly here.
+ */
+static int
+run_bootstrap_mismatch_case(void)
+{
+	char		store[] = "/tmp/psretentioncrashbsmismatchXXXXXX";
+	char		meta_path[1700];
+	char		fault_dir[1600];
+	pid_t		pid;
+	int			status;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	if (!setup_state_stripped_store(store))
+	{
+		remove_tree(store);
+		return 0;
+	}
+	if (snprintf(meta_path, sizeof(meta_path), "%s/retention.meta",
+				 store) < 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
+		mkdir(fault_dir, 0700) != 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	pid = fork();
+	if (pid == 0)
+		run_bootstrap_child(store, fault_dir);
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid &&
+		WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT;
+	check(ok, "state bootstrap after_pending setup for the mismatch case");
+	if (ok)
+	{
+		/* Simulate the log changing out from under the interrupted
+		 * bootstrap: the pending intent's recorded (old_nrecords, old_hash)
+		 * no longer matches what is on disk. */
+		int			fd = open(meta_path, O_WRONLY | O_APPEND);
+		int			wrote = fd >= 0 &&
+			write(fd, "\0", 1) == 1 && close(fd) == 0;
+
+		check(wrote, "corrupting retention.meta under the pending bootstrap "
+			  "succeeds (test setup)");
+		if (wrote)
+		{
+			int			open_rc = ps_retention_open(store);
+
+			check(open_rc != 0,
+				  "a bootstrap intent that no longer matches the on-disk "
+				  "log fails closed instead of guessing");
+			if (open_rc == 0)
+				ps_retention_close();
+		}
+	}
+	remove_tree(fault_dir);
+	remove_tree(store);
+	return ok;
+}
+
+/*
+ * Bug finding #4: retention_read_pending() must reject a retention.pending
+ * file carrying trailing bytes past the fixed-size record, not silently
+ * read only the first sizeof(PsRetentionPending) bytes and ignore the rest.
+ */
+static int
+run_pending_trailing_bytes_case(void)
+{
+	char		store[] = "/tmp/psretentioncrashtrailingXXXXXX";
+	char		fault_dir[1600];
+	char		pending_path[1700];
+	pid_t		pid;
+	int			status;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
+		mkdir(fault_dir, 0700) != 0)
+	{
+		remove_tree(store);
+		return 0;
+	}
+	pid = fork();
+	if (pid == 0)
+		run_child(&cases[2] /* "append after_write on a populated store" */,
+				  store, fault_dir);
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid &&
+		WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT;
+	check(ok, "append after_write crash setup for the trailing-bytes case");
+	if (ok)
+	{
+		int			fd;
+		int			wrote;
+
+		if (snprintf(pending_path, sizeof(pending_path),
+					 "%s/retention.pending", store) < 0)
+			ok = 0;
+		check(ok, "retention.pending path fits (test setup)");
+		if (ok)
+		{
+			fd = open(pending_path, O_WRONLY | O_APPEND);
+			wrote = fd >= 0 && write(fd, "\0", 1) == 1 && close(fd) == 0;
+			check(wrote, "appending a trailing byte to retention.pending "
+				  "succeeds (test setup)");
+			if (wrote)
+			{
+				int			open_rc = ps_retention_open(store);
+
+				check(open_rc != 0,
+					  "a retention.pending file with trailing bytes fails "
+					  "closed instead of being silently truncated to the "
+					  "fixed-size record");
+				if (open_rc == 0)
+					ps_retention_close();
+			}
+		}
+	}
+	remove_tree(fault_dir);
+	remove_tree(store);
+	return ok;
+}
+
 int
 main(void)
 {
@@ -375,6 +657,14 @@ main(void)
 		if (!case_ok)
 			ok = 0;
 	}
+	if (!run_empty_compact_case())
+		ok = 0;
+	if (!run_bootstrap_case())
+		ok = 0;
+	if (!run_bootstrap_mismatch_case())
+		ok = 0;
+	if (!run_pending_trailing_bytes_case())
+		ok = 0;
 	printf("pagestore_retention_crash_test: %d checks, %d failed\n",
 		   checks, failures);
 	return !ok || failures != 0;

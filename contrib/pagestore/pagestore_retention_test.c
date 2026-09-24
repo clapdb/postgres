@@ -130,6 +130,7 @@ main(void)
 	char		faildir[] = "/tmp/psretentionfailXXXXXX";
 	char		legacydir[] = "/tmp/psretentionlegacyXXXXXX";
 	char		migratedir[] = "/tmp/psretentionmigrateXXXXXX";
+	char		clearpendingdir[] = "/tmp/psretentionclearpendingXXXXXX";
 	char		path[512];
 	char		tmp[520];
 	char		backup[520];
@@ -373,6 +374,33 @@ main(void)
 		  "restart rejects a registry with an uncertain full DROP");
 	ps_retention_close();
 
+	/* Bug finding #2: retention_clear_pending() must not ignore its
+	 * directory fsync result.  A failed directory fsync after a genuinely
+	 * successful unlink is exactly the window where the marker's directory
+	 * entry could reappear after a machine crash, so an append/compact that
+	 * hits it must never be acknowledged as committed. */
+	check(mkdtemp(clearpendingdir) != NULL,
+		  "create clear-pending-fsync-failure test directory");
+	check(setenv("PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC", "1", 1) == 0,
+		  "enable clear-pending directory-fsync fault injection");
+	check(ps_retention_open(clearpendingdir) == 0,
+		  "open registry for clear-pending-fsync-failure test");
+	check(ps_retention_set(&pin) != PS_RETENTION_OK,
+		  "an append is not acknowledged when clearing its pending marker "
+		  "cannot prove the directory fsync durable");
+	unsetenv("PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC");
+	check(ps_retention_count(&count) != 0,
+		  "the registry is poisoned in-memory immediately after the failure");
+	ps_retention_close();
+	snprintf(path, sizeof(path), "%s/retention.failed", clearpendingdir);
+	check(stat(path, &before) == 0,
+		  "a clear-pending directory-fsync failure installs the durable "
+		  "retention.failed guard");
+	check(ps_retention_open(clearpendingdir) != 0,
+		  "restart permanently refuses a store whose clear-pending "
+		  "directory fsync could not be proven durable");
+	ps_retention_close();
+
 	check(mkdtemp(legacydir) != NULL, "create legacy-guard test directory");
 	check(ps_retention_open(legacydir) == 0,
 		  "open registry for legacy-guard test");
@@ -413,6 +441,19 @@ main(void)
 	snprintf(path, sizeof(path), "%s/retention.state.tmp", faildir);
 	unlink(path);
 	rmdir(faildir);
+	snprintf(path, sizeof(path), "%s/retention.meta", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.initialized", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state.tmp", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.pending", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.failed", clearpendingdir);
+	unlink(path);
+	rmdir(clearpendingdir);
 	snprintf(path, sizeof(path), "%s/retention.meta", legacydir);
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.initialized", legacydir);

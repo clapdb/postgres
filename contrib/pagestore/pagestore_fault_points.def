@@ -70,3 +70,7 @@ PAGESTORE_FAULT_POINT(RETENTION_COMPACT_AFTER_STATE, "retention_compact.after_st
 // is fsync'd and before the committed-prefix state is updated.
 PAGESTORE_FAULT_POINT(RETENTION_APPEND_AFTER_PENDING, "retention_append.after_pending", "store", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(RETENTION_APPEND_AFTER_WRITE, "retention_append.after_write", "store", "process_abort", "crash", 1, 1)
+// One-time PS_RETENTION_PENDING_BOOTSTRAP_STATE probe in ps_retention_open():
+// after the durable pending intent (old_nrecords == new_nrecords) is
+// installed and before retention.state is written for the first time.
+PAGESTORE_FAULT_POINT(RETENTION_BOOTSTRAP_AFTER_PENDING, "retention_bootstrap.after_pending", "store", "process_abort", "crash", 1, 1)

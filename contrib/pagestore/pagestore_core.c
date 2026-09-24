@@ -22415,6 +22415,7 @@ ps_core_open(const char *store_dir)
 		errno = EINVAL;
 		return OPEN_STEP("page_size validation");
 	}
+	errno = 0;
 	if (!core_process_valid())
 		return OPEN_STEP("core_process_valid");
 	pthread_mutex_lock(&core_state_lock);
@@ -22623,6 +22624,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	 * retain the original path and perform no POSIX path lookup. */
 	if (ps_storage->name != NULL && strcmp(ps_storage->name, "posix") == 0)
 	{
+		errno = 0;
 		if ((mkdir(store_dir, 0700) != 0 && errno != EEXIST) ||
 			realpath(store_dir, runtime_store_root) == NULL)
 			return OPEN_STEP("create/canonicalize store root");
@@ -22644,6 +22646,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		errno = ENAMETOOLONG;
 		return OPEN_STEP("forkmeta snapshot dir path");
 	}
+	errno = 0;
 	if (ps_storage->open(runtime_store_dir, segment_size) != 0)
 		return OPEN_STEP("storage open");
 	*storage_opened = 1;
@@ -22652,18 +22655,24 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	memcpy(fork_meta_snapshot_dir, next_fork_meta_snapshot_dir,
 		   strlen(next_fork_meta_snapshot_dir) + 1);
 	ps_layer_store_set_page_size(page_size);
+	errno = 0;
 	if (ps_layer_store->open(runtime_store_dir) != 0)
 		return OPEN_STEP("layer store open");
+	errno = 0;
 	if (ps_manifest_open(runtime_store_dir) != 0)
 		return OPEN_STEP("manifest open");
+	errno = 0;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return OPEN_STEP("manifest replay");
+	errno = 0;
 	if (validate_store_shard_count(runtime_store_dir,
 							   &publish_shard_count) != 0)
 		return OPEN_STEP("validate store shard count");
+	errno = 0;
 	if (use_layers && ps_layer_store->validate_local_layers != NULL &&
 		ps_layer_store->validate_local_layers(&ps_layer_map) != 0)
 		return OPEN_STEP("validate local layers");
+	errno = 0;
 	if (use_layers && mark_legacy_shard_zero_layers() != 0)
 		return OPEN_STEP("mark legacy shard-zero layers");
 	/* The map is now a complete, shard-compatible replay result.  A tolerated
@@ -22672,10 +22681,13 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	 * sweeps until an operator/repair workflow removes the ambiguity. */
 	if (use_layers && ps_layer_store->recover_local_layers != NULL)
 	{
-		int sweep_inhibited = ps_manifest_orphan_sweep_inhibited();
+		int sweep_inhibited;
 
+		errno = 0;
+		sweep_inhibited = ps_manifest_orphan_sweep_inhibited();
 		if (sweep_inhibited < 0)
 			return OPEN_STEP("manifest orphan sweep inhibited check");
+		errno = 0;
 		if (ps_manifest_replay_had_manifest() &&
 			!ps_manifest_replay_repaired() && !sweep_inhibited &&
 			ps_layer_store->recover_local_layers(&ps_layer_map) != 0)
@@ -22708,6 +22720,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			/* Rebuild exact debt only when the PAGE controller needs it.  A
 			 * disabled open deliberately avoids historical segment metadata I/O
 			 * and exposes the diagnostic as unavailable. */
+			errno = 0;
 			if (page_reclaim_high_water_bytes != 0 &&
 				rebuild_page_gc_state(&g_shards[i]) != 0)
 				return OPEN_STEP("rebuild page GC state");
@@ -22747,6 +22760,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
+	errno = 0;
 	if (load_timelines() != 0)
 	{
 		fprintf(stderr, "pagestore_core: refusing to open corrupt timelines metadata\n");
@@ -22755,15 +22769,19 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	/* Load durable branch definitions before immutable-only ids are marked used:
 	 * metadata replay must be allowed to reconstruct a legitimate branch, while
 	 * later CREATE_BRANCH requests must not reuse any discovered id. */
+	errno = 0;
 	if (wal_segment_discover_used() != 0)
 		return OPEN_STEP("discover used WAL segments");
+	errno = 0;
 	if (ps_retention_open(runtime_store_dir) != 0)
 		return OPEN_STEP("retention open");
+	errno = 0;
 	if (page_frontier_load(runtime_store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt page reclamation frontiers\n");
 		return OPEN_STEP("load page reclamation frontiers");
 	}
+	errno = 0;
 	if (walidx_frontier_load(runtime_store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt WAL-index "
@@ -22774,9 +22792,11 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		uint64_t	admission_highwater;
 		uint32_t	npins = 0;
 
+		errno = 0;
 		if (ps_retention_admission_highwater(&admission_highwater) != 0)
 			return OPEN_STEP("read retention admission highwater");
 		admission_seq_observe(admission_highwater);
+		errno = 0;
 		if (ps_retention_count(&npins) != 0)
 			return OPEN_STEP("count retention pins");
 		for (uint32_t i = 0; i < npins; i++)
@@ -22798,7 +22818,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	/* Reconcile the snapshot intent before loading either source epoch.  Only a
 	 * selected manifest transfers ownership away from the old source epoch. */
 	{
-		int manifest_exists = fork_meta_snapshot_manifest_exists(
+		int manifest_exists;
+
+		errno = 0;
+		manifest_exists = fork_meta_snapshot_manifest_exists(
 			fork_meta_snapshot_dir);
 		if (manifest_exists < 0)
 			return OPEN_STEP("check forkmeta snapshot manifest existence");
@@ -22809,8 +22832,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			PsForkmetaSnapshotPrepared pending;
 			int have_pending;
 
+			errno = 0;
 			if (ps_forkmeta_snapshot_open(&selected, fork_meta_snapshot_dir) != 0)
 				return OPEN_STEP("open selected forkmeta snapshot");
+			errno = 0;
 			have_pending = ps_forkmeta_snapshot_read_prepared(
 				fork_meta_snapshot_dir, &pending);
 			if (have_pending < 0 ||
@@ -22824,11 +22849,13 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 				return OPEN_STEP("reconcile forkmeta prepared intent");
 			}
 			ps_forkmeta_snapshot_close(&selected);
+			errno = 0;
 			if (fork_meta_snapshot_load(fork_meta_snapshot_dir) != 0)
 			{
 				fprintf(stderr, "pagestore: selected forkmeta snapshot is invalid\n");
 				return OPEN_STEP("load selected forkmeta snapshot");
 			}
+			errno = 0;
 			if (fork_meta_snapshot_reconcile_source() != 0)
 			{
 				fprintf(stderr, "pagestore: forkmeta source epoch reconcile failed\n");
@@ -22844,11 +22871,14 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		else
 		{
 			PsForkmetaSnapshotPrepared prepared;
-			int have_prepared = ps_forkmeta_snapshot_read_prepared(
-				fork_meta_snapshot_dir, &prepared);
+			int			have_prepared;
 
+			errno = 0;
+			have_prepared = ps_forkmeta_snapshot_read_prepared(
+				fork_meta_snapshot_dir, &prepared);
 			if (have_prepared < 0)
 				return OPEN_STEP("read forkmeta prepared intent");
+			errno = 0;
 			if (have_prepared == 1 &&
 				ps_forkmeta_snapshot_abort(&prepared) != 0)
 				return OPEN_STEP("abort stale forkmeta prepared intent");
@@ -22877,21 +22907,26 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	 * scans and materializes only the segment suffix.  Without a watermark (an
 	 * old store or SPDK), recover() starts at segment zero.
 	 */
+	errno = 0;
 	if (load_fork_meta() != 0)
 		return OPEN_STEP("load fork metadata");
 
 	for (uint32_t sh = 0; sh < ns; sh++)
 	{
+		errno = 0;
 		if (use_layers && recover_layer_prefix(sh) != 0)
 			return OPEN_STEP("recover layer prefix");
+		errno = 0;
 		if (recover(sh) != 0)
 			return OPEN_STEP("recover shard");
 	}
+	errno = 0;
 	if (artifact_validate_recovery() != 0)
 		return OPEN_STEP("validate artifact recovery");
 	/* Retention mutations may have committed immediately before shutdown.
 	 * Conservatively revisit every nonempty layer set after recovery. */
 	page_prune_mark_all_due();
+	errno = 0;
 	if (use_layers && mark_legacy_shard_zero_layers() != 0)
 		return OPEN_STEP("mark legacy shard-zero layers (post-recovery)");
 
@@ -22913,6 +22948,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			return OPEN_STEP("fork-meta migration");
 		}
 		memset(&zk, 0, sizeof(zk));
+		errno = 0;
 		if (fork_meta_persist(0, &zk, 0, 0, 0, FEV_MIGRATED) != 0)
 		{
 			fprintf(stderr, "pagestore: could not seal the fork-meta migration\n");
@@ -22935,8 +22971,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 				(timeline_state == PS_TIMELINE_DELETING ||
 				 timeline_state == PS_TIMELINE_DELETED))
 				continue;
+			errno = 0;
 			if (wal_recover_one(tl) != 0)
 				return OPEN_STEP("recover timeline WAL");
+			errno = 0;
 			if (wal_segment_sync(tl) != 0)
 			{
 				fprintf(stderr, "pagestore: refusing invalid immutable WAL segments "
@@ -22947,21 +22985,28 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			{
 				char directory[4096];
 
+				errno = 0;
 				if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0 ||
 					ps_walidx_snapshot_recover_prepared(directory, tl,
 										walidx_frontier_current(tl)) != 0)
 					return OPEN_STEP("recover WAL-index prepared snapshot");
 			}
+			errno = 0;
 			if (walidx_snapshot_recover(tl) != 0)
 				return OPEN_STEP("recover WAL-index snapshot");
 			for (uint32_t shard = 0; shard < core_shards(); shard++)
+			{
+				errno = 0;
 				if (walidx_recover_one(tl, shard) != 0)
 					return OPEN_STEP("recover WAL-index shard");
+			}
 		}
 
+	errno = 0;
 	if (publish_shard_count &&
 		publish_store_shard_count(runtime_store_dir) != 0)
 		return OPEN_STEP("publish store shard count");
+	errno = 0;
 	if (forkmeta_reclaim_high_water_bytes != 0 &&
 		fork_meta_reclaim_baseline_init() != 0)
 		return OPEN_STEP("initialize forkmeta reclaim baseline");
