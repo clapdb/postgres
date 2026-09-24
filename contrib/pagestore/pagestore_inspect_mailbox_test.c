@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,6 +47,15 @@ sleep_ms(long milliseconds)
 	nanosleep(&ts, NULL);
 }
 
+static int64_t
+now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int
 set_inspection_lock(int fd, off_t byte, short type)
 {
@@ -75,6 +85,29 @@ wait_child(pid_t pid, int milliseconds, int *status)
 		sleep_ms(1);
 	}
 	return waitpid(pid, status, WNOHANG) == pid;
+}
+
+/*
+ * read(2) with a bounded wait, so a handshake with a child that dies before
+ * writing (or never writes) fails promptly instead of hanging the test.
+ * Returns what read() would: the byte count on success, 0 on timeout or
+ * EOF, -1 (errno set) on error.
+ */
+static ssize_t
+read_with_timeout(int fd, void *buf, size_t len, int milliseconds)
+{
+	struct pollfd pfd;
+	int rc;
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	do
+	{
+		rc = poll(&pfd, 1, milliseconds);
+	} while (rc < 0 && errno == EINTR);
+	if (rc <= 0)
+		return rc;
+	return read(fd, buf, len);
 }
 
 static int
@@ -416,6 +449,421 @@ test_response_consistency(const char *inspector)
 	close_fixture(name, fd, hdr);
 }
 
+static int
+run_health(const char *inspector, const char *name)
+{
+	int status;
+	pid_t pid = fork();
+
+	if (pid == 0)
+	{
+		int devnull = open("/dev/null", O_WRONLY);
+
+		if (devnull >= 0)
+			dup2(devnull, STDOUT_FILENO);
+		execl(inspector, inspector, "--shm", name, "health", (char *) NULL);
+		_exit(127);
+	}
+	if (pid < 0 || !wait_child(pid, 5000, &status) || !WIFEXITED(status))
+		return -1;
+	return WEXITSTATUS(status);
+}
+
+/*
+ * A fake daemon holding the lease (byte one) and, until told to finish
+ * "initialization" through release_pipe, byte zero -- the real daemon's
+ * order.  ready_pipe and release_pipe are the whole pipe(2) pairs; each side
+ * closes the end it does not use right after the fork, so a premature exit
+ * on either side is visible to the other as EOF rather than a fd that stays
+ * open (and readable-never) because a second process still holds its write
+ * end.
+ */
+static pid_t
+start_initializing_daemon(const char *name, int ready_pipe[2],
+						  int release_pipe[2])
+{
+	pid_t pid = fork();
+
+	if (pid == 0)
+	{
+		unsigned char byte = 1;
+		int fd;
+
+		close(ready_pipe[0]);
+		close(release_pipe[1]);
+		fd = ps_shm_open(name, O_RDWR, 0);
+
+		if (fd < 0 ||
+			set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0 ||
+			set_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0 ||
+			write(ready_pipe[1], &byte, 1) != 1 ||
+			read(release_pipe[0], &byte, 1) != 1 ||
+			set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK) != 0 ||
+			write(ready_pipe[1], &byte, 1) != 1)
+			_exit(127);
+		for (;;)
+			pause();
+	}
+	if (pid > 0)
+	{
+		close(ready_pipe[1]);
+		close(release_pipe[0]);
+	}
+	return pid;
+}
+
+/*
+ * Caller-side probe matching what pagestore_inspect.c (health/non-relation
+ * ops), backend_localsvc.c, and the standalone client tools now do: take
+ * the shared init lock, and only while holding it check whether the lease
+ * has a holder.  See pagestore_shm.h for why this needs no pid comparisons
+ * and cannot straddle two daemon generations the way separate F_GETLK
+ * probes could (E-8 P1).  Returns 1/0/-1 like ps_shm_lease_held().
+ */
+static int
+probe_ready(int fd)
+{
+	int held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	int ready;
+
+	if (held != 1)
+		return held;
+	ready = ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+	ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	return ready;
+}
+
+/*
+ * E-8: a daemon killed with SIGKILL leaves its header READY.  health and
+ * probe_ready() must not report that segment ready, nor one whose new
+ * daemon still holds the initialization byte.
+ */
+static void
+test_health_requires_live_daemon(const char *inspector)
+{
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int release_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte = 1;
+
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create health fixture");
+	if (failed)
+		return;
+	init_header(hdr, PS_INSPECTION_STATE_IDLE, 1);
+	check(probe_ready(fd) == 0,
+		  "READY header without a daemon lease is not ready");
+	check(run_health(inspector, name) == 1,
+		  "health rejects a READY header left by a dead daemon");
+
+	check(pipe(ready_pipe) == 0 && pipe(release_pipe) == 0,
+		  "create initializing daemon handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = start_initializing_daemon(name, ready_pipe, release_pipe);
+	check(holder > 0 &&
+		  read_with_timeout(ready_pipe[0], &byte, 1, 5000) == 1,
+		  "fake daemon holds lease and initialization byte");
+	if (!failed)
+	{
+		check(probe_ready(fd) == 0,
+			  "initializing daemon is not ready");
+		check(run_health(inspector, name) == 1,
+			  "health rejects a stale header during initialization");
+		check(write(release_pipe[1], &byte, 1) == 1 &&
+			  read_with_timeout(ready_pipe[0], &byte, 1, 5000) == 1,
+			  "fake daemon finishes initialization");
+		check(probe_ready(fd) == 1,
+			  "initialized daemon is ready");
+		check(run_health(inspector, name) == 0,
+			  "health accepts an initialized live daemon");
+		/*
+		 * Relation inspection takes byte zero *exclusively* while it runs
+		 * (pagestore_inspect.c's lock_relation_shm(), unchanged by this
+		 * fix); health now takes it *shared* (ps_shm_hold_init_shared()),
+		 * so the two legitimately contend.  Reporting "not ready" while
+		 * the exclusive hold lasts is the documented behaviour of
+		 * EAGAIN/EACCES on the shared lock (see pagestore_shm.h), not a
+		 * bug -- it is the same conservative call a client makes about an
+		 * actually-initializing daemon, and it clears up the moment the
+		 * exclusive holder lets go.
+		 */
+		check(set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+								  F_WRLCK) == 0,
+			  "relation inspection takes byte zero exclusively after READY");
+		check(run_health(inspector, name) == 1,
+			  "health reports not ready while relation inspection holds byte zero");
+		(void) set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
+		check(run_health(inspector, name) == 0,
+			  "health is ready again once relation inspection releases byte zero");
+	}
+	if (holder > 0)
+	{
+		kill(holder, SIGKILL);
+		check(wait_child(holder, 2000, &status) && WIFSIGNALED(status),
+			  "fake daemon exit releases its lease");
+	}
+	check(run_health(inspector, name) == 1,
+		  "health rejects the header after the daemon is killed");
+	close(ready_pipe[0]);
+	close(release_pipe[1]);
+	if (holder <= 0)
+	{
+		/* start_initializing_daemon() never reached its parent-side closes. */
+		close(ready_pipe[1]);
+		close(release_pipe[0]);
+	}
+	close_fixture(name, fd, hdr);
+}
+
+/*
+ * E-8 P1: the old ps_shm_daemon_ready() made two *independent* F_GETLK
+ * probes (one of the lease byte, one of the init byte) and trusted the
+ * first one even though nothing kept its result from going stale before
+ * the second one ran.  Concretely: the lease probe observes daemon A still
+ * alive, A then exits, and the init probe -- necessarily run afterwards --
+ * finds init_byte free (A never touched it) and that alone was enough for
+ * the old decision logic to report "ready", even though by then nobody
+ * holds the lease at all.
+ *
+ * This is reproduced here deterministically rather than by racing two real
+ * processes against each other (which the old code's own comments noted
+ * would be flaky): observe the live lease for real, kill the holder for
+ * real and wait for it to be reaped (so there is no timing window left at
+ * all), and only then run the actual, current caller-side check.  The new
+ * mechanism has no second, independent probe to go stale on -- init_byte
+ * is held for the entire validation -- so it must see current reality
+ * regardless of what a moment-ago observation would have shown.
+ *
+ * (The bug this guards against was independently confirmed against the
+ * pre-fix ps_shm_daemon_ready()/ps_shm_daemon_ready_decide() with a
+ * standalone repro that performs exactly this interleaving through the old
+ * two-probe code path: it reported ready=1 in 5/5 runs after the lease
+ * holder had already exited.)
+ */
+static void
+test_lease_released_before_probe(void)
+{
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte;
+	struct flock stale_lease;
+	int held;
+	int ready;
+
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create lease-released fixture");
+	if (failed)
+		return;
+	init_header(hdr, PS_INSPECTION_STATE_IDLE, 1);
+	check(pipe(ready_pipe) == 0, "create lease-released handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = start_lease_holder(name, ready_pipe[1]);
+	close(ready_pipe[1]);
+	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+		  "fake daemon holds only the lease (already past READY)");
+	close(ready_pipe[0]);
+	if (failed)
+	{
+		if (holder > 0)
+		{
+			kill(holder, SIGKILL);
+			waitpid(holder, &status, 0);
+		}
+		close_fixture(name, fd, hdr);
+		return;
+	}
+
+	/* The stale observation an old-style first query would have made. */
+	memset(&stale_lease, 0, sizeof(stale_lease));
+	stale_lease.l_type = F_WRLCK;
+	stale_lease.l_whence = SEEK_SET;
+	stale_lease.l_start = PS_INSPECTION_DAEMON_LOCK_BYTE;
+	stale_lease.l_len = 1;
+	check(fcntl(fd, F_GETLK, &stale_lease) == 0 && stale_lease.l_type != F_UNLCK,
+		  "lease is genuinely held right before the daemon exits");
+
+	kill(holder, SIGKILL);
+	check(wait_child(holder, 2000, &status) && WIFSIGNALED(status),
+		  "lease holder exits between the stale observation and the real check");
+
+	/* The real, current check: nothing here can go stale the way a
+	 * separate earlier probe could. */
+	held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	check(held == 1, "init byte is free once the daemon is gone");
+	ready = held == 1 ? ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE) : -1;
+	if (held == 1)
+		ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	check(ready == 0,
+		  "lease is actually gone: the new mechanism does not trust the stale observation");
+
+	close_fixture(name, fd, hdr);
+}
+
+/*
+ * Architect follow-up: relation inspection holds init_byte exclusively for
+ * up to its own ~5s bound while it runs.  A client that only needs to know
+ * "is a live daemon there", not the relation mailbox itself, should wait
+ * that out instead of treating a transient EAGAIN/EACCES as "no daemon" --
+ * otherwise a backend's first touch of the store, or a restore_command
+ * invocation, can spuriously fail just because an operator happened to run
+ * `pagestore_inspect relation` at the same moment.
+ * ps_shm_hold_init_shared_wait() is the bounded-wait helper the standalone
+ * client tools use for this (the backend drives its own interruptible loop
+ * instead; see backend_localsvc.c's ls_attach()).
+ */
+static void
+test_hold_init_shared_wait_succeeds(void)
+{
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte;
+	int64_t start;
+	int64_t elapsed;
+	int held;
+
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create wait-succeeds fixture");
+	if (failed)
+		return;
+	check(pipe(ready_pipe) == 0, "create wait-succeeds handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = fork();
+	if (holder == 0)
+	{
+		int cfd = ps_shm_open(name, O_RDWR, 0);
+		unsigned char ready = 1;
+
+		close(ready_pipe[0]);
+		if (cfd < 0 || set_inspection_lock(cfd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+										   F_WRLCK) != 0)
+			_exit(127);
+		if (write(ready_pipe[1], &ready, 1) != 1)
+			_exit(127);
+		sleep_ms(300);
+		(void) set_inspection_lock(cfd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
+		_exit(0);
+	}
+	close(ready_pipe[1]);
+	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+		  "byte zero exclusive holder is in place");
+	close(ready_pipe[0]);
+	if (failed)
+	{
+		if (holder > 0)
+		{
+			kill(holder, SIGKILL);
+			waitpid(holder, &status, 0);
+		}
+		close_fixture(name, fd, hdr);
+		return;
+	}
+
+	start = now_ms();
+	held = ps_shm_hold_init_shared_wait(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, 2000);
+	elapsed = now_ms() - start;
+	check(held == 1,
+		  "wait acquires the shared init lock once the exclusive holder releases");
+	check(elapsed > 200,
+		  "wait actually waited out the ~300ms exclusive hold (elapsed > 200ms)");
+	if (held == 1)
+		ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+
+	check(wait_child(holder, 2000, &status) && WIFEXITED(status),
+		  "byte zero holder exits cleanly");
+	close_fixture(name, fd, hdr);
+}
+
+/*
+ * Symmetric case: when the exclusive hold outlives the wait's own timeout,
+ * the wait must give up and return 0 (not ready) rather than block
+ * indefinitely.
+ */
+static void
+test_hold_init_shared_wait_times_out(void)
+{
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte;
+	int held;
+
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create wait-times-out fixture");
+	if (failed)
+		return;
+	check(pipe(ready_pipe) == 0, "create wait-times-out handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = fork();
+	if (holder == 0)
+	{
+		int cfd = ps_shm_open(name, O_RDWR, 0);
+		unsigned char ready = 1;
+
+		close(ready_pipe[0]);
+		if (cfd < 0 || set_inspection_lock(cfd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+										   F_WRLCK) != 0)
+			_exit(127);
+		if (write(ready_pipe[1], &ready, 1) != 1)
+			_exit(127);
+		for (;;)
+			pause();
+	}
+	close(ready_pipe[1]);
+	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+		  "byte zero exclusive holder is in place (times-out case)");
+	close(ready_pipe[0]);
+	if (failed)
+	{
+		if (holder > 0)
+		{
+			kill(holder, SIGKILL);
+			waitpid(holder, &status, 0);
+		}
+		close_fixture(name, fd, hdr);
+		return;
+	}
+
+	held = ps_shm_hold_init_shared_wait(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, 200);
+	check(held == 0,
+		  "wait gives up once its own (short) timeout elapses while the exclusive hold continues");
+
+	kill(holder, SIGKILL);
+	check(wait_child(holder, 2000, &status) && WIFSIGNALED(status),
+		  "byte zero holder is reaped (times-out case)");
+	close_fixture(name, fd, hdr);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -432,6 +880,10 @@ main(int argc, char **argv)
 				 "create stale BUSY fixture");
 	test_live_daemon_lease(argv[1]);
 	test_response_consistency(argv[1]);
+	test_health_requires_live_daemon(argv[1]);
+	test_lease_released_before_probe();
+	test_hold_init_shared_wait_succeeds();
+	test_hold_init_shared_wait_times_out();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed == 0 ? 0 : 1;
 }

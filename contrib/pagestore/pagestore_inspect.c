@@ -836,14 +836,59 @@ main(int argc, char **argv)
 		return 1;
 	}
 	hdr = (PsShmHeader *) shm;
-	if (!header_valid(hdr))
+	if (relation_operation)
 	{
-		fprintf(stderr, "pagestore_inspect: invalid or incompatible shared memory\n");
-		munmap(shm, PS_SHM_SIZE);
-		if (relation_operation)
+		/* relation already holds byte zero exclusively (lock_relation_shm
+		 * above), which alone serializes it against daemon initialization;
+		 * it must still reclaim a dead daemon's mailbox itself, via
+		 * daemon_lease_is_free(), so it does not go through the shared-lock
+		 * helper below. */
+		if (!header_valid(hdr))
+		{
+			fprintf(stderr, "pagestore_inspect: invalid or incompatible shared memory\n");
+			munmap(shm, PS_SHM_SIZE);
 			unlock_relation_shm(fd);
-		close(fd);
-		return 1;
+			close(fd);
+			return 1;
+		}
+	}
+	else
+	{
+		/* A dead daemon's header stays READY, and closing that window means
+		 * validating the header only while a live daemon is provably
+		 * unable to be mid-initialization -- see pagestore_shm.h for the
+		 * full argument.  Take the shared init lock first, then validate
+		 * the header and the lease, then release the lock on every path. */
+		int held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		int ok = 0;
+
+		if (held < 0)
+			perror("pagestore_inspect: fcntl init lock");
+		else if (held == 0)
+			fprintf(stderr, "pagestore_inspect: no running daemon owns the shared memory, or it is still initializing\n");
+		else
+		{
+			if (!header_valid(hdr))
+				fprintf(stderr, "pagestore_inspect: invalid or incompatible shared memory\n");
+			else
+			{
+				int ready = ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+
+				if (ready == 1)
+					ok = 1;
+				else if (ready < 0)
+					perror("pagestore_inspect: fcntl daemon lease query");
+				else
+					fprintf(stderr, "pagestore_inspect: no running daemon owns the shared memory, or it is still initializing\n");
+			}
+			ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		}
+		if (!ok)
+		{
+			munmap(shm, PS_SHM_SIZE);
+			close(fd);
+			return 1;
+		}
 	}
 	if (strcmp(operation, "health") == 0)
 		print_health(hdr);

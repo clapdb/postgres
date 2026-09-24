@@ -384,9 +384,25 @@ check_inspector_seqlock(void)
 	if (fd < 0)
 		return;
 	base = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (base == MAP_FAILED)
+	{
+		close(fd);
 		return;
+	}
+	/* Stand in for a live, initialized daemon: the inspector refuses a READY
+	 * header whose daemon lease (byte one) has no holder.  Closing fd at the
+	 * end releases it. */
+	{
+		struct flock lease;
+
+		memset(&lease, 0, sizeof(lease));
+		lease.l_type = F_WRLCK;
+		lease.l_whence = SEEK_SET;
+		lease.l_start = PS_INSPECTION_DAEMON_LOCK_BYTE;
+		lease.l_len = 1;
+		check(fcntl(fd, F_SETLK, &lease) == 0,
+			  "synthetic inspection shared memory holds a daemon lease");
+	}
 	memset(base, 0, PS_SHM_SIZE);
 	hdr = base;
 	hdr->magic = PS_SHM_MAGIC;
@@ -444,6 +460,7 @@ check_inspector_seqlock(void)
 		  strcmp(output, "pagestore_inspect: timeline 7 does not exist\n") == 0,
 		  "a clean timeline snapshot reports a genuinely absent timeline");
 	munmap(base, PS_SHM_SIZE);
+	close(fd);
 	ps_shm_unlink(name);
 }
 
@@ -2004,6 +2021,83 @@ stop_daemon(pid_t pid)
 {
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);
+}
+
+/*
+ * E-8: clients now briefly take a *shared* lock on byte zero
+ * (ps_shm_hold_init_shared(), see pagestore_shm.h) while checking whether
+ * the segment is ready -- an orchestrator polling health across a daemon
+ * restart can legitimately hold it for the length of one health probe.
+ * Before this fix the daemon failed immediately ("shm initialization is
+ * busy") on any byte-zero contention; it must now retry for up to ~10s
+ * instead.  This drives the *real* daemon binary against a pre-created,
+ * pre-sized shm segment whose byte zero this test process holds shared
+ * (exactly like a health check in progress), and checks that the daemon is
+ * still running well short of the retry bound -- then releases the lock
+ * and checks the daemon goes on to become ready normally.
+ */
+static void
+check_daemon_waits_for_shared_init_lock(const char *daemon_path,
+										const char *tmpbase)
+{
+	char		name[64];
+	char		store[256];
+	int			fd;
+	pid_t		dpid;
+	int			held;
+	int			status = 0;
+	int			i;
+	int			exited_early;
+
+	snprintf(name, sizeof(name), "/pstest_%d_initlock_wait", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_initlock_wait", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(name);
+
+	fd = ps_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+	check(fd >= 0 && ftruncate(fd, PS_SHM_SIZE) == 0,
+		  "create pre-sized shm for the init-lock-wait test");
+	if (fd < 0)
+		return;
+
+	held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	check(held == 1, "test process holds the shared init lock");
+	if (held != 1)
+	{
+		close(fd);
+		ps_shm_unlink(name);
+		return;
+	}
+
+	dpid = spawn_daemon(daemon_path, name, store, 8192, test_nshards);
+
+	exited_early = 0;
+	for (i = 0; i < 200; i++)	/* ~2s, well inside the ~10s retry bound */
+	{
+		if (waitpid(dpid, &status, WNOHANG) == dpid)
+		{
+			exited_early = 1;
+			break;
+		}
+		usleep(10000);
+	}
+	check(!exited_early,
+		  "daemon retries byte zero instead of failing immediately while a client holds it shared");
+
+	ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	close(fd);
+
+	if (exited_early)
+	{
+		ps_shm_unlink(name);
+		rm_rf(store);
+		return;
+	}
+
+	wait_ready(name, 8192);
+	stop_daemon(dpid);
+	ps_shm_unlink(name);
+	rm_rf(store);
 }
 
 /* On-disk fork-meta record mirror, used only to synthesize a pre-marker store. */
@@ -5944,6 +6038,7 @@ main(int argc, char **argv)
 		return 2;
 	}
 	check_inspector_seqlock();
+	check_daemon_waits_for_shared_init_lock(daemon_path, tmpbase);
 
 	/* Legacy migration must seal before the daemon publishes readiness. */
 	run_migration_failure_suite(daemon_path, tmpbase);

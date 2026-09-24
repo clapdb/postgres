@@ -68,6 +68,19 @@ on_signal(int sig)
 	stop_requested = 1;
 }
 
+static int
+set_shm_lock(int fd, off_t byte, short type)
+{
+	struct flock lock;
+
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = type;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = byte;
+	lock.l_len = 1;
+	return fcntl(fd, F_SETLK, &lock);
+}
+
 static void
 shm_mark_starting(PsShmHeader *hdr)
 {
@@ -783,6 +796,56 @@ main(int argc, char **argv)
 		perror("shm_open");
 		return 1;
 	}
+	/*
+	 * Same ownership protocol as the POSIX daemon: byte zero is held through
+	 * initialization until READY, byte one for the process lifetime.  Clients
+	 * treat a READY header as live only under that lease, so fd stays open
+	 * (closing it would drop both locks).
+	 *
+	 * Clients now briefly take a *shared* lock on byte zero while checking
+	 * readiness (ps_shm_hold_init_shared(), see pagestore_shm.h), so retry
+	 * byte zero with a bounded wait (~10ms steps, ~10s total) instead of
+	 * failing on the first collision with such a transient hold.  Byte one
+	 * (the lease) is still refused immediately: another daemon already
+	 * holding it is a real conflict.
+	 */
+	{
+		int			attempt;
+		int			acquired = 0;
+
+		for (attempt = 0; attempt < 1000; attempt++)
+		{
+			if (set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) == 0)
+			{
+				acquired = 1;
+				break;
+			}
+			if (errno != EACCES && errno != EAGAIN)
+				break;
+			{
+				struct timespec ts = {0, 10000000};	/* 10ms */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		if (!acquired)
+		{
+			if (errno == EACCES || errno == EAGAIN)
+				fprintf(stderr, "pagestore_daemon_spdk: another process owns the shm lease\n");
+			else
+				perror("pagestore_daemon_spdk: fcntl shm lease");
+			return 1;
+		}
+	}
+	if (set_shm_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0)
+	{
+		if (errno == EACCES || errno == EAGAIN)
+			fprintf(stderr, "pagestore_daemon_spdk: another process owns the shm lease\n");
+		else
+			perror("pagestore_daemon_spdk: fcntl shm lease");
+		(void) set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
+		return 1;
+	}
 	if (ftruncate(fd, PS_SHM_SIZE) != 0)
 	{
 		perror("ftruncate shm");
@@ -794,7 +857,6 @@ main(int argc, char **argv)
 		perror("mmap");
 		return 1;
 	}
-	close(fd);
 	hdr = (PsShmHeader *) shm;
 	daemon_hdr = hdr;
 	/* Invalidate a previous daemon's header before store recovery begins. */
@@ -865,6 +927,8 @@ main(int argc, char **argv)
 		if (started == hdr->nshards && maintenance_started && !stop_requested &&
 			shm_publish_ready(hdr))
 		{
+			if (set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK) != 0)
+				perror("pagestore_daemon_spdk: fcntl initialization lock release");
 			fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
 					"page_size=%u io_unit=%u channels=%u nshards=%u ready\n",
 					shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,

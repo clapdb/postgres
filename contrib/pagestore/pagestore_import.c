@@ -69,18 +69,47 @@ client_attach(const char *shm_name)
 		perror("mmap");
 		exit(2);
 	}
-	close(fd);
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
-		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY ||
-		hdr->page_size != page_size)
+
+	/*
+	 * A dead daemon's header stays READY.  Take the shared init lock first
+	 * (so no daemon can be mid-initialization for as long as we hold it --
+	 * see pagestore_shm.h), then validate the header and the lease, then
+	 * release the lock on every path.  Wait out a transient exclusive
+	 * holder (a daemon initializing, or a bounded relation-inspection
+	 * call) rather than failing immediately.
+	 */
 	{
-		fprintf(stderr, "shm header mismatch (daemon magic=0x%x version=%u "
-				"page_size=%u; expected version=%u page_size=%u)\n",
-				hdr->magic, hdr->version, hdr->page_size,
-				PS_SHM_VERSION, page_size);
-		exit(2);
+		int held = ps_shm_hold_init_shared_wait(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+												PS_INIT_LOCK_WAIT_MS);
+		int ready = -1;
+		int header_ok = 0;
+
+		if (held == 1)
+		{
+			header_ok = (hdr->magic == PS_SHM_MAGIC && hdr->version == PS_SHM_VERSION &&
+						 __atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) == PS_SHM_READY &&
+						 hdr->page_size == page_size);
+			if (header_ok)
+				ready = ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+			ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		}
+
+		if (held == 1 && !header_ok)
+		{
+			fprintf(stderr, "shm header mismatch (daemon magic=0x%x version=%u "
+					"page_size=%u; expected version=%u page_size=%u)\n",
+					hdr->magic, hdr->version, hdr->page_size,
+					PS_SHM_VERSION, page_size);
+			exit(2);
+		}
+		if (held != 1 || ready != 1)
+		{
+			fprintf(stderr, "no running, initialized daemon owns the shared memory\n");
+			exit(2);
+		}
 	}
+	close(fd);
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
 		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
 		{

@@ -247,20 +247,74 @@ directly followed the deletion of the retired branch.  The next step is to
 count `ps_control_dropped` and the exit drain's outcome, and to read the
 control object's versions on the preserved store.
 
-**E-8. `pagestore_inspect health` reports a dead daemon's segment as
-ready** (CI seed 1, round 5; worked around in the driver).  A daemon killed
-with `SIGKILL` leaves its shared-memory object with a valid header and
-`startup_state = READY`.  The next daemon reuses the object (`O_CREAT`
-without unlinking) and re-initializes it under lock byte zero, but `health`
-maps the object read-only, checks only the header, and never probes the
-daemon lease on byte one.  A readiness probe issued between the new daemon's
-launch and its initialization therefore succeeds against the stale header;
-the writer then attached mid-initialization and failed with `pagestore
-localsvc shared memory incompatible ... magic=0x0`.  Any orchestrator that
-restarts the daemon after a crash and waits on `health` has the same race.
-Fix direction: `health` (and every client attach) should require byte one
-to be held by a live daemon, or the daemon should unlink and recreate the
-object.  The driver now removes the stale object before each daemon start.
+**E-8. `pagestore_inspect health` reported a dead daemon's segment as
+ready** (CI seed 1, round 5; fixed, twice).  A daemon killed with `SIGKILL`
+leaves its shared-memory object with a valid header and `startup_state =
+READY`.  The next daemon reuses the object (`O_CREAT` without unlinking)
+and only invalidates the header after taking its locks, while `health`
+mapped the object read-only and checked only the header.  A readiness probe
+issued between the new daemon's launch and its initialization therefore
+succeeded against the stale header; the writer then attached
+mid-initialization and failed with `pagestore localsvc shared memory
+incompatible ... magic=0x0`.
+
+The first fix (round 1) had `health` and every client attach require two
+independent `F_GETLK` probes -- one of the daemon lease (byte one), one of
+the initialization byte (byte zero) -- plus pid comparisons to rule out a
+daemon restart landing between them.  That scheme had its own gap (P1):
+`F_GETLK` never blocks and never takes anything, so nothing kept the lease
+probe's result from going stale before the init probe ran.  Concretely, the
+lease probe could observe daemon A still alive, A could then exit, and the
+init probe -- run strictly afterwards, so it necessarily found the
+never-touched init byte free -- was on its own enough for the old decision
+logic to report "ready", even though by then nobody held the lease at all.
+No amount of extra pid bookkeeping closes a gap between two probes that are
+simply not atomic with each other.
+
+The real fix (round 2) stopped probing and instead serializes with the
+daemon's own initialization protocol via a real, non-blocking lock:
+`ps_shm_hold_init_shared()` takes a *shared* (`F_RDLCK`) lock on the init
+byte.  The daemon holds the init byte *exclusively* from before it
+invalidates the header until it publishes READY, and holds the lease byte
+exclusively for its whole lifetime after that.  So a shared lock on the
+init byte cannot be acquired while any daemon is mid-initialization, and
+while our shared lock is held, no daemon can begin that window either.  For
+as long as we hold it, therefore, no daemon is initializing and none can
+start; if `ps_shm_lease_held()` then finds a lease holder, that holder must
+already be past READY, and the header we validate while still holding the
+lock is that live daemon's own stable, already-published header.  No pids
+are compared anywhere, so pid namespaces are not a concern.  `health` and
+every client attach (backend, `pagestore_import`, `pagestore_walrestore`,
+`pagestore_control_restore`) now use this hold-lock / validate-header /
+check-lease / release-lock sequence (see `pagestore_shm.h` for the full
+argument); the relation-inspection path is unaffected, since it already
+takes the init byte exclusively itself for its own mailbox-ownership
+reasons.
+
+One behavioural consequence: relation inspection's exclusive hold and
+`health`'s new shared hold now legitimately contend, so `health` correctly
+reports "not ready" for as long as a relation-inspection call is in
+flight, clearing up as soon as it releases the byte.  On the daemon side,
+clients briefly holding the init byte shared is now an expected, routine
+occurrence (an orchestrator polling health across a restart), so the
+daemon retries a busy init byte for up to ~10s instead of failing
+immediately; it still fails immediately if the *lease* byte is held (a
+live competing daemon, not a transient inspector).  Client attach
+(`ls_attach`, `pagestore_import`, `pagestore_walrestore`,
+`pagestore_control_restore`) likewise waits out a transient exclusive
+holder of the init byte (bounded, ~10s) instead of raising a spurious "no
+running, initialized daemon" error the moment it collides with a
+relation-inspection call or a daemon that is (briefly) still initializing;
+`health`/non-relation `pagestore_inspect` stays non-blocking, since its
+callers already retry.
+
+`pagestore_inspect_mailbox_test` covers a dead daemon's READY header, a
+daemon still initializing, an initialized daemon, an inspector holding
+byte zero, and -- the P1 regression -- a lease holder that has exited
+between an earlier observation and the real check.  `pagestore_test`
+additionally drives the real daemon binary against a pre-held shared init
+lock and confirms it waits instead of exiting.  The driver still removes
+the stale object before each daemon start; that is no longer required.
 
 Also needed: the daemon should log one line for every refused or failed
 READV/WRITEV/BEGIN_DELETE (opcode, timeline, key, block, reason), as it
