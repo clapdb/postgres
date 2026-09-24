@@ -601,16 +601,24 @@ make_lock(short type, pid_t pid)
  * -- old daemon A exits and successor B takes both locks between the two
  * queries -- so the init query reports B's pid where the lease query
  * reported A's, which looks exactly like an inspector holding the init
- * byte alongside a live daemon.  The fix re-queries the lease a third time
- * and only reports ready when that third query's pid still matches the
- * first query's.  Actually racing two real processes through that window
- * is inherently timing dependent and would make this test flaky, so this
- * exercises ps_shm_daemon_ready_decide() -- the pure decision logic that
- * ps_shm_daemon_ready() delegates to after its three real F_GETLK calls --
- * directly, with hand-built F_GETLK results standing in for each query.
- * That is deterministic and covers exactly the buggy comparison (and the
- * surrounding steady-state and conservative-unavailable-pid cases) without
- * needing the queries to actually interleave.
+ * byte alongside a live daemon.  When the init query finds a holder, the
+ * fix re-queries the lease a third time and only reports ready when that
+ * third query's pid still matches the first query's.  When the init query
+ * instead finds init_byte free, no pid comparison is needed or done: a
+ * daemon holds init_byte continuously from before it takes the lease
+ * through READY, so init_byte being free after a successful lease query
+ * already proves no daemon is currently initializing, regardless of pids --
+ * which matters because F_GETLK reports pid 0 (unusable for comparison)
+ * when the lock holder is in a different pid namespace, a routine case for
+ * a containerized daemon.  Actually racing two real processes through the
+ * inspector-exception window is inherently timing dependent and would make
+ * this test flaky, so this exercises ps_shm_daemon_ready_decide() -- the
+ * pure decision logic that ps_shm_daemon_ready() delegates to after its
+ * F_GETLK calls -- directly, with hand-built F_GETLK results standing in
+ * for each query.  That is deterministic and covers exactly the buggy
+ * comparison (and the surrounding steady-state, pid-namespace, and
+ * conservative-unavailable-pid cases) without needing the queries to
+ * actually interleave.
  */
 static void
 test_daemon_ready_decide(void)
@@ -631,6 +639,30 @@ test_daemon_ready_decide(void)
 	check(ps_shm_daemon_ready_decide(&lease_a, &init_by_inspector,
 									 &lease_a_again) == 1,
 		  "inspector on init byte with unchanged lease holder is ready");
+
+	/*
+	 * Pid-namespace case: F_GETLK reports l_pid 0 when the lock holder is
+	 * in a different pid namespace from the caller (e.g. a containerized
+	 * daemon queried from the host, or vice versa).  init_byte being free
+	 * needs no pid comparison at all, so this must still be ready even
+	 * though neither the first nor the (unused) third query's pid is
+	 * usable.
+	 */
+	check(ps_shm_daemon_ready_decide(&lease_pid_unknown, &init_unlocked,
+									 &lease_a_again) == 1,
+		  "pid-namespace-unavailable lease with init free is still ready");
+
+	/*
+	 * init_byte being free settles the question by itself; the third
+	 * query's result is not consulted, whether it has no holder ("gone")
+	 * or a different one ("changed").
+	 */
+	check(ps_shm_daemon_ready_decide(&lease_a, &init_unlocked,
+									 &lease_unlocked) == 1,
+		  "init free is ready even if the third lease query found no holder");
+	check(ps_shm_daemon_ready_decide(&lease_a, &init_unlocked,
+									 &lease_b) == 1,
+		  "init free is ready even if the third lease query found a different holder");
 
 	/*
 	 * The restart race: the lease query sees A, but by the time the init

@@ -210,14 +210,35 @@ ps_shm_unlink(const char *name)
  * locks, and the init query then sees B holding init_byte.  A's and B's pids
  * differ, which looks exactly like an inspector holding init_byte alongside
  * a live daemon, so without more the segment would be reported ready while
- * B is still initializing.  To close that window, after the init query we
- * query the lease byte a third time and only report ready when that third
- * query's holder's pid equals the first query's pid (both known, i.e. >0).
- * If the restart happened, the third query now sees B, which differs from
- * A's first-query pid (or the lease is briefly unheld between A's exit and
- * B's acquisition), so we correctly fall through to "not ready"; if no
- * restart happened, the same daemon still holds the lease throughout and the
- * pids match.
+ * B is still initializing.
+ *
+ * That ambiguity only arises when the init query finds a holder: if the init
+ * query instead finds init_byte free, no pid comparison is needed at all.
+ * The daemon holds init_byte continuously from before it invalidates the
+ * header until it publishes READY, and the init query runs strictly after
+ * the (successful) first lease query, so init_byte being free at that later
+ * instant already proves that whoever currently holds the lease has passed
+ * READY -- there is no live daemon still initializing right now, regardless
+ * of whether it is the same daemon the first query saw.  A stale first-query
+ * pid is harmless here, including the pid=0 that F_GETLK reports when the
+ * lock holder is in a different pid namespace (a routine case for a
+ * containerized daemon vs. an inspector on the host, or vice versa): pid
+ * comparison is simply not needed to reach this conclusion.
+ *
+ * When the init query does find a holder, that holder's pid decides between
+ * "a new daemon is still initializing" and "an inspector took init_byte
+ * alongside an already-live daemon", and here the pids do have to be
+ * compared, so a pid of 0 (or of the same process) is conservatively treated
+ * as not ready.  Even a differing, known pid is not proof enough on its own,
+ * because it is exactly what the fast-restart race above also produces: to
+ * tell the two apart we query the lease byte a third time, after the init
+ * query, and only accept the inspector explanation -- and report ready --
+ * when that third query still finds the same holder (by pid) as the first
+ * query.  If the restart happened, the third query now sees B, which
+ * differs from A's first-query pid (or the lease is briefly unheld between
+ * A's exit and B's acquisition), so we correctly fall through to "not
+ * ready"; if no restart happened, the same daemon still holds the lease
+ * throughout and the pids match.
  *
  * The decision itself lives in ps_shm_daemon_ready_decide() below, taking
  * the three F_GETLK results as plain data, so it can be unit tested with
@@ -231,15 +252,15 @@ ps_shm_daemon_ready_decide(const struct flock *first_lease,
 {
 	if (first_lease->l_type == F_UNLCK)
 		return 0;
-	if (init->l_type != F_UNLCK &&
-		(init->l_pid <= 0 || first_lease->l_pid <= 0 ||
-		 init->l_pid == first_lease->l_pid))
+	if (init->l_type == F_UNLCK)
+		return 1;
+	if (init->l_pid <= 0 || first_lease->l_pid <= 0 ||
+		init->l_pid == first_lease->l_pid)
 		return 0;
+	/* The inspector exception: confirm the lease holder hasn't changed. */
 	if (third_lease->l_type == F_UNLCK)
 		return 0;
-	if (first_lease->l_pid <= 0 || third_lease->l_pid <= 0)
-		return 0;
-	if (third_lease->l_pid != first_lease->l_pid)
+	if (third_lease->l_pid <= 0 || third_lease->l_pid != first_lease->l_pid)
 		return 0;
 	return 1;
 }
@@ -269,14 +290,21 @@ ps_shm_daemon_ready(int fd, off_t init_byte, off_t lease_byte)
 	if (fcntl(fd, F_GETLK, &init) != 0)
 		return -1;
 
-	/* Re-query the lease holder; see the comment above. */
+	/*
+	 * The third lease query is only needed for the inspector exception
+	 * (see the comment above); when init_byte is free, skip it, since
+	 * ps_shm_daemon_ready_decide() does not look at it in that case.
+	 */
 	memset(&third_lease, 0, sizeof(third_lease));
-	third_lease.l_type = F_WRLCK;
-	third_lease.l_whence = SEEK_SET;
-	third_lease.l_start = lease_byte;
-	third_lease.l_len = 1;
-	if (fcntl(fd, F_GETLK, &third_lease) != 0)
-		return -1;
+	if (init.l_type != F_UNLCK)
+	{
+		third_lease.l_type = F_WRLCK;
+		third_lease.l_whence = SEEK_SET;
+		third_lease.l_start = lease_byte;
+		third_lease.l_len = 1;
+		if (fcntl(fd, F_GETLK, &third_lease) != 0)
+			return -1;
+	}
 
 	return ps_shm_daemon_ready_decide(&first_lease, &init, &third_lease);
 }
