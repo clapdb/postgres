@@ -382,6 +382,26 @@ and compaction.  Enumeration is available over IPC, and churn is compacted off
 the request path.  Recovery truncates only an incomplete final record and fails
 closed on any complete corrupt record or a pin whose timeline is absent.
 
+Every durable mutation of `retention.meta` -- an in-place append (SET/DROP/
+admission-reserve) or a full rewrite (churn compaction, and the identical
+v1 -> v2 migration) -- is bracketed by a durable `retention.pending` marker
+that carries the mutation's *intent*: the committed (record count, rolling
+hash) pair the log had before the mutation and the one it is meant to reach
+after, CRC-protected.  A process death anywhere between installing that
+marker and removing it again is not ambiguous: the next open reads the
+surviving intent, classifies whatever `retention.meta` actually holds against
+it (tolerating a torn or complete-but-unacknowledged trailing append record),
+and deterministically rolls the mutation back or forward before clearing the
+marker and continuing the ordinary replay -- itself safe to redo verbatim
+after a second crash mid-recovery.  A small number of failures instead happen
+in a *live* process (an fsync/rename/unlink step reports an error while the
+daemon keeps running and keeps answering, i.e. rejecting, requests); those
+durably install `retention.failed`, a permanent marker that startup refuses
+to look past even once `retention.pending` is gone, so a later restart can
+never silently resurrect a mutation whose failure the process already
+observed.  A `retention.pending` in the previous (empty-guard) format, or any
+other unreconcilable content, still fails startup closed exactly as before.
+
 Managed readers and materializers install and advance durable owner generations
 before consuming retained history.  The effective-floor query projects
 explicit descendant pins through every branch cap, derives permanent fork-point

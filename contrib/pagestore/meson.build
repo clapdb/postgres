@@ -505,12 +505,30 @@ test('pagestore_manifest',
 
 # Unit test for durable retention pins, replay and churn compaction.
 pagestore_retention_test = executable('pagestore_retention_test',
-  files('pagestore_retention_test.c', 'pagestore_retention.c'),
+  files('pagestore_retention_test.c', 'pagestore_retention.c',
+        'pagestore_fault.c'),
   dependencies: [dependency('threads')],
   install: false,
 )
 test('pagestore_retention',
   pagestore_retention_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Deterministic process-abort regression for Bug C: a crash during retention
+# log compaction (or a plain in-place append) must not leave the store
+# unable to open.  Forks directly against pagestore_retention.c/pagestore_fault.c;
+# no daemon, no pagestore_core.c.
+pagestore_retention_crash_test = executable('pagestore_retention_crash_test',
+  files('pagestore_retention_crash_test.c', 'pagestore_retention.c',
+        'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_retention_crash',
+  pagestore_retention_crash_test,
   suite: ['pagestore'],
   timeout: 60,
 )

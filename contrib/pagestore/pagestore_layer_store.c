@@ -309,12 +309,22 @@ local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
 static int
 local_owner_current(void)
 {
+	int			current;
+
 	if (layer_owner == NULL)
 	{
 		errno = EPERM;
 		return 0;
 	}
-	return ps_store_owner_require_current(layer_owner) == 0;
+	current = ps_store_owner_require_current(layer_owner) == 0;
+	/* ps_store_owner_require_current() already sets errno on every failure
+	 * path, but every caller here does `if (!local_owner_current()) return
+	 * -1;`, so make that guarantee local instead of relying on a callee two
+	 * frames away: a future failure mode that forgets to set errno must not
+	 * leave the eventual open-path diagnostic reporting a stale value. */
+	if (!current && errno == 0)
+		errno = EPERM;
+	return current;
 }
 
 static int
