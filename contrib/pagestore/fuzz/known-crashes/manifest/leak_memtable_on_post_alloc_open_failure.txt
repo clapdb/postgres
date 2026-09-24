@@ -1,0 +1,54 @@
+target: manifest (layers.manifest)
+kind: LeakSanitizer-detected leak, not a crash/hang/OOB
+severity: low; real but bounded-per-attempt, not attacker-amplifiable in one
+  call -- becomes "unbounded" only across many retried opens of the same
+  persistently-corrupt store in one long-lived process.
+reproduce:
+  cd contrib/pagestore/fuzz
+  PS_FUZZ_TARGET=manifest PS_FUZZ_NO_MUTE=1 \
+    ASAN_OPTIONS=detect_leaks=1 \
+    ./build/pagestore_format_fuzz -runs=1 \
+    known-crashes/manifest/leak_memtable_on_post_alloc_open_failure.txt.bin
+  (the run_fuzz.sh exploration campaigns and the meson
+  pagestore_format_fuzz_replay_* regression tests both run with
+  detect_leaks=0 / a non-ASan build, so neither reproduces this by itself --
+  see fuzz_common.c's muting_disabled()/mute_output() comment and
+  run_fuzz.sh's ASAN_OPTIONS for why.)
+
+what: the minimized layers.manifest input (companion .bin file) contains a
+valid manifest record naming an image layer file that does not exist under
+the store directory. ps_core_open() -> ps_core_open_impl()
+(pagestore_core.c) allocates one memtable per shard at line ~22698
+(ps_memtable_create(), pagestore_memtable.c:43) *before* later
+validation/replay steps that can still fail and return -1 (load_timelines(),
+wal_segment_discover_used(), ps_retention_open(), page_frontier_load(),
+walidx_frontier_load(), retention-pin validation, and further checks later
+in the same function -- the layer-file-missing case surfaces somewhere in
+that later replay). On any such post-allocation failure, ps_core_open_impl()
+returns -1 without releasing g_shards[i].memtable (or ps_pgcache_init()'s
+allocation from the same window). ps_core_open()'s failure-unwind path
+(pagestore_core.c:22396-22413) closes the manifest, layer store and storage
+provider, but never calls ps_memtable_destroy()/ps_pgcache_free() -- those
+are only reached from ps_core_close_impl(), which a failed open's caller is
+correctly told not to call.
+
+confirmed stack (ASan leak report, from the pre-minimization repro):
+  calloc
+  ps_memtable_create            pagestore_memtable.c:43
+  ps_core_open_impl             pagestore_core.c:22698
+  ps_core_open                  pagestore_core.c:22393
+
+can a real crash-torn write trigger this: yes. Any of the files validated
+after the memtable-creation point (timelines, page-prune.frontiers,
+walidx-prune.frontiers, retention.meta/state, the WAL segment catalog, or --
+as in this repro -- a manifest record referencing a layer file lost to a
+torn/incomplete write) can fail validation there, so a store left corrupt by
+a crash mid-write leaks this memory on every subsequent failed open attempt.
+It is not a crash by itself; it matters only for a process that retries
+ps_core_open() on the same broken store many times without exiting (e.g. a
+supervisor retry loop), which is exactly the repeated-open/close-in-one-
+process pattern pagestore_core.c's own ps_core_open_impl() comment says is
+supported ("A test or embedding process may reopen without a fresh daemon").
+
+not fixed: per task instructions, product code (pagestore_core.c and
+friends) was not modified. This is reported as a finding, not patched.
