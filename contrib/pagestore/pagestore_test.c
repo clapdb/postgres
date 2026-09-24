@@ -1074,6 +1074,42 @@ op_write_control(uint32_t block, const unsigned char *page, uint64_t version)
 	cl_exec();
 }
 
+/* Like op_write_control() but on an explicit timeline (for testing a branch
+ * admitting a control rewrite that collides only with a version it
+ * INHERITS from an ancestor, never locally). */
+static void
+op_write_control_tl(uint32_t tl, uint32_t block, const unsigned char *page,
+					uint64_t version)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint32_t	nb;
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = tl;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	ch->req_lsn = 0;
+	cl_exec();
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = tl;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_NBLOCKS;
+	cl_exec();
+	nb = ch->result;
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = tl;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = (block < nb) ? PS_OP_WRITEV : PS_OP_EXTEND;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->req_lsn = version;
+	memcpy(ch->data, page, cl_page_size);
+	cl_exec();
+}
+
 /* Durable WAL retention floor for a timeline (0 = unconstrained). */
 static uint64_t
 op_wal_retain_floor(uint32_t timeline)
@@ -5454,6 +5490,115 @@ run_bugb_revision_suite(const char *daemon_path, const char *tmpbase)
 }
 
 /*
+ * Bug B, Codex round-2 review findings 4098328771 (control images) and
+ * 4098328776 (fork events): the collision check that gates promotion used to
+ * be LOCAL-ONLY (page_has_version_at()/fork_event_exists_at(), each just
+ * page_find()/fork_find() on 'timeline' itself).  A three-level timeline
+ * chain exposes the gap: timeline 1 forks from the root at L2 (>= L) and so
+ * INHERITS a version/event admitted on the root at L, without ever storing
+ * anything locally for it; timeline 2 forks from timeline 1 at L1 (also >=
+ * L), so it inherits the SAME root version/event through timeline 1.  A
+ * later same-position rewrite ADMITTED ON TIMELINE 1 (not the root) at
+ * exactly L collides with a version timeline 1 only SEES, never stores --
+ * the local-only check finds nothing on timeline 1's own PageEnt/ForkEnt
+ * and never promotes, so the rewrite lands raw on timeline 1 at L and leaks
+ * straight into timeline 2 (whose cap onto timeline 1, L1, admits it).  The
+ * fix walks ancestry (page_has_version_at_ancestry()/
+ * fork_event_exists_at_ancestry()), finding the root's original version and
+ * promoting the timeline-1 rewrite above timeline 2's own cap (an active
+ * fence against timeline 1), which correctly excludes it.
+ */
+static void
+run_bugb_ancestry_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	unsigned char *p,
+			   *rb;
+
+	fprintf(stderr, "== Bug B round 2: ancestry-inherited collision (Codex 4098328771/4098328776) ==\n");
+
+	p = malloc(ps);
+	rb = malloc(ps);
+
+	/*
+	 * Control images: root writes v1 (all-zero, tag byte 0) at L=1500.
+	 * Timeline 1 forks from root at 2000 (inherits v1, no local control
+	 * history of its own).  Timeline 2 forks from timeline 1 at 1800
+	 * (inherits v1 too, through timeline 1) and is the live fence that must
+	 * exclude a same-version rewrite timeline 1 admits locally.
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbanc1", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbanc1", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	memset(p, 0, ps);
+	op_write_control(0, p, 1500);
+	op_create_branch(1, 0, 2000);
+	op_create_branch(2, 1, 1800);
+	memset(p, 0x77, ps);
+	op_write_control_tl(1, 0, p, 1500);	/* same-version rewrite, LOCAL to timeline 1 */
+	read_control_at(2, 1800, rb);
+	check(rb[0] == 0,
+		  "control: timeline 2 does not see timeline 1's same-version rewrite of a version timeline 1 only inherited from the root");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	/*
+	 * Fork events: root CREATEs rel at L=1500 (never written to, so nblocks
+	 * stays 0).  Timeline 1 forks from root at 2000 (inherits the CREATE, no
+	 * local fork-meta history).  Timeline 2 forks from timeline 1 at 1800.
+	 * Timeline 1 then admits a stale TRUNCATE at exactly 1500, colliding
+	 * with the CREATE it only inherits.
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbanc2", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbanc2", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	op_create_at(500, 0, 1500);
+	op_create_branch(1, 0, 2000);
+	op_create_branch(2, 1, 1800);
+	/* TRUNCATE to 7 blocks, same lsn as the inherited CREATE: if this leaks
+	 * through unpromoted, timeline 2's as-of read resolves the tie between
+	 * the CREATE (nblocks=0) and this TRUNCATE (nblocks=7) at lsn 1500 by
+	 * admission_seq, and the TRUNCATE -- admitted later -- wins. */
+	op_truncate_at_tl(1, 500, 0, 7, 1500);
+	{
+		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+		cl_setkey(ch, 500, 0);
+		ch->timeline = 2;
+		ch->opcode = PS_OP_NBLOCKS;
+		ch->req_lsn = 1800;
+		cl_exec();
+		check(ch->result == 0,
+			  "fork event: timeline 2 still sees rel500 at its inherited CREATE size (got %u; timeline 1's stale TRUNCATE, colliding with an inherited CREATE, did not leak through)",
+			  ch->result);
+	}
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	free(p);
+	free(rb);
+}
+
+/*
  * Shipped WAL: the store persists a per-timeline WAL log durably, branches keep
  * their own log, and the end LSN survives a daemon restart.  (This is the
  * transport/durability layer; replaying it to pages -- redo -- is future work.)
@@ -6872,6 +7017,7 @@ main(int argc, char **argv)
 	/* Bug B: post-fork parent admissions must not leak into a live branch */
 	run_bugb_suite(daemon_path, tmpbase);
 	run_bugb_revision_suite(daemon_path, tmpbase);
+	run_bugb_ancestry_suite(daemon_path, tmpbase);
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);
