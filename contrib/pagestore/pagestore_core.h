@@ -330,6 +330,18 @@ extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
 extern int	ps_handle_meta(PsChannel *ch);
 
 /*
+ * True if this request's client-supplied nblocks/datalen fits within one
+ * channel's fixed PS_IO_UNIT data[] buffer, so the caller may safely index
+ * ch->data by it.  Both frontends (POSIX and SPDK) and this file's own
+ * WAL_APPEND/WAL_READ handling in ps_handle_meta() route their bounds check
+ * through this single helper -- see its definition in pagestore_core.c for
+ * which opcodes it covers and why the others need no check.  A request that
+ * does not fit must be refused (PS_STATUS_ERROR) without touching ch->data,
+ * never clamped and served short.
+ */
+extern int	ps_request_payload_fits(const PsChannel *ch);
+
+/*
  * Page byte-I/O helpers used by the frontends' byte-op handlers.  'version' is the
  * caller-supplied version LSN for an SLRU-class write (the dirtying/cutoff WAL LSN,
  * stored verbatim so it stays comparable to a branch cutoff); it is ignored for

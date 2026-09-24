@@ -263,6 +263,19 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
+	/* Refuse an out-of-range WRITEV/READV nblocks before either loop below
+	 * (here or in read_done()/read completions) walks ch->data by it -- see
+	 * ps_request_payload_fits() in pagestore_core.c.  Must run before
+	 * anything else touches ch->data, including ps_handle_meta() below
+	 * (which applies the same check to WAL_APPEND/WAL_READ).  READV also
+	 * keeps its own MAX_BLOCKS check further down: that bounds a distinct
+	 * fixed array (ReqState.blk[]), unrelated to PS_IO_UNIT. */
+	if (!ps_request_payload_fits(ch))
+	{
+		ch->status = PS_STATUS_ERROR;
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return;
+	}
 	if ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV ||
 		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READ_AT) &&
 		!ps_timeline_request_allowed(tl, ch->incarnation))
@@ -441,6 +454,18 @@ relation_request_lsn(const PsChannel *ch)
 	{
 		uint32_t	npages = op == PS_OP_EXTEND ? 1 : ch->nblocks;
 		uint64_t	lowest = UINT64_MAX;
+
+		/*
+		 * This runs ahead of begin()'s ps_request_payload_fits() check, from
+		 * run_request()'s admission-fence gate: an out-of-range WRITEV
+		 * nblocks must not walk ch->data by it here either.  Answer
+		 * UINT64_MAX (no fence-relevant LSN found) without touching the
+		 * buffer; the request is then admitted and promptly refused by
+		 * begin()'s own check.  EXTEND's npages is always 1 and needs no
+		 * such guard (see ps_request_payload_fits()).
+		 */
+		if (op == PS_OP_WRITEV && !ps_request_payload_fits(ch))
+			return UINT64_MAX;
 
 		for (uint32_t i = 0; i < npages; i++)
 		{

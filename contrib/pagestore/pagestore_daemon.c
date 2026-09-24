@@ -412,6 +412,15 @@ handle_request(PsChannel *ch)
 
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
+	/* Refuse an out-of-range WRITEV/READV nblocks before the loops below walk
+	 * ch->data by it -- see ps_request_payload_fits() in pagestore_core.c.
+	 * Must run before anything else touches ch->data, including ps_handle_meta()
+	 * below (which applies the same check to WAL_APPEND/WAL_READ). */
+	if (!ps_request_payload_fits(ch))
+	{
+		ch->status = PS_STATUS_ERROR;
+		return;
+	}
 	if (ch->key.klass == PS_KLASS_ARTIFACT ||
 		((ch->key.klass == PS_KLASS_SLRU || ch->key.klass == PS_KLASS_READER_SNAPSHOT) &&
 		 ch->opcode == PS_OP_WRITEV && ch->nblocks != 1))
@@ -889,6 +898,18 @@ relation_request_lsn(const PsChannel *ch)
 	{
 		uint32_t	npages = op == PS_OP_EXTEND ? 1 : ch->nblocks;
 		uint64_t	lowest = UINT64_MAX;
+
+		/*
+		 * This runs ahead of handle_request()'s ps_request_payload_fits()
+		 * check, from run_request()'s admission-fence loop: an out-of-range
+		 * WRITEV nblocks must not walk ch->data by it here either.  Answer
+		 * UINT64_MAX (no fence-relevant LSN found) without touching the
+		 * buffer; the request is then admitted and promptly refused by
+		 * handle_request()'s own check.  EXTEND's npages is always 1 and
+		 * needs no such guard (see ps_request_payload_fits()).
+		 */
+		if (op == PS_OP_WRITEV && !ps_request_payload_fits(ch))
+			return UINT64_MAX;
 
 		for (uint32_t i = 0; i < npages; i++)
 		{
