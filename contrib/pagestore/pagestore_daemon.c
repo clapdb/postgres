@@ -372,21 +372,28 @@ shm_publish_ready(PsShmHeader *hdr)
  * block; printed only when meaningful (a WRITE refusal).
  */
 static void
-log_artifact_refusal(const char *op, uint32_t tl, const PsKey *key,
-					 uint32_t block, uint64_t lsn, PsArtifactRefuseReason reason)
+log_artifact_refusal(const char *op, const PsChannel *ch, uint32_t tl,
+					 const PsKey *key, uint32_t block, uint64_t lsn,
+					 PsArtifactRefuseReason reason)
 {
 	uint64_t	last_page_lsn = 0,
 				last_commit_lsn = 0;
 	char		block_buf[32] = "";
+	/* An automatic generation refused as unfenced was superseded by a newer
+	 * checkpoint (PS_ARTIFACT_REQ_SUPERSEDABLE); keep the line, but do not
+	 * report an expected outcome as a refused operation. */
+	const char *outcome =
+		ch->parent_timeline == PS_ARTIFACT_REQ_SUPERSEDABLE &&
+		reason == PS_ARTIFACT_REFUSE_UNFENCED ? "superseded" : "refused";
 
 	ps_artifact_diag(tl, key, &last_page_lsn, &last_commit_lsn);
 	if (block != UINT32_MAX)
 		snprintf(block_buf, sizeof(block_buf), " block=%u", block);
 	fprintf(stderr,
-		"pagestore_daemon: artifact %s refused: reason=%s timeline=%u "
+		"pagestore_daemon: artifact %s %s: reason=%s timeline=%u "
 		"key=(klass=%u,spc=%u,db=%u,rel=%u,fork=%d)%s lsn=%llu "
 		"last_page_lsn=%llu last_commit=%llu\n",
-		op, pagestore_artifact_refuse_reason_name(reason), tl,
+		op, outcome, pagestore_artifact_refuse_reason_name(reason), tl,
 		key->klass, key->spcOid, key->dbOid, key->relNumber, key->forkNum,
 		block_buf,
 		(unsigned long long) lsn,
@@ -433,7 +440,7 @@ handle_request(PsChannel *ch)
 				{
 					ch->status = PS_STATUS_ERROR;
 					ch->result = (uint32_t) reason;
-					log_artifact_refusal("BEGIN", tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
+					log_artifact_refusal("BEGIN", ch, tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
 				}
 			}
 			break;
@@ -445,7 +452,7 @@ handle_request(PsChannel *ch)
 				{
 					ch->status = PS_STATUS_ERROR;
 					ch->result = (uint32_t) reason;
-					log_artifact_refusal("COMMIT", tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
+					log_artifact_refusal("COMMIT", ch, tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
 				}
 			}
 			break;
@@ -457,7 +464,7 @@ handle_request(PsChannel *ch)
 				{
 					ch->status = PS_STATUS_ERROR;
 					ch->result = (uint32_t) reason;
-					log_artifact_refusal("DROP", tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
+					log_artifact_refusal("DROP", ch, tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
 				}
 			}
 			break;
@@ -475,7 +482,7 @@ handle_request(PsChannel *ch)
 					if (artifact_klass)
 					{
 						ch->result = (uint32_t) reason;
-						log_artifact_refusal("WRITE", tl, &ch->key, ch->blocknum,
+						log_artifact_refusal("WRITE", ch, tl, &ch->key, ch->blocknum,
 											 ch->req_lsn, reason);
 					}
 				}
@@ -498,7 +505,7 @@ handle_request(PsChannel *ch)
 						if (artifact_klass)
 						{
 							ch->result = (uint32_t) reason;
-							log_artifact_refusal("WRITE", tl, &ch->key, ch->blocknum + i,
+							log_artifact_refusal("WRITE", ch, tl, &ch->key, ch->blocknum + i,
 												 ch->req_lsn, reason);
 						}
 						break;

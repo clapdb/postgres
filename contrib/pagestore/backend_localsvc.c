@@ -64,6 +64,9 @@ static int	localsvc_timeline = 0;
  */
 static char *localsvc_read_lsn_str = NULL;
 static uint64 localsvc_read_lsn = 0;
+/* Automatic-generation artifact mode; see pagestore_localsvc_artifact_supersedable(). */
+static bool localsvc_artifact_supersedable = false;
+static bool localsvc_artifact_superseded = false;
 static uint64 localsvc_read_seq = 0;
 static bool localsvc_read_seq_loaded = false;
 static uint32 localsvc_read_epoch = 0;
@@ -483,6 +486,23 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 
 	if (status == PS_STATUS_OK)
 		return;
+	/* An automatic generation refused because its LSN is already below the
+	 * page-reclaimed frontier was superseded by a newer checkpoint; say so,
+	 * and remember it for pagestore_localsvc_artifact_supersedable(). */
+	if (status == PS_STATUS_ERROR &&
+		ch->parent_timeline == PS_ARTIFACT_REQ_SUPERSEDABLE &&
+		ch->result == PS_ARTIFACT_REFUSE_UNFENCED &&
+		(ch->opcode == PS_OP_ARTIFACT_BEGIN || ch->opcode == PS_OP_ARTIFACT_COMMIT ||
+		 ch->opcode == PS_OP_ARTIFACT_DROP ||
+		 ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV) &&
+		  (ch->key.klass == PS_KLASS_SLRU || ch->key.klass == PS_KLASS_READER_SNAPSHOT))))
+	{
+		localsvc_artifact_superseded = true;
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore localsvc: artifact generation %X/%08X was superseded: its page history is already reclaimed",
+						LSN_FORMAT_ARGS(ch->req_lsn))));
+	}
 	/* An artifact BEGIN/COMMIT/DROP refusal, or a WRITE (EXTEND/WRITEV)
 	 * refusal on an SLRU/reader-artifact key, carries its reason in
 	 * ch->result (pagestore_daemon.c logs the same reason plus the
@@ -2042,7 +2062,27 @@ ls_artifact_channel(uint32 klass, const PageStoreRelKey *key, uint64 version)
 	ch->key.klass = klass;
 	ch->req_lsn = version;
 	ch->req_seq = 0;
+	ch->parent_timeline = localsvc_artifact_supersedable ?
+		PS_ARTIFACT_REQ_SUPERSEDABLE : 0;
 	return ch;
+}
+
+/*
+ * Enter (on = true) or leave (on = false) automatic-generation mode for this
+ * process's artifact requests.  In it, a refusal because the generation is
+ * below the page-reclaimed frontier and unfenced is reported by the daemon
+ * and by the raised ERROR as superseded (PS_ARTIFACT_REQ_SUPERSEDABLE).
+ * Returns whether such a refusal happened since the mode was entered; the
+ * caller leaves the mode on both its success and its error path.
+ */
+bool
+pagestore_localsvc_artifact_supersedable(bool on)
+{
+	bool		superseded = localsvc_artifact_superseded;
+
+	localsvc_artifact_supersedable = on;
+	localsvc_artifact_superseded = false;
+	return superseded;
 }
 
 uint64
@@ -2131,6 +2171,7 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 	 */
 	ch->req_lsn = version;
 	ch->req_seq = 0;
+	ch->parent_timeline = 0;	/* never an automatic generation */
 	memcpy(ch->data, page, BLCKSZ);
 	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_seq;

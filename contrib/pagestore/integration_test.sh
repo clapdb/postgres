@@ -1593,6 +1593,95 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
 	"watermark advances again once the debt is reset"
 
+# --- 28c. a superseded automatic reader snapshot is skipped, not refused ---
+# The reader snapshot worker publishes the automatic snapshot of every shipped
+# checkpoint asynchronously.  A newer checkpoint's note moves the page-history
+# cutoff, so compaction may reclaim past a job's redo before the job's
+# artifact BEGIN; no reader can pin that generation any more.  The worker
+# must skip it as superseded -- not provoke the artifact refusal the R5-2
+# assertion at the end of this script forbids (this was an intermittent CI
+# failure) -- and the newest checkpoint's job must still publish.  A test hook
+# holds the worker before its first BEGIN until the store's durable page
+# frontier for timeline 0 has passed the held redo.
+page_frontier_tl0() {
+	local f="$STORE/page-prune.frontiers" inc0 lsn0 seq0 inc1 lsn1 seq1
+	if [ ! -r "$f" ]; then
+		echo 0
+		return
+	fi
+	# PsPageFrontierState: magic, version, then {incarnation, lsn, seq} slots.
+	read -r inc0 lsn0 seq0 inc1 lsn1 seq1 < <(
+		od -An -tu8 -j8 -N48 "$f" 2>/dev/null | tr -s ' \n' ' '
+	)
+	if [ "${inc0:-}" = 1 ]; then
+		echo "${lsn0:-0}"
+	elif [ "${inc1:-}" = 1 ]; then
+		echo "${lsn1:-0}"
+	else
+		echo 0
+	fi
+}
+supersedeHold="$(dirname "$DATA")/reader-snapshot-hold"
+: > "$supersedeHold"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+PAGESTORE_TEST_READER_SNAPSHOT_HOLD="$supersedeHold" \
+	"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+$P -c "CREATE FUNCTION ps_it_validate_auto_snapshot(pg_lsn) RETURNS bigint
+         AS 'pagestore','pagestore_validate_checkpoint_reader_snapshot' LANGUAGE C STRICT;" >/dev/null
+supersedeRefusedBefore=$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)
+$P -c "CHECKPOINT;" >/dev/null
+supersededR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+supersededRInt=$($P -c "SELECT ('$supersededR'::pg_lsn - '0/0'::pg_lsn)::bigint;")
+supersedeHeld=no
+for ((i = 0; i < 300; i++)); do
+	if grep -q "test hold of automatic reader snapshot at $supersededR\$" "$DATA/server.log"; then
+		supersedeHeld=yes
+		break
+	fi
+	sleep 0.1
+done
+assert "$supersedeHeld" "yes" "the reader snapshot worker is held before publishing the checkpoint's generation"
+supersedePassed=no
+for ((i = 0; i < 120; i++)); do
+	$P -q -c "BEGIN; INSERT INTO slru_live VALUES (100 + $i); COMMIT;" >/dev/null
+	$P -c "CHECKPOINT;" >/dev/null
+	if [ "$(page_frontier_tl0)" -gt "$supersededRInt" ]; then
+		supersedePassed=yes
+		break
+	fi
+	sleep 0.5
+done
+assert "$supersedePassed" "yes" "a newer checkpoint moves the durable page frontier past the held generation"
+supersedeNewestR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+rm -f "$supersedeHold"
+supersedeOutcome=none
+for ((i = 0; i < 600; i++)); do
+	if grep -q "automatic reader snapshot at $supersededR superseded" "$DATA/server.log"; then
+		supersedeOutcome=superseded
+		break
+	fi
+	if grep -q "automatic reader snapshot publication failed at $supersededR:" "$DATA/server.log"; then
+		supersedeOutcome=failed
+		break
+	fi
+	sleep 0.1
+done
+assert "$supersedeOutcome" "superseded" "the reclaimed generation is skipped as superseded"
+assert "$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)" "$supersedeRefusedBefore" \
+	"skipping the superseded generation provokes no artifact refusal"
+supersedeNewestPublished=no
+for ((i = 0; i < 600; i++)); do
+	if $P -c "SELECT ps_it_validate_auto_snapshot('$supersedeNewestR');" >/dev/null 2>&1; then
+		supersedeNewestPublished=yes
+		break
+	fi
+	sleep 0.1
+done
+assert "$supersedeNewestPublished" "yes" "the newest checkpoint's automatic snapshot still publishes"
+$P -c "DROP FUNCTION ps_it_validate_auto_snapshot(pg_lsn);" >/dev/null
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+
 # --- 29. SLRU live reads: transaction status served from the mirror ---
 # Restart the compute with pagestore.slru_live_reads on and the local
 # pg_xact segment hidden: startup's clog read and the status lookup for our

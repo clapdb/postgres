@@ -8943,6 +8943,41 @@ pagestore_reader_mark_completions(XLogRecPtr start_lsn, XLogRecPtr end_lsn,
 	pfree(pd);
 }
 
+/*
+ * Test hook: while the file named by PAGESTORE_TEST_READER_SNAPSHOT_HOLD
+ * exists, hold an automatic job just before its first artifact BEGIN, so a
+ * test can let a newer checkpoint reclaim the job's page history first.
+ */
+static void
+pagestore_reader_snapshot_test_hold(XLogRecPtr read_lsn)
+{
+	const char *path = getenv("PAGESTORE_TEST_READER_SNAPSHOT_HOLD");
+	struct stat st;
+	bool		logged = false;
+
+	if (path == NULL || path[0] == '\0')
+		return;
+	while (stat(path, &st) == 0)
+	{
+		if (!logged)
+		{
+			ereport(LOG,
+					(errmsg("pagestore: test hold of automatic reader snapshot at %X/%08X",
+							LSN_FORMAT_ARGS(read_lsn))));
+			logged = true;
+		}
+		if (ShutdownRequestPending)
+			ereport(ERROR,
+					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					 errmsg("terminating automatic reader snapshot test hold due to administrator command")));
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 50L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
 /* Build the database-independent half of a reader artifact off-checkpoint. */
 static bool
 pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
@@ -9053,6 +9088,20 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		snapshot.header.xmax = next_xid;
 		snapshot.xids = xids;
 		pagestore_reader_snapshot_crc(&snapshot.header, xids);
+		pagestore_reader_snapshot_test_hold(read_lsn);
+
+		/*
+		 * Nothing pins an automatic generation while it is built: a newer
+		 * checkpoint's note can move the page-history cutoff past read_lsn
+		 * and compaction reclaim it before these BEGINs.  No reader can pin
+		 * such a generation any more, so publish in superseded mode: the
+		 * daemon's unfenced refusal is reported as superseded, and the
+		 * catch below skips the job.  The newest job cannot be superseded
+		 * this way -- its redo is the newest note's, which is the cutoff --
+		 * so the queue always converges on a publishable generation once
+		 * checkpoints are further apart than a build.
+		 */
+		(void) pagestore_localsvc_artifact_supersedable(true);
 		blocks = pagestore_publish_reader_snapshot_data(&snapshot, InvalidOid);
 
 		/* READY stages the database-independent snapshot. Database workers
@@ -9072,6 +9121,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
 			&key, 0, page, (uint64) read_lsn, nblocks,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		(void) pagestore_localsvc_artifact_supersedable(false);
 		pagestore_localsvc_store_sync_timeout(
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 		MemoryContextSwitchTo(oldcontext);
@@ -9083,6 +9133,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 	{
 		ErrorData  *edata;
 		MemoryContext error_context;
+		bool		superseded = pagestore_localsvc_artifact_supersedable(false);
 
 		error_context = MemoryContextSwitchTo(TopMemoryContext);
 		edata = CopyErrorData();
@@ -9097,9 +9148,14 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 			PG_RE_THROW();
 		}
 		FlushErrorState();
-		ereport(WARNING,
-				(errmsg("pagestore: automatic reader snapshot publication failed at %X/%08X: %s",
-						LSN_FORMAT_ARGS(read_lsn), edata->message)));
+		if (superseded)
+			ereport(LOG,
+					(errmsg("pagestore: automatic reader snapshot at %X/%08X superseded: a newer checkpoint already reclaimed its page history",
+							LSN_FORMAT_ARGS(read_lsn))));
+		else
+			ereport(WARNING,
+					(errmsg("pagestore: automatic reader snapshot publication failed at %X/%08X: %s",
+							LSN_FORMAT_ARGS(read_lsn), edata->message)));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
