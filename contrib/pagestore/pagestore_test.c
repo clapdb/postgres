@@ -1148,6 +1148,34 @@ op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	return cl_exec()->status;
 }
 
+/* Like op_retention_set() but also reports the admission_seq the daemon
+ * captured for this pin (PS_OP_RETENTION_PIN_RESERVE echoes it back in
+ * ch->data on success) -- the "tuple-capped reader" identity a real pinned
+ * reader must present as its own req_seq (see ls_pinned_read_seq(),
+ * backend_localsvc.c) for page_visible()'s admission-sequence tie-break to
+ * exclude a same-LSN write that landed exactly at the pin's own lsn after
+ * promotion. */
+static int
+op_retention_reserve_get_seq(uint32_t timeline, uint32_t owner_kind,
+							 uint64_t owner_id, uint32_t generation,
+							 uint32_t resources, uint64_t lsn,
+							 uint64_t *seq_out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->parent_timeline = resources;
+	ch->old_nblocks = generation;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	cl_exec();
+	if (ch->status == PS_STATUS_OK && seq_out != NULL)
+		memcpy(seq_out, ch->data, sizeof(*seq_out));
+	return ch->status;
+}
+
 static int
 op_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 				  uint32_t generation)
@@ -4924,13 +4952,33 @@ check_bugb_control_image(uint32_t timeline, const char *label)
 static void
 check_bugb_state(uint32_t ps, unsigned char *rb)
 {
-	for (uint32_t rel = 100; rel < 107; rel++)
+	/*
+	 * rel100: the post-fork EXTEND landed EXACTLY at the branch's fork LSN
+	 * L=1500, writing a brand-new block (block1) that had no prior record
+	 * at any LSN.  Under the design's revised rule A (Codex review finding
+	 * 4097536244), landing exactly at a descendant's cap is no longer by
+	 * itself grounds for promotion: a real admission at exactly L belongs
+	 * to that branch's inclusive as-of-L snapshot.  Only a same-position
+	 * REWRITE (page_has_version_at()) is ambiguous enough to promote, and
+	 * this is not one, so it stays admissible unchanged and the branch (and
+	 * the grandchild, whose projected cap onto the root is the same 1500
+	 * fork point) DOES see it -- the opposite of what an earlier revision
+	 * of this fix wrongly did.
+	 */
+	check(op_nblocks_tl(1, 100, 0) == 2,
+		  "rel100: a genuine first admission exactly at L is visible to the branch (got %u)",
+		  op_nblocks_tl(1, 100, 0));
+	op_read_at_tl(1, 100, 0, 1, 1500, rb);
+	check(page_has_tag(rb, ps, 0x20),
+		  "rel100: branch sees the new block's real bytes, admitted exactly at L");
+
+	for (uint32_t rel = 101; rel < 107; rel++)
 		check(op_nblocks_tl(1, rel, 0) == 1,
 			  "rel%u: branch stays frozen at its pre-fork size (got %u)",
 			  rel, op_nblocks_tl(1, rel, 0));
 	op_read_at_tl(1, 100, 0, 0, 1500, rb);
 	check(page_has_tag(rb, ps, 0x10),
-		  "rel100: branch block0 unaffected by the post-fork EXTEND at the cap");
+		  "rel100: branch's pre-existing block0 unaffected by the post-fork EXTEND at L");
 	op_read_at_tl(1, 103, 0, 0, 1500, rb);
 	check(page_has_tag(rb, ps, 0x10),
 		  "rel103: branch does not see the post-fork same-lsn rewrite (hint-bit case)");
@@ -4938,9 +4986,14 @@ check_bugb_state(uint32_t ps, unsigned char *rb)
 	check(page_has_tag(rb, ps, 0x10),
 		  "rel104: WAL-less rewrite was already safe, branch still unaffected");
 
-	/* grandchild (timeline 2, child of branch 1 at 1800): unaffected by the
-	 * same root-level writes, exactly like its immediate parent. */
-	for (uint32_t rel = 100; rel < 107; rel++)
+	/* grandchild (timeline 2, child of branch 1 at 1800): its projected cap
+	 * onto the root is the same 1500 fork point branch 1 has (branch 1's
+	 * own branch_lsn is the tighter bound), so it sees the same genuine
+	 * first admission and stays frozen against the same rewrites. */
+	check(op_nblocks_tl(2, 100, 0) == 2,
+		  "rel100: grandchild also sees the genuine first admission at L (got %u)",
+		  op_nblocks_tl(2, 100, 0));
+	for (uint32_t rel = 101; rel < 107; rel++)
 		check(op_nblocks_tl(2, rel, 0) == 1,
 			  "rel%u: grandchild branch also stays frozen at pre-fork size", rel);
 	op_read_at_tl(2, 103, 0, 0, 1500, rb);
@@ -4960,6 +5013,97 @@ check_bugb_state(uint32_t ps, unsigned char *rb)
 	 * resets every request field of its own rather than relying on a fresh
 	 * channel. */
 	check_bugb_control_image(1, "branch");
+}
+
+/* --- helpers for the Bug B design-revision suite (run_bugb_revision_suite) --- */
+
+/* Like op_create_at() but returns the daemon's status, and reports the
+ * fork's own req_seq back for an idempotence check. */
+static int
+op_create_at_status(uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = lsn;
+	cl_exec();
+	return ch->status;
+}
+
+/* Read the pg_control image as-of 'lsn' on 'timeline'.  Mirrors
+ * check_bugb_control_image()'s careful reset of every request field (the
+ * channel is reused across op kinds, and PS_OP_READ_AT echoes its own
+ * resolved admission_seq back into ch->req_seq on success -- a leftover
+ * value from a prior op on this channel would otherwise be treated as an
+ * input seq_cap for this read). */
+static void
+read_control_at(uint32_t timeline, uint64_t lsn, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = timeline;
+	ch->incarnation = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = 0;
+	ch->req_lsn = lsn;
+	ch->req_seq = 0;
+	ch->is_redo = 0;
+	ch->skip_fsync = 0;
+	ch->nblocks = 0;
+	ch->old_nblocks = 0;
+	ch->parent_timeline = 0;
+	ch->datalen = 0;
+	ch->pad1 = 0;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
+/* PsTimelineState (PS_TIMELINE_LIVE/DELETING/DELETED) via PS_OP_TIMELINE_STATE. */
+static int
+op_timeline_state_result(uint32_t timeline)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->opcode = PS_OP_TIMELINE_STATE;
+	ch->timeline = timeline;
+	ch->req_seq = 0;
+	ch->incarnation = 0;
+	cl_exec();
+	return (int) ch->result;
+}
+
+/* BEGIN_DELETE (LIVE -> DELETING); returns the daemon's status. */
+static int
+op_begin_delete_status(uint32_t timeline, uint64_t expected_incarnation)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->timeline = timeline;
+	ch->req_seq = expected_incarnation;
+	ch->incarnation = 0;
+	cl_exec();
+	return ch->status;
+}
+
+/* The real daemon's maintenance thread drives DELETING -> DELETED in the
+ * background (timeline_delete_publish_one(), pagestore_core.c); poll for it
+ * the same way wait_for_compacted_layers() polls for compaction. */
+static int
+wait_for_timeline_deleted(uint32_t timeline)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		if (op_timeline_state_result(timeline) == PS_TIMELINE_DELETED)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
 }
 
 static void
@@ -5093,6 +5237,218 @@ run_bugb_suite(const char *daemon_path, const char *tmpbase)
 	stop_daemon(dpid);
 	rm_rf(store);
 	ps_shm_unlink(shm);
+	free(p);
+	free(rb);
+}
+
+/*
+ * Bug B, design revision: Codex raised six P1s against the original fix
+ * (PR #294).  Two are already re-checked in run_bugb_suite() above (the
+ * "lsn == descendant cap" rule is gone -- rel100's genuine first admission
+ * at exactly L is now visible, per Codex finding 4097536244 -- and the
+ * fork-meta CREATE-retry ordering still holds).  This suite covers the
+ * remaining four, each against its OWN fresh daemon so one scenario's
+ * branches/pins cannot leak into another's fence set:
+ *
+ *   - 4097536238: the promotion fast gate considered only descendant branch
+ *     caps and missed active PAGE_HISTORY pins, so with no live descendant
+ *     at all a same-LSN rewrite could still leak past a pinned reader;
+ *   - 4097536254: a control image was promoted with the relation-page fence
+ *     set (page_prune_fences()) instead of the broader control fence set
+ *     (control_prune_fences(), which also covers WAL-only retention pins);
+ *   - 4097536226: promotion considered only the CURRENTLY active fences, so
+ *     deleting a sibling branch could shrink the fence set enough to
+ *     reverse two already-promoted fork-meta events' relative order;
+ *   - 4097536220: a CREATE retry's idempotence check ran on the
+ *     POST-promotion lsn instead of the original one, so a retry issued
+ *     after a live descendant existed could hide every page already
+ *     admitted under the original CREATE.
+ */
+static void
+run_bugb_revision_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	unsigned char *p,
+			   *rb;
+
+	fprintf(stderr, "== Bug B design revision: Codex P1 findings ==\n");
+
+	p = malloc(ps);
+	rb = malloc(ps);
+
+	/*
+	 * 4097536238: with NO live descendant at all, a same-LSN rewrite must
+	 * still be promoted above an active PAGE_HISTORY pin.  The original
+	 * fix's fast gate consulted only timeline_desc_cap[timeline] (0 here,
+	 * with no branches), so it never reached the exact fence computation
+	 * and the pinned reader's frozen view leaked the rewrite; the revised
+	 * design's cheap collision check (page_has_version_at()) always leads
+	 * to the exact fence set when it fires, regardless of any cap.
+	 *
+	 * The rewrite's own lsn (2500) is strictly below the pin's lsn (3000),
+	 * so page_visible()'s "v->lsn < read_lsn" clause -- not the
+	 * admission-sequence tie-break -- is what must exclude it: a version
+	 * strictly below the read horizon is visible regardless of any seq_cap,
+	 * so nothing short of promoting the rewrite's own lsn above 3000 can
+	 * protect the reader.  The read below therefore simulates a REAL
+	 * pinned reader (the pin's own captured admission_seq as req_seq, the
+	 * same identity ls_pinned_read_seq() presents in production) rather
+	 * than an unconstrained as-of query, so it exercises exactly the
+	 * promoted position (not merely whatever admission_seq tie-break
+	 * happens to apply at that position).
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbrev1", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbrev1", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	{
+		uint64_t	pin_seq = 0;
+
+		op_create_at(300, 0, 1000);
+		fill_page(p, ps, 2500, 0x50);
+		check(op_write_tl_status(0, 300, 0, 0, p) == PS_STATUS_OK,
+			  "rel300: genuine first admission at lsn 2500 (no collision yet)");
+		check(op_retention_reserve_get_seq(0, PS_RETENTION_OWNER_READER, 89100, 1,
+										   PS_RETENTION_RESOURCE_PAGE_HISTORY, 3000,
+										   &pin_seq) == PS_STATUS_OK && pin_seq != 0,
+			  "register a page-history reader pin at 3000 with no descendants live");
+		fill_page(p, ps, 2500, 0x60);
+		check(op_write_tl_status(0, 300, 0, 0, p) == PS_STATUS_OK,
+			  "rel300: same-lsn rewrite at 2500 collides with the earlier admission");
+		op_read_at_seq(300, 0, 0, 3000, pin_seq, rb);
+		check(page_has_tag(rb, ps, 0x50),
+			  "no descendants, only a PAGE_HISTORY reader pinned at 3000: a same-lsn rewrite at 2500 is not seen by the reader");
+	}
+
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 89100, 1) == PS_STATUS_OK,
+		  "release the page-history reader pin");
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	/*
+	 * 4097536254: a control image needs the broader control_prune_fences()
+	 * set (WAL-only retention pins and retained artifact cutoffs), not the
+	 * relation-page page_prune_fences() set.  A branch cap at 2500 alone
+	 * would already promote a same-version rewrite at 2000 to 2501, which
+	 * looks safe from an as-of-3000 view either way; the WAL-only pin at
+	 * 3000 is what actually distinguishes control_prune_fences() from
+	 * page_prune_fences() here (page_prune_fences() does not fold in
+	 * WAL-only pins at all).
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbrev2", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbrev2", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	memset(p, 0, ps);
+	op_write_control(0, p, 2000);
+	op_create_branch(20, 0, 2500);
+	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 89200, 1,
+						   PS_RETENTION_RESOURCE_WAL, 3000) == PS_STATUS_OK,
+		  "register a WAL-only retention pin (a WAL owner) at 3000");
+	memset(p, 0x77, ps);
+	op_write_control(0, p, 2000);	/* same-version rewrite: collides at 2000 */
+	read_control_at(0, 3000, rb);
+	check(rb[0] == 0,
+		  "control image: a branch cap at 2500 plus a WAL owner at 3000 -- the same-version rewrite at 2000 is not seen by the owner's as-of-3000 view");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	/*
+	 * 4097536226: sibling caps 1500 and 2000.  A stale-position TRUNCATE
+	 * collides with rel310's own CREATE at 1000 and promotes to just above
+	 * the higher sibling cap (2001).  Deleting the 2000 branch then shrinks
+	 * the live fence set to just 1500; without a floor at the key's own
+	 * current newest visible lsn, a later stale-position UNLINK (also
+	 * colliding at 1000) would promote only to 1501 and sort BEFORE the
+	 * earlier TRUNCATE, so the newest read would still see the TRUNCATE's
+	 * SET event instead of the later DELETE.
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbrev3", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbrev3", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	op_create_at(310, 0, 1000);
+	op_create_branch(21, 0, 1500);
+	op_create_branch(22, 0, 2000);
+	op_truncate_at(310, 0, 0, 1000);	/* stale, collides with the CREATE at 1000 */
+	check(op_exists(310, 0),
+		  "rel310: the promoted stale TRUNCATE leaves the relation existing (sanity)");
+
+	{
+		uint64_t	incarnation = op_timeline_incarnation(22);
+
+		check(incarnation != 0 &&
+			  op_begin_delete_status(22, incarnation) == PS_STATUS_OK,
+			  "BEGIN_DELETE the 2000-cap sibling branch");
+		check(wait_for_timeline_deleted(22),
+			  "the 2000-cap sibling branch reaches DELETED");
+	}
+
+	op_unlink_at(310, 0, 1000);	/* also stale, collides with the same CREATE at 1000 */
+	check(!op_exists(310, 0),
+		  "sibling caps 1500/2000: after deleting the 2000 branch, a later stale UNLINK of the same key still sorts after the earlier promoted TRUNCATE -- the newest read sees rel310 as deleted");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	/*
+	 * 4097536220: a CREATE retry at its original LSN, after a child branch
+	 * (a live descendant) exists, must be idempotent -- and must not hide
+	 * the pages already written under the original CREATE.  Checking
+	 * fork_has_create_at() only AFTER promotion looks for the retry's own
+	 * record at the PROMOTED position instead of the original one, so it
+	 * never finds it and persists a fresh zero-block CREATE on top of the
+	 * real one.
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbrev4", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbrev4", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	op_create_at(320, 0, 1000);
+	fill_page(p, ps, 1000, 0x70);
+	op_write_tl(0, 320, 0, 0, p);
+	op_create_branch(23, 0, 1500);
+
+	check(op_create_at_status(320, 0, 1000) == PS_STATUS_OK,
+		  "a CREATE retry at L after a child exists is idempotent");
+	check(op_nblocks_tl(0, 320, 0) == 1,
+		  "the CREATE retry does not hide the block written before the retry (got %u)",
+		  op_nblocks_tl(0, 320, 0));
+	op_read_tl(0, 320, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x70),
+		  "the CREATE retry does not hide the existing page's bytes");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
 	free(p);
 	free(rb);
 }
@@ -6515,6 +6871,7 @@ main(int argc, char **argv)
 
 	/* Bug B: post-fork parent admissions must not leak into a live branch */
 	run_bugb_suite(daemon_path, tmpbase);
+	run_bugb_revision_suite(daemon_path, tmpbase);
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);

@@ -240,29 +240,63 @@ and control images below their own timeline's floor are remapped to that
 floor (the `SEG_CLAMPED_ADMISSION_MAGIC` "ordered" record shape); and,
 symmetrically, an admission on an *ancestor* of a live branch is promoted
 strictly above the branch's cap when landing at or below it is ambiguous
-enough to be a leak rather than genuine WAL-ordered history: landing at
-*exactly* the cap (the fork boundary itself), or reusing an lsn/req_lsn this
-same key already has a record at (a same-lsn rewrite -- skip-WAL hint bits
-keep the old pd_lsn, and `page_visible()`'s admission-sequence tie-break
-would let a fresh rewrite at that lsn silently supersede the version a
-branch had frozen).  An unstamped fork-meta mutation (`req_lsn == 0`) is
-promoted unconditionally whenever it lands at or below the cap, the same
-"no real WAL-based claim" treatment a WAL-less relation page (lsn 0) already
-gets.  A distinct, strictly-lower lsn that collides with nothing already
-recorded is left unpromoted: it is ordinary WAL-ordered history that must
-remain visible to the branch however late it is physically admitted (a COW
-branch's whole point).  This walks every live descendant, including
-grandchildren, via the same `page_prune_fences()` fence set the
-ordered-record path already used for the floor case -- see
-`timeline_desc_cap[]`, `page_has_version_at()`, `fork_event_exists_at()`, and
-`fence_promote_lsn()` in pagestore_core.c, and `fork_meta_lsn_promote()` for
-the CREATE/UNLINK/TRUNCATE/ZEROEXTEND fork-metadata events.  This promotion
-is what closed Bug B (a branch seeing writes its parent admitted after the
-fork): before it, only the floor-remap direction was enforced, so a post-fork
-parent write landing at the branch's exact fork boundary, or reusing an
-already-recorded lsn (e.g. a hint-bit rewrite, or a stale/derived op-LSN --
-see `ls_op_lsn()`, backend_localsvc.c), was admitted unchanged and read
-straight through into the child.
+enough to be a leak rather than genuine WAL-ordered history.  Only one shape
+is ambiguous enough to promote: reusing an lsn this same key already has a
+record at -- a same-key/same-position rewrite (skip-WAL hint bits keep the
+old pd_lsn for a relation page or control image, `page_has_version_at()`;
+the fork-metadata analogue is `fork_event_exists_at()`) -- because
+`page_visible()`'s admission-sequence tie-break would let a fresh rewrite at
+that lsn silently supersede the version a branch or pin had frozen, and that
+rewrite is necessarily later than the original admission it collides with.
+An unstamped fork-meta mutation (`req_lsn == 0`) is the other promoted
+shape, the same "no real WAL-based claim" treatment a WAL-less relation page
+(lsn 0) already gets.  Landing *exactly* at a branch's cap is deliberately
+**not** by itself a promotion trigger any more: a real first admission whose
+own lsn genuinely IS the fork LSN belongs to that fork's inclusive as-of-L
+snapshot, not a leak, and an earlier revision of this fix wrongly hid it by
+treating every exact-boundary lsn as post-fork (Codex review finding
+4097536244).  A distinct, strictly-lower lsn that collides with nothing
+already recorded is left unpromoted regardless of its relation to any cap:
+it is ordinary WAL-ordered history that must remain visible to the branch
+however late it is physically admitted (a COW branch's whole point).
+Because only a collision (or an unstamped event) can trigger promotion, the
+promotion path checks that cheap condition first and only pays for the exact
+fence computation when it fires -- there is no separate fast-path cache of
+descendant caps to maintain (an earlier revision's `timeline_desc_cap[]`
+lock-free cache was deleted for exactly this reason: once promotion no
+longer fires on cap equality alone, a cheap collision pre-check makes the
+cache unnecessary, and the cache could itself go stale between a sibling
+branch's deletion and the next admission, reversing admission order --
+Codex review finding 4097536226).  The promoted target is the maximum of
+every relevant fence at or above the colliding lsn, plus one, AND the key's
+current newest visible lsn/version (so shrinking the live-descendant set,
+e.g. deleting a sibling branch, cannot make a later promoted event sort
+*before* one promoted earlier while that sibling was still live -- a fresh
+admission sequence always sorts after an older one at an equal lsn).  This
+walks every live descendant, including grandchildren, via the same fence set
+the ordered-record path already used for the floor case: relation pages and
+fork-metadata events reuse `page_prune_fences()` (branch caps and active
+PAGE_HISTORY pins -- see `page_has_version_at()`, `fork_event_exists_at()`,
+and `fence_promote_lsn()`/`fork_meta_lsn_promote()` in pagestore_core.c for
+the CREATE/UNLINK/TRUNCATE/ZEROEXTEND fork-metadata events), while control
+images use the broader `control_prune_fences()` set -- WAL-only retention
+pins and retained artifact cutoffs also protect a control image, not just
+PAGE_HISTORY pins and branch caps (Codex review finding 4097536254).  This
+promotion is what closed Bug B (a branch seeing writes its parent admitted
+after the fork): before it, only the floor-remap direction was enforced, so
+a post-fork parent write reusing an already-recorded lsn (e.g. a hint-bit
+rewrite, or a stale/derived op-LSN -- see `ls_op_lsn()`,
+backend_localsvc.c) was admitted unchanged and read straight through into
+the child.  `ls_op_lsn()`'s stale-op-LSN fallback is itself split by opcode:
+`smgrDoPendingDeletes()`'s end-of-transaction UNLINK cleanup runs after
+`XactLastRecEnd` has already been reset by commit/abort, so it keeps the
+original `Max(XactLastCommitEnd, XactLastAbortEnd)` fallback (the commit/
+abort record it must sort after already happened; `GetXLogInsertRecPtr()`
+is not a safe stand-in, since concurrent WAL insertion can push the global
+pointer arbitrarily far past that record), while CREATE and TRUNCATE, which
+have no transaction-end record of their own, fall back to
+`GetXLogInsertRecPtr()` (or `GetXLogReplayRecPtr()` under
+`RecoveryInProgress()`) (Codex review finding 4097536209).
 
 Branch creation participates in the same cutoff-selection fence as owner SET.
 It validates the requested `(LSN, admission_sequence)` against the durable
