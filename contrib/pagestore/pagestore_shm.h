@@ -203,22 +203,64 @@ ps_shm_unlink(const char *name)
  * mappings can use this too.  Callers check the header's own fields as well;
  * probing the locks after reading it closes the window where a stale header
  * is read just before a new daemon takes over.
+ *
+ * The lease and init bytes are queried with two separate F_GETLK calls, so a
+ * fast daemon restart between them can straddle two generations: the lease
+ * query sees old daemon A (about to exit), A exits, successor B takes both
+ * locks, and the init query then sees B holding init_byte.  A's and B's pids
+ * differ, which looks exactly like an inspector holding init_byte alongside
+ * a live daemon, so without more the segment would be reported ready while
+ * B is still initializing.  To close that window, after the init query we
+ * query the lease byte a third time and only report ready when that third
+ * query's holder's pid equals the first query's pid (both known, i.e. >0).
+ * If the restart happened, the third query now sees B, which differs from
+ * A's first-query pid (or the lease is briefly unheld between A's exit and
+ * B's acquisition), so we correctly fall through to "not ready"; if no
+ * restart happened, the same daemon still holds the lease throughout and the
+ * pids match.
+ *
+ * The decision itself lives in ps_shm_daemon_ready_decide() below, taking
+ * the three F_GETLK results as plain data, so it can be unit tested with
+ * hand-built results (including a changed pid between the first and third)
+ * without needing to actually race two processes through the real window.
  */
+static inline int
+ps_shm_daemon_ready_decide(const struct flock *first_lease,
+							const struct flock *init,
+							const struct flock *third_lease)
+{
+	if (first_lease->l_type == F_UNLCK)
+		return 0;
+	if (init->l_type != F_UNLCK &&
+		(init->l_pid <= 0 || first_lease->l_pid <= 0 ||
+		 init->l_pid == first_lease->l_pid))
+		return 0;
+	if (third_lease->l_type == F_UNLCK)
+		return 0;
+	if (first_lease->l_pid <= 0 || third_lease->l_pid <= 0)
+		return 0;
+	if (third_lease->l_pid != first_lease->l_pid)
+		return 0;
+	return 1;
+}
+
 static inline int
 ps_shm_daemon_ready(int fd, off_t init_byte, off_t lease_byte)
 {
-	struct flock lease;
+	struct flock first_lease;
 	struct flock init;
+	struct flock third_lease;
 
-	memset(&lease, 0, sizeof(lease));
-	lease.l_type = F_WRLCK;
-	lease.l_whence = SEEK_SET;
-	lease.l_start = lease_byte;
-	lease.l_len = 1;
-	if (fcntl(fd, F_GETLK, &lease) != 0)
+	memset(&first_lease, 0, sizeof(first_lease));
+	first_lease.l_type = F_WRLCK;
+	first_lease.l_whence = SEEK_SET;
+	first_lease.l_start = lease_byte;
+	first_lease.l_len = 1;
+	if (fcntl(fd, F_GETLK, &first_lease) != 0)
 		return -1;
-	if (lease.l_type == F_UNLCK)
+	if (first_lease.l_type == F_UNLCK)
 		return 0;
+
 	memset(&init, 0, sizeof(init));
 	init.l_type = F_WRLCK;
 	init.l_whence = SEEK_SET;
@@ -226,11 +268,17 @@ ps_shm_daemon_ready(int fd, off_t init_byte, off_t lease_byte)
 	init.l_len = 1;
 	if (fcntl(fd, F_GETLK, &init) != 0)
 		return -1;
-	if (init.l_type == F_UNLCK)
-		return 1;
-	if (init.l_pid > 0 && lease.l_pid > 0 && init.l_pid != lease.l_pid)
-		return 1;
-	return 0;
+
+	/* Re-query the lease holder; see the comment above. */
+	memset(&third_lease, 0, sizeof(third_lease));
+	third_lease.l_type = F_WRLCK;
+	third_lease.l_whence = SEEK_SET;
+	third_lease.l_start = lease_byte;
+	third_lease.l_len = 1;
+	if (fcntl(fd, F_GETLK, &third_lease) != 0)
+		return -1;
+
+	return ps_shm_daemon_ready_decide(&first_lease, &init, &third_lease);
 }
 
 #endif							/* PAGESTORE_SHM_H */

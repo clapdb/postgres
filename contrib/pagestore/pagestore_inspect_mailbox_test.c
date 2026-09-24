@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -75,6 +76,29 @@ wait_child(pid_t pid, int milliseconds, int *status)
 		sleep_ms(1);
 	}
 	return waitpid(pid, status, WNOHANG) == pid;
+}
+
+/*
+ * read(2) with a bounded wait, so a handshake with a child that dies before
+ * writing (or never writes) fails promptly instead of hanging the test.
+ * Returns what read() would: the byte count on success, 0 on timeout or
+ * EOF, -1 (errno set) on error.
+ */
+static ssize_t
+read_with_timeout(int fd, void *buf, size_t len, int milliseconds)
+{
+	struct pollfd pfd;
+	int rc;
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	do
+	{
+		rc = poll(&pfd, 1, milliseconds);
+	} while (rc < 0 && errno == EINTR);
+	if (rc <= 0)
+		return rc;
+	return read(fd, buf, len);
 }
 
 static int
@@ -438,28 +462,43 @@ run_health(const char *inspector, const char *name)
 
 /*
  * A fake daemon holding the lease (byte one) and, until told to finish
- * "initialization" through release_fd, byte zero -- the real daemon's order.
+ * "initialization" through release_pipe, byte zero -- the real daemon's
+ * order.  ready_pipe and release_pipe are the whole pipe(2) pairs; each side
+ * closes the end it does not use right after the fork, so a premature exit
+ * on either side is visible to the other as EOF rather than a fd that stays
+ * open (and readable-never) because a second process still holds its write
+ * end.
  */
 static pid_t
-start_initializing_daemon(const char *name, int ready_fd, int release_fd)
+start_initializing_daemon(const char *name, int ready_pipe[2],
+						  int release_pipe[2])
 {
 	pid_t pid = fork();
 
 	if (pid == 0)
 	{
 		unsigned char byte = 1;
-		int fd = ps_shm_open(name, O_RDWR, 0);
+		int fd;
+
+		close(ready_pipe[0]);
+		close(release_pipe[1]);
+		fd = ps_shm_open(name, O_RDWR, 0);
 
 		if (fd < 0 ||
 			set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0 ||
 			set_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0 ||
-			write(ready_fd, &byte, 1) != 1 ||
-			read(release_fd, &byte, 1) != 1 ||
+			write(ready_pipe[1], &byte, 1) != 1 ||
+			read(release_pipe[0], &byte, 1) != 1 ||
 			set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK) != 0 ||
-			write(ready_fd, &byte, 1) != 1)
+			write(ready_pipe[1], &byte, 1) != 1)
 			_exit(127);
 		for (;;)
 			pause();
+	}
+	if (pid > 0)
+	{
+		close(ready_pipe[1]);
+		close(release_pipe[0]);
 	}
 	return pid;
 }
@@ -499,8 +538,9 @@ test_health_requires_live_daemon(const char *inspector)
 		close_fixture(name, fd, hdr);
 		return;
 	}
-	holder = start_initializing_daemon(name, ready_pipe[1], release_pipe[0]);
-	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+	holder = start_initializing_daemon(name, ready_pipe, release_pipe);
+	check(holder > 0 &&
+		  read_with_timeout(ready_pipe[0], &byte, 1, 5000) == 1,
 		  "fake daemon holds lease and initialization byte");
 	if (!failed)
 	{
@@ -510,7 +550,7 @@ test_health_requires_live_daemon(const char *inspector)
 		check(run_health(inspector, name) == 1,
 			  "health rejects a stale header during initialization");
 		check(write(release_pipe[1], &byte, 1) == 1 &&
-			  read(ready_pipe[0], &byte, 1) == 1,
+			  read_with_timeout(ready_pipe[0], &byte, 1, 5000) == 1,
 			  "fake daemon finishes initialization");
 		check(ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
 								  PS_INSPECTION_DAEMON_LOCK_BYTE) == 1,
@@ -534,10 +574,87 @@ test_health_requires_live_daemon(const char *inspector)
 	check(run_health(inspector, name) == 1,
 		  "health rejects the header after the daemon is killed");
 	close(ready_pipe[0]);
-	close(ready_pipe[1]);
-	close(release_pipe[0]);
 	close(release_pipe[1]);
+	if (holder <= 0)
+	{
+		/* start_initializing_daemon() never reached its parent-side closes. */
+		close(ready_pipe[1]);
+		close(release_pipe[0]);
+	}
 	close_fixture(name, fd, hdr);
+}
+
+static struct flock
+make_lock(short type, pid_t pid)
+{
+	struct flock lock;
+
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = type;
+	lock.l_pid = pid;
+	return lock;
+}
+
+/*
+ * E-8 follow-up: a fast daemon restart can make ps_shm_daemon_ready()'s
+ * lease query (F_GETLK) and its init query straddle two daemon generations
+ * -- old daemon A exits and successor B takes both locks between the two
+ * queries -- so the init query reports B's pid where the lease query
+ * reported A's, which looks exactly like an inspector holding the init
+ * byte alongside a live daemon.  The fix re-queries the lease a third time
+ * and only reports ready when that third query's pid still matches the
+ * first query's.  Actually racing two real processes through that window
+ * is inherently timing dependent and would make this test flaky, so this
+ * exercises ps_shm_daemon_ready_decide() -- the pure decision logic that
+ * ps_shm_daemon_ready() delegates to after its three real F_GETLK calls --
+ * directly, with hand-built F_GETLK results standing in for each query.
+ * That is deterministic and covers exactly the buggy comparison (and the
+ * surrounding steady-state and conservative-unavailable-pid cases) without
+ * needing the queries to actually interleave.
+ */
+static void
+test_daemon_ready_decide(void)
+{
+	struct flock lease_a = make_lock(F_WRLCK, 100);
+	struct flock lease_a_again = make_lock(F_WRLCK, 100);
+	struct flock lease_b = make_lock(F_WRLCK, 222);
+	struct flock init_unlocked = make_lock(F_UNLCK, 0);
+	struct flock init_by_inspector = make_lock(F_WRLCK, 300);
+	struct flock init_by_a = make_lock(F_WRLCK, 100);
+	struct flock lease_unlocked = make_lock(F_UNLCK, 0);
+	struct flock lease_pid_unknown = make_lock(F_WRLCK, 0);
+	struct flock init_pid_unknown = make_lock(F_WRLCK, 0);
+
+	check(ps_shm_daemon_ready_decide(&lease_a, &init_unlocked,
+									 &lease_a_again) == 1,
+		  "no initializer and unchanged lease holder is ready");
+	check(ps_shm_daemon_ready_decide(&lease_a, &init_by_inspector,
+									 &lease_a_again) == 1,
+		  "inspector on init byte with unchanged lease holder is ready");
+
+	/*
+	 * The restart race: the lease query sees A, but by the time the init
+	 * query runs, successor B already holds both bytes, so the init query
+	 * sees B -- indistinguishable, so far, from an inspector.  The third
+	 * (re-)query of the lease byte also now sees B, which differs from A,
+	 * the first query's pid, so this must report "not ready" rather than
+	 * mistaking B's own init hold for an inspector's.
+	 */
+	check(ps_shm_daemon_ready_decide(&lease_a, &lease_b, &lease_b) == 0,
+		  "lease holder changed between queries is not ready");
+
+	check(ps_shm_daemon_ready_decide(&lease_unlocked, &init_unlocked,
+									 &lease_a_again) == 0,
+		  "no lease holder is not ready");
+	check(ps_shm_daemon_ready_decide(&lease_a, &init_by_a,
+									 &lease_a_again) == 0,
+		  "same pid on lease and init byte is not ready");
+	check(ps_shm_daemon_ready_decide(&lease_pid_unknown, &init_pid_unknown,
+									 &lease_a_again) == 0,
+		  "unavailable pids with an init holder is conservatively not ready");
+	check(ps_shm_daemon_ready_decide(&lease_a, &init_by_inspector,
+									 &lease_unlocked) == 0,
+		  "lease released by the time of the third query is not ready");
 }
 
 int
@@ -548,6 +665,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "usage: %s PAGestore_INSPECT_BINARY\n", argv[0]);
 		return 2;
 	}
+	test_daemon_ready_decide();
 	test_initialization_lock_exclusion();
 	test_lock_busy(argv[1]);
 	test_stale_state(argv[1], PS_INSPECTION_STATE_REQUEST,
