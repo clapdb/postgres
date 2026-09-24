@@ -74,6 +74,58 @@ rm_rf(const char *path)
 	}
 }
 
+/*
+ * Read from a pipe until EOF (the write end closes when the child exits) or
+ * the buffer fills, retrying across EINTR.
+ *
+ * A single read() is not enough here even though the child logically makes
+ * one diagnostic call (e.g. usage()'s one fprintf(stderr, ...)): under CPU
+ * pressure that call's output can reach the kernel as more than one write(),
+ * and read() is allowed to return as soon as the first of those lands,
+ * handing the caller a truncated buffer.  Worse, if the caller then closes
+ * the read end and calls waitpid() (as this file used to), the child's next
+ * write() to the now-reader-less pipe raises SIGPIPE and kills it before it
+ * reaches its own exit(), corrupting the exit status the test asserts on.
+ * Looping to EOF avoids both problems.
+ */
+static ssize_t
+read_all(int fd, char *buf, size_t bufsize)
+{
+	size_t		total = 0;
+
+	while (total < bufsize)
+	{
+		ssize_t		n = read(fd, buf + total, bufsize - total);
+
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return total > 0 ? (ssize_t) total : -1;
+		}
+		if (n == 0)
+			break;
+		total += (size_t) n;
+	}
+	return (ssize_t) total;
+}
+
+/*
+ * waitpid() wrapper that retries across EINTR instead of leaving *status
+ * unset/stale for the caller's WIFEXITED()/WEXITSTATUS() to misread.
+ */
+static pid_t
+waitpid_retry(pid_t pid, int *status)
+{
+	pid_t		r;
+
+	do
+	{
+		r = waitpid(pid, status, 0);
+	} while (r < 0 && errno == EINTR);
+	return r;
+}
+
 /* The inspector must observe a live daemon without claiming an I/O channel. */
 static int
 run_inspector(const char *shm, const char *operation, char *output, size_t output_size)
@@ -103,7 +155,7 @@ run_inspector(const char *shm, const char *operation, char *output, size_t outpu
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 	{
@@ -111,7 +163,8 @@ run_inspector(const char *shm, const char *operation, char *output, size_t outpu
 		exit(2);
 	}
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -145,12 +198,13 @@ run_inspector_timeline(const char *shm, uint32_t timeline,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -195,12 +249,13 @@ run_inspector_relation(const char *shm, uint32_t timeline,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -234,12 +289,13 @@ run_inspector_timeline_error(const char *shm, uint32_t timeline,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) != 0;
 }
 
@@ -271,12 +327,13 @@ run_inspector_timeline_missing(const char *shm, char *output,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 2;
 }
 
