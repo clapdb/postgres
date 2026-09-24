@@ -845,6 +845,26 @@ main(int argc, char **argv)
 		close(fd);
 		return 1;
 	}
+	/* A dead daemon's header stays READY; require its live, initialized
+	 * lease as well (checked after the header, see ps_shm_daemon_ready).
+	 * relation holds byte zero and must still reclaim a dead daemon's
+	 * mailbox, so it probes the lease itself before publishing. */
+	if (!relation_operation)
+	{
+		int ready = ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+										PS_INSPECTION_DAEMON_LOCK_BYTE);
+
+		if (ready != 1)
+		{
+			if (ready < 0)
+				perror("pagestore_inspect: fcntl daemon lease query");
+			else
+				fprintf(stderr, "pagestore_inspect: no running daemon owns the shared memory, or it is still initializing\n");
+			munmap(shm, PS_SHM_SIZE);
+			close(fd);
+			return 1;
+		}
+	}
 	if (strcmp(operation, "health") == 0)
 		print_health(hdr);
 	else if (strcmp(operation, "timeline") == 0)

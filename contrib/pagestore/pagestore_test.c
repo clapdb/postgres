@@ -384,9 +384,25 @@ check_inspector_seqlock(void)
 	if (fd < 0)
 		return;
 	base = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (base == MAP_FAILED)
+	{
+		close(fd);
 		return;
+	}
+	/* Stand in for a live, initialized daemon: the inspector refuses a READY
+	 * header whose daemon lease (byte one) has no holder.  Closing fd at the
+	 * end releases it. */
+	{
+		struct flock lease;
+
+		memset(&lease, 0, sizeof(lease));
+		lease.l_type = F_WRLCK;
+		lease.l_whence = SEEK_SET;
+		lease.l_start = PS_INSPECTION_DAEMON_LOCK_BYTE;
+		lease.l_len = 1;
+		check(fcntl(fd, F_SETLK, &lease) == 0,
+			  "synthetic inspection shared memory holds a daemon lease");
+	}
 	memset(base, 0, PS_SHM_SIZE);
 	hdr = base;
 	hdr->magic = PS_SHM_MAGIC;
@@ -444,6 +460,7 @@ check_inspector_seqlock(void)
 		  strcmp(output, "pagestore_inspect: timeline 7 does not exist\n") == 0,
 		  "a clean timeline snapshot reports a genuinely absent timeline");
 	munmap(base, PS_SHM_SIZE);
+	close(fd);
 	ps_shm_unlink(name);
 }
 

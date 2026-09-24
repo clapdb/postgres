@@ -416,6 +416,130 @@ test_response_consistency(const char *inspector)
 	close_fixture(name, fd, hdr);
 }
 
+static int
+run_health(const char *inspector, const char *name)
+{
+	int status;
+	pid_t pid = fork();
+
+	if (pid == 0)
+	{
+		int devnull = open("/dev/null", O_WRONLY);
+
+		if (devnull >= 0)
+			dup2(devnull, STDOUT_FILENO);
+		execl(inspector, inspector, "--shm", name, "health", (char *) NULL);
+		_exit(127);
+	}
+	if (pid < 0 || !wait_child(pid, 5000, &status) || !WIFEXITED(status))
+		return -1;
+	return WEXITSTATUS(status);
+}
+
+/*
+ * A fake daemon holding the lease (byte one) and, until told to finish
+ * "initialization" through release_fd, byte zero -- the real daemon's order.
+ */
+static pid_t
+start_initializing_daemon(const char *name, int ready_fd, int release_fd)
+{
+	pid_t pid = fork();
+
+	if (pid == 0)
+	{
+		unsigned char byte = 1;
+		int fd = ps_shm_open(name, O_RDWR, 0);
+
+		if (fd < 0 ||
+			set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0 ||
+			set_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0 ||
+			write(ready_fd, &byte, 1) != 1 ||
+			read(release_fd, &byte, 1) != 1 ||
+			set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK) != 0 ||
+			write(ready_fd, &byte, 1) != 1)
+			_exit(127);
+		for (;;)
+			pause();
+	}
+	return pid;
+}
+
+/*
+ * E-8: a daemon killed with SIGKILL leaves its header READY.  health and
+ * ps_shm_daemon_ready() must not report that segment ready, nor one whose
+ * new daemon still holds the initialization byte.
+ */
+static void
+test_health_requires_live_daemon(const char *inspector)
+{
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int release_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte = 1;
+
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create health fixture");
+	if (failed)
+		return;
+	init_header(hdr, PS_INSPECTION_STATE_IDLE, 1);
+	check(ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+							  PS_INSPECTION_DAEMON_LOCK_BYTE) == 0,
+		  "READY header without a daemon lease is not ready");
+	check(run_health(inspector, name) == 1,
+		  "health rejects a READY header left by a dead daemon");
+
+	check(pipe(ready_pipe) == 0 && pipe(release_pipe) == 0,
+		  "create initializing daemon handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = start_initializing_daemon(name, ready_pipe[1], release_pipe[0]);
+	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+		  "fake daemon holds lease and initialization byte");
+	if (!failed)
+	{
+		check(ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+								  PS_INSPECTION_DAEMON_LOCK_BYTE) == 0,
+			  "initializing daemon is not ready");
+		check(run_health(inspector, name) == 1,
+			  "health rejects a stale header during initialization");
+		check(write(release_pipe[1], &byte, 1) == 1 &&
+			  read(ready_pipe[0], &byte, 1) == 1,
+			  "fake daemon finishes initialization");
+		check(ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+								  PS_INSPECTION_DAEMON_LOCK_BYTE) == 1,
+			  "initialized daemon is ready");
+		check(run_health(inspector, name) == 0,
+			  "health accepts an initialized live daemon");
+		/* An inspector holding byte zero is not initialization. */
+		check(set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+								  F_WRLCK) == 0,
+			  "inspector takes byte zero after READY");
+		check(run_health(inspector, name) == 0,
+			  "health stays ready while an inspector holds byte zero");
+		(void) set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
+	}
+	if (holder > 0)
+	{
+		kill(holder, SIGKILL);
+		check(wait_child(holder, 2000, &status) && WIFSIGNALED(status),
+			  "fake daemon exit releases its lease");
+	}
+	check(run_health(inspector, name) == 1,
+		  "health rejects the header after the daemon is killed");
+	close(ready_pipe[0]);
+	close(ready_pipe[1]);
+	close(release_pipe[0]);
+	close(release_pipe[1]);
+	close_fixture(name, fd, hdr);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -432,6 +556,7 @@ main(int argc, char **argv)
 				 "create stale BUSY fixture");
 	test_live_daemon_lease(argv[1]);
 	test_response_consistency(argv[1]);
+	test_health_requires_live_daemon(argv[1]);
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed == 0 ? 0 : 1;
 }

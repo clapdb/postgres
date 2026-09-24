@@ -132,7 +132,6 @@ client_attach(const char *shm_name)
 		exit(2);
 	}
 	shm = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (shm == MAP_FAILED)
 	{
 		fprintf(stderr, "pagestore_control_restore: mmap: %m\n");
@@ -145,6 +144,14 @@ client_attach(const char *shm_name)
 		fprintf(stderr, "pagestore_control_restore: shm header mismatch (daemon built against a different PS_SHM_VERSION?)\n");
 		exit(2);
 	}
+	/* A dead daemon's header stays READY. */
+	if (ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+							PS_INSPECTION_DAEMON_LOCK_BYTE) != 1)
+	{
+		fprintf(stderr, "pagestore_control_restore: no running, initialized daemon owns the shared memory\n");
+		exit(2);
+	}
+	close(fd);
 	if (hdr->page_size < PG_CONTROL_FILE_SIZE)
 	{
 		fprintf(stderr, "pagestore_control_restore: daemon page size %u cannot hold a %d-byte control file\n",

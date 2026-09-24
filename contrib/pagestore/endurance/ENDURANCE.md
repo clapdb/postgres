@@ -247,20 +247,23 @@ directly followed the deletion of the retired branch.  The next step is to
 count `ps_control_dropped` and the exit drain's outcome, and to read the
 control object's versions on the preserved store.
 
-**E-8. `pagestore_inspect health` reports a dead daemon's segment as
-ready** (CI seed 1, round 5; worked around in the driver).  A daemon killed
-with `SIGKILL` leaves its shared-memory object with a valid header and
-`startup_state = READY`.  The next daemon reuses the object (`O_CREAT`
-without unlinking) and re-initializes it under lock byte zero, but `health`
-maps the object read-only, checks only the header, and never probes the
-daemon lease on byte one.  A readiness probe issued between the new daemon's
-launch and its initialization therefore succeeds against the stale header;
-the writer then attached mid-initialization and failed with `pagestore
-localsvc shared memory incompatible ... magic=0x0`.  Any orchestrator that
-restarts the daemon after a crash and waits on `health` has the same race.
-Fix direction: `health` (and every client attach) should require byte one
-to be held by a live daemon, or the daemon should unlink and recreate the
-object.  The driver now removes the stale object before each daemon start.
+**E-8. `pagestore_inspect health` reported a dead daemon's segment as
+ready** (CI seed 1, round 5; fixed).  A daemon killed with `SIGKILL` leaves
+its shared-memory object with a valid header and `startup_state = READY`.
+The next daemon reuses the object (`O_CREAT` without unlinking) and only
+invalidates the header after taking its locks, while `health` mapped the
+object read-only and checked only the header.  A readiness probe issued
+between the new daemon's launch and its initialization therefore succeeded
+against the stale header; the writer then attached mid-initialization and
+failed with `pagestore localsvc shared memory incompatible ... magic=0x0`.
+`health` and every client attach (backend, `pagestore_import`,
+`pagestore_walrestore`, `pagestore_control_restore`) now also require
+`ps_shm_daemon_ready()`: the daemon lease (byte one) must have a holder that
+no longer holds the initialization byte (byte zero), which the daemon keeps
+until it publishes READY.  `pagestore_inspect_mailbox_test` covers a dead
+daemon's READY header, a daemon still initializing, an initialized daemon,
+and an inspector holding byte zero.  The driver still removes the stale
+object before each daemon start; that is no longer required.
 
 Also needed: the daemon should log one line for every refused or failed
 READV/WRITEV/BEGIN_DELETE (opcode, timeline, key, block, reason), as it

@@ -187,4 +187,50 @@ ps_shm_unlink(const char *name)
 
 #endif							/* __APPLE__ */
 
+/*
+ * Return 1 when a live daemon owns the segment and has finished initializing
+ * it, 0 when it does not, and -1 (errno set) when the locks cannot be probed.
+ *
+ * A READY header alone is not proof: a daemon killed with SIGKILL leaves its
+ * header READY, and the next daemon only invalidates it after it has taken
+ * its locks.  The daemon holds lease_byte for its whole lifetime and holds
+ * init_byte from before it invalidates the header until it publishes READY,
+ * so the segment is ready only while lease_byte has a holder that does not
+ * also hold init_byte.  Inspectors take init_byte briefly as well; when the
+ * holders' pids cannot be compared (another pid namespace reports 0), any
+ * init_byte holder counts as initialization, which a caller only sees as a
+ * transient "not ready".  F_GETLK needs no write access, so read-only
+ * mappings can use this too.  Callers check the header's own fields as well;
+ * probing the locks after reading it closes the window where a stale header
+ * is read just before a new daemon takes over.
+ */
+static inline int
+ps_shm_daemon_ready(int fd, off_t init_byte, off_t lease_byte)
+{
+	struct flock lease;
+	struct flock init;
+
+	memset(&lease, 0, sizeof(lease));
+	lease.l_type = F_WRLCK;
+	lease.l_whence = SEEK_SET;
+	lease.l_start = lease_byte;
+	lease.l_len = 1;
+	if (fcntl(fd, F_GETLK, &lease) != 0)
+		return -1;
+	if (lease.l_type == F_UNLCK)
+		return 0;
+	memset(&init, 0, sizeof(init));
+	init.l_type = F_WRLCK;
+	init.l_whence = SEEK_SET;
+	init.l_start = init_byte;
+	init.l_len = 1;
+	if (fcntl(fd, F_GETLK, &init) != 0)
+		return -1;
+	if (init.l_type == F_UNLCK)
+		return 1;
+	if (init.l_pid > 0 && lease.l_pid > 0 && init.l_pid != lease.l_pid)
+		return 1;
+	return 0;
+}
+
 #endif							/* PAGESTORE_SHM_H */

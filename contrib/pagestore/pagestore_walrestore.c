@@ -132,7 +132,6 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 		perror("mmap");
 		exit(2);
 	}
-	close(fd);
 	hdr = (PsShmHeader *) shm;
 	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
 		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY)
@@ -141,6 +140,14 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 				"walrestore built against different PS_SHM_VERSION?)\n");
 		exit(2);
 	}
+	/* A dead daemon's header stays READY. */
+	if (ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+							PS_INSPECTION_DAEMON_LOCK_BYTE) != 1)
+	{
+		fprintf(stderr, "no running, initialized daemon owns the shared memory\n");
+		exit(2);
+	}
+	close(fd);
 
 	/*
 	 * Arm cleanup before claiming, then block terminating signals across the

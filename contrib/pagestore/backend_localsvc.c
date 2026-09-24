@@ -213,6 +213,19 @@ ls_attach(void)
 				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
 						   got_page_size, BLCKSZ, got_magic, got_version)));
 	}
+	/* A daemon that died leaves its header READY, and its successor rewrites
+	 * the segment only after taking the locks; attach only to a live,
+	 * initialized daemon. */
+	if (ps_shm_daemon_ready(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+							PS_INSPECTION_DAEMON_LOCK_BYTE) != 1)
+	{
+		munmap(shm, PS_SHM_SIZE);
+		close(fd);
+		ereport(ERROR,
+				(errmsg("pagestore localsvc shared memory \"%s\" has no running, initialized daemon",
+						localsvc_shm_name),
+				 errhint("Is the pagestore daemon running?")));
+	}
 	ls_shm = shm;
 	ls_shm_fd = fd;
 	ls_nchannels = hdr->nchannels;
