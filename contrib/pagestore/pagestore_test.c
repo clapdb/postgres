@@ -5658,6 +5658,102 @@ run_bugb_ancestry_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	ps_shm_unlink(shm);
 
+	/*
+	 * Codex round-4 review finding 4099084946: fork_newest_definitive_event_through()
+	 * originally returned the definitive event with the numerically LARGEST
+	 * lsn across the WHOLE ancestry, but fork resolution gives a child's own
+	 * local definitive event precedence over anything an ancestor can offer,
+	 * even a numerically newer one.  Root CREATEs rel800 at L=1500 (a
+	 * definitive event timeline 1 can still reach through ancestry, since it
+	 * forks well above that).  Timeline 1 then admits its OWN LOCAL CREATE at
+	 * L=1000 for rel800 -- nothing exists ancestry-wide at exactly 1000, so
+	 * this lands honestly, unpromoted, local to timeline 1.  Timeline 1 then
+	 * gains a page (grows to 1 block).  Timeline 1 now retries its own
+	 * CREATE at L=1000: the buggy version compared timeline 1's local
+	 * definitive event (1000) against root's (1500) and picked 1500 -- the
+	 * idempotence check's def_lsn==lsn(1000) comparison then failed, so the
+	 * retry fell through to promotion (fork_event_exists_at_ancestry(1000)
+	 * IS true, since timeline 1 does have that local event) and persisted a
+	 * fresh zero-block FEV_SET at the promoted position, which -- being a
+	 * definitive event newer than the timeline's own growth -- hid the page
+	 * timeline 1 had just grown.  The fix stops the walk at the first level
+	 * (here, timeline 1 itself) with its own visible definitive event, so
+	 * the retry is recognized as idempotent and never touches fork state.
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbanc4", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbanc4", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	op_create_at(800, 0, 1500);
+	op_create_branch(1, 0, 2000);
+	check(op_create_at_tl_status(1, 800, 0, 1000) == PS_STATUS_OK,
+		  "fork event: timeline 1's own local CREATE at L=1000, below root's L=1500 definitive event it can still reach, is admitted unpromoted");
+	fill_page(p, ps, 1600, 0x66);
+	op_write_tl(1, 800, 0, 0, p);
+	check(op_nblocks_tl(1, 800, 0) == 1,
+		  "fork event: timeline 1's own local CREATE grows to 1 block before the retry (got %u)",
+		  op_nblocks_tl(1, 800, 0));
+
+	check(op_create_at_tl_status(1, 800, 0, 1000) == PS_STATUS_OK,
+		  "fork event: a CREATE retry on timeline 1 for its OWN local CREATE at L=1000 is idempotent even though root has a numerically larger definitive event at L=1500 timeline 1 can also reach");
+	check(op_nblocks_tl(1, 800, 0) == 1,
+		  "fork event: timeline 1 still sees its own grown page after the CREATE retry -- the child-local definitive event must shadow root's numerically larger one, not the reverse (got %u)",
+		  op_nblocks_tl(1, 800, 0));
+	op_read_tl(1, 800, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x66),
+		  "fork event: timeline 1's grown page bytes survive the CREATE retry (child-hop precedence)");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	/*
+	 * Codex round-4 review finding 4099084959: fence_promote_lsn() only
+	 * folded page_prune_fences() (structural branch caps and PAGE_HISTORY
+	 * pins) into a colliding fork-meta mutation's promoted target, missing
+	 * walidx_prune_fences() -- the WAL-index-only owner pins forkmeta
+	 * compaction treats as fork-history fences too (a materializer that
+	 * only retains PS_RETENTION_RESOURCE_WAL_INDEX, no page history).  Root
+	 * CREATEs rel900 at L=1000 (zero blocks); a materializer registers a
+	 * WAL-index-ONLY retention pin at L=3000 (no PAGE_HISTORY, no WAL); a
+	 * stale ZEROEXTEND then arrives at exactly L=1000, colliding with
+	 * rel900's own CREATE.  The buggy version promoted the collision using
+	 * only page_prune_fences() -- empty here, since nothing pins page
+	 * history -- so the ZEROEXTEND stayed near its own L=1000 and the new
+	 * growth leaked into an as-of-3000 read the pinned materializer depends
+	 * on staying frozen.  The fix also merges walidx_prune_fences() (and
+	 * the timeline's WAL-index progress) into the promotion target, with
+	 * LSN-only strictly-above semantics, so the colliding ZEROEXTEND must
+	 * sort strictly above 3000 and the as-of-3000 read stays at 0 blocks.
+	 */
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugbanc5", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugbanc5", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	op_create_at(900, 0, 1000);
+	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 501, 1,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000) ==
+		  PS_STATUS_OK,
+		  "register a WAL-index-only materializer pin at L=3000");
+	op_zeroextend_at(900, 0, 0, 1, 1000);	/* stale req_lsn==1000, collides with rel900's own CREATE */
+	check(op_nblocks_asof_tl(0, 900, 0, 3000) == 0,
+		  "fork event: a stale ZEROEXTEND colliding with the CREATE it shares an lsn with does not leak new growth past a WAL-index-only pin's fence (as-of-3000 nblocks got %u)",
+		  op_nblocks_asof_tl(0, 900, 0, 3000));
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
 	free(p);
 	free(rb);
 }
