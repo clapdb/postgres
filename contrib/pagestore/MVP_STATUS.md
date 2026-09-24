@@ -383,24 +383,41 @@ the request path.  Recovery truncates only an incomplete final record and fails
 closed on any complete corrupt record or a pin whose timeline is absent.
 
 Every durable mutation of `retention.meta` -- an in-place append (SET/DROP/
-admission-reserve) or a full rewrite (churn compaction, and the identical
-v1 -> v2 migration) -- is bracketed by a durable `retention.pending` marker
-that carries the mutation's *intent*: the committed (record count, rolling
-hash) pair the log had before the mutation and the one it is meant to reach
-after, CRC-protected.  A process death anywhere between installing that
-marker and removing it again is not ambiguous: the next open reads the
-surviving intent, classifies whatever `retention.meta` actually holds against
-it (tolerating a torn or complete-but-unacknowledged trailing append record),
-and deterministically rolls the mutation back or forward before clearing the
-marker and continuing the ordinary replay -- itself safe to redo verbatim
-after a second crash mid-recovery.  A small number of failures instead happen
-in a *live* process (an fsync/rename/unlink step reports an error while the
-daemon keeps running and keeps answering, i.e. rejecting, requests); those
-durably install `retention.failed`, a permanent marker that startup refuses
-to look past even once `retention.pending` is gone, so a later restart can
-never silently resurrect a mutation whose failure the process already
-observed.  A `retention.pending` in the previous (empty-guard) format, or any
-other unreconcilable content, still fails startup closed exactly as before.
+admission-reserve), a full rewrite (churn compaction, and the identical
+v1 -> v2 migration), or the one-time bootstrap that installs `retention.state`
+over a v2 log that predates it -- is bracketed by a durable `retention.pending`
+marker that carries the mutation's *intent*: the committed (record count,
+rolling hash) pair the log had before the mutation and the one it is meant to
+reach after, CRC-protected.  The marker is published atomically (a private
+`retention.pending.tmp` is written, fsync'd, then renamed into place, then the
+directory is fsync'd) so it can never itself be observed torn; a crash before
+the rename leaves only an inert `.tmp` file, which open always removes
+regardless of what `retention.pending` holds.  A process death anywhere
+between the rename completing and the marker being removed again is not
+ambiguous: the next open reads the surviving intent, classifies whatever
+`retention.meta` actually holds against it (tolerating a torn or
+complete-but-unacknowledged trailing append record, or -- for the state
+bootstrap specifically -- a torn tail already present in a log that predates
+this crash-safety format at all), and deterministically rolls the mutation
+back or forward before clearing the marker and continuing the ordinary
+replay -- itself safe to redo verbatim after a second crash mid-recovery.  A
+small number of failures instead happen in a *live* process (an
+fsync/rename/unlink step reports an error while the daemon keeps running and
+keeps answering, i.e. rejecting, requests); those durably install
+`retention.failed`, a permanent marker that startup refuses to look past even
+once `retention.pending` is gone, so a later restart can never silently
+resurrect a mutation whose failure the process already observed.  A
+`retention.pending` shorter than one complete record -- including empty --
+still fails startup closed instead of being discarded: it is exactly the
+shape of the *previous* format's retention.pending, an intentionally empty
+guard created before and removed only after its whole mutation (for a DROP,
+including the matching `retention.state` write) was durable, and its shape
+alone cannot distinguish a crash before that mutation started from a crash
+after it committed but before the guard was removed -- discarding it could
+let an unacknowledged DROP silently take effect.  Startup logs which case
+applies and, for the unreconcilable short-marker case, instructs an operator
+to inspect `retention.meta`/`retention.state` and remove the marker by hand
+only after confirming no unacknowledged mutation is present.
 
 Managed readers and materializers install and advance durable owner generations
 before consuming retained history.  The effective-floor query projects

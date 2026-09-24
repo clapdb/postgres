@@ -522,26 +522,32 @@ retention_pending_crc(const PsRetentionPending *pending)
  *
  * Published atomically -- write a private retention.pending.tmp, fsync it,
  * rename(2) it into place, fsync the directory -- rather than written in
- * place.  An in-place O_CREAT|O_EXCL write left a window where a crash
- * between the create and the write (confirmed in production by the
- * op-sequence fuzzer: a SIGKILL landing exactly there left a 0-byte
- * retention.pending) produced a retention.pending that existed but did not
- * yet hold a complete, valid record.  retention_read_pending()'s size/CRC
- * checks correctly refused to trust it, but that meant every future open
- * was permanently refused even though no log byte had actually changed
- * yet -- recreating the original bug this whole intent format exists to
- * fix.  With rename(2) atomic on every filesystem this backend supports,
- * retention_pending_path can now only ever be observed either absent or
- * holding the complete bytes that were durable before the rename.  A
- * leftover retention.pending.tmp from a crash during this function is
- * inert: ps_retention_open() below removes it unconditionally before ever
- * looking at retention_pending_path, because (exactly as before the
- * rename here) no log byte can have changed while only the tmp file
- * existed.  A short/torn retention.pending itself can now only be a
- * leftover from an older build that wrote in place (or the exact crash the
- * fuzzer hit, on an unpatched daemon); ps_retention_open() still
- * recognizes and safely discards exactly that shape for the same reason
- * (see the comment there). */
+ * place.  An in-place O_CREAT|O_EXCL write of the intent record left a
+ * window where a crash between the create and the write produced a
+ * retention.pending that existed but did not yet hold a complete, valid
+ * record: retention_read_pending()'s size/CRC checks correctly refused to
+ * trust it, but that meant every future open was permanently refused even
+ * though no log byte had actually changed yet.  (That in-place-write
+ * implementation was itself only ever an intermediate state of this
+ * feature on this branch -- it never shipped -- but the op-sequence fuzzer
+ * still caught it: a SIGKILL landing exactly in that window left a 0-byte
+ * retention.pending in a captured failure store.)  With rename(2) atomic
+ * on every filesystem this backend supports, retention_pending_path can
+ * now only ever be observed either absent or holding the complete bytes
+ * that were durable before the rename, so this format's own writer can no
+ * longer produce a short retention.pending at all.  A leftover
+ * retention.pending.tmp from a crash during this function is inert:
+ * ps_retention_open() below removes it unconditionally before ever looking
+ * at retention_pending_path, because no log byte can have changed while
+ * only the tmp file existed.
+ *
+ * A short retention.pending can still be found, though: it is exactly the
+ * shape of the *previous* format's retention.pending, an intentionally
+ * empty guard whose presence alone cannot prove whether the crash that
+ * left it landed before or after the mutation it guarded (see the
+ * short-file branch in ps_retention_open()).  That is genuinely
+ * unreconcilable, not merely inconvenient, so it fails closed rather than
+ * being discarded. */
 static int
 retention_begin_pending(uint32_t op, uint64_t old_nrecords, uint32_t old_hash,
 						uint64_t new_nrecords, uint32_t new_hash)
@@ -1678,36 +1684,42 @@ ps_retention_open(const char *store_dir)
 		}
 		if (pending_st.st_size < (off_t) sizeof(PsRetentionPending))
 		{
-			/* Strictly shorter than one complete record.  Every
-			 * implementation this file has ever had -- the atomic
-			 * tmp+rename publish above, and the in-place O_CREAT|O_EXCL
-			 * write it replaces -- durably completes the marker before
-			 * the mutation it guards ever touches the log (see
-			 * retention_begin_pending()), so a short file proves that
-			 * mutation never started, regardless of which build wrote
-			 * it.  This is exactly the shape a SIGKILL landing between
-			 * the old code's open() and write() produced: the
-			 * op-sequence fuzzer reproduced a 0-byte retention.pending
-			 * this way against an unpatched daemon.  A file at or
-			 * beyond the full size is never given this pass: it might
-			 * be genuine corruption of an otherwise-complete marker
-			 * whose mutation had already progressed, so
-			 * retention_recover_pending() below still fails closed on
-			 * that exactly as before. */
+			/* Strictly shorter than one complete record: this is exactly
+			 * the shape of the *previous* format's retention.pending, an
+			 * intentionally empty guard created and fsynced before every
+			 * mutation and removed only after the mutation (meta and, for
+			 * a DROP, state) was fully durable.  Unlike this format's own
+			 * intent record, that guard's presence does not say *where* in
+			 * the mutation a crash landed: a crash could have landed
+			 * before the mutation ever touched the log (safe to ignore),
+			 * but it could equally have landed after retention.meta and
+			 * retention.state were both made durable and consistent with
+			 * each other, immediately before the guard's own removal --
+			 * in which case the mutation (e.g. a DROP) was never
+			 * acknowledged to its caller, and silently letting it stand
+			 * because meta/state happen to agree could reclaim
+			 * still-needed history.  Ordinary meta/state validation
+			 * cannot tell these two cases apart, because in both cases
+			 * meta and state are internally consistent.  There is
+			 * therefore no safe automatic recovery: fail closed, exactly
+			 * as the previous format always did, and require a human to
+			 * inspect retention.meta/retention.state and confirm no
+			 * unacknowledged mutation is present before removing the
+			 * marker by hand.  (The atomic tmp+rename publish this format
+			 * uses -- see retention_begin_pending() -- means retention.pending
+			 * itself can no longer end up short this way; a torn write is
+			 * now confined to retention.pending.tmp, which is never the
+			 * formal marker and is always safely removed above.) */
 			fprintf(stderr,
-					"pagestore_retention: removing incomplete %s (%lld "
-					"byte(s), short of a complete record): the mutation it "
-					"would have guarded never touched %s\n",
-					retention_pending_path,
-					(long long) pending_st.st_size, retention_path);
-			if (unlink(retention_pending_path) != 0 ||
-				retention_fsync_dir() != 0)
-			{
-				fprintf(stderr,
-						"pagestore_retention: could not remove %s: %s\n",
-						retention_pending_path, strerror(errno));
-				goto done;
-			}
+					"pagestore_retention: %s is %lld bytes: an interrupted "
+					"mutation from an earlier version (or a torn marker) "
+					"cannot be reconciled automatically; inspect "
+					"retention.meta/retention.state and remove the marker "
+					"manually only after confirming no unacknowledged "
+					"mutation is present\n",
+					retention_pending_path, (long long) pending_st.st_size);
+			errno = EILSEQ;
+			goto done;
 		}
 		else if (retention_recover_pending() != 0)
 			goto done;			/* diagnostic already printed */

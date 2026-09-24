@@ -818,29 +818,42 @@ run_pending_tmp_leftover_case(const char *fault_name, const char *label)
 }
 
 /*
- * Addendum: the continuous op-sequence fuzzer independently reproduced this
- * exact bug in production against an unpatched (pre-atomic-publish) daemon:
- * a SIGKILL landed after retention_begin_pending()'s open(O_CREAT|O_EXCL)
- * succeeded but before its write() ran, leaving a 0-byte retention.pending
- * (failure root 20260925T042327-w2-seed1211994399 in the fuzz corpus).  The
- * atomic tmp+rename publish above makes the *new* code structurally unable
- * to reproduce this again (retention.pending itself is only ever created by
- * a rename, which is atomic), but a store still carrying that leftover
- * artifact -- from an older build, or from this exact fuzz run -- must open
- * cleanly with a patched daemon rather than being refused forever.
+ * Codex round-3 (pagestore_retention.c:1680): a retention.pending shorter
+ * than a complete record must fail closed, not be discarded.  The
+ * op-sequence fuzzer independently found a 0-byte retention.pending in
+ * production (failure root 20260925T042327-w2-seed1211994399), but that was
+ * a SIGKILL landing between retention_begin_pending()'s open(O_CREAT|O_EXCL)
+ * and its write() -- an artifact of this PR branch's own intermediate,
+ * never-released in-place-write implementation (the commit right before the
+ * atomic tmp+rename publish above), not of the *previous* (pre-this-PR)
+ * format.  That intermediate implementation cannot recur once fixed, and
+ * needs no compatibility path.
+ *
+ * The previous format's retention.pending, however, was an intentionally
+ * empty guard: created (and fsynced) before a mutation, removed only after
+ * that mutation's own writes (the log append, and -- for a DROP -- the
+ * matching retention.state) were durable.  A crash between that removal and
+ * the mutation completing leaves retention.meta and retention.state fully
+ * consistent with each other, but the mutation was never acknowledged to
+ * its caller.  A short retention.pending cannot be told apart, by its shape
+ * alone, from a crash before the mutation ever started, so it cannot be
+ * discarded on the strength of meta/state looking fine: doing so could let
+ * an unacknowledged DROP silently take effect and reclaim still-needed
+ * history.  It must fail closed, exactly as the previous format always did.
  */
 static int
-run_short_pending_compat_case(void)
+run_short_pending_fails_closed_case(void)
 {
 	char		store[] = "/tmp/psretentioncrashshortpendXXXXXX";
 	char		pending_path[1700];
 	int			fd;
 	int			ok;
+	int			open_rc;
 
 	if (mkdtemp(store) == NULL)
 		return 0;
 	ok = populate_store(store);
-	check(ok, "populate a store for the short-pending compatibility case");
+	check(ok, "populate a store for the short-pending fail-closed case");
 	ps_retention_close();
 	if (ok)
 	{
@@ -850,24 +863,94 @@ run_short_pending_compat_case(void)
 	}
 	if (ok)
 	{
-		/* Reproduce the fuzzer's exact artifact: a 0-byte retention.pending,
-		 * exactly what the old in-place O_CREAT|O_EXCL write left behind by
-		 * a crash between the create and the write. */
 		fd = open(pending_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 		ok = fd >= 0 && close(fd) == 0;
 		check(ok, "create a 0-byte retention.pending (test setup)");
 	}
 	if (ok)
 	{
-		check(snapshot_matches_expected(store, 0),
-			  "a 0-byte leftover retention.pending from an old build opens "
-			  "cleanly and recovers the expected pin set instead of being "
-			  "permanently refused");
-		check(access(pending_path, F_OK) != 0 && errno == ENOENT,
-			  "the 0-byte retention.pending is removed on open");
-		check(snapshot_matches_expected(store, 0),
-			  "second restart after the 0-byte leftover marker is "
-			  "idempotent");
+		open_rc = ps_retention_open(store);
+		check(open_rc != 0,
+			  "a 0-byte retention.pending fails closed instead of being "
+			  "silently discarded");
+		if (open_rc == 0)
+			ps_retention_close();
+		check(access(pending_path, F_OK) == 0,
+			  "the 0-byte retention.pending is left in place for manual "
+			  "inspection, not removed");
+	}
+	remove_tree(store);
+	return ok;
+}
+
+/*
+ * Codex's own scenario, built directly: retention.meta/retention.state
+ * already durably and consistently reflect a completed DROP (via the
+ * ordinary API, so both are exactly as a successful DROP leaves them), and
+ * a 0-byte guard sits alongside them as if a previous-format implementation
+ * had crashed after that DROP committed but before removing its guard.
+ * Meta/state validation alone cannot distinguish this from a guard that
+ * predates any mutation, so this must fail closed too, regardless of how
+ * consistent meta/state look.
+ */
+static int
+run_legacy_guard_unacked_drop_case(void)
+{
+	char		store[] = "/tmp/psretentioncrashlegacydropXXXXXX";
+	char		pending_path[1700];
+	PsRetentionPin pin;
+	int			fd;
+	int			ok;
+
+	if (mkdtemp(store) == NULL)
+		return 0;
+	ok = ps_retention_open(store) == 0;
+	check(ok, "open a store for the legacy-guard unacked-DROP case");
+	if (ok)
+	{
+		make_pin(&pin, PS_RETENTION_OWNER_READER, PIN_D_OWNER,
+				 PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000, 1, 1);
+		ok = ps_retention_set(&pin) == PS_RETENTION_OK;
+		check(ok, "persist a pin to later drop (test setup)");
+	}
+	if (ok)
+	{
+		ok = ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id,
+								2) == PS_RETENTION_OK;
+		check(ok, "durably drop the pin through the ordinary, already-fixed "
+			  "API (test setup)");
+	}
+	ps_retention_close();
+	if (ok)
+	{
+		ok = snprintf(pending_path, sizeof(pending_path),
+					  "%s/retention.pending", store) > 0;
+		check(ok, "retention.pending path fits (test setup)");
+	}
+	if (ok)
+	{
+		/* retention.meta/retention.state are now durably consistent with
+		 * the DROP having fully committed, with no pending marker left
+		 * behind (the fixed API already cleared it).  Drop in a 0-byte
+		 * guard as if an old-format implementation had crashed after that
+		 * same commit but before removing its own guard. */
+		fd = open(pending_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		ok = fd >= 0 && close(fd) == 0;
+		check(ok, "create a 0-byte legacy guard over a committed DROP "
+			  "(test setup)");
+	}
+	if (ok)
+	{
+		int			open_rc = ps_retention_open(store);
+
+		check(open_rc != 0,
+			  "a 0-byte legacy guard fails closed even though "
+			  "retention.meta/retention.state already durably agree on the "
+			  "DROP it might be guarding");
+		if (open_rc == 0)
+			ps_retention_close();
+		check(access(pending_path, F_OK) == 0,
+			  "the legacy guard is left in place, not silently removed");
 	}
 	remove_tree(store);
 	return ok;
@@ -907,7 +990,9 @@ main(void)
 									   "contents (crash after tmp fsync, "
 									   "before rename)"))
 		ok = 0;
-	if (!run_short_pending_compat_case())
+	if (!run_short_pending_fails_closed_case())
+		ok = 0;
+	if (!run_legacy_guard_unacked_drop_case())
 		ok = 0;
 	printf("pagestore_retention_crash_test: %d checks, %d failed\n",
 		   checks, failures);
