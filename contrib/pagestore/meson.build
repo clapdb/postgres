@@ -455,6 +455,23 @@ test('pagestore_soak',
   timeout: 600,
 )
 
+# Stage 1 op-sequence fuzzer: coverage of opcode x status x interleaving
+# combinations against one real daemon in a short, fixed-seed CI run (see
+# pagestore_fuzz_test.c's header for the full design).  PAGESTORE_FUZZ_SEED /
+# PAGESTORE_FUZZ_OPS raise the seed count / op budget for exploration runs
+# outside CI.
+pagestore_fuzz_test = executable('pagestore_fuzz_test',
+  files('pagestore_fuzz_test.c'),
+  install: false,
+)
+test('pagestore_op_fuzz',
+  pagestore_fuzz_test,
+  args: [pagestore_daemon],
+  depends: [pagestore_daemon],
+  suite: ['pagestore'],
+  timeout: 90,
+)
+
 # Deterministic page/WAL lag-controller and admission-wait coverage.
 pagestore_backpressure_test = executable('pagestore_backpressure_test',
   files('pagestore_backpressure_test.c', 'pagestore_core.c',
