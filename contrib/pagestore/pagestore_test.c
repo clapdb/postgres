@@ -4899,6 +4899,22 @@ check_bugb_control_image(uint32_t timeline, const char *label)
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = 0;
 	ch->req_lsn = 1500;
+	/* Explicitly reset every other request field: the channel is reused
+	 * across ops, and PS_OP_READ_AT echoes its *own* resolved admission_seq
+	 * back into ch->req_seq on success (pagestore_daemon.c, PS_OP_READ_AT
+	 * case).  A prior relation READ_AT on this same channel therefore
+	 * leaves ch->req_seq holding that read's resolved admission_seq, which
+	 * page_visible()/read_resolve_version() treat as an input seq_cap for
+	 * the *next* request at the same LSN -- silently hiding this control
+	 * image's own (newer) admission_seq if the leftover value is smaller. */
+	ch->req_seq = 0;
+	ch->is_redo = 0;
+	ch->skip_fsync = 0;
+	ch->nblocks = 0;
+	ch->old_nblocks = 0;
+	ch->parent_timeline = 0;
+	ch->datalen = 0;
+	ch->pad1 = 0;
 	cl_exec();
 	check(ch->status == PS_STATUS_OK && ch->result != 0 && ch->data[0] == 0,
 		  "control image: %s does not see the post-fork same-version rewrite",
@@ -4908,13 +4924,6 @@ check_bugb_control_image(uint32_t timeline, const char *label)
 static void
 check_bugb_state(uint32_t ps, unsigned char *rb)
 {
-	/* Checked first, on its own freshly-claimed channel: the control image
-	 * lives at the exact same lsn (1500) both the branch's frozen read_lsn
-	 * and the promoted rewrite's original position land on, so it is the
-	 * most sensitive of these checks to a stale/reused ch->key or timeline
-	 * left over from a prior op on the shared client channel. */
-	check_bugb_control_image(1, "branch");
-
 	for (uint32_t rel = 100; rel < 107; rel++)
 		check(op_nblocks_tl(1, rel, 0) == 1,
 			  "rel%u: branch stays frozen at its pre-fork size (got %u)",
@@ -4943,6 +4952,14 @@ check_bugb_state(uint32_t ps, unsigned char *rb)
 	op_read_at_tl(0, 103, 0, 0, 1200, rb);
 	check(page_has_tag(rb, ps, 0x10),
 		  "pinned reader at 1200 does not see the post-fork same-lsn rewrite");
+
+	/* Checked last, matching the order the post-fork mutations were applied
+	 * in (run_bugb_suite() writes the control image rewrite after all the
+	 * other leak shapes): reuses the client channel after a run of relation
+	 * NBLOCKS/READ_AT calls, so it also exercises that check_bugb_control_image()
+	 * resets every request field of its own rather than relying on a fresh
+	 * channel. */
+	check_bugb_control_image(1, "branch");
 }
 
 static void
