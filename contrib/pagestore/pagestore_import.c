@@ -75,10 +75,13 @@ client_attach(const char *shm_name)
 	 * A dead daemon's header stays READY.  Take the shared init lock first
 	 * (so no daemon can be mid-initialization for as long as we hold it --
 	 * see pagestore_shm.h), then validate the header and the lease, then
-	 * release the lock on every path.
+	 * release the lock on every path.  Wait out a transient exclusive
+	 * holder (a daemon initializing, or a bounded relation-inspection
+	 * call) rather than failing immediately.
 	 */
 	{
-		int held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		int held = ps_shm_hold_init_shared_wait(fd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+												PS_INIT_LOCK_WAIT_MS);
 		int ready = -1;
 		int header_ok = 0;
 

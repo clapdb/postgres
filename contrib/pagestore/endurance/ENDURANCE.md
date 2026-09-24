@@ -299,7 +299,14 @@ clients briefly holding the init byte shared is now an expected, routine
 occurrence (an orchestrator polling health across a restart), so the
 daemon retries a busy init byte for up to ~10s instead of failing
 immediately; it still fails immediately if the *lease* byte is held (a
-live competing daemon, not a transient inspector).
+live competing daemon, not a transient inspector).  Client attach
+(`ls_attach`, `pagestore_import`, `pagestore_walrestore`,
+`pagestore_control_restore`) likewise waits out a transient exclusive
+holder of the init byte (bounded, ~10s) instead of raising a spurious "no
+running, initialized daemon" error the moment it collides with a
+relation-inspection call or a daemon that is (briefly) still initializing;
+`health`/non-relation `pagestore_inspect` stays non-blocking, since its
+callers already retry.
 
 `pagestore_inspect_mailbox_test` covers a dead daemon's READY header, a
 daemon still initializing, an initialized daemon, an inspector holding

@@ -208,14 +208,35 @@ ls_attach(void)
 	 * release the lock on every path.  ls_shm_fd is the only fd this
 	 * backend ever opens on the segment, so there is no risk of a second,
 	 * conflicting fcntl lock owner within this process.
+	 *
+	 * init_byte can also be held exclusively, briefly, by relation
+	 * inspection (bounded by its own ~5s timeout) as well as by an
+	 * initializing daemon; wait that out (up to PS_INIT_LOCK_WAIT_MS)
+	 * rather than raising ERROR immediately, or a backend's first touch of
+	 * the store could spuriously fail an in-flight query just because an
+	 * operator happened to run `pagestore_inspect relation` at the same
+	 * moment.  This drives its own loop, rather than using
+	 * ps_shm_hold_init_shared_wait(), so it stays interruptible: a query
+	 * cancel or backend termination must not be stuck behind this wait.
 	 */
 	{
-		int			held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		int			held;
+		int			elapsed_ms = 0;
 		int			ready = -1;
 		uint32		got_magic = 0;
 		uint32		got_version = 0;
 		uint32		got_page_size = 0;
 		bool		header_ok = false;
+
+		for (;;)
+		{
+			held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+			if (held != 0 || elapsed_ms >= PS_INIT_LOCK_WAIT_MS)
+				break;
+			pg_usleep(10000L);
+			CHECK_FOR_INTERRUPTS();
+			elapsed_ms += 10;
+		}
 
 		if (held == 1)
 		{

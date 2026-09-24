@@ -30,6 +30,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __APPLE__
@@ -263,6 +264,66 @@ ps_shm_hold_init_shared(int fd, off_t init_byte)
 	if (errno == EACCES || errno == EAGAIN)
 		return 0;
 	return -1;
+}
+
+/*
+ * Default bound for waiting out a transient exclusive holder of init_byte
+ * (a daemon initializing, or relation inspection's own ~5s-bounded hold):
+ * comfortably larger than either, so a routine wait never spuriously times
+ * out.  Shared by ps_shm_hold_init_shared_wait() and by callers (such as
+ * backend_localsvc.c's ls_attach()) that must drive their own interruptible
+ * retry loop instead of using it directly.
+ */
+#define PS_INIT_LOCK_WAIT_MS	10000
+
+/*
+ * Bounded-wait version of ps_shm_hold_init_shared(): retry on EAGAIN/EACCES
+ * (~10ms steps) until timeout_ms has elapsed, then give up.  Returns 1/0/-1
+ * exactly like the non-blocking version.
+ *
+ * The two legitimate exclusive holders of init_byte -- a daemon
+ * initializing, and relation inspection's own mailbox-ownership hold (see
+ * pagestore_inspect.c) -- are both bounded (initialization completes in a
+ * bounded time; relation inspection times out after ~5s), so a client that
+ * only needs *a* live daemon, not the relation-inspection mailbox itself,
+ * can simply wait the exclusive hold out instead of failing immediately.
+ * Callers should pick a timeout comfortably larger than relation
+ * inspection's own timeout (e.g. 10000ms) so a routine relation-inspection
+ * call never produces a spurious "no running, initialized daemon" error.
+ * This cannot deadlock against the daemon's own byte-zero retry (see
+ * pagestore_daemon.c): the daemon holds the lock exclusively only while
+ * actually initializing, and readers here only hold it, briefly, shared.
+ *
+ * This is a plain, uninterruptible libc sleep loop -- fine for the
+ * standalone client tools, which have nothing else to service while
+ * waiting.  A caller that must stay responsive to interrupts (e.g. a
+ * PostgreSQL backend) should not use this function; it should drive its
+ * own loop around the non-blocking ps_shm_hold_init_shared(), checking for
+ * interrupts between retries (see backend_localsvc.c's ls_attach()).
+ */
+static inline int
+ps_shm_hold_init_shared_wait(int fd, off_t init_byte, int timeout_ms)
+{
+	int			elapsed_ms = 0;
+
+	for (;;)
+	{
+		int			held = ps_shm_hold_init_shared(fd, init_byte);
+
+		if (held != 0)
+			return held;
+		if (elapsed_ms >= timeout_ms)
+			return 0;
+		{
+			struct timespec ts;
+
+			ts.tv_sec = 0;
+			ts.tv_nsec = 10000000L;	/* 10ms */
+			while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+				;
+		}
+		elapsed_ms += 10;
+	}
 }
 
 static inline int

@@ -47,6 +47,15 @@ sleep_ms(long milliseconds)
 	nanosleep(&ts, NULL);
 }
 
+static int64_t
+now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int
 set_inspection_lock(int fd, off_t byte, short type)
 {
@@ -706,6 +715,155 @@ test_lease_released_before_probe(void)
 	close_fixture(name, fd, hdr);
 }
 
+/*
+ * Architect follow-up: relation inspection holds init_byte exclusively for
+ * up to its own ~5s bound while it runs.  A client that only needs to know
+ * "is a live daemon there", not the relation mailbox itself, should wait
+ * that out instead of treating a transient EAGAIN/EACCES as "no daemon" --
+ * otherwise a backend's first touch of the store, or a restore_command
+ * invocation, can spuriously fail just because an operator happened to run
+ * `pagestore_inspect relation` at the same moment.
+ * ps_shm_hold_init_shared_wait() is the bounded-wait helper the standalone
+ * client tools use for this (the backend drives its own interruptible loop
+ * instead; see backend_localsvc.c's ls_attach()).
+ */
+static void
+test_hold_init_shared_wait_succeeds(void)
+{
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte;
+	int64_t start;
+	int64_t elapsed;
+	int held;
+
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create wait-succeeds fixture");
+	if (failed)
+		return;
+	check(pipe(ready_pipe) == 0, "create wait-succeeds handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = fork();
+	if (holder == 0)
+	{
+		int cfd = ps_shm_open(name, O_RDWR, 0);
+		unsigned char ready = 1;
+
+		close(ready_pipe[0]);
+		if (cfd < 0 || set_inspection_lock(cfd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+										   F_WRLCK) != 0)
+			_exit(127);
+		if (write(ready_pipe[1], &ready, 1) != 1)
+			_exit(127);
+		sleep_ms(300);
+		(void) set_inspection_lock(cfd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
+		_exit(0);
+	}
+	close(ready_pipe[1]);
+	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+		  "byte zero exclusive holder is in place");
+	close(ready_pipe[0]);
+	if (failed)
+	{
+		if (holder > 0)
+		{
+			kill(holder, SIGKILL);
+			waitpid(holder, &status, 0);
+		}
+		close_fixture(name, fd, hdr);
+		return;
+	}
+
+	start = now_ms();
+	held = ps_shm_hold_init_shared_wait(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, 2000);
+	elapsed = now_ms() - start;
+	check(held == 1,
+		  "wait acquires the shared init lock once the exclusive holder releases");
+	check(elapsed > 200,
+		  "wait actually waited out the ~300ms exclusive hold (elapsed > 200ms)");
+	if (held == 1)
+		ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+
+	check(wait_child(holder, 2000, &status) && WIFEXITED(status),
+		  "byte zero holder exits cleanly");
+	close_fixture(name, fd, hdr);
+}
+
+/*
+ * Symmetric case: when the exclusive hold outlives the wait's own timeout,
+ * the wait must give up and return 0 (not ready) rather than block
+ * indefinitely.
+ */
+static void
+test_hold_init_shared_wait_times_out(void)
+{
+	char name[64];
+	int fd;
+	int ready_pipe[2];
+	int status;
+	PsShmHeader *hdr;
+	pid_t holder;
+	unsigned char byte;
+	int held;
+
+	check(open_fixture(name, sizeof(name), &fd, &hdr) == 0,
+		  "create wait-times-out fixture");
+	if (failed)
+		return;
+	check(pipe(ready_pipe) == 0, "create wait-times-out handshake");
+	if (failed)
+	{
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = fork();
+	if (holder == 0)
+	{
+		int cfd = ps_shm_open(name, O_RDWR, 0);
+		unsigned char ready = 1;
+
+		close(ready_pipe[0]);
+		if (cfd < 0 || set_inspection_lock(cfd, PS_INSPECTION_CLIENT_LOCK_BYTE,
+										   F_WRLCK) != 0)
+			_exit(127);
+		if (write(ready_pipe[1], &ready, 1) != 1)
+			_exit(127);
+		for (;;)
+			pause();
+	}
+	close(ready_pipe[1]);
+	check(holder > 0 && read(ready_pipe[0], &byte, 1) == 1,
+		  "byte zero exclusive holder is in place (times-out case)");
+	close(ready_pipe[0]);
+	if (failed)
+	{
+		if (holder > 0)
+		{
+			kill(holder, SIGKILL);
+			waitpid(holder, &status, 0);
+		}
+		close_fixture(name, fd, hdr);
+		return;
+	}
+
+	held = ps_shm_hold_init_shared_wait(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, 200);
+	check(held == 0,
+		  "wait gives up once its own (short) timeout elapses while the exclusive hold continues");
+
+	kill(holder, SIGKILL);
+	check(wait_child(holder, 2000, &status) && WIFSIGNALED(status),
+		  "byte zero holder is reaped (times-out case)");
+	close_fixture(name, fd, hdr);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -724,6 +882,8 @@ main(int argc, char **argv)
 	test_response_consistency(argv[1]);
 	test_health_requires_live_daemon(argv[1]);
 	test_lease_released_before_probe();
+	test_hold_init_shared_wait_succeeds();
+	test_hold_init_shared_wait_times_out();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed == 0 ? 0 : 1;
 }
