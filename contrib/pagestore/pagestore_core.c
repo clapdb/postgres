@@ -4149,6 +4149,160 @@ typedef struct TimelineMeta
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+
+/*
+ * Bug B fix: a fast cached upper bound on every live descendant timeline's
+ * projected branch cap, indexed by ancestor.  read_resolve_version()/
+ * tl_walk_next() cap each ancestor level a branch's read walks through only
+ * by LSN: a branch created at branch_lsn L freezes read_lsn at L for every
+ * ancestor it reads through, so ANY version later admitted on an ancestor
+ * with lsn <= L becomes visible to that branch even though it postdates the
+ * fork (hint bits, phantom zero pages, ...).  The read path is deliberately
+ * left alone -- widening every ancestor's cap by every live descendant on
+ * every read would both be wrong (a descendant's own later writes must stay
+ * invisible above its own cap) and expensive; instead this promotes the
+ * write at admission time.
+ *
+ * Landing at or below a live descendant's cap is NOT by itself a leak: a
+ * genuinely WAL-ordered admission -- redo replaying a page/control image, or
+ * a fork-meta event, whose own lsn/req_lsn honestly predates the branch --
+ * must stay admissible completely unchanged even if it is admitted (in wall-
+ * clock order) after the branch was created; a COW branch's whole point is
+ * to see that real pre-fork history however late it physically arrives
+ * (pagestore_test.c's "branch sees parent as-of branch LSN, not later writes
+ * (snapshot)" depends on this).  Only two shapes are ambiguous enough to
+ * promote: landing at EXACTLY the cap (the fork boundary itself -- a fresh
+ * admission claiming to BE the fork point, rather than some distinct earlier
+ * fact, is exactly what a stale/derived op-LSN produces; see ls_op_lsn(),
+ * backend_localsvc.c), and a same-lsn rewrite of something this same key
+ * already has a record at (a hint-bit-only WRITEV keeps the old pd_lsn;
+ * page_visible()'s admission_seq >= tie-break picks the newest record at a
+ * given lsn even for an ancestor's seq_cap==0 read, so a fresh same-lsn
+ * rewrite silently supersedes the original a branch had frozen).  An
+ * *unstamped* fork-meta mutation (req_lsn==0) is promoted unconditionally
+ * whenever it lands at or below the cap, the same as a WAL-less relation
+ * page (lsn 0): there is no real WAL-based claim to protect either way.
+ * See page_has_version_at()/fork_event_exists_at() and the promotion checks
+ * in append_page_impl() and fork_meta_lsn_promote() for the exact shapes.
+ *
+ * A hit against either shape is routed through the exact fence set
+ * page_prune_fences() already computes for the below-floor/WAL-less
+ * ordered-admission path (which also folds in active PAGE_HISTORY retention
+ * pins, so a parent's pinned reader correctly still does not see the
+ * promoted version).  timeline_desc_cap[] exists only so the common case --
+ * no live descendant, or the write is already above every cap -- is a single
+ * array read instead of a page_prune_fences() call on every admission; a hit
+ * still pays for that exact computation.
+ *
+ * Maintained at:
+ *   - CREATE_BRANCH (desc_cap_bump_for_branch()): lock-free, because
+ *     CREATE_BRANCH publishes new timeline metadata without map_wr (see
+ *     timeline_define_incarnation()) and runs concurrently with ordinary
+ *     admission under admission-rd (both are "write" opcodes serialized only
+ *     by admission-rd's shared access -- see request_is_write() in
+ *     pagestore_daemon.c), so each ancestor's entry is bumped with a CAS
+ *     loop rather than a plain store;
+ *   - a timeline's transition to PS_TIMELINE_DELETED (desc_cap_rebuild_all()
+ *     under admission-write + map-write, which excludes every admission-rd
+ *     holder -- see the PS_OP_BEGIN_DELETE handling in pagestore_daemon.c
+ *     and the PS_TIMELINE_DELETED store near ps_lifecycle_write_lock() in
+ *     this file): a deleted branch's cap no longer fences anything and the
+ *     cache can only shrink, so a full rescan under that exclusion is safe
+ *     and (deletion being rare) cheap enough;
+ *   - restart recovery (desc_cap_rebuild_all(), single-threaded during
+ *     ps_core_open() before any worker thread runs).
+ */
+static uint64_t timeline_desc_cap[MAX_TIMELINES];
+
+/* Lock-free monotonic max: safe against concurrent CREATE_BRANCH calls that
+ * bump a shared ancestor (see the header comment above). */
+static void
+desc_cap_bump(uint32_t timeline, uint64_t candidate)
+{
+	uint64_t	cur = __atomic_load_n(&timeline_desc_cap[timeline],
+									  __ATOMIC_ACQUIRE);
+
+	while (candidate > cur &&
+		   !__atomic_compare_exchange_n(&timeline_desc_cap[timeline], &cur,
+										candidate, 0,
+										__ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+		;
+}
+
+/*
+ * Extend the cache for a newly (or re-)defined branch forking from 'parent'
+ * at 'branch_lsn'.  Walk parent's own ancestry, projecting branch_lsn through
+ * each ancestor's own branch point exactly as retention_project_lsn() would
+ * (a branch may request an LSN below its immediate parent's own fork point --
+ * it is then equivalent, for capping purposes, to a direct child of a higher
+ * ancestor; see branch_frontiers_allow()), and bump every ancestor's cap.
+ * Call after timeline_define_incarnation() has published the new branch,
+ * before the CREATE_BRANCH request is marked done: any admission dispatched
+ * after the client observes completion is then guaranteed to see the bump,
+ * via the same channel release-store publication this file's other
+ * cross-thread state relies on.
+ */
+static void
+desc_cap_bump_for_branch(int parent, uint64_t branch_lsn)
+{
+	uint64_t	cap = branch_lsn;
+	int			current = parent;
+	uint32_t	hops = 0;
+
+	while (current >= 0 && current < (int) MAX_TIMELINES &&
+		   timelines[current].defined && hops++ < MAX_TIMELINES)
+	{
+		desc_cap_bump((uint32_t) current, cap);
+		if (timelines[current].branch_lsn < cap)
+			cap = timelines[current].branch_lsn;
+		current = timelines[current].parent;
+	}
+}
+
+/*
+ * Full rebuild from timeline metadata: every live (non-DELETED) descendant
+ * projects its branch cap onto every ancestor on its own path, walking each
+ * descendant's chain once (O(T) per descendant, same technique
+ * refresh_inspection_timeline_cache()'s descendant loop uses, and for the
+ * same reason: a target/candidate cross product here would be O(T^3) for a
+ * deep tree).  Only safe where nothing can concurrently read or bump the
+ * cache: under admission-write (which excludes every admission-rd holder,
+ * i.e. every ordinary request including CREATE_BRANCH) or during
+ * single-threaded startup recovery.
+ */
+static void
+desc_cap_rebuild_all(void)
+{
+	memset(timeline_desc_cap, 0, sizeof(timeline_desc_cap));
+	for (uint32_t descendant = 0; descendant < MAX_TIMELINES; descendant++)
+	{
+		uint32_t	current;
+		uint64_t	cap;
+		uint32_t	hops = 0;
+		PsTimelineState state;
+
+		if (!timelines[descendant].defined ||
+			!ps_timeline_state(descendant, &state, NULL) ||
+			state == PS_TIMELINE_DELETED ||
+			timelines[descendant].parent < 0)
+			continue;
+		cap = UINT64_MAX;
+		current = descendant;
+		while (timelines[current].parent >= 0)
+		{
+			uint32_t	parent = (uint32_t) timelines[current].parent;
+
+			if (++hops > MAX_TIMELINES)
+				break;
+			if (timelines[current].branch_lsn < cap)
+				cap = timelines[current].branch_lsn;
+			if (cap > timeline_desc_cap[parent])
+				timeline_desc_cap[parent] = cap;
+			current = parent;
+		}
+	}
+}
+
 /* A metadata append failure is ambiguous: the lower layer may have made the
  * record durable before reporting an error.  Refuse all timeline services
  * until the process reopens and replays the log. */
@@ -5558,6 +5712,30 @@ page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
 			best = v;
 	}
 	return best;
+}
+
+/*
+ * Does (timeline, key, block) already have a stored version at exactly
+ * 'lsn'?  Used by the Bug B admission check above: a fresh record at an lsn
+ * some earlier record already occupies is a same-lsn rewrite (skip-WAL hint
+ * bits keep the old pd_lsn), which page_visible()'s admission_seq tie-break
+ * would let silently supersede the original at that lsn for any ancestor
+ * read (seq_cap==0 there) -- unlike a genuinely new, distinct lsn, which is
+ * ordinary WAL-ordered history and must stay admissible unchanged.  Caller
+ * holds this shard's write lock, same as the rest of append_page_impl().
+ */
+static int
+page_has_version_at(uint32_t timeline, const PsKey *key, uint32_t block,
+					uint64_t lsn)
+{
+	PageEnt    *e = page_find(timeline, key, block);
+
+	if (!e)
+		return 0;
+	for (int i = 0; i < e->nver; i++)
+		if (e->vers[i].lsn == lsn)
+			return 1;
+	return 0;
 }
 
 uint32_t
@@ -14618,6 +14796,14 @@ timeline_delete_publish_one(void)
 			/* The deleted branch's cap no longer fences its ancestors' page
 			 * and control history; revisit their layers (map-wr is held). */
 			page_prune_mark_all_due_locked();
+			/* Bug B: this timeline's cap can no longer promote an ancestor's
+			 * admission above it; only a full rescan can tell whether some
+			 * other live descendant still requires that ancestor's cap (see
+			 * timeline_desc_cap[]'s declaration).  admission-write + every
+			 * shard-write + map-write, all held here, exclude every
+			 * admission-rd holder (ordinary requests, including
+			 * CREATE_BRANCH), so a plain rescan is safe. */
+			desc_cap_rebuild_all();
 			/* L2: DELETED is the durable proof this incarnation is fully
 			 * gone; a reuse of this slot must not have its own "deletion
 			 * blocked" diagnostic suppressed by a stale tuple left behind
@@ -17023,6 +17209,46 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (clamped)
 				hdr.lsn = growth_floor;
 		}
+	}
+	/*
+	 * Bug B: this timeline's own floor is satisfied, but the raw lsn can
+	 * still fall at or below a live descendant's branch cap -- a fork that
+	 * happened after this append's source bytes were produced, or a
+	 * route_all compute writing the parent directly with a stale/zero
+	 * op-LSN (see ls_op_lsn(), backend_localsvc.c).  timeline_desc_cap[] is
+	 * the cheap upper bound described at its declaration; a hit is routed
+	 * through the same page_prune_fences()-driven promotion the
+	 * below-floor/zero-version case gets below, by reusing 'clamped'.
+	 * Applies to relation pages and control images (SLRU/READER_SNAPSHOT
+	 * already refuse admission below a fence instead -- see
+	 * artifact_lsn_fenced() above -- and are left alone).
+	 */
+	if ((key->klass == PS_KLASS_RELATION || key->klass == PS_KLASS_CONTROL) &&
+		hdr.lsn != 0 && !clamped)
+	{
+		uint64_t	cap = __atomic_load_n(&timeline_desc_cap[timeline],
+										  __ATOMIC_ACQUIRE);
+
+		/*
+		 * A real WAL-ordered admission strictly below the cap is legitimate
+		 * history (redo can and does write a page/control image whose own
+		 * lsn genuinely predates a branch that forked later in wall-clock
+		 * admission order -- pagestore_test.c's "branch sees parent as-of
+		 * branch LSN, not later writes (snapshot)" depends on this staying
+		 * admissible unchanged).  Only two shapes are ambiguous enough to
+		 * promote: landing at EXACTLY the cap (the fork boundary itself --
+		 * a fresh admission claiming to BE the fork point, rather than some
+		 * distinct earlier fact, is exactly what a stale/derived op-LSN
+		 * produces; see ls_op_lsn()), and a same-lsn rewrite of a block that
+		 * already has a stored version there (a hint-bit-only WRITEV keeps
+		 * the old pd_lsn -- page_visible()'s admission_seq >= tie-break picks
+		 * the newest record at that lsn even for an ancestor's seq_cap==0
+		 * read, so a fresh rewrite at an old lsn silently supersedes the
+		 * original version a branch had frozen).
+		 */
+		if (hdr.lsn <= cap &&
+			(hdr.lsn == cap || page_has_version_at(timeline, key, block, hdr.lsn)))
+			clamped = 1;
 	}
 	if (hdr.lsn == 0)
 	{
@@ -20156,6 +20382,113 @@ fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
 	return newest == UINT64_MAX ? UINT64_MAX : newest + 1;
 }
 
+/*
+ * Bug B, fork-meta side: bump *lsn_inout so an event admitted at
+ * (*lsn_inout, admission_seq) on 'timeline' sorts strictly after every live
+ * descendant branch cap and every active PAGE_HISTORY retention pin, the
+ * same fence set and same tie-break rule append_page_impl()'s ordered-record
+ * path applies to page admissions (see page_prune_fences(), and
+ * timeline_desc_cap[]'s declaration above for why a plain write can leak
+ * into a descendant otherwise).  Caller must not hold map_lock.  Returns 0
+ * on success, -1 on an internal failure (allocation, or the pathological
+ * UINT64_MAX-collision case) the caller should surface as a refusal.
+ */
+static int
+fence_promote_lsn(uint32_t timeline, uint64_t admission_seq,
+				  uint64_t *lsn_inout)
+{
+	PsPruneFence *fences = NULL;
+	uint32_t	nfences = 0;
+	uint64_t	lsn = *lsn_inout;
+	int			rc;
+
+	ps_lock_map_rd();
+	rc = page_prune_fences(timeline, &fences, &nfences);
+	ps_unlock_map();
+	if (rc != 0)
+		return -1;
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		if (lsn < fences[i].lsn)
+			lsn = fences[i].lsn;
+		if (lsn == fences[i].lsn && admission_seq <= fences[i].admission_seq)
+		{
+			if (lsn == UINT64_MAX)
+			{
+				free(fences);
+				return -1;
+			}
+			lsn++;
+		}
+	}
+	free(fences);
+	*lsn_inout = lsn;
+	return 0;
+}
+
+/*
+ * Does 'key' already have a recorded fork-meta event at exactly 'lsn' on
+ * this timeline?  The fork-meta-event analogue of page_has_version_at(),
+ * used by the same-lsn-rewrite leg of fork_meta_lsn_promote() below.
+ */
+static int
+fork_event_exists_at(uint32_t timeline, const PsKey *key, uint64_t lsn)
+{
+	ForkEnt    *e = fork_find(timeline, key);
+
+	if (!e)
+		return 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].lsn == lsn)
+			return 1;
+	return 0;
+}
+
+/*
+ * Fast check + exact promotion for a fork-meta event LSN (CREATE/UNLINK/
+ * TRUNCATE/ZEROEXTEND): the cheap common case -- no live descendant, or
+ * *lsn_inout is already above every cap -- is a single array read against
+ * timeline_desc_cap[]; a hit pays for fence_promote_lsn()'s exact
+ * page_prune_fences() computation.  admission_seq==0 (allocation failure) and
+ * lsn==0/UINT64_MAX (WAL-less floor / already-maximal) are passed through
+ * unchanged -- the caller's existing admission_seq==0 handling covers the
+ * former, and the latter cannot be pushed any higher or need not be.
+ *
+ * 'orig_req_lsn' is the caller's ORIGINAL request, before fork_op_lsn()
+ * resolved it: 0 means unstamped/legacy, the same "no real WAL-based claim"
+ * signal a WAL-less relation page (lsn 0) already gets unconditionally
+ * promoted for (see append_page_impl()'s zero_version path) -- so an
+ * unstamped fork-meta event is promoted unconditionally whenever it lands at
+ * or below the cap too.  A caller with a genuine explicit LSN is trusted the
+ * same way a relation page's own pd_lsn is: promoted only at the two
+ * ambiguous shapes page_has_version_at()'s comment describes -- landing
+ * EXACTLY at the cap, or reusing an lsn this same key already has an event
+ * at (a redo-safe same-lsn rewrite, e.g. two definitive events colliding
+ * after a stale/derived op-LSN).  A distinct, strictly-lower lsn is ordinary
+ * WAL-ordered fork history and stays admissible unchanged, exactly like a
+ * relation page's own below-cap pd_lsn.
+ *
+ * Returns 1 on success (possibly bumping *lsn_inout), 0 on an internal
+ * failure the caller should surface as PS_STATUS_ERROR.
+ */
+static int
+fork_meta_lsn_promote(uint32_t timeline, const PsKey *key,
+					  uint64_t orig_req_lsn, uint64_t admission_seq,
+					  uint64_t *lsn_inout)
+{
+	uint64_t	cap;
+
+	if (admission_seq == 0 || *lsn_inout == 0 || *lsn_inout == UINT64_MAX)
+		return 1;
+	cap = __atomic_load_n(&timeline_desc_cap[timeline], __ATOMIC_ACQUIRE);
+	if (*lsn_inout > cap)
+		return 1;
+	if (orig_req_lsn != 0 && *lsn_inout != cap &&
+		!fork_event_exists_at(timeline, key, *lsn_inout))
+		return 1;
+	return fence_promote_lsn(timeline, admission_seq, lsn_inout) == 0;
+}
+
 /* Caller holds map_lock for writing and the global admission write lock. */
 static int
 timeline_has_live_descendant(uint32_t ancestor)
@@ -20447,6 +20780,8 @@ ps_handle_meta(PsChannel *ch)
 						break;
 				}
 				seq = admission_seq_alloc();
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
@@ -20532,7 +20867,11 @@ ps_handle_meta(PsChannel *ch)
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
-				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
+				int			delayed;
+
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
+				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
 				{
@@ -20597,7 +20936,11 @@ ps_handle_meta(PsChannel *ch)
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
-				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
+				int			delayed;
+
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
+				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
 				{
@@ -20629,6 +20972,8 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	seq = admission_seq_alloc();
 				uint32_t	to = ch->blocknum + ch->nblocks;
 
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
 				/* Validate the caller's explicit tuple before fork_grow_with_seq()
 				 * can clamp its effective LSN to a newer definitive event. */
 				if (seq == 0 ||
@@ -20685,6 +21030,11 @@ ps_handle_meta(PsChannel *ch)
 					timeline_define_incarnation(ch->timeline,
 											(int) ch->parent_timeline, ch->req_lsn,
 											new_incarnation, parent_incarnation);
+					/* Publish this branch's cap to every ancestor's
+					 * desc_cap[] before the request is marked done (Bug B);
+					 * see timeline_desc_cap[]'s declaration comment. */
+					desc_cap_bump_for_branch((int) ch->parent_timeline,
+											 ch->req_lsn);
 					ch->incarnation = new_incarnation;
 				}
 				else
@@ -22812,6 +23162,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		fprintf(stderr, "pagestore_core: refusing to open corrupt timelines metadata\n");
 		return OPEN_STEP("load timelines");
 	}
+	/* Bug B: rebuild timeline_desc_cap[] from the just-loaded metadata.
+	 * Single-threaded here (no worker thread runs before ps_core_open()
+	 * returns), so a plain rescan is safe; see its declaration comment. */
+	desc_cap_rebuild_all();
 	/* Load durable branch definitions before immutable-only ids are marked used:
 	 * metadata replay must be allowed to reconstruct a legitimate branch, while
 	 * later CREATE_BRANCH requests must not reuse any discovered id. */

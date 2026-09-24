@@ -724,6 +724,26 @@ ls_pinned_read_seq(void)
  * relation's own CREATE and resurrect it).  WAL-less mutations (unlogged
  * relations) can leave all of these at older records; their content is
  * not LSN-ordered to begin with.
+ *
+ * A caller that reaches here with XactLastRecEnd == 0 and no commit/abort
+ * of its own (a route_all compute issuing a metadata-only op -- ZEROEXTEND,
+ * CREATE -- with no fresh WAL record of its own for this operation) used to
+ * fall back to Max(XactLastCommitEnd, XactLastAbortEnd): a stale position
+ * left over from whatever this backend last did, possibly long before some
+ * branch was forked off the same timeline since.  Stamping that stale, too-
+ * low position let the mutation land at or below the branch's cap and leak
+ * into it (pagestore Bug B) -- the pagestore daemon now also promotes an
+ * admission that lands at or below a live descendant's cap (see
+ * timeline_desc_cap[] in pagestore_core.c), but the honest fix here is to
+ * not hand it a stale position to begin with.  GetXLogInsertRecPtr() is a
+ * safe, fresh upper bound for a WAL-less/unstamped op: it can only be >=
+ * XactLastCommitEnd/XactLastAbortEnd (the global insert pointer has already
+ * passed any record this backend produced), so it cannot sort a related
+ * mutation before a record it must follow, and it cannot understate "now"
+ * the way a leftover, possibly ancient session value can.  A non-startup
+ * backend in recovery (hot standby) never inserts WAL itself, so use the
+ * last replayed position there instead -- the same horizon ls_read_lsn()
+ * uses for its own recovery case, just below.
  */
 static uint64
 ls_op_lsn(void)
@@ -732,7 +752,9 @@ ls_op_lsn(void)
 		return (uint64) GetCurrentReplayRecPtr(NULL);
 	if (XactLastRecEnd != 0)
 		return (uint64) XactLastRecEnd;
-	return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+	if (RecoveryInProgress())
+		return (uint64) GetXLogReplayRecPtr(NULL);
+	return (uint64) GetXLogInsertRecPtr();
 }
 
 /* A materializer is writable, not a pinned reader, but during recovery it

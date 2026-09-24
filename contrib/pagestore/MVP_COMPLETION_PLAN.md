@@ -229,10 +229,40 @@ advance past it.  The bounded-space soak keeps a fixed reader alive while its
 timeline receives continuing updates and verifies bounded page, forkmeta,
 WAL-index, and raw-WAL storage.
 The operational frontier may continue to advance while compaction retains
-those discrete bases for all live descendants.  Durable timeline metadata stores the complete fork tuple
-`(branch_lsn, branch_admission_sequence)`, not a bare LSN; restart, ancestor
-reads, page/forkmeta visibility, and compaction all apply that tuple so a
-same-LSN post-fork mutation cannot enter the child.
+those discrete bases for all live descendants.  Durable timeline metadata
+stores only `branch_lsn` (`TimelineMeta`, pagestore_core.c) -- there is no
+persisted `branch_admission_sequence`.  Ancestor reads cap each level purely
+by LSN (`tl_walk_next()`): a branch's frozen `read_lsn` equals `branch_lsn`
+at its own fork point, so a same-LSN post-fork mutation is kept out of the
+child not by a stored tuple but by never being *admitted* at or below that
+LSN in the first place.  Every admission path enforces this: relation pages
+and control images below their own timeline's floor are remapped to that
+floor (the `SEG_CLAMPED_ADMISSION_MAGIC` "ordered" record shape); and,
+symmetrically, an admission on an *ancestor* of a live branch is promoted
+strictly above the branch's cap when landing at or below it is ambiguous
+enough to be a leak rather than genuine WAL-ordered history: landing at
+*exactly* the cap (the fork boundary itself), or reusing an lsn/req_lsn this
+same key already has a record at (a same-lsn rewrite -- skip-WAL hint bits
+keep the old pd_lsn, and `page_visible()`'s admission-sequence tie-break
+would let a fresh rewrite at that lsn silently supersede the version a
+branch had frozen).  An unstamped fork-meta mutation (`req_lsn == 0`) is
+promoted unconditionally whenever it lands at or below the cap, the same
+"no real WAL-based claim" treatment a WAL-less relation page (lsn 0) already
+gets.  A distinct, strictly-lower lsn that collides with nothing already
+recorded is left unpromoted: it is ordinary WAL-ordered history that must
+remain visible to the branch however late it is physically admitted (a COW
+branch's whole point).  This walks every live descendant, including
+grandchildren, via the same `page_prune_fences()` fence set the
+ordered-record path already used for the floor case -- see
+`timeline_desc_cap[]`, `page_has_version_at()`, `fork_event_exists_at()`, and
+`fence_promote_lsn()` in pagestore_core.c, and `fork_meta_lsn_promote()` for
+the CREATE/UNLINK/TRUNCATE/ZEROEXTEND fork-metadata events.  This promotion
+is what closed Bug B (a branch seeing writes its parent admitted after the
+fork): before it, only the floor-remap direction was enforced, so a post-fork
+parent write landing at the branch's exact fork boundary, or reusing an
+already-recorded lsn (e.g. a hint-bit rewrite, or a stale/derived op-LSN --
+see `ls_op_lsn()`, backend_localsvc.c), was admitted unchanged and read
+straight through into the child.
 
 Branch creation participates in the same cutoff-selection fence as owner SET.
 It validates the requested `(LSN, admission_sequence)` against the durable

@@ -4870,6 +4870,217 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 }
 
 /*
+ * Bug B: after a branch forks off a live parent at branch_lsn L, read-through
+ * caps every ancestor level the branch walks through purely by LSN
+ * (tl_walk_next()); nothing stopped a NEW admission the parent takes after
+ * the fork, at an lsn/req_lsn landing at or below L, from becoming visible
+ * to the branch even though it postdates the fork (hint-bit rewrites,
+ * phantom zero pages, a route_all compute's stale op-LSN).  This runs the
+ * eight leak shapes bugb_repro.c (used to confirm the bug against a live
+ * daemon) found through the standalone daemon and checks the branch's --
+ * and a page-history reader's -- frozen view is unaffected by any of them,
+ * across a clean restart, a crash restart, and forced page compaction.  It
+ * also covers a grandchild branch: a write on the root must stay invisible
+ * to a grandchild exactly as it does to its immediate child.
+ *
+ * check_bugb_state() asserts the complete post-fix state; called after the
+ * initial writes and again after each restart/compaction, so a regression in
+ * any one of them shows up the same way a first-run leak would.
+ */
+static void
+check_bugb_control_image(uint32_t timeline, const char *label)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = timeline;
+	ch->incarnation = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = 0;
+	ch->req_lsn = 1500;
+	cl_exec();
+	check(ch->status == PS_STATUS_OK && ch->result != 0 && ch->data[0] == 0,
+		  "control image: %s does not see the post-fork same-version rewrite",
+		  label);
+}
+
+static void
+check_bugb_state(uint32_t ps, unsigned char *rb)
+{
+	/* Checked first, on its own freshly-claimed channel: the control image
+	 * lives at the exact same lsn (1500) both the branch's frozen read_lsn
+	 * and the promoted rewrite's original position land on, so it is the
+	 * most sensitive of these checks to a stale/reused ch->key or timeline
+	 * left over from a prior op on the shared client channel. */
+	check_bugb_control_image(1, "branch");
+
+	for (uint32_t rel = 100; rel < 107; rel++)
+		check(op_nblocks_tl(1, rel, 0) == 1,
+			  "rel%u: branch stays frozen at its pre-fork size (got %u)",
+			  rel, op_nblocks_tl(1, rel, 0));
+	op_read_at_tl(1, 100, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel100: branch block0 unaffected by the post-fork EXTEND at the cap");
+	op_read_at_tl(1, 103, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel103: branch does not see the post-fork same-lsn rewrite (hint-bit case)");
+	op_read_at_tl(1, 104, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel104: WAL-less rewrite was already safe, branch still unaffected");
+
+	/* grandchild (timeline 2, child of branch 1 at 1800): unaffected by the
+	 * same root-level writes, exactly like its immediate parent. */
+	for (uint32_t rel = 100; rel < 107; rel++)
+		check(op_nblocks_tl(2, rel, 0) == 1,
+			  "rel%u: grandchild branch also stays frozen at pre-fork size", rel);
+	op_read_at_tl(2, 103, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel103: grandchild does not see the post-fork same-lsn rewrite either");
+	/* the page-history reader pinned at 1200 (in (P=1000, L=1500]) must not
+	 * see the promoted writes either -- fence_promote_lsn() folds active
+	 * PAGE_HISTORY pins into the same fence set as branch caps. */
+	op_read_at_tl(0, 103, 0, 0, 1200, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "pinned reader at 1200 does not see the post-fork same-lsn rewrite");
+}
+
+static void
+run_bugb_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	unsigned char *p,
+			   *rb;
+
+	fprintf(stderr, "== Bug B: post-fork parent admission promotion ==\n");
+
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugb", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugb", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	p = malloc(ps);
+	rb = malloc(ps);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	/* seven pre-fork relations on the root, block0 written at P=1000 */
+	for (uint32_t rel = 100; rel < 107; rel++)
+	{
+		op_create_at(rel, 0, 1000);
+		fill_page(p, ps, 1000, 0x10);
+		op_write_tl(0, rel, 0, 0, p);
+	}
+
+	/* the control image legitimately established at exactly L, as part of
+	 * branch preparation (same shape as a materializer's env_materialize) --
+	 * must happen BEFORE the branch so the branch's frozen view has
+	 * something real at that version to protect. */
+	memset(p, 0, ps);
+	op_write_control(0, p, 1500);
+
+	/* branch 1 off root at L=1500; grandchild 2 off branch 1 at 1800 --
+	 * both must freeze the SAME root-level relations at the SAME size. */
+	op_create_branch(1, 0, 1500);
+	op_create_branch(2, 1, 1800);
+	for (uint32_t rel = 100; rel < 107; rel++)
+	{
+		check(op_nblocks_tl(1, rel, 0) == 1,
+			  "rel%u: branch starts at the pre-fork size", rel);
+		check(op_nblocks_tl(2, rel, 0) == 1,
+			  "rel%u: grandchild starts at the pre-fork size", rel);
+	}
+
+	/* a page-history reader pinned at 1200, strictly between P and L --
+	 * registered before the post-fork writes below, exactly like a branch's
+	 * own cap, so fence_promote_lsn() must respect it too. */
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 88100, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 1200) ==
+		  PS_STATUS_OK,
+		  "register the page-history reader pin at 1200");
+
+	/* --- post-fork parent mutations: the eight bugb_repro.c leak shapes --- */
+	fill_page(p, ps, 1500, 0x20);
+	check(op_write_tl_status(0, 100, 0, 1, p) == PS_STATUS_OK,
+		  "rel100: EXTEND a new block at exactly the branch cap L");
+	op_zeroextend_at(101, 0, 1, 3, 1000);	/* stale req_lsn==P, collides with rel101's own CREATE */
+	op_zeroextend(102, 0, 1, 3);			/* unstamped req_lsn==0 */
+	fill_page(p, ps, 1000, 0x30);
+	check(op_write_tl_status(0, 103, 0, 0, p) == PS_STATUS_OK,
+		  "rel103: WRITEV rewrites block0 keeping its old pd_lsn (hint-bit case)");
+	fill_page(p, ps, 0, 0x40);
+	check(op_write_tl_status(0, 104, 0, 0, p) == PS_STATUS_OK,
+		  "rel104: WAL-less WRITEV rewrite (already-safe negative control)");
+	op_truncate_at(105, 0, 0, 1000);		/* stale req_lsn==P, collides with rel105's own CREATE */
+	memset(p, 0, ps);
+	check(op_write_tl_status(0, 106, 0, 1, p) == PS_STATUS_OK,
+		  "rel106: all-zero-page EXTEND (already-safe negative control)");
+	memset(p, 0x77, ps);
+	op_write_control(0, p, 1500);			/* post-fork rewrite at the SAME version -- must not leak */
+
+	check_bugb_state(ps, rb);
+
+	/* clean restart */
+	client_detach();
+	stop_daemon(dpid);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after clean restart)\n");
+
+	/* crash restart */
+	client_detach();
+	kill(dpid, SIGKILL);
+	{
+		int status;
+
+		waitpid(dpid, &status, 0);
+	}
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after crash restart)\n");
+
+	/* forced page compaction: push enough churn through the root's other
+	 * blocks to make the pruning/compaction path run over these relations
+	 * too, then reverify under the pinned reader's registered floor. */
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(p, ps, 5000 + block, (unsigned char) block);
+		op_write_tl(0, 107, 0, block, p);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "Bug B suite: forced compaction reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(dpid);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after forced page compaction)\n");
+
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 88100, 1) == PS_STATUS_OK,
+		  "release the page-history reader pin");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	free(p);
+	free(rb);
+}
+
+/*
  * Shipped WAL: the store persists a per-timeline WAL log durably, branches keep
  * their own log, and the end LSN survives a daemon restart.  (This is the
  * transport/durability layer; replaying it to pages -- redo -- is future work.)
@@ -6284,6 +6495,9 @@ main(int argc, char **argv)
 
 	/* branch / snapshot isolation (page-size independent, run once) */
 	run_branch_suite(daemon_path, tmpbase);
+
+	/* Bug B: post-fork parent admissions must not leak into a live branch */
+	run_bugb_suite(daemon_path, tmpbase);
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);
