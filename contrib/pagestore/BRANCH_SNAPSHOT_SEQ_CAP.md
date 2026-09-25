@@ -4,6 +4,7 @@
 - Rev 2 addressed PR #297 Codex round 1 and PR #296 comment 4100769750.
 - Rev 3 addresses round 2: 4100994214/4100994220/4100994223/4100994229/4100994233/4100994236.
 - Rev 4 replaces the rev-3 G3 attestation and core hook with compute-side proofs R1 and R2 (§7).
+- Rev 5 addresses round 3 (4101119417/4101119423/4101119428/4101119435): R1 removed; R2 requires a shutdown checkpoint; exact-retry-safe post-check; R2 moved into P3b.
 
 **Baseline:** `origin/pagestore` @ `0550146156d`. Line references are to that tree.
 
@@ -28,6 +29,7 @@
 | 3 | STRICT boundary keeps the first-arrival escape; composition re-proved | §1.2, §1.3 |
 | 3 | G3 proof serialized with the S sample | §7 |
 | 4 | G3 without checksums, hooks or attestation: R1 (`wal_log_hints` + cut at the redo of a checkpoint in the current lifetime) or R2 (controller flow, verified structurally) | §7, §9 |
+| 5 | G3: controller flow only (R2 with a shutdown-checkpoint proof); direct entry points gated by a test-only GUC; `ch->result` newly-created flag; R2 lands with P3b | §7, §9 |
 | 3 | U3 plan-epoch validation moved into P2 | §3.7, §9 |
 | 3 | Phases re-sequenced: formats before activation | §9 |
 | 3 | Removed order-dependent optimizations are listed | §9.1 |
@@ -178,7 +180,7 @@ Admissible to a capped view iff `lsn ≤ L ∧ (lsn < L ∨ seq ≤ X) ∧ seq �
 
 | View | cap_seq | When / locks | Persistence | Recovery |
 |---|---|---|---|---|
-| **Branch** `branch_seq` | `admission_seq_alloc()` inside CREATE_BRANCH (unused by any record; pre-S means `seq < S`) | admission-rd + all shard-wr + map-wr (`pagestore_daemon.c:766-777`). Exact retries return the persisted S; a DELETED id reuse allocates fresh. The G3 proof (R1 or R2, §7) is checked on the compute side in the same backend immediately before this request. | `TimelineRecEventV3.branch_seq` | `admission_seq_observe` (required) |
+| **Branch** `branch_seq` | `admission_seq_alloc()` inside CREATE_BRANCH (unused by any record; pre-S means `seq < S`) | admission-rd + all shard-wr + map-wr (`pagestore_daemon.c:766-777`). Exact retries return the persisted S; a DELETED id reuse allocates fresh. The G3 proof (R2, §7) is checked on the compute side immediately before and after this request, in the same backend. The daemon reports whether this call newly created the timeline in `ch->result`. | `TimelineRecEventV3.branch_seq` | `admission_seq_observe` (required) |
 | **Retention pin** | `pin.admission_seq` (under admission-wr, `:20948-20951`) | stable | retention log | existing |
 | **Exact-R / advancing reader** | `(R, S)` from `ps_admission_barrier()` (`:1828`) | stable. **Must be covered by a retention pin at `(R, S)` before use** (§3.5, audited in P5). | existing | existing |
 | **Artifact fence** | `S_a` = `begin_seq` of the committed attempt, plus a transient `inflight` token cap (§2.1) | bound at COMMIT, under the artifact key's shard lock | `PsArtifactLifecycle.begin_seq` (lifecycle v2, `pagestore_artifact_format.h:47`); **no format change** | rebuilt from completion records |
@@ -451,117 +453,120 @@ Page segments, image layers, frontier files, the retention log, artifact formats
 | Stale/synthetic label at a fresh position | P0 `+1`, then P4 (§5.2); other sources in §5.3. |
 | **G3** | Closed by the requirement below. |
 
-### G3 requirement (rev 4: no data-checksum dependence, no core hook, no attestation protocol)
+### G3 requirement (rev 5: the controller flow only)
 
-**What must hold.** Every page version with `pd_lsn ≤ L` that is admitted before S, or that is the first arrival at its position after S, carries no hint bit about a transaction that commits after L. After S, the rule already hides every same-position rewrite of a position that has a pre-S version. So G3 reduces to two conditions:
+**What must hold.**
+- **(G3-i)** No version with `pd_lsn ≤ L` admitted before S carries a hint about a transaction that commits after L.
+- **(G3-ii)** Every position `≤ L` that can later receive post-L hints already has a pre-S version, so any later rewrite is a same-position rewrite and is hidden (§1.3).
 
-- **(G3-i)** no pre-S version with `pd_lsn ≤ L` carries a post-L hint; and
-- **(G3-ii)** every position `≤ L` that can later be rewritten with post-L hints has a pre-S version, or its first post-S arrival carries no post-L hint.
+**Why a live-parent proof is not possible (rev 4's R1 is removed; 4101119417).**
+- A buffer that is already `BM_DIRTY` when checkpoint C starts takes the fast path in `MarkSharedBufferDirtyHint` (`bufmgr.c:5769-5830`) and emits **no FPI**, even with `wal_log_hints`. A post-L hint can therefore be written while `pd_lsn` is still `≤ L`.
+- The same applies to other unlogged page changes, such as index `LP_DEAD` marks.
+- A read-side scrub would have to understand every AM's unlogged bits, so it is rejected.
+- **In production, a branch can therefore be created only through the controller flow, proven by R2 below.** R1 and everything that belonged to it (the `wal_log_hints` requirement, the lifetime floor, the `control_file_write_hook` use) are deleted.
 
-Two proofs, **R1** and **R2**, discharge this. Branch creation must satisfy one of them.
+#### The controller flow (verified in rev 4)
 
-#### R1: live parent, cut at a checkpoint redo, `wal_log_hints = on`
+`pagestore_branch_prepare.py` `execute()` (`:1572-1650`) runs these steps in order:
+1. `stop_writer` (`:1162`): `pg_ctl -m fast stop`, which writes a **shutdown checkpoint C**.
+2. `start_restricted_writer` (`:1168-1202`): private socket, `autovacuum=off`.
+3. `select_checkpoint` (`:1204`).
+4. `archive_checkpoint` (`:1226`, `pg_switch_wal`).
+5. `wait_materializer` and `pause_and_capture` (`:1291`, `:1131`): a materializer restartpoint; `L` is the segment boundary after the switch.
+6. `prepare_branch` (`:1304`): `pagestore_prepare_branch_from_control` on the restricted writer, which issues CREATE_BRANCH and so samples S.
+7. `success_restore`: resume the materializer and restore the normal writer (`:1358-1375`).
 
-**Requirements:**
-1. **`wal_log_hints = on` on the parent**, as its own setting. Rev 4 deliberately does **not** accept data checksums instead: this tree can disable checksums online (`SetDataChecksumsOff`, `xlog.c:4807-5050`), and trusting them would need a core hook. `wal_log_hints` is `PGC_POSTMASTER`, so it cannot change within a postmaster lifetime.
-2. **`L = redo(C)`** for a checkpoint C that completed **within the current postmaster lifetime**.
+#### R2: the proof, checked inside `pagestore_prepare_branch_from_control` (`pagestore.c:13664`)
 
-**Proof.**
-- C completed, so every buffer dirtied before `redo(C)` was flushed before S. Such a buffer's hints concern commits at or before `redo(C) = L`.
-- For the whole lifetime, `XLogHintBitIsNeeded()` is true, so the first hint-only dirtying of a page with `pd_lsn ≤ RedoRecPtr` emits an FPI (`XLogSaveBufferForHint`). After C began, `RedoRecPtr = L`, so any hint set after `redo(C)` on a page with `pd_lsn ≤ L` moves its `pd_lsn` above L.
-- Hence every version with `pd_lsn ≤ L`, pre-S or post-S, holds only hints set before `redo(C)`. That gives G3-i and G3-ii.
-- A checkpoint from an *earlier* lifetime gives no such guarantee, because that lifetime may have run without `wal_log_hints`.
+- **(R2-s) C is a shutdown checkpoint.**
+  - `ps_checkpoint_record_end()` (`pagestore.c:3806`) already reads C's record from WAL and accepts `XLOG_CHECKPOINT_ONLINE | XLOG_CHECKPOINT_SHUTDOWN`. It gains an out-parameter for the info code.
+  - `pagestore_branch_horizons_from_control()` (`:13261`) exports it in `PagestoreBranchHorizons`.
+  - The entry point requires `info == XLOG_CHECKPOINT_SHUTDOWN` and `checkPointCopy.redo == checkpoint record LSN`, which is true of every shutdown checkpoint.
+  - A shutdown checkpoint means there is no running transaction at C: fast shutdown aborts every backend transaction before the checkpoint. Only prepared transactions survive a shutdown.
+- **(R2-x) No transaction commits in (C, S].**
+  - `ReadNextFullTransactionId()` must equal `checkPointCopy.nextXid`, meaning no XID was assigned since C.
+  - `pg_prepared_xacts` must be empty, **kept**: prepared transactions survive a shutdown and can commit without a new XID.
+  - Both conditions are checked **immediately before and immediately after** CREATE_BRANCH, in the same backend.
+  - Together with R2-s, this shows that no transaction commits between C and the post-check, which is after S. **(Proves G3-i.)**
+- **(R2-m) Everything at or below L is materialized before S.** The store-observed materializer marker (`pagestore_materializer_status()`, `pagestore.c:2184`) must be `≥ L`, checked before CREATE_BRANCH.
+  - Today `fork ≤ materialized` is checked only when the caller is the materializer (`:13697-13710`).
+  - The restartpoint flushed every page state with `pd_lsn ≤ L`, so every position `≤ L` has a pre-S version.
+  - Post-S hint-only rewrites, by the normal writer after `restore_writer` or by the resumed materializer, are therefore hidden same-position rewrites, whatever the hint-WAL setting. **(Proves G3-ii.)**
+- The controller statements issued between `stop_writer` and `prepare_branch` must not assign XIDs.
+  - Today they are `pagestore_branch_checkpoint()`, `pg_switch_wal()`, `pagestore_shipped_wal_lsn()`, `SET`, and the prepare call itself.
+  - P3b verifies this on the mvp_golden controller run, and a regression test asserts nextXid is unchanged.
 
-**How "C within the current lifetime" is checked.**
-- pagestore already installs `control_file_write_hook` (`pagestore_control.c:684-685`, part of the existing core series). No new hook is needed.
-- The first invocation after shared-memory initialization records `ps_lifetime_floor_lsn = update_lsn` in pagestore shared memory. `StartupXLOG` updates the control file (to production or crash-recovery state) before any backend can write, so this floor is at or below every WAL position this lifetime writes.
-- The check requires `ps_lifetime_floor_lsn != 0 ∧ ps_lifetime_floor_lsn ≤ redo(C)`.
-- As a cross-check (logged if inconsistent, but not relied on), it also compares `CheckPoint.time ≥ PgStartTime`.
-- A crash-restart inside one postmaster re-initializes shared memory and resets the floor, which is conservative. `wal_log_hints` does not change across such a restart.
+#### Post-check failure and exact retries (4101119435)
 
-**Serialization with S.** The check and CREATE_BRANCH run in the same backend of the parent writer, back to back, inside `pagestore_branch_g3_check_and_create()`. No proof has to be carried to the daemon:
-- `wal_log_hints` and the lifetime can change only through a new postmaster.
-- PostgreSQL refuses to start a new postmaster while any process of the previous one is still attached to its shared memory (`PGSharedMemoryIsInUse`, `src/backend/port/sysv_shmem.c`). So while the checking backend lives, including while its CREATE_BRANCH IPC is in flight, the lifetime cannot change.
-- A backend orphaned by a postmaster crash keeps the old segment attached, which blocks the restart until it exits.
-- R1 requires the caller to be the parent writer itself: `pagestore_localsvc_timeline() == parent` and `!RecoveryInProgress()`. A recovery server cannot use R1, because on a standby hint-only changes are either not dirtied (hint WAL on) or written without WAL (off), and the lifetime argument does not transfer. Recovery-side branching uses R2.
+**Detecting "newly created".** CREATE_BRANCH currently returns the same incarnation for a first creation and for an exact retry. For example, target incarnation 0 or 1 on a fresh id yields 1 on both paths (`pagestore_core.c` CREATE_BRANCH handler `:20598-20640`). So the incarnation cannot express "created by this call".
 
-**Cost of requiring `wal_log_hints` everywhere.** With data checksums on (this tree's `initdb` default, `src/bin/initdb/initdb.c:167`), `XLogHintBitIsNeeded()` is already true, so `wal_log_hints = on` adds **no extra WAL**. Without checksums it adds one FPI per page per checkpoint cycle on the first hint-only dirtying, which is the standard `wal_log_hints` overhead.
+- The daemon sets **`ch->result = 1`** only on the path that actually persists a new create record (`timeline_persist_create()` succeeded). The exact-retry `break` leaves it at 0.
+- `ch->result` is already reset to 0 by the daemon before every request (`pagestore_daemon.c:414`) and is otherwise unused for this opcode.
+- **No struct or wire change.** An older daemon always returns 0, which the new client treats as "not newly created" and so never deletes: fail-closed.
+- The new meaning is recorded in the `PS_SHM_VERSION` history comment (`pagestore_ipc.h`). A version bump is not required for safety.
+- `pagestore_localsvc_create_branch()` (`backend_localsvc.c:1496-1512`) returns the flag.
 
-#### R2: controller flow (`pagestore_prepare_branch_from_control`)
+**Rules inside `pagestore_prepare_branch_from_control`** (ordering: R2 pre-check → `prepare_branch_impl` (seeds SLRUs, SLRU manifest, CREATE_BRANCH) → R2 post-check → bootstrap readiness file, i.e. `PAGESTORE_BRANCH_BOOTSTRAP_FILE` written after the SLRU manifest):
 
-**Verification of the controller flow** (`pagestore_branch_prepare.py`, `execute()` at `:1572-1650`):
+1. **The readiness file already exists and matches** (the existing retry branch at `:13730`). An earlier call already passed R2, because the file is written only after a passing post-check. The retry skips R2 and is idempotent.
+2. **Pre-check fails**: error, nothing created.
+3. **Post-check fails and this call newly created the timeline** (flag = 1): the readiness file was not written by this call and no manifest advertising the branch exists.
+   - Issue BEGIN_DELETE for the new incarnation, with the existing `pagestore_delete_branch` semantics.
+   - Remove the prepared directory's SLRU manifest.
+   - Raise the R2 error with SQLSTATE `55000`.
+4. **Post-check fails and the timeline already existed** (flag = 0, e.g. an earlier call crashed between CREATE_BRANCH and its post-check).
+   - **Do not delete.** A published branch manifest (the target installer's `pagestore_branch.manifest`) or any other consumer may reference the timeline, and this call cannot prove otherwise.
+   - Fail closed: raise the error with the timeline id and incarnation and HINT: "the branch must be deleted manually (pagestore_delete_branch) and the preparation rerun with a new incarnation".
+5. **The controller journal** (`pagestore_branch_prepare.py`). An R2 error leaves the journal at intent `prepare_branch`. The existing `preserve_prepare_fence` logic (`:1686-1715`) already keeps the journal and keeps services fenced.
+   - `recover_journal` must **not** blindly retry after an R2 error that states the branch was deleted (rule 3), because the same incarnation cannot be reused. It records `r2_failed` and requires an operator rerun with `new_incarnation + 1`.
+   - After rule 4 it likewise requires manual deletion first.
 
-1. `capture_and_pin_base()`.
-2. `stop_writer()` (`:1162-1166`): `pg_ctl -m fast stop`, which is a **shutdown checkpoint C**.
-3. `start_restricted_writer()` (`:1168-1202`): **the writer is restarted, not kept stopped.** It runs with `listen_addresses=''`, a private socket, `autovacuum=off`, `max_wal_senders=0`, no logical workers, and `auto_reader_artifacts` / `auto_wal_index` off. The checkpointer, bgwriter and walwriter run, and the controller's own SQL sessions run catalog lookups, which can set hint bits.
-4. `select_checkpoint()` (`:1204-1224`): `pagestore_branch_checkpoint()` (`pagestore.c:13395`) returns C's redo and end.
-5. `archive_checkpoint()` (`:1226-1267`): `pg_switch_wal()` on the restricted writer, which writes WAL after C.
-6. `wait_materializer(boundary)` (`:1291-1302`), then `pause_and_capture(keep_paused=True)` (`:1131-1160`). This is a materializer restartpoint that durably covers the paused replay position (`pagestore_capture_slru_snapshot()`; a stale restartpoint is rejected, `STALE_RESTARTPOINT` at `:29`). **fork = L =** that position, a WAL-segment boundary **after** the switch, so `L > redo(C)`.
-7. `prepare_branch()` (`:1304-1353`): `pagestore_prepare_branch_from_control(...)` on the **restricted writer**. This issues CREATE_BRANCH, which samples S.
-8. `success_restore()`: resume the materializer, stop the restricted writer, and start the normal writer (`restore_writer`, `:1358-1375`).
+#### Direct entry points (test-only)
 
-**Conclusions:**
-- **There is a window.** Between C and S the writer runs (restricted), writes WAL (the switch, plus FPIs from hints if hint WAL is on), and its background processes can flush pages.
-- **R1 does not apply here**, because `L ≠ redo(C)`. Applying the `wal_log_hints` + lifetime check to this flow would reject every controller branch. The flow is covered by R2.
+- The direct entry points are `pagestore_create_branch` (`pagestore.c:1425`), `pagestore_create_branch_with_incarnation` (`:1446`), and the legacy `pagestore_prepare_branch` (the path at `:13535`, `:13567`).
+- They refuse by default. They are allowed only when **`pagestore.allow_unsafe_branch_cut = on`**:
+  - PGC_SUSET, `GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE`;
+  - described as "UNSAFE, test only: permits branches without the G3 hint-bit proof";
+  - each use logs a WARNING.
+- `pagestore_prepare_branch_from_control` never honours the GUC. R2 is always enforced there.
+- **G3 exposure in unsafe mode:** the branch may contain parent pages with `pd_lsn ≤ L` carrying hint bits (or `LP_DEAD` marks) about transactions that committed after L. A branch that reuses those XIDs can then see wrong tuple visibility. The mode is acceptable only for test data.
 
-**R2 requirements, all checked inside `pagestore_prepare_branch_from_control` (`pagestore.c:13664`):**
-- **(R2-a) No transaction committed after C up to S:**
-  - the parent's `ReadNextFullTransactionId()` equals C's `checkPointCopy.nextXid` (from the control image the function already resolves via `pagestore_branch_horizons_from_control`);
-  - `pg_prepared_xacts` is empty.
-
-  Checked **before and after** the CREATE_BRANCH call. If the post-check fails, the function issues BEGIN_DELETE for the new timeline and raises the error below. The prepared manifest is published only after this, so nothing can boot the branch. An unchanged nextXid means no XID was assigned in `[C, post-check]`. With no prepared transactions, no pre-C XID can commit either.
-- **(R2-b) Every relation position `≤ L` is materialized before S:** the store-observed materializer marker (`pagestore_materializer_status()`, `pagestore.c:2184`; control block 3) must be `≥ L`. This is read by the writer before CREATE_BRANCH. Today `fork_lsn ≤ materialized` is checked only when the caller is the materializer itself (`pagestore.c:13697-13710`), so for the controller flow this is a **new** check.
-
-**Proof.**
-- By R2-a, no transaction commits after L until after S. Hints set before S (by the restricted writer's sessions, or by the materializer replaying up to L) concern commits at or before L. That gives G3-i.
-- By R2-b, the materializer restartpoint wrote a version of every page state with `pd_lsn ≤ L` before S, because each such state was dirtied by replay at or before L and flushed by the restartpoint or earlier. So every position `≤ L` has a pre-S version. Post-S hint-only rewrites, by the normal writer after `restore_writer` or by the resumed materializer, are same-position rewrites and are hidden **whatever the hint-WAL setting**. That gives G3-ii.
-- **So the controller flow is G3-free without requiring `wal_log_hints`, given R2-a/b.**
-
-**Serialization.** R2-b is monotonic: the marker only advances, so it cannot be undone. R2-a is proven over the whole interval by the before/after checks.
-
-#### Entry points and errors
-
-| Entry point | Proof |
-|---|---|
-| `pagestore_create_branch` (`pagestore.c:1425`) | R1 |
-| `pagestore_create_branch_with_incarnation` (`:1446`) | R1 |
-| legacy prepare (`:13535`, `:13567`) | R1 |
-| `pagestore_prepare_branch_from_control` (`:13664`) | R2 |
-
-In all cases R1 or R2 must be satisfied. The daemon is unchanged.
-
-Errors use `ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`:
+**Errors** (`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`):
 ```
--- R1, setting
-ERROR:  cannot create pagestore branch %u of timeline %u at %X/%08X
-DETAIL: wal_log_hints is off on the parent; hint-bit changes are not WAL-logged, so parent hint bits written after the branch point could enter the branch.
-HINT:   Set wal_log_hints = on, restart the parent, run CHECKPOINT, and create the branch at the new checkpoint's redo LSN.
+-- direct entry point, GUC off
+ERROR:  pagestore branch creation outside the controller flow is disabled
+DETAIL: Branches created without the shutdown-checkpoint proof may contain parent hint bits written after the branch point.
+HINT:   Use pagestore_branch_prepare (pagestore_prepare_branch_from_control). For tests only, SET pagestore.allow_unsafe_branch_cut = on.
 
--- R1, cut / lifetime
-ERROR:  cannot create pagestore branch %u of timeline %u at %X/%08X
-DETAIL: %X/%08X is not the redo pointer of a checkpoint completed by the parent's current postmaster (lifetime starts at %X/%08X).
-HINT:   Run CHECKPOINT on the parent and branch at pg_control_checkpoint().redo_lsn.
-
--- R1, caller
-ERROR:  cannot create pagestore branch of timeline %u from this server
-DETAIL: A live-parent branch must be created by the parent's own primary; this server is %s.
-
--- R2
+-- R2-s
 ERROR:  cannot prepare pagestore branch %u of timeline %u at %X/%08X
-DETAIL: %s   -- one of: "a transaction was assigned an XID after checkpoint %X/%08X (next XID %llu, checkpoint next XID %llu)"; "prepared transactions exist"; "the materializer has made only %X/%08X durable, before the fork"
-HINT:   Keep the parent writer restricted between the checkpoint and branch preparation, and retry the preparation.
+DETAIL: The checkpoint at redo %X/%08X is an online checkpoint; a branch requires the parent's shutdown checkpoint.
+HINT:   Stop the parent writer with a fast shutdown and branch from that checkpoint (pagestore_branch_prepare does this).
+
+-- R2-x
+ERROR:  cannot prepare pagestore branch %u of timeline %u at %X/%08X
+DETAIL: A transaction could commit after the checkpoint: next XID is %llu, checkpoint next XID is %llu, prepared transactions: %d.
+HINT:   Keep the parent writer restricted and issue no XID-assigning statements between its shutdown checkpoint and branch preparation.
+
+-- R2-m
+ERROR:  cannot prepare pagestore branch %u of timeline %u at %X/%08X
+DETAIL: The materializer has made the store durable only through %X/%08X, before the fork.
+
+-- rule 4 suffix
+DETAIL: ... Timeline %u incarnation %llu already existed and was not deleted.
+HINT:   Delete it with pagestore_delete_branch after confirming no manifest references it, and rerun the preparation with a new incarnation.
 ```
 
-**Override.** The compute GUC `pagestore.branch_allow_unsafe_cut` (PGC_SUSET, default off) downgrades R1 and R2 errors to WARNING, for unit harnesses that cut at synthetic LSNs. Core/IPC tests that send CREATE_BRANCH directly are unaffected, because the check is on the compute side.
+#### Impact on existing tests and scripts
 
-#### Compatibility
-
-- **Test and golden clusters in this tree** use `initdb` defaults (checksums on), and none sets `wal_log_hints`. Grep: all `initdb` calls in `integration_test.sh`, `mvp_golden_test.sh`, `branch_boot_test.sh`, the redo demos, `harness/pagestore_harness.py` and `harness/pagestore_pgdata_fixture.py`.
-- **R1 callers** (direct `pagestore_create_branch*`) must add `wal_log_hints = on` to the writer's config. Because checksums are already on, this costs no WAL. They must also branch at a fresh `CHECKPOINT`'s redo, or set the override.
-- **The controller flow (R2)** needs no configuration change. It gains the R2-a/b checks, which the existing flow already satisfies: the restricted writer runs no XID-assigning statements, and the capture precedes prepare.
-- **REL_15–17:** `initdb` defaults to checksums off, but because rev 4 requires `wal_log_hints` rather than checksums, the branchdb_15/16/17 scripts only need `wal_log_hints = on` for R1 callers. R2 is unaffected.
-- **Deferred alternatives:** accepting data checksums in place of `wal_log_hints` (needs a core hook against online disable); a PG-side hint scrub (clearing hints for XIDs ≥ the branch's `nextXid` at L on read-through).
-
+| Caller | Current use | Change |
+|---|---|---|
+| `mvp_golden_test.sh` (`:419`, `:501`) | the controller (`pagestore_branch_prepare`) | none, except that the verified no-XID property is asserted. The `:293` API-count query is unchanged. |
+| `endurance/pagestore_endurance.py` (`:295`) | the controller | none |
+| `integration_test.sh` `:742-762`, `:1253` | legacy `pagestore_prepare_branch` | prefix the session with `SET pagestore.allow_unsafe_branch_cut = on;` |
+| `integration_test.sh` `:1317-1443` | `pagestore_prepare_branch_from_control` after an **online** `CHECKPOINT` (`:1317`) | replace `CHECKPOINT` with a fast stop and start of the writer (`pg_ctl -m fast restart`), then read `pg_control_checkpoint()`. With no XID-assigning statements until the prepare, this exercises R2-s/x/m for real. The negative cases `:1439` (`shortFork`) and `:1443` (`badAuto`) keep their expected errors. Add cases: an online checkpoint is rejected (R2-s); an XID assigned between the checkpoint and the prepare is rejected (R2-x). |
+| `branch_boot_test.sh` `:123-144` | legacy `pagestore_prepare_branch` | `SET pagestore.allow_unsafe_branch_cut = on` |
+| `harness/pagestore_harness.py` and the other core/IPC tests (`pagestore_test.c`, the op fuzzer) | the daemon's CREATE_BRANCH directly | unaffected: the gate and R2 are compute-side |
 
 ---
 
@@ -603,7 +608,7 @@ HINT:   Keep the parent writer restricted between the checkpoint and branch prep
 - V4 flags, and identical `META_FIRST` after reopen.
 - `S_H`.
 - Artifact caps from completion records.
-- **G3 lifetime floor:** `ps_lifetime_floor_lsn` is reset on postmaster restart and crash-reinit; R1 rejects a checkpoint from an earlier lifetime.
+- **G3 retry semantics:** crash between CREATE_BRANCH and the post-check, then retry: the flag is 0 and the branch is not deleted (fail closed). Crash after the readiness file: the retry is idempotent with no R2 re-check.
 - Fault points on the V3 appends.
 
 ### 8.4 Compaction / prune integration
@@ -631,17 +636,13 @@ HINT:   Keep the parent writer restricted between the checkpoint and branch prep
 
 ### 8.5a G3 checks
 
-- **R1:**
-  - `wal_log_hints = off` is rejected;
-  - a cut that is not a redo pointer is rejected;
-  - a checkpoint from before a restart is rejected;
-  - a caller in recovery is rejected;
-  - acceptance at a fresh `CHECKPOINT` redo.
-- **R2**, in the `pagestore_branch_prepare.py` harness:
-  - an XID-assigning statement injected on the restricted writer between the checkpoint and prepare, or during CREATE_BRANCH (fault hook), is rejected by the pre- or post-check, and the new timeline ends up DELETED;
-  - an existing prepared transaction is rejected;
-  - a materializer marker below the fork is rejected;
-  - an end-to-end check: after `restore_writer`, run post-L commits plus hint-setting scans on the parent. The branch pages keep their pre-S bytes, with and without `wal_log_hints`.
+- **Direct entry points:** refused with the GUC off; allowed with a WARNING with it on; `prepare_branch_from_control` ignores the GUC.
+- **R2-s:** an online checkpoint is rejected; a shutdown checkpoint is accepted.
+- **R2-x:** an XID assigned (fault hook) before CREATE_BRANCH is rejected by the pre-check. One assigned *during* CREATE_BRANCH is rejected by the post-check; the new timeline ends up DELETED and the SLRU manifest is removed. An existing prepared transaction is rejected.
+- **R2-m:** a materializer marker below the fork is rejected.
+- **Newly created flag:** 1 on first creation, 0 on an exact retry, 0 from an old daemon (so no deletion).
+- **Rule 4:** a pre-existing timeline plus a post-check failure is not deleted; the error names it; the controller journal is kept at `prepare_branch` / `r2_failed`.
+- **End to end** (controller harness): after `restore_writer`, run post-L commits and hint-setting scans on the parent. The branch pages keep their pre-S bytes, with `wal_log_hints` off and on.
 
 ### 8.6 System
 
@@ -659,12 +660,12 @@ HINT:   Keep the parent writer restricted between the checkpoint and branch prep
 | **P1** | Refactor, no behaviour change. ViewCap and composition (STRICT-exact), `TlWalk` + `B_k`, `page_select`, identity lookups, ForkEvent flags and indexes, the fold slow path, I-ALLOC/U5 asserts. All caps ∞. | ~750 + ~550 |
 | **P2** | Planner. `PsViewFence`, positional/STRICT modes, closure (page/control/forkmeta), the invalidation exception, masks, derived fences, the LSN-strict ordered bump, **U3 plan-epoch validation**, property tests. | ~800 + ~850 |
 | **P3a** | Formats, no activation. `TimelineRecEventV3` (writes `branch_seq`, observed but read as ∞); forkmeta V4 / FMS v2 (META/UNSTAMPED flags written); WIPG v2 / WISD v4 (`S_H` written and observed, read as ∞); `req_floor_lsn` + UNSTAMPED persistence on the daemon side; **PAGE GROW dedup removal** and in-memory GROW compaction (behaviour-neutral for views, since all caps are ∞); identities and fixtures. | ~700 + ~550, plus fixtures |
-| **P3b** | Activate branches. Branch edges use `branch_seq` in reads, fences, gates and projection in **one commit**; the registration gate for branch levels; the kept child-first CREATE idempotence; ports `run_bugb_suite` and the ancestry suite. | ~300 + ~450 |
+| **P3b** | Activate branches **together with G3 enforcement, atomically**. Branch edges use `branch_seq` in reads, fences, gates and projection in one commit; the registration gate for branch levels; the kept child-first CREATE idempotence. **R2** in `pagestore_prepare_branch_from_control`: the shutdown-checkpoint check via `ps_checkpoint_record_end` info, nextXid and prepared-xact pre/post checks, the materializer-marker check. The `ch->result` newly-created flag and the retry/delete rules. **Direct entry points gated** by `pagestore.allow_unsafe_branch_cut`. Test migrations (§7 table). Ports `run_bugb_suite` and the ancestry suite. | ~650 + ~800 |
 | **P4** | Activate client unstamped. `req_lsn = 0` + `req_floor_lsn`; removes P0's `+1` and `ls_zeroextend`'s stamp; `PS_SHM_VERSION` bump. | ~150 + ~200 |
 | **P5** | Activate the other views. Pins positional below R (reads, fences, gate; pins required for exact-R readers); `S_H` caps in the walidx planner and fold; artifact caps and producer `(C, token)`; control-restore client seqs; §5.3 audits; ports the revision suite. | ~550 + ~450 |
-| **P6** | G3 (compute side only, no daemon or core change): `ps_lifetime_floor_lsn` via the existing `control_file_write_hook`; `pagestore_branch_g3_check_and_create()` with R1 at `pagestore_create_branch*` and legacy prepare, and R2 (nextXid / prepared-xact before and after checks, materializer-marker check, BEGIN_DELETE on post-check failure) in `pagestore_prepare_branch_from_control`; errors and override; `wal_log_hints = on` plus redo cuts for R1 test callers (and REL_15–17 scripts). Also the fuzzer and the docs. | ~450 + ~450, plus docs |
+| **P6** | Fuzzer (§8.5) and docs (READ_CONSISTENCY_DESIGN §1d, MVP_COMPLETION_PLAN: fork tuple and the controller-only G3 contract; RELEASE_VALIDATION; MVP_STATUS). No G3 code is left here. | ~250 + ~300, plus docs |
 
-Total: about 3.8k lines of code and 3.5k lines of tests, plus fixtures and docs.
+Total: about 3.9k lines of code and 3.6k lines of tests, plus fixtures and docs.
 
 **Top risks:**
 1. Read/prune divergence, including lost `s_min` facts. Mitigated by one predicate for fold and masks, closure everywhere, and the §8.2 future-arrival property test.
@@ -673,7 +674,7 @@ Total: about 3.8k lines of code and 3.5k lines of tests, plus fixtures and docs.
 4. The LSN-strict ordered bump and `UINT64_MAX`-as-bare-LSN consumers (grep `fences[`, `PsPruneFence`, `retention_project_lsn`, `admission_seq = projected`).
 5. Memory growth from always-recorded GROWs, bounded only by the cutover cadence. A stalled cutover (forkmeta backpressure) must surface through the existing controller.
 6. Reader registration (P5): an unpinned exact-R reader now fails closed.
-7. G3 R2 relies on the controller keeping the writer restricted; its checks (nextXid, prepared transactions, materializer marker) must fail closed.
+7. G3 R2: its checks (shutdown checkpoint, nextXid, prepared transactions, materializer marker) must fail closed. Retry and delete coordination with the prepare journal must never delete a timeline this call did not create. Test migrations: integration_test switches from an online CHECKPOINT to a fast restart.
 8. Client/daemon lockstep (P4).
 9. Three format bumps with fixtures.
 
