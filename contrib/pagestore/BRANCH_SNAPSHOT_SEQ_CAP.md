@@ -1,6 +1,7 @@
 # Branch snapshot seq cap: a read-side same-position freeze for Bug B
 
-**Status:** design proposal, revision 4, for review before any implementation.
+**Status:** **Design frozen for implementation (2026-09-25), revision 9.** Changes made during implementation are recorded as amendments in the phase PRs. Items that code review must confirm are listed in §10.
+- Rev 9 (final) addresses round 7 (4101392015/4101392022/4101392030/4101392035/4101392043/4101392050); adds §10 and the detailed P1 scope (§9.3).
 - Rev 2 addressed PR #297 Codex round 1 and PR #296 comment 4100769750.
 - Rev 3 addresses round 2: 4100994214/4100994220/4100994223/4100994229/4100994233/4100994236.
 - Rev 4 replaces the rev-3 G3 attestation and core hook with compute-side proofs R1 and R2 (§7).
@@ -36,6 +37,7 @@
 | 6 | Full-cap registration match; R2-x proven from the parent's WAL after L; `r2_cleanup` ordering; activation epochs per view kind, so views that exist before activation stay ∞; rollout audit | §2.2, §3.5, §7, §9.2 |
 | 7 | Pre-activation views exempt from the gate by epoch; `PS_FRONTEND_CAP_BRANCH_SEQ` + `R2_PROVEN` magic; replay observes only finite seqs; sentinel audit | §2.2, §3.5, §3.8, §7, §9 |
 | 8 | Retry needs `R2_PROVEN` for finite branches; the readiness file is the durable validated marker; atomic pin sample+register via the barrier fence pin and hand-off; walidx publish switch under admission-wr | §2.3, §3.7, §7 |
+| 9 | Barrier takes `page_prune_lock` + frontier validation; hand-off requires a resource superset; `PS_SHM_VERSION` bumps at P3a and P5; the safe controller refuses ∞ retries; P5 bidirectional gate; walidx recovery accepts either manifest; freeze, §10 checklist, P1 detail | §2.3, §3.7, §5, §7, §9, §10 |
 | 3 | U3 plan-epoch validation moved into P2 | §3.7, §9 |
 | 3 | Phases re-sequenced: formats before activation | §9 |
 | 3 | Removed order-dependent optimizations are listed | §9.1 |
@@ -245,11 +247,22 @@ Transitions:
 **Rule: a finite-S view exists only if it was registered in the same critical section that sampled S, or handed off from a live registration with the identical cap.**
 - **RESERVE** (`PS_OP_RETENTION_PIN_RESERVE`, `:20927-21000`) already allocates `seq` under admission-wr and calls `ps_retention_reserve_and_set()` (`pagestore_retention.c:1101-1124`). It is atomic as is, and is the default way to create a fresh reader or owner pin.
 - **ADMISSION_BARRIER** (`ps_admission_barrier`, `:1828`) becomes atomic too. The request carries `R` in `req_lsn` and the magic `PS_BARRIER_REGISTER` in `is_redo`: channel fields are not reset between requests, so a magic is needed, as in §7.
-  - Under admission-wr the daemon allocates S and calls `ps_retention_reserve_and_set()` with a pin `{timeline, owner_kind = CHECKPOINT_FENCE, lsn = R, resources = PAGE_HISTORY, admission_seq = S}`, then returns S.
+  - The daemon takes exactly the RESERVE path's locks and checks (`pagestore_core.c:20948-20995`): `admission-wr → page_prune_lock (wr) → walidx_prune_lock (wr)`, then map-rd for validation (round 7, 4101392015).
+  - It allocates S and validates `page_frontier_ancestry_allows(tl, R, S)` (and the WAL/WAL-index frontier checks RESERVE performs). On failure it refuses the barrier and allocates no fence.
+  - It then calls `ps_retention_reserve_and_set()` with a pin `{timeline, owner_kind = CHECKPOINT_FENCE, lsn = R, resources = PAGE_HISTORY | WAL | WAL_INDEX, admission_seq = S}` and returns S.
+  - Holding `page_prune_lock` (wr) excludes a compaction that snapshotted fences before the registration from publishing after it.
   - `CHECKPOINT_FENCE` pins are daemon-owned. The daemon keeps the newest two per timeline, so a reader adopting the previous generation still has a window, and drops older ones on each new barrier, which marks prune due.
   - Without the magic (an old compute), the barrier behaves as today. Its S is post-activation and unregistered, so readers cannot hand off from it and fail closed until the compute is upgraded.
-- **PIN_SET with an explicit seq** becomes a **hand-off only**. Under `retention_lock` plus `page_prune_lock` (write), which is the same exclusion compaction uses to snapshot fences, it succeeds only if a live registration with the identical `(timeline, lsn, admission_seq)` exists: a `CHECKPOINT_FENCE` pin, or another owner's pin. Otherwise it returns the new refusal `PS_RETENTION_NOT_REGISTERED`. So no prune can run between the moment the cap is known to be protected and the new owner's registration.
+- **PIN_SET with an explicit seq** becomes a **hand-off only**. Under `retention_lock` plus `page_prune_lock` (write), which is the same exclusion compaction uses to snapshot fences, it succeeds only if a live registration with the identical `(timeline, lsn, admission_seq)` exists (a `CHECKPOINT_FENCE` pin, or another owner's pin) **whose resources are a superset of the requested resources** (round 7, 4101392022). For example, a WAL-only source cannot hand off `PAGE_HISTORY`, because the page fence set never included it. It also holds `walidx_prune_lock` (wr) when `WAL_INDEX` is requested. Otherwise it returns the new refusal `PS_RETENTION_NOT_REGISTERED`. So no prune can run between the moment the cap is known to be protected and the new owner's registration.
 - **Pre-activation pins and reads** (seq at or below `activation_seq[PIN]`) keep today's SET semantics (legacy).
+
+**P5 version gate** (round 7, 4101392043).
+- P5 changes the semantics of existing opcodes: the barrier registers, explicit PIN_SET is hand-off only, artifact BEGIN implies `(C, token)` reads. So **P5 bumps `PS_SHM_VERSION`**. A P4 daemon and a P5 compute, or the reverse, refuse to attach, and neither mixed direction can proceed silently.
+- **Within P5** (same version), the daemon still enforces its side after activation:
+  - a post-activation barrier without `PS_BARRIER_REGISTER` is refused;
+  - an explicit-seq PIN_SET for a post-activation seq that is not a valid hand-off is refused;
+  - after `CAP_ACTIVATION{ARTIFACT}`, an artifact BEGIN is accepted only with the new flag `PS_ARTIFACT_BEGIN_CAPPED_READ` (a magic in an unused field). This is the producer's promise to read its control era with `(C, token)`.
+- The P5 client checks the daemon capability `PS_FRONTEND_CAP_ATOMIC_PINS` before using any of these paths.
 
 **Call sites that change (P5):**
 
@@ -389,12 +402,13 @@ Closure depends on the *current* fence set, which is inherent to fence-driven re
    - The planner records the value at plan time.
    - **Final comparison and switch run under admission-wr** (rev 8; 4101315045). `walidx_publish` alone does not exclude fork or PAGE-GROW admissions, which hold only admission-rd plus a shard lock.
    - **WAL-index snapshot publication is split into three phases:**
-     - **(A) Prepare, without admission.** Plan, under `walidx_prune_lock` (rd) and map (rd) as today. Write the new generation's payload and its manifest as *pending* (not yet referenced) files, then fsync them. These are the heavy writes.
+     - **(A) Prepare, without admission.** Plan, under `walidx_prune_lock` (rd) and map (rd) as today. Write the new generation's payload and its manifest as *pending* (not yet referenced) files, fsync them, **and fsync the directory**, so every newly created name is durable before the switch (round 7, 4101392050). These are the heavy writes.
      - **(B) Switch, under admission-wr.** Take `admission-wr → walidx_publish (wr)`. This follows the global order admission → shard → page_prune → walidx_prune → map → walidx_publish → wal_lock → walidx_meta; no shard or prune locks are needed in (B). Compare `fork_event_admit_seq` with the plan's value. On mismatch, release both locks, discard the pending files and re-plan. On a match, `rename()` the pending manifest over the current one and switch the in-memory generation. Release.
        - (B) contains no fsync, only one `rename` plus pointer updates, so all admissions stall for microseconds. This is comparable to the existing barrier.
      - **(C) Durability, after (B).** fsync the directory to make the rename durable, then publish the WAL-index frontier and retire the sources in the existing order. Source retirement waits for (C).
-       - A crash before the directory fsync can only lose the rename. Recovery then sees the old, self-consistent generation, and the sources were not retired.
-       - Readers that observed the new in-memory generation before the crash held no durable state from it.
+       - A **process** crash after the rename sees the new manifest, since the rename is visible immediately. A **power loss** before the directory fsync may see either manifest.
+       - Recovery therefore **accepts and validates either** manifest. Both are complete and durable because of (A), and the sources are still intact because retirement waits for (C).
+       - The plan-epoch check is not needed at recovery. If the new generation won, it was switched under admission-wr with a matching epoch; if the old one won, it is the pre-switch state.
    - **Forkmeta cutover.** It already takes admission-wr for `freeze_seq` (`:10575`). Its epoch comparison moves inside that same section, immediately before its switch. The same prepare/switch split applies if its switch currently fsyncs under admission-wr.
 8. **Restart.** `META_FIRST`, `max_meta_seq` and `max_inherited_page_seq` are recomputed from the retained events. Closure makes `META_FIRST` identical, and the other two are functions of the present set.
 
@@ -463,7 +477,7 @@ Page segments, image layers, frontier files, the retention log, artifact formats
 
 ### 5.1 Daemon side
 
-- `req_lsn == 0` is placed at `max(fork_op_lsn(), req_floor_lsn)` (`:20139`; `req_floor_lsn` is a new channel field, 0 for legacy clients).
+- `req_lsn == 0` is placed at `max(fork_op_lsn(), req_floor_lsn)` (`:20139`; `req_floor_lsn` is a new `PsChannel` field, 0 for legacy clients). **The struct change bumps `PS_SHM_VERSION` in P3a**, in the same phase as the field (round 7, 4101392030), so mismatched layouts refuse to attach. P4 needs no further bump: every daemon at that version already honours the field.
 - It is persisted `UNSTAMPED`, with seq-only visibility (§1.6).
 - The ordered page path is unchanged except for the LSN-strict bump.
 
@@ -476,7 +490,7 @@ Page segments, image layers, frontier files, the retention log, artifact formats
 **P4 (precise).**
 - The client sends `req_lsn = 0` together with `req_floor_lsn = insert + 1`.
 - Bare `req_lsn = 0` is insufficient: `newest_visible + 1` can lie far below the op's real time, so a *later* view at a past `L'` would see it.
-- In the same P4 commit, `ls_op_lsn()`'s `+1` and `ls_zeroextend`'s insert stamp (`backend_localsvc.c:977-996`) are removed, behind a `PS_SHM_VERSION` bump. The format (the UNSTAMPED flag) is already in place from P3a.
+- In the same P4 commit, `ls_op_lsn()`'s `+1` and `ls_zeroextend`'s insert stamp (`backend_localsvc.c:977-996`) are removed, with no further `PS_SHM_VERSION` bump. The field and its daemon-side handling landed with the P3a bump. The format (the UNSTAMPED flag) is already in place from P3a.
 
 ### 5.3 Equality at the cut for other label sources
 
@@ -588,7 +602,12 @@ Page segments, image layers, frontier files, the retention log, artifact formats
 
 **Detecting "newly created".** CREATE_BRANCH currently returns the same incarnation for a first creation and for an exact retry. For example, target incarnation 0 or 1 on a fresh id yields 1 on both paths (`pagestore_core.c` CREATE_BRANCH handler `:20598-20640`). So the incarnation cannot express "created by this call".
 
-- The daemon sets **`ch->result = 1`** only on the path that actually persists a new create record (`timeline_persist_create()` succeeded). The exact-retry `break` leaves it at 0.
+- The daemon reports two bits in `ch->result`:
+  - `PS_BRANCH_RESULT_NEW` (bit 0), set only on the path that actually persists a new create record (`timeline_persist_create()` succeeded). The exact-retry `break` leaves it clear.
+  - `PS_BRANCH_RESULT_FINITE` (bit 1), set iff the persisted `branch_seq` is finite.
+- **The safe controller path refuses ∞** (round 7, 4101392035). If CREATE_BRANCH returns without `FINITE`, which can only be an exact retry of a branch created by a P3a binary or an unsafe direct caller, `pagestore_prepare_branch_from_control` does **not** publish readiness:
+  - Under the controller, a timeline of its own journaled incarnation before `branch_prepared` goes to `r2_cleanup`, and the operator reruns with a new incarnation.
+  - Otherwise the call errors with `pagestore branch %u incarnation %llu is uncapped (created without safe caps); it cannot be prepared by the safe controller`.
 - `ch->result` is already reset to 0 by the daemon before every request (`pagestore_daemon.c:414`) and is otherwise unused for this opcode.
 - **No struct or wire change.** An older daemon always returns 0, which the new client treats as "not newly created" and so never deletes: fail-closed.
 - The new meaning is recorded in the `PS_SHM_VERSION` history comment (`pagestore_ipc.h`). A version bump is not required for safety.
@@ -790,7 +809,7 @@ HINT:   Delete it with pagestore_delete_branch after confirming no manifest refe
 - **Legacy strict reads:** a pre-activation exact-R read without a pin still returns today's result, including the §1d tuple fence at R (a post-pin rewrite at R stays hidden) and is not gated. A post-activation unpinned strict read gets -2.
 - **Unproven retry:** an exact retry of a finite branch without the magic is refused (`PS_BRANCH_REFUSE_UNPROVEN_RETRY`). A retry after a crash between CREATE_BRANCH and readiness redoes the WAL scan before writing readiness; with the writer restored in between, it fails into `r2_cleanup`.
 - **Atomic pins (§2.3):** a barrier with `PS_BARRIER_REGISTER` leaves a `CHECKPOINT_FENCE` pin. Hand-off PIN_SET at its `(R, S)` succeeds. An explicit-seq SET with no identical live registration gets `PS_RETENTION_NOT_REGISTERED`. A prune racing the hand-off (fault hook between them) cannot drop the pre-S version. Fence pins beyond the newest two are released.
-- **WAL-index publish:** an admission injected between (A) and (B) forces a re-plan. A crash between the rename and the directory fsync recovers the old generation with sources intact. An admission-latency measurement for (B) is recorded in the PR.
+- **WAL-index publish:** an admission injected between (A) and (B) forces a re-plan. A crash between the rename and the directory fsync recovers either generation (both validated), with sources intact. Tests accept both outcomes. An admission-latency measurement for (B) is recorded in the PR.
 - **Mixed versions (P3b):** a new client with an old daemon (capability bit clear) refuses with the error. An old client with a new daemon (no magic) gets ∞ and legacy behaviour. A stale `is_redo` value of 1 or 2 left in the channel does not count as `R2_PROVEN`.
 - **Activation epochs:** a pin, horizon or artifact fence created before activation still reads today's result after activation plus compaction; one created after activation is frozen. A branch created by a P3a binary stays ∞ after the upgrade to P3b. A P3a binary refuses a store that has a `CAP_ACTIVATION` record.
 - **R2-m:** a materializer marker below the fork is rejected.
@@ -811,15 +830,15 @@ HINT:   Delete it with pagestore_delete_branch after confirming no manifest refe
 | Phase | Content | Code + tests |
 |---|---|---|
 | **P0** | `ls_op_lsn()` `+1` fallback (PR #296) | ~60 + 0 |
-| **P1** | Refactor, no behaviour change. ViewCap and composition (STRICT-exact), `TlWalk` + `B_k`, `page_select`, identity lookups, ForkEvent flags and indexes, the fold slow path, I-ALLOC/U5 asserts. All caps ∞. | ~750 + ~550 |
+| **P1** | Refactor, no behaviour change. ViewCap and composition (STRICT-exact), `TlWalk` + `B_k`, `page_select`, identity lookups, ForkEvent flags and indexes, the fold slow path, I-ALLOC/U5 asserts. All caps ∞. | ~750 + ~600 (detail in §9.3) |
 | **P2** | Planner. `PsViewFence`, positional/STRICT modes, closure (page/control/forkmeta), the invalidation exception, masks, derived fences, the LSN-strict ordered bump, **U3 plan-epoch validation, with the WAL-index publish split into prepare / switch-under-admission-wr / durable (§3.7(7))**, property tests. | ~900 + ~900 |
-| **P3a** | Formats, no activation. `TimelineRecEventV3` (**writes `branch_seq = ∞`**; the `CAP_ACTIVATION` kind is defined and fail-closed); forkmeta V4 / FMS v2 (META/UNSTAMPED flags written); WIPG v2 / WISD v4 (**writes `S_H = ∞`**); `req_floor_lsn` + UNSTAMPED persistence on the daemon side; PAGE GROW dedup removal and in-memory GROW compaction; `admission_seq_observe_finite` and the sentinel guard (§3.8); the retention owner kind `CHECKPOINT_FENCE` (retention identity bump); identities and fixtures. | ~750 + ~600, plus fixtures |
-| **P3b** | Activate branches **together with G3 enforcement, atomically**: write `CAP_ACTIVATION{BRANCH}` and finite `branch_seq`. Branch edges use `branch_seq` in reads, fences, gates and projection in one commit; the registration gate for branch levels; the kept child-first CREATE idempotence. **R2** in `pagestore_prepare_branch_from_control`: the shutdown-checkpoint check via `ps_checkpoint_record_end` info, `pagestore_branch_window_open` + the journaled snapshot, the post-CREATE WAL scan (R2-x), the `r2_cleanup` journal states, the materializer-marker check. `PS_FRONTEND_CAP_BRANCH_SEQ` + the `R2_PROVEN` magic (mixed-version gating); the `ch->result` newly-created flag; refusal of an unproven retry of a finite branch; readiness written only after a passing post-check and the retry/delete rules. **Direct entry points gated** by `pagestore.allow_unsafe_branch_cut`. Test migrations (§7 table). Ports `run_bugb_suite` and the ancestry suite. | ~900 + ~1050 |
-| **P4** | Activate client unstamped. `req_lsn = 0` + `req_floor_lsn`; removes P0's `+1` and `ls_zeroextend`'s stamp; `PS_SHM_VERSION` bump. | ~150 + ~200 |
-| **P5** | Activate the other views. Atomic pin registration (§2.3: barrier fence pin, hand-off-only explicit SET, call-site migration); write `CAP_ACTIVATION{PIN, WALIDX_HORIZON, ARTIFACT}`; finite `S_H` from the first commit after activation. Pins positional below R (reads, fences, gate; pins required for exact-R readers); `S_H` caps in the walidx planner and fold; artifact caps and producer `(C, token)`; control-restore client seqs; §5.3 audits; ports the revision suite. | ~800 + ~650 |
+| **P3a** | Formats, no activation. `TimelineRecEventV3` (**writes `branch_seq = ∞`**; the `CAP_ACTIVATION` kind is defined and fail-closed); forkmeta V4 / FMS v2 (META/UNSTAMPED flags written); WIPG v2 / WISD v4 (**writes `S_H = ∞`**); `req_floor_lsn` + UNSTAMPED persistence on the daemon side, **with the `PS_SHM_VERSION` bump for the `PsChannel` change**; PAGE GROW dedup removal and in-memory GROW compaction; `admission_seq_observe_finite` and the sentinel guard (§3.8); the retention owner kind `CHECKPOINT_FENCE` (retention identity bump); identities and fixtures. | ~750 + ~600, plus fixtures |
+| **P3b** | Activate branches **together with G3 enforcement, atomically**: write `CAP_ACTIVATION{BRANCH}` and finite `branch_seq`. Branch edges use `branch_seq` in reads, fences, gates and projection in one commit; the registration gate for branch levels; the kept child-first CREATE idempotence. **R2** in `pagestore_prepare_branch_from_control`: the shutdown-checkpoint check via `ps_checkpoint_record_end` info, `pagestore_branch_window_open` + the journaled snapshot, the post-CREATE WAL scan (R2-x), the `r2_cleanup` journal states, the materializer-marker check. `PS_FRONTEND_CAP_BRANCH_SEQ` + the `R2_PROVEN` magic (mixed-version gating); the `ch->result` NEW/FINITE bits; refusal of ∞ results on the safe path; refusal of an unproven retry of a finite branch; readiness written only after a passing post-check and the retry/delete rules. **Direct entry points gated** by `pagestore.allow_unsafe_branch_cut`. Test migrations (§7 table). Ports `run_bugb_suite` and the ancestry suite. | ~900 + ~1050 |
+| **P4** | Activate client unstamped. `req_lsn = 0` + `req_floor_lsn`; removes P0's `+1` and `ls_zeroextend`'s stamp; no version bump (it landed in P3a). | ~150 + ~200 |
+| **P5** | Activate the other views. **`PS_SHM_VERSION` bump + `PS_FRONTEND_CAP_ATOMIC_PINS` + daemon-side post-activation refusals**; atomic pin registration (§2.3: barrier under `page_prune_lock` with frontier validation, resource-superset hand-off, barrier fence pin, hand-off-only explicit SET, call-site migration); write `CAP_ACTIVATION{PIN, WALIDX_HORIZON, ARTIFACT}`; finite `S_H` from the first commit after activation. Pins positional below R (reads, fences, gate; pins required for exact-R readers); `S_H` caps in the walidx planner and fold; artifact caps and producer `(C, token)`; control-restore client seqs; §5.3 audits; ports the revision suite. | ~850 + ~700 |
 | **P6** | Fuzzer (§8.5) and docs (READ_CONSISTENCY_DESIGN §1d, MVP_COMPLETION_PLAN: fork tuple and the controller-only G3 contract; RELEASE_VALIDATION; MVP_STATUS). No G3 code is left here. | ~250 + ~300, plus docs |
 
-Total: about 4.6k lines of code and 4.2k lines of tests, plus fixtures and docs.
+Total: about 4.7k lines of code and 4.3k lines of tests, plus fixtures and docs.
 
 **Top risks:**
 1. Read/prune divergence, including lost `s_min` facts. Mitigated by one predicate for fold and masks, closure everywhere, and the §8.2 future-arrival property test.
@@ -855,7 +874,7 @@ Total: about 4.6k lines of code and 4.2k lines of tests, plus fixtures and docs.
 | → P3a | Forkmeta events written before P3a (no META/UNSTAMPED flags; legacy ZEROEXTEND GROW loads as PAGE) | A post-activation view could fail to hide them | None needed: every such event has a seq below any post-activation S, so it is pre-S and visible to every finite view anyway. Only events admitted after activation can be hidden, and P3a precedes activation, so they carry flags. |
 | → P3a | GROWs deduped before P3a | A post-activation view could miss a GROW | None needed: a later view has `S ≥` every earlier event, so the dedup's fold equals its fold (§3.2 argument). |
 | → P3b | Legacy branches | Retroactive freeze | ∞ via V3/legacy mapping and `activation_seq[BRANCH]` |
-| → P3b | An in-flight controller operation started by an older binary (journal past `fork_captured`) | A prepare retry would run without R2 proof | The P3b retry has no journaled `window_opened` snapshot. It performs the WAL scan only; if the writer is no longer restricted (scan finds commits), it fails closed, goes to `r2_cleanup`, and requires an operator rerun. |
+| → P3b | An in-flight controller operation started by an older binary (journal past `fork_captured`) | A retry would return an ∞ branch, or run without R2 proof | The retry gets no `FINITE` bit, so it is refused (§7). It goes to `r2_cleanup` and requires an operator rerun with a new incarnation. It never publishes an uncapped production branch. |
 | → P3b | Tests calling the direct entry points | They are refused | GUC migration (§7 table) |
 | → P4 | P0 clients (`+1` stamps) mixed with P4 clients (unstamped) | none | The daemon accepts both. A new client with an old daemon is refused by `PS_SHM_VERSION`. |
 | → P5 | Pins, readers, WAL-index horizons, artifact fences | Retroactive finite caps over pruned history (4101176495) | Activation epochs (§2.2) |
@@ -863,3 +882,101 @@ Total: about 4.6k lines of code and 4.2k lines of tests, plus fixtures and docs.
 | → P5 | The registration gate | Existing unpinned exact-R readers would get -2 (4101247317) | Pre-activation `(R, S)` maps to `(R, ∞, S)` marked `legacy`, which is today's semantics, and is not gated. Readers adopting a *new* generation after activation must pin it first (P5 audit). |
 | any, downgrade | A store with `CAP_ACTIVATION` opened by an older binary | Its old retention would prune history finite views need | Fail closed (§2.2) |
 
+
+### 9.3 P1 scope in detail (start here)
+
+**Goal.** Introduce the §1.2/§1.3 machinery with **every cap set to ∞**, so behaviour is bit-for-bit today's. No persisted format changes, no protocol changes, no retention changes (the planner is P2).
+
+**New types and helpers** (in `pagestore_core.c` unless noted):
+
+| Item | Content |
+|---|---|
+| `PS_SEQ_UNBOUNDED` | `UINT64_MAX` |
+| `typedef struct ViewCap { uint64_t lsn, seq, strict_seq; bool legacy; } ViewCap;` | |
+| `viewcap_from_request(read_lsn, read_seq)` | Maps today's request pair `(R, read_seq)` to `(R, ∞, read_seq ? read_seq : ∞, legacy = true)`. This is exactly today's semantics: tuple at R, uncapped below. `read_lsn == UINT64_MAX` (newest) maps to `(∞, ∞, ∞)`. **`read_seq == 0` becomes ∞ here, and 0 is never passed as a cap past this point.** |
+| `viewcap_compose(ViewCap c, uint64_t edge_lsn, uint64_t edge_seq)` | §1.2. In P1 every edge seq is ∞. |
+| `timeline_branch_seq(tl)` | Returns ∞ in P1; P3b reads the field. |
+| `timeline_inherited_below(tl, &has_range)` | `B_k`: `branch_lsn` for a branch. For the root, `has_range = false` (the rule's `−∞`). Do not encode the root as 0, because LSN-0 positions must stay escape-eligible at the root. |
+| `page_select(PageEnt *e, const ViewCap *c, uint64_t B)` | §3.1 |
+| `page_visible(e, lsn, seq)` | Kept as a wrapper: `page_select(e, &viewcap_from_request(lsn, seq), 0)`. |
+| `fork_event_hidden(const ForkEnt *, uint32_t i, const ViewCap *, uint64_t B)` | The single hidden-event predicate (§3.2), shared later by the P2 planner masks. |
+
+**Structures:**
+- `ForkEvent.snapshot_dropped` becomes a flags byte: `FEV_F_SNAPSHOT_DROPPED` (bit0, existing meaning), `FEV_F_META`, `FEV_F_META_FIRST`, `FEV_F_UNSTAMPED`. Update every reader and writer of `snapshot_dropped`: `fork_meta_snapshot_build`, `fork_event_compact_dropped_markers`, and the other `snapshot_dropped` sites found by grep. The `_Static_assert(sizeof == 40)` stays.
+- `ForkEnt` gains `max_meta_seq`, `max_inherited_page_seq`, `late_meta_idx`, `nlate_meta` and `late_meta_cap`. Free `late_meta_idx` next to `def_idx` (`free_page_fork_indexes`, fork removal paths).
+- `TlWalk` gains `ViewCap cap` and `uint64_t inherited_below`. `tl_walk_first(tl, ViewCap)` and `tl_walk_next()` use `viewcap_compose`.
+
+**Functions changed:**
+
+| Area | Functions |
+|---|---|
+| Classification | `fork_event_add`, `fork_event_add_seg_marker`, `fork_event_insert_pos`: META/META_FIRST/late index/`max_*` maintenance, including the out-of-order insert case. In P1, ZEROEXTEND GROWs get `META` in memory (`fork_grow_with_seq`). UNSTAMPED is set for `req_lsn == 0` ops (`fork_op_lsn` callers in `ps_handle_meta`). Classification has no effect at ∞. |
+| Folds | `fork_asof_hop` (fast path = today's code; slow path added), `fork_inheritance_fenced`, `fork_size_asof_hop`, `fork_page_invalidated`, `fork_block_death_through`. These take a `ViewCap*` and `B`. |
+| Walks | `read_through_checked`, `read_resolve_version` (including the switch to identity lookups for `ps_memtable_lookup` / `layer_map_lookup`: pass `(pv->lsn, pv->admission_seq)`), `fork_nblocks_through`, `fork_exists_through`, `page_frontier_ancestry_allows`, `fork_asof_query_allowed`. Every `seq_cap = w.lsn == read_lsn ? read_seq : 0` expression is removed. |
+| Other callers | `artifact_visible` (signature only), `walidx_plan_bases_build`'s `fork_asof_hop(f, h, 0, …)` calls, `prune_version_needed`'s `fork_page_invalidated` call, and `ps_core_inspection_relation`. |
+
+**Invariants and assertions** (debug builds):
+- **I-ALLOC:** a thread-local "shard-wr held for this key's shard" check in the indexed-record allocation paths.
+- **U5:** capped reads never resolve a counter-versioned klass.
+- The compaction merge preserves `admission_seq` identity.
+- No `ViewCap` with `seq == 0` or `strict_seq == 0` is ever constructed.
+- `fork_event_check_order()` also verifies the `META_FIRST` / `late_meta_idx` consistency.
+
+**Equivalence argument.**
+- With `seq = ∞` and `B = 0` at the reader's level, `fork_event_hidden` is always false, and `page_select` reduces to "the newest at or below L, subject to `seq ≤ X` at L", which is `page_visible` today.
+- At ancestor levels P1 composes `(branch_lsn, ∞, ∞)`. Today's `seq_cap = 0` there also means uncapped.
+- `B_k` affects only the escape, which is irrelevant when `S = ∞`.
+- Hence every result is unchanged.
+
+**Differential test method** (`pagestore_test.c` or a new `pagestore_viewcap_test.c`, test-only):
+1. Copy today's implementations verbatim into test-only `ref_page_visible`, `ref_fork_asof_hop`, `ref_fork_inheritance_fenced`, `ref_fork_page_invalidated`, `ref_fork_block_death_through` and `ref_read_through_walk`, via `ps_test_*` hooks. They are frozen references.
+2. Randomized histories (seeded, at least 10^5 cases):
+   - page versions with random LSNs, including 0, duplicates and equal LSNs with differing seqs, plus legacy seq 0;
+   - fork events of every kind, including legacy seq 0 (`nlegacy_seq` > 0 forks exercise the fallback paths), SEG markers and out-of-order inserts;
+   - 1–4-level ancestry with random `branch_lsn`;
+   - random `(read_lsn, read_seq)`, including 0, `UINT64_MAX` and exact version tuples.
+3. Assert that the new functions equal the references on every output: selected `(lsn, seq)`, `nb` plus state, fence result, invalidation, death `(lsn, seq)`, and the ancestry read result.
+4. A **literal §1.3 reference**: a brute-force admissibility plus fold written directly from the rule text. Cross-check it against the new functions with **finite** random caps and `B`. This tests the machinery P3b/P5 will activate; it is not wired into production yet.
+5. Keep `ps_test_fork_event_index_selftest` and `test_fork_event_index_scaling` green, and add a slow-path step bound.
+6. The full existing suite must pass unchanged: meson `--suite pagestore`, `integration_test.sh`, `mvp_golden_test.sh`, `branch_boot_test.sh`, and the op fuzzer with default and 20 seeds. Run `fev_bench` before and after; report it in the PR and target no regression above 5%.
+
+**Out of scope for P1:** formats, retention/planner, gates, R2, and dedup removal (P3a).
+
+**Size:** ~750 lines of code and ~600 lines of tests.
+
+---
+
+## 10. Open items for implementation review (code-review checklist)
+
+Each item must be confirmed against real code in the named phase PR. Deviations are recorded as amendments in that PR.
+
+| # | Phase | Item to confirm |
+|---|---|---|
+| 1 | P1 | Every `seq_cap` site was converted. Grep for `read_seq : 0`, `seq_cap`, and `, 0, &nb` in fold calls. No 0-as-cap remains. |
+| 2 | P1 | The `snapshot_dropped` → flags conversion did not change the snapshot build/compaction semantics of bit0. |
+| 3 | P1 | Memtable/layer identity lookups return the same bytes as before (pgcache keys unchanged). |
+| 4 | P2 | Lock order for the WAL-index publish switch: `admission-wr → walidx_publish`, with no shard, prune or map lock taken inside (B). No fsync inside (B). Measure admission stall. |
+| 5 | P2 | The forkmeta cutover epoch comparison sits inside its existing admission-wr section and before its switch. Check whether that switch fsyncs under admission-wr; if it does, apply the prepare/switch split. |
+| 6 | P2 | `fork_event_admit_seq` is updated under the key's shard lock *before* the admission releases admission-rd. |
+| 7 | P2 | The planner masks call the same `fork_event_hidden` / `page_select` as the read path, with no re-implementation. The §8.2 property tests are merge blockers. |
+| 8 | P2 | Closure: `prune_version_needed` never drops a closure-required version. `control_chain_keeps` keeps the min-seq note. |
+| 9 | P2 | The ordered-path fence bump is LSN-strict for positional fences. Audit every `UINT64_MAX`-as-bare-LSN consumer. |
+| 10 | P3a | `PS_SHM_VERSION` is bumped with the `PsChannel.req_floor_lsn` field. Old/new attach is refused both ways. |
+| 11 | P3a | Every new format (TLM V3 plus the CAP_ACTIVATION kind, forkmeta V4, FMS v2, WIPG v2, WISD v4, the retention owner kind) has an identity bump and a legacy/current fixture pair (D5). Older binaries fail closed. |
+| 12 | P3a | The P3a binary writes ∞ for `branch_seq` and `S_H`. `admission_seq_observe_finite` is used at every new observe site. The restart test with ∞ records passes. |
+| 13 | P3a | Recovery loads the timelines log and the retention registry before page replay. This is no longer needed for correctness since dedup was removed; confirm there is no hidden dependency. |
+| 14 | P3a | The PAGE GROW dedup removal covers every site (`fork_event_add`, `segment_grows`, `fork_grow_apply`). The below-cutoff admission uses `extends_uncapped`. In-memory GROW compaction runs only after a successful cutover publish. |
+| 15 | P3b | CREATE_BRANCH: the `R2_PROVEN` magic in `is_redo`, the NEW/FINITE result bits, and the `PS_FRONTEND_CAP_BRANCH_SEQ` bit. An exact retry of a finite branch without the magic is refused. The safe path refuses ∞ results. |
+| 16 | P3b | The R2 entry point ordering: capability → pre-checks (R2-s, window snapshot, R2-m) → CREATE_BRANCH → WAL scan `(L, P]` after `XLogFlush(P)` → readiness plus fsyncs. Cleanup: manifest removal and directory fsync → BEGIN_DELETE. The journal sub-states resume correctly after a crash at every step (fault points). |
+| 17 | P3b | `pagestore_branch_window_open` is the first statement after the restricted writer's health check in `execute()`. The controller issues no XID-committing statements after L. |
+| 18 | P3b | Reads, fences, projection and the gate flip in one commit. `CAP_ACTIVATION{BRANCH}` is written before serving, under admission-wr. |
+| 19 | P3b | Test migrations: `integration_test.sh` switches to a fast restart instead of an online CHECKPOINT, and uses the GUC for the legacy prepare. `branch_boot_test.sh` uses the GUC. The mvp_golden no-XID assertion. |
+| 20 | P4 | The client sends `req_lsn = 0` plus `req_floor_lsn` only for WAL-less ops. P0's `+1` and the `ls_zeroextend` insert stamp are removed in the same commit. |
+| 21 | P5 | The `PS_SHM_VERSION` bump plus `PS_FRONTEND_CAP_ATOMIC_PINS`. The daemon refuses a post-activation barrier without the magic, a non-hand-off explicit SET, and an artifact BEGIN without `PS_ARTIFACT_BEGIN_CAPPED_READ`. |
+| 22 | P5 | The barrier takes `admission-wr → page_prune_lock (wr) → walidx_prune_lock (wr) → map-rd` and validates frontiers exactly like RESERVE (`:20948-20995`). The hand-off requires a resource superset, under `retention_lock` plus the prune locks. |
+| 23 | P5 | Every §2.3 call site is migrated (`pagestore.c:~1070-1125`, `:9884`, `:12355`, `pagestore_control.c:241`, `pagestore_branch_prepare.py:1015-1060`, `continuous_redo_demo.sh:360`). The newest-two `CHECKPOINT_FENCE` release marks prune due. |
+| 24 | P5 | Activation epochs for PIN / WALIDX_HORIZON / ARTIFACT. Pre-activation reads are `legacy` (tuple at R, not gated). The composed-cap legacy flag is correct through post-activation branch edges. |
+| 25 | P5 | The `walidx_commit` `S_H` sampling holds all shards (shard 0 wr, 1..n-1 rd, ascending) before `walidx_publish`. Run TSAN plus the soak. |
+| 26 | P5 | Artifact caps (`committed` / `inflight`): the producer reads with `(C, token)`. Caps are rebuilt from completion records only. |
+| 27 | all | Every new durable record is covered by fault points (torn/failed append poisons as today). Every refusal path has an explicit status code and a test. |
+| 28 | all | Rollout table §9.2 is re-checked against the actual phase contents before each activation phase (P3b, P4, P5). |
