@@ -5,6 +5,7 @@
 - Rev 3 addresses round 2: 4100994214/4100994220/4100994223/4100994229/4100994233/4100994236.
 - Rev 4 replaces the rev-3 G3 attestation and core hook with compute-side proofs R1 and R2 (§7).
 - Rev 5 addresses round 3 (4101119417/4101119423/4101119428/4101119435): R1 removed; R2 requires a shutdown checkpoint; exact-retry-safe post-check; R2 moved into P3b.
+- Rev 6 addresses round 4 (4101176465/4101176475/4101176481/4101176487/4101176495): the gate matches the full cap; the R2 commit proof comes from a WAL scan; cleanup order is manifest first, then delete; activation epochs (§2.2, §9.2).
 
 **Baseline:** `origin/pagestore` @ `0550146156d`. Line references are to that tree.
 
@@ -30,6 +31,7 @@
 | 3 | G3 proof serialized with the S sample | §7 |
 | 4 | G3 without checksums, hooks or attestation: R1 (`wal_log_hints` + cut at the redo of a checkpoint in the current lifetime) or R2 (controller flow, verified structurally) | §7, §9 |
 | 5 | G3: controller flow only (R2 with a shutdown-checkpoint proof); direct entry points gated by a test-only GUC; `ch->result` newly-created flag; R2 lands with P3b | §7, §9 |
+| 6 | Full-cap registration match; R2-x proven from the parent's WAL after L; `r2_cleanup` ordering; activation epochs per view kind, so views that exist before activation stay ∞; rollout audit | §2.2, §3.5, §7, §9.2 |
 | 3 | U3 plan-epoch validation moved into P2 | §3.7, §9 |
 | 3 | Phases re-sequenced: formats before activation | §9 |
 | 3 | Removed order-dependent optimizations are listed | §9.1 |
@@ -176,7 +178,7 @@ Admissible to a capped view iff `lsn ≤ L ∧ (lsn < L ∨ seq ≤ X) ∧ seq �
 
 **Stable seq.** `next_admission_seq - 1` read under all shard locks, or any seq allocated under admission-wr.
 
-**Registration.** Every finite-S view is registered at the level it reads. A capped read whose composed `(level, L, S)` does not match a registered view is rejected (§3.5).
+**Registration.** Every view with finite S or finite X is registered at the level it reads. A capped read whose composed **full cap `(level, L, S, X)`** does not match a registered view is rejected (§3.5). Views that predate their kind's activation are interpreted as ∞ (§2.2).
 
 | View | cap_seq | When / locks | Persistence | Recovery |
 |---|---|---|---|---|
@@ -204,6 +206,29 @@ Transitions:
 **Producer requirement (audited in P5).** The producer reads the control era it embeds with `(C, token)`. Legacy lifecycle-less seeds use `S_a = ∞`.
 
 ---
+
+### 2.2 Activation epochs (rev 6; 4101176487/4101176495)
+
+**Problem.** A view whose seq predates activation of finite caps for its kind was retained under the old rules. Pre-S versions, first arrivals and masked fork history it would need under the new rule may already have been pruned. Interpreting it with a finite S retroactively would silently change what it reads.
+
+**Principle.** A view is servable with a finite cap **iff its seq was allocated after its kind was activated**. For a view allocated after activation, every version or event existing at its creation is pre-S, so its selection at every position is the newest retained version, which old retention always kept. Everything after it is governed by the new retention.
+
+**Mechanism.**
+- One durable record per view kind, `CAP_ACTIVATION {kind, activation_seq}`, a new `TIMELINE_META_EVENT_CAP_ACTIVATION` in the V3 timelines log.
+  - The format is defined in P3a. It is written by the first binary that activates that kind: P3b for `BRANCH`, P5 for `PIN`, `WALIDX_HORIZON` and `ARTIFACT`.
+  - The binary writes it during open, after recovery and before serving requests, with `activation_seq = admission_seq_alloc()` under admission-wr. So it is stable, and it is observed on replay.
+- The rule: `effective_S(view) = (view.seq > activation_seq[kind]) ? view.seq : ∞`. The same applies to `X` for pins: a pre-activation pin keeps exactly today's semantics, `(R, ∞, S_r)`.
+- The rule is applied in one place: the view-cap constructor used by reads, fence builders and the registration gate. Retention and reads therefore always agree.
+
+| View kind | Its seq | Pre-activation behaviour | Extra persistence |
+|---|---|---|---|
+| Branch | `branch_seq` | **P3a writes `branch_seq = PS_SEQ_UNBOUNDED`** (4101176487). A finite value is written only by a P3b binary. `branch_seq ≤ activation_seq[BRANCH]` also maps to ∞, which is redundant but uniform. An exact CREATE retry returns the persisted value, so a branch created by P3a stays ∞. | none beyond V3 |
+| Retention pin (reader, owner, materializer) | `pin.admission_seq` (existing) | ∞ (today's STRICT-at-R) | none |
+| Exact-R / advancing reader | `(R, S)` from the barrier | the client's `req_seq` is mapped through the same rule, so it matches its pin's legacy registration | none |
+| WAL-index horizon | `S_H` | **P3a writes `S_H = ∞`** in WIPG v2 / WISD v4. The first `walidx_commit()` after P5 activation records a finite `S_H` for the *new* horizon. That view is fresh, so the principle applies. | none beyond WIPG v2 |
+| Artifact fence | committed attempt's `begin_seq` (existing) | ∞ (LSN-only fence, as today) | none |
+
+**Downgrade.** A binary older than the activating phase must not open a store with a `CAP_ACTIVATION` record for a kind it does not implement. P3a's loader treats that record as "requires a newer binary" and fails closed. Otherwise its retention would prune history that finite views need.
 
 ## 3. Code touch points
 
@@ -301,13 +326,15 @@ Closure depends on the *current* fence set, which is inherent to fence-driven re
 **Ordered-path fence bump** (`:17040-17075`): positional fences are LSN-strict, so the write always lands at `> L`. STRICT pins keep the tuple test.
 
 **Registration gate** (rev 3; 4100994214). `page_frontier_allows()` (`:4650`) and `…_structural/projected_fence_active()` (`:4620`, `:4568`):
-- A level read with **finite composed S is honoured only if `(level, L, S)` matches a registered view**:
-  - a live descendant's projected `(L, S)`;
-  - a projected pin `(L, S)`;
-  - a WAL-index horizon `(H, S_H)` or WAL_INDEX pin;
+- A level read with **finite composed S or X is honoured only if its full cap `(level, L, S, X)` equals a registered view's composed cap** (rev 6; 4100994214, 4101176465):
+  - a live descendant's projected `(L, S, ∞)`;
+  - a projected pin `(L, S, X)`, where X is the pin's own `S_r` if unprojected and ∞ if projected;
+  - a WAL-index horizon `(H, S_H, ∞)` or a WAL_INDEX pin;
   - an artifact fence cap.
+
+  An unregistered STRICT read can no longer borrow a positional branch registration with the same `(L, S)`, because X differs. A STRICT read must be matched by its own registered pin.
 - **Otherwise it gets -2**, whatever `F.seq` is. Rev 2 allowed unregistered reads with `S ≥ F.seq`; that is removed (§9.1).
-- Seq-less reads (`S = ∞`) are unchanged.
+- Seq-less reads (`S = X = ∞`) and pre-activation views (§2.2) are unchanged. They keep today's frontier behaviour.
 - Consequence: exact-R and advancing readers must hold a retention pin at `(R, S)` before issuing capped reads. P5 audits `ls_pinned_read_seq` and the adoption path, and the tests that pass a raw `pin_seq` already hold that pin.
 
 ### 3.6 Retention: control
@@ -349,7 +376,8 @@ Closure depends on the *current* fence set, which is inherent to fence-driven re
   parent_incarnation, branch_seq, crc, reserved }
 ```
 
-- CREATE and STATE carry `branch_seq`; replay validates equality and observes it.
+- CREATE and STATE carry `branch_seq`; replay validates equality and observes it. A P3a binary always writes `PS_SEQ_UNBOUNDED` (§2.2).
+- New event kind `TIMELINE_META_EVENT_CAP_ACTIVATION {kind, activation_seq}` (§2.2). It is defined and fail-closed-parsed in P3a, and written by P3b/P5.
 - Legacy creates map to ∞.
 - Identity `timelines` goes from 2 to 3.
 - Old binaries reject `rec_len = 64`.
@@ -368,7 +396,7 @@ Closure depends on the *current* fence set, which is inherent to fence-driven re
 
 ### 4.3 WAL-index progress
 
-WIPG v2 `horizon_seq`, WISD v4. Legacy is ∞. Identity plus fixture.
+WIPG v2 `horizon_seq`, WISD v4. Legacy is ∞, and a P3a binary writes ∞ (§2.2). Identity plus fixture.
 
 ### 4.4 Unchanged
 
@@ -483,18 +511,23 @@ Page segments, image layers, frontier files, the retention log, artifact formats
   - `pagestore_branch_horizons_from_control()` (`:13261`) exports it in `PagestoreBranchHorizons`.
   - The entry point requires `info == XLOG_CHECKPOINT_SHUTDOWN` and `checkPointCopy.redo == checkpoint record LSN`, which is true of every shutdown checkpoint.
   - A shutdown checkpoint means there is no running transaction at C: fast shutdown aborts every backend transaction before the checkpoint. Only prepared transactions survive a shutdown.
-- **(R2-x) No transaction commits in (C, S].**
-  - `ReadNextFullTransactionId()` must equal `checkPointCopy.nextXid`, meaning no XID was assigned since C.
-  - `pg_prepared_xacts` must be empty, **kept**: prepared transactions survive a shutdown and can commit without a new XID.
-  - Both conditions are checked **immediately before and immediately after** CREATE_BRANCH, in the same backend.
-  - Together with R2-s, this shows that no transaction commits between C and the post-check, which is after S. **(Proves G3-i.)**
+- **(R2-x) No transaction commits or finishes a prepared transaction after L, before S** (rev 6; 4101119428, 4101176475).
+  - **Why this is the right window.** Commits at or before L are part of the branch's history, since the branch replays WAL to L. Hints about them are correct for the branch. The danger is a transaction whose commit, commit-prepared or abort-prepared record lies after L, while a hint about it can reach a pre-S page version. For example, a COMMIT PREPARED issued before any check leaves no prepared transaction behind and assigns no new XID, which defeats the rev-5 checks.
+  - **Why connection restrictions are not a proof.** The restricted writer's private socket and `autovacuum=off` exclude client sessions and autovacuum. They do **not** exclude background workers registered by `shared_preload_libraries` (for example pg_cron, or the pagestore workers that are not disabled), which connect internally without the socket. So "the first statement sees no prepared transactions" cannot be established from connection policy.
+  - **Authoritative check: a WAL scan in the server entry point.** After CREATE_BRANCH returns, the entry point takes `P = GetXLogInsertRecPtr()` and calls `XLogFlush(P)`. It then reads the parent's local WAL from `L` to `P` with the same XLogReader machinery that `ps_checkpoint_record_end()` (`pagestore.c:3806`) uses.
+    - It rejects any `RM_XACT_ID` record with info `XLOG_XACT_COMMIT`, `XLOG_XACT_COMMIT_PREPARED` or `XLOG_XACT_ABORT_PREPARED`.
+    - Plain `XLOG_XACT_ABORT` is allowed. That XID is in progress at L for the branch, so the branch aborts it too, and an "invalid" hint is consistent.
+    - Every commit before S has its record before the insert position at S, which is `≤ P`. So the scan covers `(L, S]`.
+    - `L` is a WAL segment boundary after `pg_switch_wal()` (controller step 5), so no record spans it.
+    - The scan covers only the restricted window: one segment's worth plus whatever the window wrote.
+  - **Early checks (fail fast, not the proof).** The existing `nextXid == checkPointCopy.nextXid` and `pg_prepared_xacts` empty checks stay as pre-checks.
+  - **Ordering in the controller.** They move to a new SQL function, `pagestore_branch_window_open(checkpoint_redo)`. `execute()` calls it as **the first statement on the restricted writer after the read-only isolation health check inside** `start_restricted_writer()` (`pagestore_branch_prepare.py:1168-1202`) and before `select_checkpoint()` (`:1204`). Its result (nextXid, prepared count) is recorded in the journal (`window_opened`). `pagestore_prepare_branch_from_control` repeats both checks as its pre-check and fails if they differ from the journaled snapshot, which the controller passes as an argument. These only give earlier, clearer errors: correctness rests on the WAL scan.
+  - Together with R2-s (no running transactions at C) and R2-m, the scan proves G3-i with no assumption about who can connect.
 - **(R2-m) Everything at or below L is materialized before S.** The store-observed materializer marker (`pagestore_materializer_status()`, `pagestore.c:2184`) must be `≥ L`, checked before CREATE_BRANCH.
   - Today `fork ≤ materialized` is checked only when the caller is the materializer (`:13697-13710`).
   - The restartpoint flushed every page state with `pd_lsn ≤ L`, so every position `≤ L` has a pre-S version.
   - Post-S hint-only rewrites, by the normal writer after `restore_writer` or by the resumed materializer, are therefore hidden same-position rewrites, whatever the hint-WAL setting. **(Proves G3-ii.)**
-- The controller statements issued between `stop_writer` and `prepare_branch` must not assign XIDs.
-  - Today they are `pagestore_branch_checkpoint()`, `pg_switch_wal()`, `pagestore_shipped_wal_lsn()`, `SET`, and the prepare call itself.
-  - P3b verifies this on the mvp_golden controller run, and a regression test asserts nextXid is unchanged.
+- The controller's own statements after `stop_writer` (`pagestore_branch_window_open`, `pagestore_branch_checkpoint()`, `pg_switch_wal()`, `pagestore_shipped_wal_lsn()`, `SET`, the prepare call) must not commit XID-assigning transactions after L. P3b verifies this on the mvp_golden run; the WAL scan enforces it.
 
 #### Post-check failure and exact retries (4101119435)
 
@@ -510,16 +543,23 @@ Page segments, image layers, frontier files, the retention log, artifact formats
 
 1. **The readiness file already exists and matches** (the existing retry branch at `:13730`). An earlier call already passed R2, because the file is written only after a passing post-check. The retry skips R2 and is idempotent.
 2. **Pre-check fails**: error, nothing created.
-3. **Post-check fails and this call newly created the timeline** (flag = 1): the readiness file was not written by this call and no manifest advertising the branch exists.
-   - Issue BEGIN_DELETE for the new incarnation, with the existing `pagestore_delete_branch` semantics.
-   - Remove the prepared directory's SLRU manifest.
-   - Raise the R2 error with SQLSTATE `55000`.
+3. **Post-check fails and this call newly created the timeline** (flag = 1). The readiness file was not written by this call. Cleanup runs **in this order**, each step idempotent (4101176481):
+   1. Remove every prepared-directory artifact that could advertise the branch: the SLRU manifest and, defensively, any `PAGESTORE_BRANCH_BOOTSTRAP_FILE` or `pagestore_branch.manifest`. Then `fsync` the prepared directory.
+   2. Only then issue BEGIN_DELETE for `(new_tl, new_incarnation)`, with the existing `pagestore_delete_branch` semantics.
+   3. Raise the R2 error with SQLSTATE `55000`. Its DETAIL states `cleanup=complete`, or which step failed.
 4. **Post-check fails and the timeline already existed** (flag = 0, e.g. an earlier call crashed between CREATE_BRANCH and its post-check).
    - **Do not delete.** A published branch manifest (the target installer's `pagestore_branch.manifest`) or any other consumer may reference the timeline, and this call cannot prove otherwise.
-   - Fail closed: raise the error with the timeline id and incarnation and HINT: "the branch must be deleted manually (pagestore_delete_branch) and the preparation rerun with a new incarnation".
-5. **The controller journal** (`pagestore_branch_prepare.py`). An R2 error leaves the journal at intent `prepare_branch`. The existing `preserve_prepare_fence` logic (`:1686-1715`) already keeps the journal and keeps services fenced.
-   - `recover_journal` must **not** blindly retry after an R2 error that states the branch was deleted (rule 3), because the same incarnation cannot be reused. It records `r2_failed` and requires an operator rerun with `new_incarnation + 1`.
-   - After rule 4 it likewise requires manual deletion first.
+   - Fail closed: raise the error with the timeline id and incarnation. A caller without a journal (a direct SQL call) must delete it manually. The controller cleans it up under rule 5.
+5. **The controller journal** (`pagestore_branch_prepare.py`).
+   - Before the prepare call, the journal already records intent `prepare_branch` together with `new_tl` and `new_incarnation`. The controller owns that incarnation exclusively for this operation.
+   - On an R2 error, **or** on any ambiguous outcome (a lost reply or a server crash inside the call), the controller writes state **`r2_cleanup`** and then performs the same two steps itself, in the same order:
+     1. manifest and readiness artifacts removed and the directory fsynced (journal `r2_cleanup/manifest_removed`);
+     2. `pagestore_delete_branch(new_tl, new_incarnation)` (journal `r2_cleanup/timeline_deleting`).
+   - Then it writes `r2_failed`.
+   - `recover_journal` resumes from whichever sub-state it finds, and never runs step 2 before step 1 is journaled.
+   - The controller may delete a timeline that exists under its own `(new_tl, new_incarnation)` even when the flag is 0 (rule 4), **as long as the journal has not reached `branch_prepared`**. Before that point no installer can have published a manifest for it, because the target installer runs only after the prepared receipt.
+   - After `r2_failed` an operator reruns with `new_incarnation + 1`.
+   - `preserve_prepare_fence` (`:1686-1715`) keeps services fenced throughout.
 
 #### Direct entry points (test-only)
 
@@ -543,10 +583,14 @@ ERROR:  cannot prepare pagestore branch %u of timeline %u at %X/%08X
 DETAIL: The checkpoint at redo %X/%08X is an online checkpoint; a branch requires the parent's shutdown checkpoint.
 HINT:   Stop the parent writer with a fast shutdown and branch from that checkpoint (pagestore_branch_prepare does this).
 
--- R2-x
+-- R2-x (WAL scan)
 ERROR:  cannot prepare pagestore branch %u of timeline %u at %X/%08X
-DETAIL: A transaction could commit after the checkpoint: next XID is %llu, checkpoint next XID is %llu, prepared transactions: %d.
-HINT:   Keep the parent writer restricted and issue no XID-assigning statements between its shutdown checkpoint and branch preparation.
+DETAIL: The parent's WAL contains a transaction %s record at %X/%08X after the fork (transaction %u).
+HINT:   Keep the parent writer restricted, and disable background workers that run transactions, between its shutdown checkpoint and branch preparation.
+
+-- R2-x (early check)
+ERROR:  cannot prepare pagestore branch %u of timeline %u at %X/%08X
+DETAIL: The restricted writer changed since the window was opened: next XID %llu (expected %llu), prepared transactions %d.
 
 -- R2-m
 ERROR:  cannot prepare pagestore branch %u of timeline %u at %X/%08X
@@ -638,10 +682,18 @@ HINT:   Delete it with pagestore_delete_branch after confirming no manifest refe
 
 - **Direct entry points:** refused with the GUC off; allowed with a WARNING with it on; `prepare_branch_from_control` ignores the GUC.
 - **R2-s:** an online checkpoint is rejected; a shutdown checkpoint is accepted.
-- **R2-x:** an XID assigned (fault hook) before CREATE_BRANCH is rejected by the pre-check. One assigned *during* CREATE_BRANCH is rejected by the post-check; the new timeline ends up DELETED and the SLRU manifest is removed. An existing prepared transaction is rejected.
+- **R2-x:**
+  - a COMMIT PREPARED issued by a background worker (test bgworker) after L and before the pre-check is rejected by the WAL scan (4101176475);
+  - a commit during CREATE_BRANCH (fault hook) is rejected by the WAL scan;
+  - a plain abort after L is accepted;
+  - a commit between C and L is accepted;
+  - a nextXid or prepared-count mismatch against the journaled `window_opened` snapshot gives the early error.
+- **Cleanup order:** crash injected between the two cleanup steps. Recovery finds the manifest gone and the timeline still LIVE, then deletes it. There is never a LIVE manifest pointing at a DELETED timeline, and never a deleted timeline with the manifest present.
+- **Full-cap gate:** an unregistered STRICT read with the same `(L, S)` as a branch gets -2.
+- **Activation epochs:** a pin, horizon or artifact fence created before activation still reads today's result after activation plus compaction; one created after activation is frozen. A branch created by a P3a binary stays ∞ after the upgrade to P3b. A P3a binary refuses a store that has a `CAP_ACTIVATION` record.
 - **R2-m:** a materializer marker below the fork is rejected.
 - **Newly created flag:** 1 on first creation, 0 on an exact retry, 0 from an old daemon (so no deletion).
-- **Rule 4:** a pre-existing timeline plus a post-check failure is not deleted; the error names it; the controller journal is kept at `prepare_branch` / `r2_failed`.
+- **Rule 4:** after a direct SQL call, a pre-existing timeline plus a post-check failure is not deleted, and the error names it. Under the controller, a timeline of the journal's own incarnation, before `branch_prepared`, is cleaned up through `r2_cleanup`.
 - **End to end** (controller harness): after `restore_writer`, run post-L commits and hint-setting scans on the parent. The branch pages keep their pre-S bytes, with `wal_log_hints` off and on.
 
 ### 8.6 System
@@ -659,13 +711,13 @@ HINT:   Delete it with pagestore_delete_branch after confirming no manifest refe
 | **P0** | `ls_op_lsn()` `+1` fallback (PR #296) | ~60 + 0 |
 | **P1** | Refactor, no behaviour change. ViewCap and composition (STRICT-exact), `TlWalk` + `B_k`, `page_select`, identity lookups, ForkEvent flags and indexes, the fold slow path, I-ALLOC/U5 asserts. All caps ∞. | ~750 + ~550 |
 | **P2** | Planner. `PsViewFence`, positional/STRICT modes, closure (page/control/forkmeta), the invalidation exception, masks, derived fences, the LSN-strict ordered bump, **U3 plan-epoch validation**, property tests. | ~800 + ~850 |
-| **P3a** | Formats, no activation. `TimelineRecEventV3` (writes `branch_seq`, observed but read as ∞); forkmeta V4 / FMS v2 (META/UNSTAMPED flags written); WIPG v2 / WISD v4 (`S_H` written and observed, read as ∞); `req_floor_lsn` + UNSTAMPED persistence on the daemon side; **PAGE GROW dedup removal** and in-memory GROW compaction (behaviour-neutral for views, since all caps are ∞); identities and fixtures. | ~700 + ~550, plus fixtures |
-| **P3b** | Activate branches **together with G3 enforcement, atomically**. Branch edges use `branch_seq` in reads, fences, gates and projection in one commit; the registration gate for branch levels; the kept child-first CREATE idempotence. **R2** in `pagestore_prepare_branch_from_control`: the shutdown-checkpoint check via `ps_checkpoint_record_end` info, nextXid and prepared-xact pre/post checks, the materializer-marker check. The `ch->result` newly-created flag and the retry/delete rules. **Direct entry points gated** by `pagestore.allow_unsafe_branch_cut`. Test migrations (§7 table). Ports `run_bugb_suite` and the ancestry suite. | ~650 + ~800 |
+| **P3a** | Formats, no activation. `TimelineRecEventV3` (**writes `branch_seq = ∞`**; the `CAP_ACTIVATION` kind is defined and fail-closed); forkmeta V4 / FMS v2 (META/UNSTAMPED flags written); WIPG v2 / WISD v4 (**writes `S_H = ∞`**); `req_floor_lsn` + UNSTAMPED persistence on the daemon side; PAGE GROW dedup removal and in-memory GROW compaction; identities and fixtures. | ~750 + ~600, plus fixtures |
+| **P3b** | Activate branches **together with G3 enforcement, atomically**: write `CAP_ACTIVATION{BRANCH}` and finite `branch_seq`. Branch edges use `branch_seq` in reads, fences, gates and projection in one commit; the registration gate for branch levels; the kept child-first CREATE idempotence. **R2** in `pagestore_prepare_branch_from_control`: the shutdown-checkpoint check via `ps_checkpoint_record_end` info, `pagestore_branch_window_open` + the journaled snapshot, the post-CREATE WAL scan (R2-x), the `r2_cleanup` journal states, the materializer-marker check. The `ch->result` newly-created flag and the retry/delete rules. **Direct entry points gated** by `pagestore.allow_unsafe_branch_cut`. Test migrations (§7 table). Ports `run_bugb_suite` and the ancestry suite. | ~800 + ~950 |
 | **P4** | Activate client unstamped. `req_lsn = 0` + `req_floor_lsn`; removes P0's `+1` and `ls_zeroextend`'s stamp; `PS_SHM_VERSION` bump. | ~150 + ~200 |
-| **P5** | Activate the other views. Pins positional below R (reads, fences, gate; pins required for exact-R readers); `S_H` caps in the walidx planner and fold; artifact caps and producer `(C, token)`; control-restore client seqs; §5.3 audits; ports the revision suite. | ~550 + ~450 |
+| **P5** | Activate the other views: write `CAP_ACTIVATION{PIN, WALIDX_HORIZON, ARTIFACT}`; finite `S_H` from the first commit after activation. Pins positional below R (reads, fences, gate; pins required for exact-R readers); `S_H` caps in the walidx planner and fold; artifact caps and producer `(C, token)`; control-restore client seqs; §5.3 audits; ports the revision suite. | ~550 + ~450 |
 | **P6** | Fuzzer (§8.5) and docs (READ_CONSISTENCY_DESIGN §1d, MVP_COMPLETION_PLAN: fork tuple and the controller-only G3 contract; RELEASE_VALIDATION; MVP_STATUS). No G3 code is left here. | ~250 + ~300, plus docs |
 
-Total: about 3.9k lines of code and 3.6k lines of tests, plus fixtures and docs.
+Total: about 4.1k lines of code and 3.8k lines of tests, plus fixtures and docs.
 
 **Top risks:**
 1. Read/prune divergence, including lost `s_min` facts. Mitigated by one predicate for fold and masks, closure everywhere, and the §8.2 future-arrival property test.
@@ -692,3 +744,20 @@ Total: about 3.9k lines of code and 3.6k lines of tests, plus fixtures and docs.
 - The exact-identity GROW collapse: identity, not state.
 - Artifact `inflight` caps: correctness, rebuilt deterministically.
 - Stable-seq sampling: correctness.
+
+### 9.2 Rollout audit: pre-existing state read with new semantics (rev 6)
+
+| Phase boundary | Pre-existing state | Risk | Resolution |
+|---|---|---|---|
+| → P3a | Branches, horizons | P3a would write real seqs that later become finite retroactively | P3a writes ∞ (§2.2) |
+| → P3a | Forkmeta events written before P3a (no META/UNSTAMPED flags; legacy ZEROEXTEND GROW loads as PAGE) | A post-activation view could fail to hide them | None needed: every such event has a seq below any post-activation S, so it is pre-S and visible to every finite view anyway. Only events admitted after activation can be hidden, and P3a precedes activation, so they carry flags. |
+| → P3a | GROWs deduped before P3a | A post-activation view could miss a GROW | None needed: a later view has `S ≥` every earlier event, so the dedup's fold equals its fold (§3.2 argument). |
+| → P3b | Legacy branches | Retroactive freeze | ∞ via V3/legacy mapping and `activation_seq[BRANCH]` |
+| → P3b | An in-flight controller operation started by an older binary (journal past `fork_captured`) | A prepare retry would run without R2 proof | The P3b retry has no journaled `window_opened` snapshot. It performs the WAL scan only; if the writer is no longer restricted (scan finds commits), it fails closed, goes to `r2_cleanup`, and requires an operator rerun. |
+| → P3b | Tests calling the direct entry points | They are refused | GUC migration (§7 table) |
+| → P4 | P0 clients (`+1` stamps) mixed with P4 clients (unstamped) | none | The daemon accepts both. A new client with an old daemon is refused by `PS_SHM_VERSION`. |
+| → P5 | Pins, readers, WAL-index horizons, artifact fences | Retroactive finite caps over pruned history (4101176495) | Activation epochs (§2.2) |
+| → P5 | Artifact attempts in flight across activation (token < activation) | A mixed cap | The token maps to ∞, so the fence stays LSN-only until the next generation. |
+| → P5 | The registration gate | Existing unpinned exact-R readers would get -2 | Pre-activation `(R, S)` maps to `(R, ∞, S)`, which is today's semantics, and is not gated. Readers adopting a *new* generation after activation must pin it first (P5 audit). |
+| any, downgrade | A store with `CAP_ACTIVATION` opened by an older binary | Its old retention would prune history finite views need | Fail closed (§2.2) |
+
