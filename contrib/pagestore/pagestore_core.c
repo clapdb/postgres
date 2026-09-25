@@ -46,6 +46,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_admissible.h"
 #include "pagestore_artifact_format.h"
 #include "pagestore_compat.h"
 #include "pagestore_core.h"
@@ -941,6 +942,90 @@ admission_seq_observe(uint64_t seq)
 									 false, __ATOMIC_RELAXED,
 									 __ATOMIC_RELAXED))
 		;
+}
+
+/*
+ * P2 plan-epoch validation (design doc S3.7(7), checklist item 6/U3).  One
+ * counter per timeline, holding the maximum admission_seq of any fork event
+ * or PAGE GROW admitted for it.  fork_event_admit_seq_bump() is called from
+ * fork_event_add()/fork_event_add_seg_marker() -- the two entry points
+ * every production fork-event insertion goes through (the I-ALLOC audit,
+ * "pagestore: wire in the I-ALLOC assertion") -- under the caller's
+ * existing key-shard write lock, before that admission releases
+ * admission-rd, satisfying checklist item 6.  A retention planner that
+ * samples this value before doing its (possibly slow) analysis can later
+ * compare it again under a stronger lock to detect whether a fork-event
+ * admission raced its plan; a mismatch means the plan may be stale and must
+ * not be published as-is.
+ *
+ * A plain per-timeline maximum (not scoped to "at lsn <= the plan's max
+ * horizon", the design doc's tighter formulation) is a conservative
+ * over-approximation: it can only cause *more* spurious re-plans (a fork
+ * event admitted at a position the plan never looked at still bumps it),
+ * never fewer -- so it can never miss a genuine race.  Recorded as a P2
+ * amendment (see the phase report): the doc's lsn-scoped counter would
+ * avoid unnecessary re-plans from unrelated high-LSN activity, at the cost
+ * of a second index lookup on every admission; the simpler, and strictly
+ * safe, per-timeline maximum is used instead.
+ */
+static uint64_t fork_event_admit_seq_by_tl[MAX_TIMELINES];
+
+static inline void
+fork_event_admit_seq_bump(uint32_t timeline, uint64_t seq)
+{
+	uint64_t	cur;
+
+	if (timeline >= MAX_TIMELINES || seq == 0)
+		return;
+	cur = __atomic_load_n(&fork_event_admit_seq_by_tl[timeline], __ATOMIC_ACQUIRE);
+	while (seq > cur &&
+		   !__atomic_compare_exchange_n(&fork_event_admit_seq_by_tl[timeline],
+										&cur, seq, true, __ATOMIC_RELEASE,
+										__ATOMIC_ACQUIRE))
+		;
+}
+
+/* Sample the current epoch for timeline tl, to be re-checked later under a
+ * stronger lock (fork_event_plan_epoch_validate()) right before publishing
+ * a plan built from this sample. */
+static inline uint64_t
+fork_event_plan_epoch_capture(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&fork_event_admit_seq_by_tl[timeline], __ATOMIC_ACQUIRE);
+}
+
+/* True iff no fork event/PAGE GROW has been admitted for tl since
+ * `captured` was sampled. */
+static inline bool
+fork_event_plan_epoch_validate(uint32_t timeline, uint64_t captured)
+{
+	if (timeline >= MAX_TIMELINES)
+		return true;
+	return __atomic_load_n(&fork_event_admit_seq_by_tl[timeline],
+						   __ATOMIC_ACQUIRE) == captured;
+}
+
+/* Test-only: observe the current epoch, and force a bump, so a test can
+ * deterministically inject "an admission raced the plan" between a capture
+ * and a validate. */
+uint64_t
+ps_test_plan_epoch(uint32_t timeline)
+{
+	return fork_event_plan_epoch_capture(timeline);
+}
+
+void
+ps_test_plan_epoch_bump(uint32_t timeline, uint64_t seq)
+{
+	fork_event_admit_seq_bump(timeline, seq);
+}
+
+int
+ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured)
+{
+	return fork_event_plan_epoch_validate(timeline, captured) ? 1 : 0;
 }
 
 void
@@ -3462,29 +3547,70 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			free(plan.kept);
 			free(plan.pending);
 		}
-		else if (ps_page_prune_plan(versions, end - first,
-								(PsPruneFence) {floor, UINT64_MAX}, fences,
-									 nfences, keep) < 0)
-		{
-			free(order);
-			free(versions);
-			free(keep);
-			free(selected);
-			free(dropped);
-			free(fences);
-			free(control_fences);
-			artifact_prune_cache_free(artifact_cache);
-			return -1;
-		}
 		else
 		{
+			/*
+			 * P2 (design doc S3.5, checklist item 8): route relation pages
+			 * through the closure-aware planner so a position closure
+			 * requires cannot be dropped by the forkmeta-invalidation check
+			 * below.  Every fence here still carries S = PS_PRUNE_SEQ_
+			 * UNBOUNDED (ps_prune_fence_to_view()), so closure never
+			 * actually triggers yet (no behaviour change: closure_protect
+			 * comes back all-zero) -- this only wires the mechanism through
+			 * for when a finite-S fence source lands (P5 activation).
+			 */
+			PsViewFence	vfences_local[8];
+			PsViewFence *vfences = vfences_local;
+			unsigned char *closure_protect = malloc(end - first);
+			int			rc;
+
+			if (nfences > 8)
+				vfences = malloc((size_t) nfences * sizeof(*vfences));
+			if (closure_protect == NULL || vfences == NULL)
+			{
+				free(closure_protect);
+				if (vfences != vfences_local)
+					free(vfences);
+				free(order);
+				free(versions);
+				free(keep);
+				free(selected);
+				free(dropped);
+				free(fences);
+				free(control_fences);
+				artifact_prune_cache_free(artifact_cache);
+				return -1;
+			}
+			for (uint32_t i = 0; i < nfences; i++)
+				vfences[i] = ps_prune_fence_to_view(fences[i]);
+			rc = ps_page_prune_plan_capped(versions, end - first,
+										   (PsPruneFence) {floor, UINT64_MAX},
+										   vfences, nfences, 0, 0, keep,
+										   closure_protect);
+			if (vfences != vfences_local)
+				free(vfences);
+			if (rc < 0)
+			{
+				free(closure_protect);
+				free(order);
+				free(versions);
+				free(keep);
+				free(selected);
+				free(dropped);
+				free(fences);
+				free(control_fences);
+				artifact_prune_cache_free(artifact_cache);
+				return -1;
+			}
 			for (uint32_t i = first; i < end; i++)
 				if (keep[i - first] && order[i].version.lsn < floor &&
+					!closure_protect[i - first] &&
 					!prune_version_needed(timeline, &order[first].key,
 										  order[first].block, versions,
 										  end - first, i - first, floor,
 										  fences, nfences))
 					keep[i - first] = 0;
+			free(closure_protect);
 		}
 		out = compact_emit_grouped(order, first, end, keep, recs, selected,
 								   out, dropped, &ndropped);
@@ -4189,6 +4315,11 @@ _Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 #define FEV_F_SNAPSHOT_DROPPED	0x01	/* former snapshot_dropped byte */
 #define FEV_F_META				0x02	/* SET/DEAD, or a ZEROEXTEND-origin GROW */
 #define FEV_F_META_FIRST		0x04	/* the min-seq META event at its own lsn */
+_Static_assert(FEV_F_META == PS_ADM_F_META &&
+			   FEV_F_META_FIRST == PS_ADM_F_META_FIRST,
+			   "FEV_F_* must track pagestore_admissible.h's PS_ADM_F_* "
+			   "bit for bit -- fork_event_hidden() passes ForkEvent.flags "
+			   "straight through with no translation");
 #define FEV_F_UNSTAMPED			0x08	/* a WAL-less (req_lsn == 0) op's event.
 										 * No setter yet in P1: the classifier
 										 * (fork_event_hidden()) and tests
@@ -4200,6 +4331,8 @@ _Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 										 * flag and the client's req_lsn == 0 +
 										 * req_floor_lsn switch (design doc
 										 * S5). */
+_Static_assert(FEV_F_UNSTAMPED == PS_ADM_F_UNSTAMPED,
+			   "FEV_F_UNSTAMPED must track PS_ADM_F_UNSTAMPED");
 
 typedef struct ForkEnt
 {
@@ -5763,27 +5896,29 @@ static PageVer *
 page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 {
 	PageVer    *best = NULL;
+	PsAdmitCap	ac;
 
+	ac.lsn = c->lsn;
+	ac.seq = c->seq;
+	ac.strict_seq = c->strict_seq;
 	for (int i = 0; i < e->nver; i++)
 	{
 		PageVer    *v = &e->vers[i];
 		uint64_t	vseq = v->admission_seq;
-		bool		ok;
 
-		if (v->lsn > c->lsn)
-			continue;
-		if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
-			vseq != 0 && vseq > c->strict_seq)
-			continue;
+		/*
+		 * page_select_is_smin() is O(nver) per call; skip it unless the
+		 * boundary test already passed and the plain seq <= S disjunct
+		 * already failed, exactly as the pre-refactor inline logic did (the
+		 * escape is unreachable in P1 production, where c->seq stays
+		 * PS_SEQ_UNBOUNDED -- see ps_version_admissible()'s own short
+		 * circuit on that same condition).
+		 */
+		bool		is_smin = (vseq != 0 && c->seq != PS_SEQ_UNBOUNDED &&
+							   vseq > c->seq) ?
+			page_select_is_smin(e, v) : false;
 
-		if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
-			ok = true;
-		else if (!has_B || v->lsn > B)
-			ok = page_select_is_smin(e, v);
-		else
-			ok = false;
-
-		if (!ok)
+		if (!ps_version_admissible(v->lsn, vseq, is_smin, &ac, B, has_B))
 			continue;
 		if (!best || v->lsn > best->lsn ||
 			(v->lsn == best->lsn && vseq >= best->admission_seq))
@@ -5982,25 +6117,14 @@ fork_event_hidden(const ForkEnt *e, uint32_t i, const ViewCap *c,
 				  uint64_t B, bool has_B)
 {
 	const ForkEvent *v = &e->ev[i];
-	uint64_t	vseq = v->admission_seq;
+	PsAdmitCap	ac;
 
-	if (v->lsn > c->lsn)
-		return true;
-	if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
-		vseq != 0 && vseq > c->strict_seq)
-		return true;
-
-	if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
-		return false;
-
-	/* vseq > S: only a class-appropriate escape can still admit it. */
-	if (v->flags & FEV_F_UNSTAMPED)
-		return true;
-	if (has_B && v->lsn <= B)
-		return true;			/* inherited range: no escape (S1.5) */
-	if (v->flags & FEV_F_META)
-		return !(v->flags & FEV_F_META_FIRST);
-	return false;				/* PAGE-class GROW: lsn > B_k is enough */
+	ac.lsn = c->lsn;
+	ac.seq = c->seq;
+	ac.strict_seq = c->strict_seq;
+	/* PS_ADM_F_* is defined bit-for-bit identical to FEV_F_* (see
+	 * pagestore_admissible.h); v->flags is passed straight through. */
+	return ps_event_hidden(v->lsn, v->admission_seq, v->flags, &ac, B, has_B);
 }
 
 /*
@@ -6716,6 +6840,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 {
 	ps_assert_shard_held_for_key(&e->key);
 	fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta);
+	fork_event_admit_seq_bump(e->timeline, admission_seq);
 }
 
 /*
@@ -6765,6 +6890,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	ps_assert_shard_held_for_key(&e->key);
 	fork_event_add_seg_marker_unchecked(e, lsn, nblocks, kind, order_id,
 										admission_seq);
+	fork_event_admit_seq_bump(e->timeline, admission_seq);
 }
 
 static int
@@ -11524,6 +11650,27 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	int preserve_survivors;
 	int overflow_cutover;
 	int rc = 0;
+#ifdef PAGESTORE_ASSERT_CHECKING
+	/*
+	 * P2 plan-epoch validation (design doc S3.7(7), checklist item 5).  The
+	 * caller (the forkmeta-cutover branch of the maintenance loop) already
+	 * holds admission-wr *and* every shard's write lock across this entire
+	 * call, which excludes fork_event_add()/fork_event_add_seg_marker() on
+	 * every timeline, not just this one -- so no fork-event admission can
+	 * race this function at all, and the epoch sampled here can never
+	 * change before freeze_seq is taken below.  This assertion is the
+	 * epoch-comparison checklist asks for, placed "inside its existing
+	 * admission-wr section and before its switch"; it is a proof-carrying
+	 * no-op today (never trips) rather than new error-handling, because the
+	 * existing, coarser lock already makes it unconditionally true.
+	 */
+	uint64_t	plan_epoch_snapshot[MAX_TIMELINES];
+	uint32_t	plan_epoch_ei;
+
+	for (plan_epoch_ei = 0; plan_epoch_ei < MAX_TIMELINES; plan_epoch_ei++)
+		plan_epoch_snapshot[plan_epoch_ei] =
+			fork_event_plan_epoch_capture(plan_epoch_ei);
+#endif
 
 	if (fork_meta_pending_load(&fork_meta_snapshot_gc_pending))
 	{
@@ -11666,6 +11813,11 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	 * allocator through that selected position before freezing the snapshot. */
 	if (force_deleting)
 		admission_seq_observe(cutoff.admission_seq);
+#ifdef PAGESTORE_ASSERT_CHECKING
+	for (plan_epoch_ei = 0; plan_epoch_ei < MAX_TIMELINES; plan_epoch_ei++)
+		PS_ASSERT(fork_event_plan_epoch_validate(plan_epoch_ei,
+												 plan_epoch_snapshot[plan_epoch_ei]));
+#endif
 	freeze_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (freeze_seq <= 1)
 		goto retry;
