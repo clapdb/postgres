@@ -77,6 +77,53 @@ main(void)
 	check(ps_test_fork_event_index_selftest(2, 400, 400, 1) == 0,
 		  "fork-event index selftest seed=2 legacy=1");
 
+	/*
+	 * P2 plan-epoch validation (design doc S3.7(7), S8.2's "plan-epoch
+	 * abort" merge-blocker case).  ps_test_plan_epoch()/
+	 * ps_test_plan_epoch_bump() reach pagestore_core.c's real
+	 * fork_event_admit_seq_by_tl[]/fork_event_plan_epoch_capture()/
+	 * fork_event_plan_epoch_validate() -- the same counter
+	 * fork_event_add()/fork_event_add_seg_marker() bump on every real
+	 * production fork-event admission.
+	 */
+	{
+		uint32_t	tl = 3;
+		uint64_t	captured;
+
+		/* No admission since capture: validate succeeds (no re-plan). */
+		captured = ps_test_plan_epoch(tl);
+		check(ps_test_plan_epoch_validate(tl, captured) == 1,
+			  "plan-epoch: unchanged since capture validates");
+
+		/* An admission races the plan (design doc's exact scenario: "a
+		 * fork event admitted between plan and publish"): validate must
+		 * now detect it and force a re-plan. */
+		ps_test_plan_epoch_bump(tl, captured + 1);
+		check(ps_test_plan_epoch_validate(tl, captured) == 0,
+			  "plan-epoch: a racing admission is detected (forces re-plan)");
+
+		/* Re-capturing after the race validates again -- it is the
+		 * *staleness of the sample*, not some sticky failure flag. */
+		captured = ps_test_plan_epoch(tl);
+		check(ps_test_plan_epoch_validate(tl, captured) == 1,
+			  "plan-epoch: a fresh capture after the race validates again");
+
+		/* A bump on a *different* timeline never affects this one -- the
+		 * counter is genuinely per-timeline. */
+		captured = ps_test_plan_epoch(tl);
+		ps_test_plan_epoch_bump(tl + 1, captured + 50);
+		check(ps_test_plan_epoch_validate(tl, captured) == 1,
+			  "plan-epoch: independent per timeline");
+
+		/* A bump with a *smaller or equal* seq than already recorded never
+		 * regresses the counter (fork_event_admit_seq_bump() is a max, not
+		 * an overwrite) and so never spuriously invalidates a valid plan. */
+		captured = ps_test_plan_epoch(tl);
+		ps_test_plan_epoch_bump(tl, captured == 0 ? 0 : captured - 1);
+		check(ps_test_plan_epoch_validate(tl, captured) == 1,
+			  "plan-epoch: a non-advancing bump does not invalidate");
+	}
+
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }
