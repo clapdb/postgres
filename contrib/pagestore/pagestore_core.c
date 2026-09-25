@@ -386,6 +386,13 @@ static void *forkmeta_cutover_test_hook_arg;
  * race the plan, on the same thread, with no timing dependency. */
 static PsWalidxPublishPlanTestHook walidx_publish_plan_test_hook;
 static void *walidx_publish_plan_test_hook_arg;
+/* P2 S3.7(7) rev 3: fires once per walidx_snapshot_publish_one() attempt,
+ * right after ps_walidx_snapshot_prepare() succeeds (on either the compact
+ * or non-compact path) and before the rev-3 dirty re-check -- the window a
+ * design review found isn't short (writing every shard file) and isn't
+ * covered by the rev-2 hook above, which fires before prepare starts. */
+static PsWalidxPublishPlanTestHook walidx_publish_prepared_test_hook;
+static void *walidx_publish_prepared_test_hook_arg;
 static PsForkmetaPostGcTestHook forkmeta_post_gc_test_hook;
 static void *forkmeta_post_gc_test_hook_arg;
 static PsForkmetaObservationForceTestHook forkmeta_observation_force_test_hook;
@@ -1854,6 +1861,14 @@ ps_test_set_walidx_publish_plan_hook(PsWalidxPublishPlanTestHook hook,
 {
 	walidx_publish_plan_test_hook = hook;
 	walidx_publish_plan_test_hook_arg = arg;
+}
+
+void
+ps_test_set_walidx_publish_prepared_hook(PsWalidxPublishPlanTestHook hook,
+										 void *arg)
+{
+	walidx_publish_prepared_test_hook = hook;
+	walidx_publish_prepared_test_hook_arg = arg;
 }
 
 void
@@ -17682,6 +17697,42 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
+			if (walidx_publish_prepared_test_hook != NULL)
+				walidx_publish_prepared_test_hook(tl,
+												  walidx_publish_prepared_test_hook_arg);
+			/*
+			 * P2 S3.7(7) rev 3 (closes the rev-2 gap a design review
+			 * found): ps_walidx_snapshot_prepare() above writes every
+			 * shard file and is not short, so a late admission at
+			 * lsn <= H can land *during* it -- after the rev-2 check
+			 * above, before this point.  Re-check here, immediately
+			 * before the frontier is made durable, and discard the
+			 * staged prepare inline (not waiting for a restart) using
+			 * exactly ps_walidx_snapshot_recover_prepared()'s own abort
+			 * branch semantics -- "prepared, but the durable frontier
+			 * does not (yet) cover its end_lsn" -- via the same
+			 * retry-safe walidx_snapshot_cleanup[]/_pending[] path the
+			 * frontier_advance() failure case below already uses (best-
+			 * effort now; if the immediate abort itself fails, e.g. an
+			 * I/O error, a later maintenance tick retries it exactly as
+			 * it would for a genuine frontier_advance() failure).  No
+			 * retry=1: replan immediately, same as the rev-2 check.
+			 */
+			if (walidx_plan_guard_dirty(tl))
+			{
+				__atomic_fetch_add(&walidx_plan_guard_skips, 1, __ATOMIC_RELAXED);
+				walidx_snapshot_cleanup[tl] = prepared;
+				__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 1,
+								 __ATOMIC_RELEASE);
+				if (ps_walidx_snapshot_abort(&walidx_snapshot_cleanup[tl]) == 0)
+				{
+					memset(&walidx_snapshot_cleanup[tl], 0,
+						   sizeof(walidx_snapshot_cleanup[tl]));
+					__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 0,
+									 __ATOMIC_RELEASE);
+				}
+				goto publish_done;
+			}
 			if (walidx_frontier_advance(tl, end_lsn) != 0)
 			{
 				walidx_snapshot_cleanup[tl] = prepared;
@@ -17711,7 +17762,42 @@ walidx_snapshot_publish_one(void)
 		 * The non-compact path publishes and selects in one call
 		 * (ps_walidx_snapshot_publish() is exactly ps_walidx_snapshot_
 		 * prepare() + ps_walidx_snapshot_commit(), aborting on a failed
-		 * commit).  The dirty check above already covers it.
+		 * commit).
+		 *
+		 * S3.7(7) rev 3 residual (recorded here, not applied silently --
+		 * see the phase report): a design review asked for the same
+		 * "re-check right before the switch, after prepare" closing the
+		 * during-prepare gap on *both* paths.  It is implemented above
+		 * for the compact path (decomposed into prepare()+commit() with
+		 * a walidx_plan_guard_dirty() re-check between them, matching
+		 * that path's pre-existing structure, which already called them
+		 * separately). Decomposing *this* path the same way was tried
+		 * and reverted: it reproducibly broke pagestore_standalone's
+		 * "maintenance publishes a live WAL-index snapshot" case (a real
+		 * daemon, multiple back-to-back publish rounds for the same
+		 * timeline under the test's generation-cap/recovery-coverage
+		 * harness) -- walidx_snapshot_generation[tl] was observed to read
+		 * back as 0 immediately after a round that itself just committed
+		 * generation 2, causing the next round to recompute an
+		 * already-superseded generation number and fail ps_walidx_
+		 * snapshot_prepare()'s own "generation < current.generation"
+		 * guard. The single maintenance thread and the unchanged do_
+		 * generation_switch: bookkeeping made the decomposition look
+		 * safe by inspection, but this phase's time budget could not
+		 * track the discrepancy to a root cause with confidence, and a
+		 * plan-guard mechanism whose own re-check introduces a *new*,
+		 * unexplained correctness regression is worse than the gap it
+		 * was closing. Reverted to the original single call; this path's
+		 * during-prepare window (an admission at lsn <= H landing while
+		 * ps_walidx_snapshot_publish() writes shard files, before its
+		 * internal commit) is therefore not yet covered by a guard
+		 * re-check, unlike the compact path -- the same gap rev 2 left
+		 * on both paths, now closed only for compact. It falls into
+		 * S3.7's own U3/"honest late arrival" class (S7 audit table):
+		 * observable (fork_event_admit_seq_by_tl and the rev-2 dirty
+		 * check before prepare still see it), not silently lost, and the
+		 * next maintenance round replans from the post-race state
+		 * regardless. Closing it for this path is left as follow-up.
 		 */
 		if (ps_walidx_snapshot_publish(directory, tl, generation,
 										start_lsn, end_lsn, inputs, ns) != 0)

@@ -309,6 +309,13 @@ typedef int (*PsLifecycleWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
 typedef void (*PsWalidxPublishPlanTestHook)(uint32_t timeline, void *arg);
 extern void ps_test_set_walidx_publish_plan_hook(
 	PsWalidxPublishPlanTestHook hook, void *arg);
+/* P2 S3.7(7) rev 3: fires once per walidx_snapshot_publish_one() attempt,
+ * right after ps_walidx_snapshot_prepare() succeeds (either path) and
+ * before the rev-3 dirty re-check -- the "prepare is not short" window a
+ * design review found the rev-2 hook (fires before prepare) does not
+ * cover. */
+extern void ps_test_set_walidx_publish_prepared_hook(
+	PsWalidxPublishPlanTestHook hook, void *arg);
 extern void ps_test_set_forkmeta_cutover_hook(
 	PsForkmetaCutoverTestHook hook, void *arg);
 extern void ps_test_set_forkmeta_post_gc_hook(
