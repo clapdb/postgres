@@ -577,6 +577,28 @@ claim_extra_channel(void)
 	return NULL;
 }
 
+/*
+ * Claim the one channel at index 'idx', or NULL if it is already claimed or
+ * out of range.  Unlike claim_extra_channel(), the caller picks the index --
+ * ps_channel() lays channels out contiguously (base + idx * PS_CHANNEL_STRIDE),
+ * so claim_channel_at(cl_chan + 1) is the channel physically adjacent to
+ * cl_chan's own PsChannel struct: an out-of-bounds write past cl_chan's
+ * data[PS_IO_UNIT] lands there first.
+ */
+static PsChannel *
+claim_channel_at(uint32_t idx)
+{
+	PsShmHeader *hdr = (PsShmHeader *) cl_shm;
+	PsChannel  *ch;
+
+	if (idx >= hdr->nchannels)
+		return NULL;
+	ch = ps_channel(cl_shm, idx);
+	if (ps_cas(&ch->claimed, 0, 1))
+		return ch;
+	return NULL;
+}
+
 static PsChannel *
 cl_exec(void)
 {
@@ -1728,6 +1750,17 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 {
 	for (uint32_t i = 0; i < ps; i++)
 		if (buf[i] != 0)
+			return 0;
+	return 1;
+}
+
+/* True if every one of the first 'n' bytes at buf equals 'byte' (a sentinel
+ * check: proves a neighboring channel's data[] was not touched). */
+static int
+memcmp_all(const unsigned char *buf, unsigned char byte, size_t n)
+{
+	for (size_t i = 0; i < n; i++)
+		if (buf[i] != byte)
 			return 0;
 	return 1;
 }
@@ -5804,6 +5837,182 @@ run_vectored_suite(const char *daemon_path, const char *tmpbase)
 	free(rbuf);
 }
 
+/*
+ * IPC request-bounds hardening (Bug A, found by the op fuzzer): handle_request()'s
+ * WRITEV/READV loops used to index ch->data by the client-supplied ch->nblocks
+ * with no check that nblocks * page_size <= PS_IO_UNIT, and ps_handle_meta()'s
+ * WAL_APPEND/WAL_READ used ch->datalen the same way.  A too-large count/length
+ * walks past this channel's fixed data[] buffer into the physically adjacent
+ * channel's shared memory (ps_channel() lays channels out contiguously) -- or,
+ * for nblocks near UINT32_MAX, far beyond it.  ps_request_payload_fits() now
+ * refuses any request whose declared payload does not fit, before ch->data is
+ * touched.  Exercise: nblocks == capacity (OK), capacity+1 (refused),
+ * UINT32_MAX (refused, no 32-bit multiplication wraparound), and an
+ * out-of-range WAL_APPEND/WAL_READ datalen (refused) -- each checked against a
+ * sentinel planted in the adjacent channel, which must survive every refusal.
+ */
+static void
+run_ipc_bounds_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	uint32_t	capacity = PS_IO_UNIT / ps;	/* 32 at the default page size */
+	unsigned char *wbuf;
+	unsigned char *rbuf;
+	PsChannel  *ch;
+	PsChannel  *neighbor;
+
+	fprintf(stderr, "== IPC request-bounds hardening (Bug A) ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_ipcbounds", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_ipcbounds", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	wbuf = malloc((size_t) capacity * ps);
+	rbuf = malloc((size_t) capacity * ps);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	neighbor = claim_channel_at((uint32_t) cl_chan + 1);
+	check(neighbor != NULL,
+		  "IPC bounds test claims the channel physically adjacent to cl_chan");
+	if (neighbor == NULL)
+		goto done;
+
+	/* A recognizable pattern nothing else in this suite ever writes. */
+	memset(neighbor->data, 0xa5, PS_IO_UNIT);
+
+	/* 1. nblocks == capacity: fits exactly.  A plain OK path (not the bug),
+	 * proving the fix does not also reject the legitimate boundary case. */
+	for (uint32_t i = 0; i < capacity; i++)
+		fill_page(wbuf + (size_t) i * ps, ps, 3000 + i, (unsigned char) (i + 1));
+	op_writev(REL_A, FORK0, 0, wbuf, capacity);
+	check(ps_channel(cl_shm, cl_chan)->status == PS_STATUS_OK,
+		  "WRITEV nblocks=capacity (%u) succeeds", capacity);
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "WRITEV nblocks=capacity leaves the adjacent channel untouched");
+
+	op_readv(REL_A, FORK0, 0, rbuf, capacity);
+	{
+		int			ok = 1;
+
+		for (uint32_t i = 0; i < capacity; i++)
+			if (!page_has_tag(rbuf + (size_t) i * ps, ps, (unsigned char) (i + 1)))
+				ok = 0;
+		check(ok, "READV nblocks=capacity (%u) succeeds and returns every page",
+			  capacity);
+	}
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "READV nblocks=capacity leaves the adjacent channel untouched");
+
+	/* 2. nblocks == capacity+1: the minimal repro (33 at the default page
+	 * size).  Set the field directly -- do not memcpy capacity+1 pages of
+	 * client-side data first, or the *test* would spill into the neighbor's
+	 * memory before the request is even sent. */
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = 0;
+	ch->nblocks = capacity + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WRITEV nblocks=capacity+1 (%u) is refused", capacity + 1);
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WRITEV nblocks=capacity+1 leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = capacity + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "READV nblocks=capacity+1 (%u) is refused", capacity + 1);
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused READV nblocks=capacity+1 leaves the adjacent channel untouched");
+
+	/* 3. nblocks == UINT32_MAX: must be refused outright, with no 32-bit
+	 * multiplication wraparound turning it into something that looks small. */
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = 0;
+	ch->nblocks = UINT32_MAX;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR, "WRITEV nblocks=UINT32_MAX is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WRITEV nblocks=UINT32_MAX leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = UINT32_MAX;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR, "READV nblocks=UINT32_MAX is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused READV nblocks=UINT32_MAX leaves the adjacent channel untouched");
+
+	/* Daemon must still be alive and serving after the UINT32_MAX requests
+	 * (an unbounded loop indexing ch->data by nblocks would have crashed it). */
+	check(op_nblocks(REL_A, FORK0) == capacity,
+		  "daemon still serves ordinary requests after the UINT32_MAX probes");
+
+	/* 4. datalen out of range: WAL_APPEND/WAL_READ must be refused for a
+	 * datalen beyond PS_IO_UNIT, without reading/writing ch->data by it.
+	 * Set the field directly rather than through op_wal_append()'s memcpy
+	 * (which would need datalen valid bytes to copy). */
+	ch = ps_channel(cl_shm, cl_chan);
+	ch->timeline = 0;
+	ch->incarnation = 0;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = 0;
+	ch->datalen = PS_IO_UNIT + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WAL_APPEND datalen=PS_IO_UNIT+1 is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WAL_APPEND datalen=PS_IO_UNIT+1 leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	ch->timeline = 0;
+	ch->incarnation = 0;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = 0;
+	ch->datalen = UINT32_MAX;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WAL_APPEND datalen=UINT32_MAX is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WAL_APPEND datalen=UINT32_MAX leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	ch->timeline = 0;
+	ch->incarnation = 0;
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = 0;
+	ch->datalen = PS_IO_UNIT + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WAL_READ datalen=PS_IO_UNIT+1 is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WAL_READ datalen=PS_IO_UNIT+1 leaves the adjacent channel untouched");
+
+	ps_store_release(&neighbor->claimed, 0);
+
+done:
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	free(wbuf);
+	free(rbuf);
+}
+
 /* One concurrent client: own channel, own relation, write then verify. */
 static int
 conc_child(const char *shm_name, uint32_t ps, int id)
@@ -6085,6 +6294,9 @@ main(int argc, char **argv)
 
 	/* vectored multi-page I/O */
 	run_vectored_suite(daemon_path, tmpbase);
+
+	/* IPC request-bounds hardening (Bug A): nblocks/datalen vs PS_IO_UNIT */
+	run_ipc_bounds_suite(daemon_path, tmpbase);
 
 	/* many concurrent clients */
 	run_concurrency_suite(daemon_path, tmpbase);

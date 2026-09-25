@@ -20319,12 +20319,58 @@ timeline_op_allowed(uint32_t timeline, PsOpcode opcode,
 	return state == PS_TIMELINE_LIVE;
 }
 
+/*
+ * True if this request's client-supplied nblocks/datalen fits within one
+ * channel's fixed PS_IO_UNIT data[] buffer.  A client publishes a plain
+ * uint32_t for either field, and nothing on the wire otherwise bounds it, so
+ * every opcode that indexes ch->data by one of them -- on either byte-I/O
+ * path (READV/WRITEV, handled by the frontends) or this file's own
+ * WAL_APPEND/WAL_READ -- must be checked here before the buffer is touched:
+ * a too-large count walks PS_IO_UNIT bytes past data[] into a neighboring
+ * channel's shared memory, or off the end of the mapping.
+ *
+ * The other opcodes that carry a count need no check here:
+ *   - EXTEND/READ_AT move exactly one page at data[0]; page_size is bounded
+ *     to <= PS_IO_UNIT once at daemon startup, so a single page always fits.
+ *   - ZEROEXTEND never touches ch->data (it only advances a fork's size).
+ *   - WAL_INDEX_GET clamps its own output count to PS_IO_UNIT / sizeof(PsWalRec)
+ *     before writing to ch->data.
+ *   - WAL_INDEX_ADD_BATCH validates ch->datalen <= PS_IO_UNIT (and that
+ *     ch->nblocks * sizeof(PsWalIndexEntry) == ch->datalen) itself before
+ *     indexing ch->data, right where it is used.
+ * so their existing, opcode-local checks are left as the single source of
+ * truth for those instead of being duplicated/scattered here.
+ */
+int
+ps_request_payload_fits(const PsChannel *ch)
+{
+	switch ((PsOpcode) ch->opcode)
+	{
+		case PS_OP_WRITEV:
+		case PS_OP_READV:
+			return page_size > 0 && page_size <= PS_IO_UNIT &&
+				ch->nblocks > 0 && ch->nblocks <= PS_IO_UNIT / page_size;
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_READ:
+			return ch->datalen <= PS_IO_UNIT;
+		default:
+			return 1;
+	}
+}
+
 int
 ps_handle_meta(PsChannel *ch)
 {
 	uint32_t	tl = ch->timeline;
 
 	if (!core_process_valid())
+	{
+		ch->status = PS_STATUS_ERROR;
+		return 1;
+	}
+	/* Refuse an out-of-range WAL_APPEND/WAL_READ datalen before anything
+	 * below reads or writes ch->data by it (see ps_request_payload_fits()). */
+	if (!ps_request_payload_fits(ch))
 	{
 		ch->status = PS_STATUS_ERROR;
 		return 1;
