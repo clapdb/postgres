@@ -411,6 +411,13 @@ static void *walidx_observation_error_test_hook_arg;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
+/* Guards the ArtifactFence registry (declared near its other machinery,
+ * below); declared here too so append_page_impl()'s control-image admission
+ * path can hold it from sampling control_prune_fences() through publication
+ * (Codex review finding 4098328787), matching where the file already
+ * declares page_prune_lock early for the same reason -- a lock several
+ * distant call sites need. */
+static pthread_mutex_t artifact_fence_lock = PTHREAD_MUTEX_INITIALIZER;
 /* WAL-index pins must stay fixed from replacement-chain planning through the
  * durable frontier and generation-manifest cutover. */
 static pthread_rwlock_t walidx_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -4149,6 +4156,7 @@ typedef struct TimelineMeta
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+
 /* A metadata append failure is ambiguous: the lower layer may have made the
  * record durable before reporting an error.  Refuse all timeline services
  * until the process reopens and replays the log. */
@@ -5558,6 +5566,30 @@ page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
 			best = v;
 	}
 	return best;
+}
+
+/*
+ * Does (timeline, key, block) already have a stored version at exactly
+ * 'lsn'?  Used by the Bug B admission check above: a fresh record at an lsn
+ * some earlier record already occupies is a same-lsn rewrite (skip-WAL hint
+ * bits keep the old pd_lsn), which page_visible()'s admission_seq tie-break
+ * would let silently supersede the original at that lsn for any ancestor
+ * read (seq_cap==0 there) -- unlike a genuinely new, distinct lsn, which is
+ * ordinary WAL-ordered history and must stay admissible unchanged.  Caller
+ * holds this shard's write lock, same as the rest of append_page_impl().
+ */
+static int
+page_has_version_at(uint32_t timeline, const PsKey *key, uint32_t block,
+					uint64_t lsn)
+{
+	PageEnt    *e = page_find(timeline, key, block);
+
+	if (!e)
+		return 0;
+	for (int i = 0; i < e->nver; i++)
+		if (e->vers[i].lsn == lsn)
+			return 1;
+	return 0;
 }
 
 uint32_t
@@ -7466,6 +7498,53 @@ fork_has_wal_less_page(uint32_t timeline, const PsKey *key)
 }
 
 /*
+ * Does (timeline, key, block) have a stored version at EXACTLY 'lsn' either
+ * locally, or INHERITED from an ancestor through ordinary read-through
+ * ancestry (each level capped by tl_walk_next()'s branch_lsn, exactly like
+ * an actual read would resolve it)?  Codex review finding 4098328771: the
+ * local-only page_has_version_at() collision check misses a version 'timeline'
+ * only SEES via inheritance -- if timeline 1 inherits a control image at L
+ * from the root, timeline 2 forks from timeline 1, and timeline 1 later
+ * admits its own local same-position rewrite at L, page_find(timeline1,...)
+ * finds nothing (the original version 'timeline1' sees at L physically lives
+ * on the root, not on timeline1's own PageEnt), so the local-only check
+ * wrongly skips promotion and the fresh local rewrite becomes visible to
+ * timeline 2 through timeline1's own frozen cap.  Relation pages need no
+ * equivalent fix: growth_floor is always raised to branch_floor
+ * (branch_lsn + 1) for any timeline with a parent, and anything genuinely
+ * inheritable from an ancestor is by definition <= that timeline's own
+ * branch_lsn, so the existing below-branch-floor clamp in append_page_impl()
+ * already promotes it unconditionally before this collision check is ever
+ * reached; only control images (no such floor) need the ancestry walk.
+ * Caller holds this shard's write lock, same as the rest of
+ * append_page_impl() (matches page_has_version_at()'s own contract); this
+ * additionally takes map_rd internally to walk ancestry safely against
+ * concurrent CREATE_BRANCH.
+ */
+static int
+page_has_version_at_ancestry(uint32_t timeline, const PsKey *key,
+							 uint32_t block, uint64_t lsn)
+{
+	TlWalk		w;
+	int			found = 0;
+
+	ps_lock_map_rd();
+	w = tl_walk_first(timeline, lsn);
+	for (;;)
+	{
+		if (w.lsn == lsn && page_has_version_at(w.tl, key, block, lsn))
+		{
+			found = 1;
+			break;
+		}
+		if (!tl_walk_next(&w) || w.lsn < lsn)
+			break;
+	}
+	ps_unlock_map();
+	return found;
+}
+
+/*
  * Validate a branch-creation request before it is recorded.  read_through() and
  * the fork-size walks follow the parent chain assuming it is finite and well
  * formed, so a bad CREATE_BRANCH must be rejected rather than persisted.  Refuse:
@@ -7942,6 +8021,89 @@ fork_newest_visible_lsn_through(uint32_t timeline, const PsKey *key)
 		}
 	} while (tl_walk_next(&w));
 	return newest;
+}
+
+/*
+ * Find the newest DEFINITIVE (SET/DEAD) fork-meta event visible through
+ * 'timeline's ancestry, skipping ordinary FEV_GROW page-growth bookkeeping
+ * via each level's own e->def_idx -- the "is this genuinely the fork's
+ * current terminal state" notion the CREATE-retry idempotence check needs
+ * (Codex review finding 4098831601): for a retry on a non-root timeline
+ * whose original CREATE is only INHERITED (never stored locally on that
+ * timeline), a local-only check sees no definitive event at all, so
+ * fork_meta_lsn_promote() -- now ancestry-aware -- can bump the retry above
+ * a descendant fence or the key's newest inherited page, after which the
+ * (still local-only) idempotence check misses the duplicate at the
+ * promoted position too and a fresh zero-block FEV_SET gets persisted on
+ * top of the real one, hiding every inherited page.
+ *
+ * Design revision (Codex review finding 4099084946): this originally
+ * walked the WHOLE ancestry and returned the definitive event with the
+ * numerically GREATEST lsn across every level, but fork resolution does not
+ * work that way -- read_through_checked()/fork_nblocks_through()/
+ * fork_exists_through() all walk tl_walk() child-to-parent and give the
+ * FIRST level with its own visible answer precedence, regardless of an
+ * ancestor's larger capped lsn (fork_nblocks_through()'s "a definitive hop
+ * ends the walk" rule; see its comment above): a child's own local
+ * definitive event always SHADOWS anything an ancestor could otherwise
+ * offer, even a numerically newer one, because COW gives the child sole
+ * authority over its own fork lifecycle from that point on.  For example, a
+ * child's own local zero-block CREATE at 1000 must win over a parent's
+ * definitive event at 1500 -- the parent's 1500 is never even reachable
+ * from the child's own reads.  Fixed to match: walk child-to-parent and
+ * return the FIRST level's own newest definitive event at or below that
+ * level's cap (per-level found via the same backward e->def_idx scan as
+ * before), stopping there -- never comparing across levels.  A level with
+ * only FEV_GROW history (no local definitive event at or below its cap)
+ * does NOT stop the walk, matching fork_nblocks_through()'s FORK_HOP_GROW
+ * case: bare growth layers on top of whatever the ancestry ultimately
+ * resolves to and carries no lifecycle answer of its own, so the walk
+ * continues to the parent exactly as size resolution does.
+ *
+ * *found_out is 0 (with the other outputs left at their zero default) when
+ * nothing definitive is visible anywhere in the ancestry.  Caller holds
+ * this shard's write lock; takes map_rd internally.
+ */
+static void
+fork_newest_definitive_event_through(uint32_t timeline, const PsKey *key,
+									 uint64_t *lsn_out, uint8_t *kind_out,
+									 uint32_t *nblocks_out, int *found_out)
+{
+	TlWalk		w;
+	uint64_t	newest_lsn = 0;
+	uint8_t		newest_kind = 0;
+	uint32_t	newest_nblocks = 0;
+	int			found = 0;
+
+	ps_lock_map_rd();
+	w = tl_walk_first(timeline, UINT64_MAX);
+	do
+	{
+		ForkEnt    *e = fork_find(w.tl, key);
+
+		if (e == NULL)
+			continue;
+		for (int i = (int) e->ndef - 1; i >= 0; i--)
+		{
+			const ForkEvent *v = &e->ev[e->def_idx[i]];
+
+			if (v->lsn > w.lsn)
+				continue;
+			newest_lsn = v->lsn;
+			newest_kind = v->kind;
+			newest_nblocks = v->nblocks;
+			found = 1;
+			break;
+		}
+	} while (!found && tl_walk_next(&w));
+	ps_unlock_map();
+	*lsn_out = newest_lsn;
+	if (kind_out != NULL)
+		*kind_out = newest_kind;
+	if (nblocks_out != NULL)
+		*nblocks_out = newest_nblocks;
+	if (found_out != NULL)
+		*found_out = found;
 }
 
 /*
@@ -16814,6 +16976,13 @@ static int append_page_impl(uint32_t timeline, const PsKey *key,
 							uint32_t block, const unsigned char *page,
 							uint64_t version, uint64_t *out_admission_seq,
 							uint64_t *artifact_lsn, PsAppendOutcome *outcome);
+static void control_pair_follow_promotion(uint32_t timeline, const PsKey *key,
+										  uint32_t block, uint64_t orig_lsn,
+										  uint64_t promoted_lsn);
+static int layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
+							uint64_t read_lsn, uint64_t read_seq,
+							uint64_t expected_lsn, uint64_t *out_lsn,
+							uint64_t *out_seq, unsigned char *out);
 
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
@@ -16867,6 +17036,21 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	ForkEnt    *fe;
 	uint64_t	branch_floor = 0;
 	uint64_t	growth_floor;
+
+	/*
+	 * Set once a control-image admission takes artifact_fence_lock to
+	 * serialize with artifact_fence_reserve() (Codex review finding
+	 * 4098328787; see the ordered_record block below and every early return
+	 * between there and page_add_version(), all of which release it on this
+	 * flag before returning -- publication at page_add_version() is where it
+	 * is normally released).
+	 */
+	int			artifact_fence_locked = 0;
+	/* Set when the control-collision pre-check below has already computed
+	 * the exact fence-driven position (or decided none applies): the shared
+	 * ordered_record block must not sample control_prune_fences() again for
+	 * this same admission (see the pre-check's own comment). */
+	int			control_fence_done = 0;
 
 	if (!core_process_valid())
 	{
@@ -17024,6 +17208,207 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				hdr.lsn = growth_floor;
 		}
 	}
+	/*
+	 * Bug B: this timeline's own floor is satisfied, but the raw lsn can
+	 * still land on a position some live descendant's frozen view, or an
+	 * active PAGE_HISTORY/WAL retention pin, already depends on -- a fork
+	 * or pin registered after this append's source bytes were produced, or
+	 * a route_all compute writing the parent directly with a stale/zero
+	 * op-LSN (see ls_op_lsn(), backend_localsvc.c).
+	 *
+	 * Landing at or below such a fence is NOT by itself a leak: a genuinely
+	 * WAL-ordered admission -- redo replaying a page/control image whose
+	 * own lsn honestly predates the branch/pin -- must stay admissible
+	 * completely unchanged even if it is admitted (in wall-clock order)
+	 * after the fence was registered; a COW branch's whole point is to see
+	 * that real pre-fork history however late it physically arrives
+	 * (pagestore_test.c's "branch sees parent as-of branch LSN, not later
+	 * writes (snapshot)" depends on this).  This fix originally also
+	 * promoted every admission landing EXACTLY at a descendant's cap, on
+	 * the theory that an exact-cap lsn could only be a stale/derived
+	 * op-LSN -- but a real first admission whose own lsn genuinely IS the
+	 * fork LSN is part of that fork's inclusive as-of-L snapshot, not a
+	 * leak, and that equality rule wrongly hid it (Codex review finding
+	 * 4097536244).  The only shape ambiguous enough to promote is a
+	 * same-key/same-block REWRITE at an lsn this key already has a stored
+	 * version at (a hint-bit-only WRITEV keeps the old pd_lsn --
+	 * page_visible()'s admission_seq >= tie-break picks the newest record
+	 * at a given lsn even for an ancestor's seq_cap==0 read, so a fresh
+	 * same-lsn rewrite would silently supersede the original a branch/pin
+	 * had frozen).
+	 *
+	 * page_has_version_at() is the cheap check; only when it collides do we
+	 * pay for the exact fence set (page_prune_fences(), folding in live
+	 * descendant caps and active retention pins) to see whether any fence
+	 * actually sits at or above this lsn -- if none does, this is an
+	 * ordinary later admission at the same position and nothing downstream
+	 * depends on its order, so it is left unpromoted.  A hit routes through
+	 * the same fence-driven promotion the below-floor/zero-version case
+	 * gets below, by reusing 'clamped' (which recomputes the exact target,
+	 * including the tie-break and the key's newest-visible floor).
+	 * (SLRU/READER_SNAPSHOT already refuse admission below a fence instead
+	 * -- see artifact_lsn_fenced() above -- and are left alone.)
+	 */
+	if (key->klass == PS_KLASS_RELATION && hdr.lsn != 0 && !clamped &&
+		page_has_version_at(timeline, key, block, hdr.lsn))
+	{
+		PsPruneFence *cfences = NULL;
+		uint32_t	ncfences = 0;
+		int			rc;
+
+		ps_lock_map_rd();
+		rc = page_prune_fences(timeline, &cfences, &ncfences);
+		if (rc == 0)
+		{
+			for (uint32_t i = 0; i < ncfences; i++)
+				if (cfences[i].lsn >= hdr.lsn)
+				{
+					clamped = 1;
+					break;
+				}
+			free(cfences);
+		}
+		ps_unlock_map();
+		if (rc != 0)
+		{
+			*outcome = PS_APPEND_IO_FAILED;
+			return -1;
+		}
+	}
+	/*
+	 * Control images use page_has_version_at_ancestry() (Codex review
+	 * finding 4098328771): 'timeline' can inherit a control version from an
+	 * ancestor it never locally stored (page_has_version_at(timeline, ...)
+	 * alone finds nothing), and a later local same-position rewrite on
+	 * 'timeline' must still be caught as a collision.
+	 *
+	 * Unlike the relation path above, the WHOLE promotion decision -- the
+	 * exact fence set, whether any fence actually applies, and (if so) the
+	 * promoted target -- is computed here in ONE pass, not split between a
+	 * "does a fence exist" pre-check and a separate exact-target
+	 * computation in the shared ordered_record block below.  Two reasons,
+	 * both hard requirements, not just an efficiency choice:
+	 *
+	 *   - control_prune_fences() internally takes artifact_fence_lock (via
+	 *     artifact_fence_snapshot()) to read the artifact registry, and
+	 *     this path also needs to hold that SAME lock across the whole
+	 *     decision, from this sample through publication (Codex review
+	 *     finding 4098328787, below).  Sampling control_prune_fences() a
+	 *     second time while still holding artifact_fence_lock from the
+	 *     first sample would self-deadlock on the non-recursive mutex.
+	 *   - a collision that no live fence actually protects must stay
+	 *     COMPLETELY UNPROMOTED, not merely fenced-but-unchanged: an
+	 *     earlier revision of this fix promoted every control collision
+	 *     unconditionally (clamped=1 outright), which also routed it
+	 *     through the shared ordered_record block's key-level (not
+	 *     block-level) fork_newest_visible_lsn_through() floor -- for the
+	 *     control key's OTHER block (0 = the pg_control image, 1 = the
+	 *     retention-floor note, sharing one ForkEnt), a later, unrelated
+	 *     write to block 1 could then spuriously bump a same-redo
+	 *     re-shipped block-0 rewrite OFF its own honest checkpoint redo
+	 *     LSN.  That broke pagestore_branch_checkpoint()'s exact
+	 *     as-of-redo mirror comparison (mvp_golden_test.sh), which depends
+	 *     on an honest, unpromoted re-ship landing at EXACTLY its own redo.
+	 *
+	 * So: sample control_prune_fences() once; if no fence sits at or above
+	 * hdr.lsn, leave hdr.lsn (and 'clamped') alone entirely, exactly like
+	 * the relation path's "if none does, ... left unpromoted" above.  Only
+	 * when a fence actually applies do we take artifact_fence_lock (Codex
+	 * review finding 4098328787: another shard's SLRU/reader-snapshot
+	 * append can register or bump an artifact cutoff via
+	 * artifact_fence_reserve() -- guarded only by artifact_fence_lock, a
+	 * plain mutex -- at any point it can reach map_rd; taking
+	 * artifact_fence_lock here while we still hold map-wr closes the
+	 * window, matching control_prune_fences()'s own nested
+	 * page_prune_lock -> map -> artifact_fence_lock order, the same one
+	 * compact_timeline()'s Phase 2 already establishes, so this is not a
+	 * new lock order) and compute the exact target (the key's newest
+	 * visible floor plus the fence tie-break loop, identical to what the
+	 * shared block below still does for the zero_version/relation cases),
+	 * holding artifact_fence_lock through to publication (page_add_version()
+	 * below; every early return between here and there releases it first,
+	 * same as the shared block).  control_fence_done then tells the shared
+	 * block this admission's control fences were already handled, so it
+	 * must not sample them again.
+	 */
+	else if (key->klass == PS_KLASS_CONTROL && hdr.lsn != 0 && !clamped &&
+			 page_has_version_at_ancestry(timeline, key, block, hdr.lsn))
+	{
+		PsPruneFence *cfences = NULL;
+		uint32_t	ncfences = 0;
+		uint64_t	newest;
+		int			rc;
+		int			has_fence = 0;
+
+		pthread_rwlock_rdlock(&page_prune_lock);
+		ps_lock_map_wr();
+		rc = control_prune_fences(timeline, &cfences, &ncfences);
+		newest = fork_newest_visible_lsn_through(timeline, key);
+		if (rc == 0)
+			for (uint32_t i = 0; i < ncfences; i++)
+				if (cfences[i].lsn >= hdr.lsn)
+				{
+					has_fence = 1;
+					break;
+				}
+		/*
+		 * Codex review finding 4098831587: take artifact_fence_lock for
+		 * EVERY colliding control admission, not only when has_fence is
+		 * already true from THIS sample.  An empty (or fence-free) sample
+		 * is exactly as exposed to the race as a non-empty one: another
+		 * shard's SLRU/reader-snapshot append can still register a NEW
+		 * artifact fence at or above hdr.lsn, under only
+		 * artifact_fence_lock, in the window between releasing map-wr here
+		 * and this record's eventual page_add_version() below -- an empty
+		 * sample proves nothing about what gets registered immediately
+		 * after it.  Locking unconditionally on any collision (still while
+		 * map-wr is held, so no other thread can even reach
+		 * artifact_fence_reserve()'s map_rd in the gap -- same reasoning
+		 * and same page_prune_lock -> map -> artifact_fence_lock order as
+		 * before) closes that window whether or not this sample found a
+		 * fence.  When it did not, hdr.lsn is deliberately left unchanged
+		 * below (no promotion) -- the lock is what protects an honest
+		 * unpromoted position, not a change to it.
+		 */
+		pthread_mutex_lock(&artifact_fence_lock);
+		ps_unlock_map();
+		pthread_rwlock_unlock(&page_prune_lock);
+		artifact_fence_locked = 1;
+		control_fence_done = 1;
+		if (rc != 0)
+		{
+			free(cfences);
+			pthread_mutex_unlock(&artifact_fence_lock);
+			artifact_fence_locked = 0;
+			*outcome = PS_APPEND_IO_FAILED;
+			return -1;
+		}
+		if (has_fence)
+		{
+			if (hdr.lsn < newest)
+				hdr.lsn = newest;
+			for (uint32_t i = 0; i < ncfences; i++)
+			{
+				if (hdr.lsn < cfences[i].lsn)
+					hdr.lsn = cfences[i].lsn;
+				if (hdr.lsn == cfences[i].lsn &&
+					admission_seq <= cfences[i].admission_seq)
+				{
+					if (hdr.lsn == UINT64_MAX)
+					{
+						free(cfences);
+						pthread_mutex_unlock(&artifact_fence_lock);
+						artifact_fence_locked = 0;
+						*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
+						return -1;
+					}
+					hdr.lsn++;
+				}
+			}
+			clamped = 1;
+		}
+		free(cfences);
+	}
 	if (hdr.lsn == 0)
 	{
 		hdr.magic = SEG_WALLESS_ADMISSION_MAGIC;
@@ -17047,31 +17432,96 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (ordered_record && fork_meta_snapshot_generation != 0 &&
 		hdr.lsn < fork_meta_snapshot_cutoff_lsn)
 		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
-	if (ordered_record)
+	/*
+	 * control_fence_done means the control-collision pre-check above
+	 * already computed this admission's exact fence-driven position (or
+	 * determined none applies) in one pass and is holding
+	 * artifact_fence_lock if it promoted -- see that check's comment for
+	 * why a second control_prune_fences() sample here would self-deadlock.
+	 * Every other ordered_record case (relation clamped, either klass'
+	 * zero_version) still needs this block.
+	 */
+	if (ordered_record && !control_fence_done)
 	{
 		PsPruneFence *fences = NULL;
 		uint32_t nfences = 0;
 		uint64_t newest;
 		int rc;
+		int is_control = key->klass == PS_KLASS_CONTROL;
 
 		/* An operational write must be newer than every protected snapshot,
 		 * not just the compaction cutoff.  Reuse pruning's ancestry projection
-		 * for branch caps and PAGE_HISTORY pins.  A tuple-capped reader can
-		 * exclude our fresh admission at the same LSN; a bare-LSN branch or
-		 * legacy pin requires its successor.  Admission-rd excludes pin SET,
-		 * and the caller's shard-write lock excludes CREATE_BRANCH through
-		 * publication, so neither fence set can change after this sample. */
-		ps_lock_map_rd();
-		rc = page_prune_fences(timeline, &fences, &nfences);
+		 * for branch caps and PAGE_HISTORY pins -- a control image instead
+		 * uses control_prune_fences()'s broader set (WAL-only pins and
+		 * retained artifact cutoffs also protect it; Codex review finding
+		 * 4097536254), under its stricter map-wr + page-prune-read-fence
+		 * contract, which nests in the same shard-wr -> page_prune_lock(rd)
+		 * -> map-wr order compact_timeline()'s Phase 2 already uses (the
+		 * caller holds this shard's write lock throughout).  A tuple-capped
+		 * reader can exclude our fresh admission at the same LSN; a
+		 * bare-LSN branch or legacy pin requires its successor.
+		 * Admission-rd excludes pin SET, and the caller's shard-write lock
+		 * excludes CREATE_BRANCH through publication, so neither fence set
+		 * can change after this sample. */
+		if (is_control)
+		{
+			pthread_rwlock_rdlock(&page_prune_lock);
+			ps_lock_map_wr();
+			rc = control_prune_fences(timeline, &fences, &nfences);
+		}
+		else
+		{
+			ps_lock_map_rd();
+			rc = page_prune_fences(timeline, &fences, &nfences);
+		}
 		/* A dropped pin/branch must not make a later ordered write sort
 		 * behind a version already admitted at that former horizon.  The
 		 * bound markers preserve this operational position across restart. */
 		newest = fork_newest_visible_lsn_through(timeline, key);
+		/*
+		 * Codex review finding 4098328787: on a multi-shard store, another
+		 * shard's SLRU/reader-snapshot append can call
+		 * artifact_fence_reserve() -- which registers or bumps a NEW
+		 * artifact cutoff under only artifact_fence_lock, a plain mutex --
+		 * at any point where it can reach map_rd.  If we released map-wr
+		 * right after sampling control_prune_fences() as before, that
+		 * append could register a cutoff we never saw AFTER our sample but
+		 * BEFORE our colliding record is indexed by page_add_version()
+		 * below, leaving this control rewrite unprotected from an as-of
+		 * restore against that artifact.  Take artifact_fence_lock here,
+		 * still under page_prune_lock+map-wr: that matches
+		 * control_prune_fences()'s own nested order (it takes
+		 * artifact_fence_lock internally, via artifact_fence_snapshot(),
+		 * while compaction already holds page_prune_lock+map-wr), so this
+		 * is not a new lock order.  Because we still hold map-wr at this
+		 * point, no other thread can even reach artifact_fence_reserve()'s
+		 * map_rd yet, so there is no gap between the fence sample above and
+		 * this acquisition for a new registration to land in.  We then
+		 * release page_prune_lock+map-wr as usual but keep
+		 * artifact_fence_lock -- a plain mutex, not held across any other
+		 * shard's or timeline's map access -- through to publication
+		 * (page_add_version() below); every early return between here and
+		 * there releases it first.  Control images are rare, so holding a
+		 * plain mutex across the rest of one admission (including its
+		 * segment I/O) is acceptable.
+		 */
+		if (is_control)
+			pthread_mutex_lock(&artifact_fence_lock);
 		ps_unlock_map();
+		if (is_control)
+		{
+			pthread_rwlock_unlock(&page_prune_lock);
+			artifact_fence_locked = 1;
+		}
 		if (hdr.lsn < newest)
 			hdr.lsn = newest;
 		if (rc != 0)
 		{
+			if (artifact_fence_locked)
+			{
+				pthread_mutex_unlock(&artifact_fence_lock);
+				artifact_fence_locked = 0;
+			}
 			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
 		}
@@ -17085,6 +17535,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				if (hdr.lsn == UINT64_MAX)
 				{
 					free(fences);
+					if (artifact_fence_locked)
+					{
+						pthread_mutex_unlock(&artifact_fence_lock);
+						artifact_fence_locked = 0;
+					}
 					*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
 					return -1;
 				}
@@ -17103,6 +17558,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	if ((ordered_record || segment_grows) &&
 		!fork_meta_mutation_future(hdr_grow_lsn, admission_seq))
 	{
+		if (artifact_fence_locked)
+		{
+			pthread_mutex_unlock(&artifact_fence_lock);
+			artifact_fence_locked = 0;
+		}
 		*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
 		return -1;
 	}
@@ -17131,6 +17591,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off,
 								  &bound_hdr, sizeof(bound_hdr)) != 0)
 		{
+			if (artifact_fence_locked)
+			{
+				pthread_mutex_unlock(&artifact_fence_lock);
+				artifact_fence_locked = 0;
+			}
 			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
 		}
@@ -17142,6 +17607,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off,
 								  &admission_hdr, sizeof(admission_hdr)) != 0)
 		{
+			if (artifact_fence_locked)
+			{
+				pthread_mutex_unlock(&artifact_fence_lock);
+				artifact_fence_locked = 0;
+			}
 			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
 		}
@@ -17149,6 +17619,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	data_off = s->cur_off + header_size;
 	if (ps_storage->seg_write(s->id, s->cur_seg, data_off, page, page_size) != 0)
 	{
+		if (artifact_fence_locked)
+		{
+			pthread_mutex_unlock(&artifact_fence_lock);
+			artifact_fence_locked = 0;
+		}
 		*outcome = PS_APPEND_IO_FAILED;
 		return -1;
 	}
@@ -17166,6 +17641,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		/* The complete body is not committed without its marker.  Retire this
 		 * segment so a later torn header cannot reuse that stale body. */
 		s->cur_off = segment_size;
+		if (artifact_fence_locked)
+		{
+			pthread_mutex_unlock(&artifact_fence_lock);
+			artifact_fence_locked = 0;
+		}
 		*outcome = PS_APPEND_IO_FAILED;
 		return -1;
 	}
@@ -17173,6 +17653,17 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	/* index points at the page bytes (data_off), so reads skip the header */
 	page_add_version(timeline, key, block, page_version, admission_seq,
 					 s->id, s->cur_seg, data_off);
+	/*
+	 * Publication (Codex review finding 4098328787): the version is now
+	 * indexed and resolvable by reads/compaction, so a new artifact fence
+	 * registered from here on legitimately fences only what it can still
+	 * see -- release the hold taken in the ordered_record block above.
+	 */
+	if (artifact_fence_locked)
+	{
+		pthread_mutex_unlock(&artifact_fence_lock);
+		artifact_fence_locked = 0;
+	}
 
 	/* Drop a partial cache insertion for this exact durable version, if any. */
 	ps_pgcache_invalidate(timeline, key, block, page_version, admission_seq);
@@ -17251,9 +17742,140 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	else
 		fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn, admission_seq);
+	/*
+	 * Codex review finding 4099084954: this admission just promoted a
+	 * control image/note (block 0/1) above a fence (clamped, via the
+	 * control-collision pre-check above, control_fence_done).  Its paired
+	 * block may still sit at the original, unpromoted LSN -- ps_control_drain()
+	 * always ships the pair at one shared version, but whichever half is
+	 * admitted FIRST publishes before a fence can appear and has no way to
+	 * retroactively move once it has.  Chase it now that this record's own
+	 * bookkeeping (segment cursor, memtable staging, fork size history) is
+	 * completely finished: the paired write below reuses this same shard's
+	 * append cursor via a nested append_page_impl() call, which must not
+	 * run any earlier, before s->cur_off has advanced past this record --
+	 * an earlier attempt at this (during review) placed the call right
+	 * after page_add_version(), while s->cur_off still pointed at this
+	 * record's own offset, so the nested write silently landed on top of
+	 * the bytes just written here.  No lock beyond the shard write lock the
+	 * caller already holds throughout this whole call is needed: it alone
+	 * already serializes every admission to this key (either block, since
+	 * shard_for() maps by key, not block) against this one, and the
+	 * follow-write makes no fence-dependent decision of its own -- it only
+	 * copies bytes to an lsn this admission already determined -- so
+	 * holding artifact_fence_lock across it (already released above) would
+	 * only risk the map-wr the memtable-flush path above can take, against
+	 * the page_prune_lock -> map -> artifact_fence_lock order established
+	 * elsewhere in this function.
+	 */
+	if (key->klass == PS_KLASS_CONTROL && clamped && control_fence_done &&
+		(block == PS_CONTROL_IMAGE_BLOCK || block == PS_CONTROL_NOTE_BLOCK))
+		control_pair_follow_promotion(timeline, key, block, version, hdr.lsn);
 	if (out_admission_seq)
 		*out_admission_seq = admission_seq;
 	return 0;
+}
+
+/*
+ * Codex review finding 4099084954: ps_control_drain() always ships a
+ * control image (block 0) and its floor note (block 1) at one shared
+ * version -- the normal pair (note then image, both at the update LSN)
+ * and the exact-redo pair (image then note, both at the checkpoint's
+ * redo) -- so control_images_covered()/wal_retain_floor() require every
+ * restorable image to have a same-LSN note.  The control-collision
+ * pre-check in append_page_impl() (above) promotes a colliding block 0/1
+ * admission above a fence one block at a time; whichever half of the
+ * pair is admitted SECOND naturally lands at the promoted LSN through
+ * that SAME check (it collides with the pair's shared original LSN and
+ * sees the same fence), but the half admitted FIRST has already
+ * published at the original LSN before the fence existed and cannot
+ * retroactively move.  Called at the very end of the promoted admission's
+ * own append_page_impl() call, after every piece of that record's own
+ * bookkeeping (segment cursor advance, memtable staging, fork size
+ * history) has finished: look up the paired block's version at the
+ * pair's ORIGINAL (pre-promotion) LSN on this same timeline and, if the
+ * pair does not already have a version at the promoted LSN, republish a
+ * byte-identical copy of it there through the ordinary admission path
+ * (a nested append_page_impl() call), restoring the same-LSN pairing
+ * control_images_covered() checks.  It must run this late, not right
+ * after page_add_version(): the nested call reuses this same shard's
+ * append cursor (shard_for() maps by key, not block), and that cursor
+ * has not advanced past the promoted record's own bytes until its own
+ * bookkeeping is done -- calling any earlier would silently overwrite
+ * them.
+ *
+ * This re-admission is not itself a collision (nothing yet exists for
+ * the paired block at promoted_lsn), so it takes append_page_impl()'s
+ * plain, unfenced path: it does not re-enter the control-collision
+ * branch (which only fires on a collision), so it never touches
+ * artifact_fence_lock -- which the caller has in any case already
+ * released by this point (see the comment at the call site).  No lock
+ * beyond the shard write lock the caller holds throughout the whole
+ * outer call is needed: that alone already serializes every admission
+ * to this key (either block) against this one.  This also does not need
+ * PS_KLASS_SLRU/READER_SNAPSHOT's artifact_lsn plumbing (control images
+ * do not use it), and does not need admission-rd explicitly -- it is
+ * already held across the whole dispatched operation this runs inside
+ * of, exactly as append_page_impl()'s own contract already assumes.
+ *
+ * Best-effort: a failure here (allocation, I/O, or simply finding
+ * nothing to follow) does not fail the admission that triggered it.
+ * wal_retain_floor() already fails closed -- retaining everything --
+ * rather than under-retaining when a pair goes unmatched, so a missed
+ * follow-promotion is safe, just conservative, until a later successful
+ * one (or compaction, M5) closes the gap.
+ */
+static void
+control_pair_follow_promotion(uint32_t timeline, const PsKey *key,
+							  uint32_t block, uint64_t orig_lsn,
+							  uint64_t promoted_lsn)
+{
+	uint32_t	other_block;
+	PageEnt    *other;
+	PageVer    *src = NULL;
+	unsigned char *buf;
+	uint64_t	dummy_seq = 0;
+	uint64_t	dummy_artifact_lsn = 0;
+	PsAppendOutcome dummy_outcome = PS_APPEND_OK;
+
+	if (orig_lsn == promoted_lsn)
+		return;
+	other_block = (block == PS_CONTROL_IMAGE_BLOCK) ? PS_CONTROL_NOTE_BLOCK :
+		PS_CONTROL_IMAGE_BLOCK;
+	other = page_find(timeline, key, other_block);
+	if (!other)
+		return;					/* nothing shipped for the paired block yet */
+	for (int i = 0; i < other->nver; i++)
+		if (other->vers[i].lsn == promoted_lsn)
+			return;				/* already paired at the promoted version */
+	for (int i = 0; i < other->nver; i++)
+		if (other->vers[i].lsn == orig_lsn &&
+			(!src || other->vers[i].admission_seq > src->admission_seq))
+			src = &other->vers[i];
+	if (!src)
+		return;					/* paired block was never at the shared LSN */
+	buf = malloc(page_size);
+	if (!buf)
+		return;
+	if (src->seg >= 0)
+	{
+		if (read_version(src, buf) != 0)
+		{
+			free(buf);
+			return;
+		}
+	}
+	else if (layer_map_lookup(timeline, key, other_block, src->lsn, 0,
+							  src->lsn, NULL, NULL, buf) != 1)
+	{
+		free(buf);
+		return;
+	}
+	(void) append_page_impl(timeline, key, other_block, buf, promoted_lsn,
+							&dummy_seq, &dummy_artifact_lsn, &dummy_outcome);
+	if (dummy_artifact_lsn != 0)
+		artifact_fence_release(timeline, dummy_artifact_lsn);
+	free(buf);
 }
 
 /* Read a specific version's page bytes into out (page_size bytes). */
@@ -18480,7 +19102,8 @@ typedef struct ArtifactFence
 static ArtifactFence *artifact_fences;
 static uint32_t nartifact_fences;
 static uint32_t artifact_fence_cap;
-static pthread_mutex_t artifact_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+/* artifact_fence_lock is declared near page_prune_lock, above, so distant
+ * callers (append_page_impl()'s control-image admission path) can use it. */
 
 /*
  * Find or add the registry entry for (timeline, lsn).  Caller holds the
@@ -20156,6 +20779,278 @@ fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
 	return newest == UINT64_MAX ? UINT64_MAX : newest + 1;
 }
 
+/*
+ * Bug B, fork-meta side: bump *lsn_inout so an event admitted at
+ * (*lsn_inout, admission_seq) on 'timeline' sorts strictly after every live
+ * descendant branch cap and every active PAGE_HISTORY retention pin, the
+ * same fence set and same tie-break rule append_page_impl()'s ordered-record
+ * path applies to page admissions (see page_prune_fences()).  Also floors
+ * *lsn_inout at 'key's current newest visible fork-meta lsn: shrinking the
+ * live-descendant set (a sibling branch deletion) must never let a later
+ * promoted event sort BEFORE one promoted earlier while that sibling was
+ * still live -- fences alone are not enough once a fence that produced an
+ * earlier promotion can later disappear (Codex review finding 4097536226;
+ * append_page_impl()'s ordered-record path applies the identical floor via
+ * fork_newest_visible_lsn_through()).  Landing exactly on the floor is safe
+ * without a further tie-break bump: a fresh admission_seq is always greater
+ * than whatever produced the existing newest event, so the ordinary
+ * admission_seq tie-break at equal lsn already keeps this event sorting
+ * after it.
+ *
+ * Also sorts strictly above every WAL-index-only owner pin
+ * (walidx_prune_fences()) and 'timeline's own WAL-index progress horizon
+ * (walidx_progress_read()) (Codex review finding 4099084959):
+ * page_prune_fences() alone only covers PAGE_HISTORY pins and descendant
+ * branch caps, but WAL-index compaction/replay plans against fork history
+ * up to its own progress horizon and any WAL-index-only pin exactly the
+ * same way page-history compaction plans against page_prune_fences() (see
+ * walidx_plan_bases_build(), which folds walidx_progress_read() and
+ * walidx_prune_fences() into one "horizons" set for exactly this reason) --
+ * a fork-meta mutation that lands at or below either, undetected because it
+ * carries no page fence of its own, leaves WAL-index replay reasoning about
+ * a fork state the daemon's own history no longer agrees with.  These two
+ * are LSN-only (walidx_prune_fences() returns bare uint64_t positions, no
+ * paired admission_seq the way PsPruneFence carries), so a collision always
+ * sorts STRICTLY above them -- there is no tuple to tie-break against.
+ *
+ * Lock order: page_prune_fences() only needs map-rd (its documented
+ * contract).  walidx_prune_fences()'s contract is stricter ("Caller holds
+ * map-rd and the WAL-index prune read fence") -- acquire walidx_prune_lock
+ * as reader BEFORE map-rd, matching walidx_plan_bases_build()'s own
+ * established order (shard-rd(s) -> walidx_prune_lock(rd) -> map-rd; this
+ * caller holds no shard lock, so it only reuses the walidx_prune_lock ->
+ * map suffix of that order, introducing nothing new).  The one place that
+ * takes walidx_prune_lock as WRITER without first excluding admission-rd
+ * via admission_write_lock() is PS_OP_RETENTION_PIN_DROP (this file, a few
+ * hundred lines below), which can therefore run concurrently with this
+ * admission-rd-held call; that writer only ever waits on walidx_prune_lock
+ * itself (then briefly map-rd, released before it does anything else) and
+ * never on anything this function holds first, so contention here is
+ * ordinary reader/writer waiting, not a cycle.  walidx_progress_read() is
+ * read after releasing both locks; it uses its own independent
+ * walidx_meta_lock and only ever advances, so a slightly later read is
+ * still a safe (if marginally more current) floor.
+ *
+ * Caller must not hold map_lock or walidx_prune_lock.  Returns 0 on
+ * success, -1 on an internal failure (allocation, or the pathological
+ * UINT64_MAX-collision case) the caller should surface as a refusal.
+ */
+static int
+fence_promote_lsn(uint32_t timeline, const PsKey *key, uint64_t admission_seq,
+				  uint64_t *lsn_inout)
+{
+	PsPruneFence *fences = NULL;
+	uint32_t	nfences = 0;
+	uint64_t   *wfences = NULL;
+	uint32_t	nwfences = 0;
+	uint64_t	lsn = *lsn_inout;
+	uint64_t	newest;
+	uint64_t	walidx_progress;
+	int			rc;
+	int			wrc = -1;
+
+	pthread_rwlock_rdlock(&walidx_prune_lock);
+	ps_lock_map_rd();
+	rc = page_prune_fences(timeline, &fences, &nfences);
+	if (rc == 0)
+		wrc = walidx_prune_fences(timeline, &wfences, &nwfences);
+	newest = fork_newest_visible_lsn_through(timeline, key);
+	ps_unlock_map();
+	pthread_rwlock_unlock(&walidx_prune_lock);
+	if (rc != 0 || wrc != 0)
+	{
+		free(fences);
+		free(wfences);
+		return -1;
+	}
+	if (lsn < newest)
+		lsn = newest;
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		if (lsn < fences[i].lsn)
+			lsn = fences[i].lsn;
+		if (lsn == fences[i].lsn && admission_seq <= fences[i].admission_seq)
+		{
+			if (lsn == UINT64_MAX)
+			{
+				free(fences);
+				free(wfences);
+				return -1;
+			}
+			lsn++;
+		}
+	}
+	free(fences);
+	walidx_progress = walidx_progress_read(timeline);
+	if (lsn <= walidx_progress)
+	{
+		if (walidx_progress == UINT64_MAX)
+		{
+			free(wfences);
+			return -1;
+		}
+		lsn = walidx_progress + 1;
+	}
+	for (uint32_t i = 0; i < nwfences; i++)
+		if (lsn <= wfences[i])
+		{
+			if (wfences[i] == UINT64_MAX)
+			{
+				free(wfences);
+				return -1;
+			}
+			lsn = wfences[i] + 1;
+		}
+	free(wfences);
+	*lsn_inout = lsn;
+	return 0;
+}
+
+/*
+ * Does 'key' have a recorded fork-meta event at EXACTLY 'lsn', either
+ * locally on 'timeline' or INHERITED from an ancestor through ordinary
+ * read-through ancestry (tl_walk, each level capped by branch_lsn exactly
+ * like a real read)?  The fork-meta analogue of page_has_version_at_ancestry()
+ * (see its comment for the inheritance-miss shape; Codex review finding
+ * 4098328776's fork-event case: a post-fork TRUNCATE/UNLINK reusing an lsn
+ * 'timeline' only inherited a CREATE at, from an ancestor it never locally
+ * recorded, must still be recognized as a collision so it does not leak
+ * into 'timeline's own descendants).  Caller holds this shard's write lock
+ * (matches fork_event_exists_at()'s old contract); takes map_rd internally.
+ */
+static int
+fork_event_exists_at_ancestry(uint32_t timeline, const PsKey *key,
+							  uint64_t lsn)
+{
+	TlWalk		w;
+	int			found = 0;
+
+	ps_lock_map_rd();
+	w = tl_walk_first(timeline, lsn);
+	for (;;)
+	{
+		if (w.lsn == lsn)
+		{
+			ForkEnt    *e = fork_find(w.tl, key);
+
+			if (e != NULL)
+			{
+				for (uint32_t i = 0; i < e->nev; i++)
+					if (e->ev[i].lsn == lsn)
+					{
+						found = 1;
+						break;
+					}
+			}
+			if (found)
+				break;
+		}
+		if (!tl_walk_next(&w) || w.lsn < lsn)
+			break;
+	}
+	ps_unlock_map();
+	return found;
+}
+
+/*
+ * Cheap collision check + exact promotion for a fork-meta event LSN
+ * (CREATE/UNLINK/TRUNCATE/ZEROEXTEND).  admission_seq==0 (allocation
+ * failure) and lsn==0/UINT64_MAX (WAL-less floor / already-maximal) are
+ * passed through unchanged -- the caller's existing admission_seq==0
+ * handling covers the former, and the latter cannot be pushed any higher or
+ * need not be.
+ *
+ * Two ambiguous shapes route through the exact fence computation
+ * (fence_promote_lsn()): an *unstamped* fork-meta mutation (orig_req_lsn ==
+ * 0, the caller's ORIGINAL request before fork_op_lsn() resolved it) -- the
+ * same "no real WAL-based claim" treatment a WAL-less relation page (lsn 0)
+ * already gets unconditionally (see append_page_impl()'s zero_version path)
+ * -- or reusing an lsn this same key already has an event recorded at, now
+ * checked through ancestry (fork_event_exists_at_ancestry(), Codex review
+ * finding 4098328776: a post-fork TRUNCATE/UNLINK reusing an lsn 'timeline'
+ * only inherited a CREATE at, never locally, used to bypass promotion and
+ * leak into 'timeline's own descendants).  This fix originally also
+ * promoted any lsn landing EXACTLY at a live descendant's cap on the theory
+ * that an exact-cap lsn could only be a stale/derived op-LSN, but a real
+ * event whose own lsn genuinely IS the fork LSN belongs to that fork's
+ * inclusive as-of-L snapshot and that equality rule wrongly hid it (Codex
+ * review finding 4097536244); a distinct, strictly-lower lsn -- exact-cap
+ * or not -- is ordinary WAL-ordered fork history and stays admissible
+ * unchanged.  "Arrival order is not version order"
+ * (pagestore_test.c's run_prune_relation_lifecycle_suite and
+ * run_branches_suite): a fork-meta mutation genuinely CAN be admitted with
+ * a lower lsn after one with a higher lsn was already recorded for the same
+ * key (a materializer/recovery worker replaying a different record for the
+ * same relation than the one a writer just admitted), and ordinary
+ * lsn-based resolution -- not admission order -- must keep deciding
+ * "newest" for those; only an EXACT reuse of an already-occupied position
+ * is ambiguous enough to promote.
+ *
+ * KNOWN GAP (Codex review finding 4098328796, not fully closed here):
+ * exact-match evidence is not eternal.  Forkmeta compaction (see
+ * ps_forkmeta_prune_plan(), pagestore_forkmeta_prune.h, an ongoing
+ * retention pass independent of the coarser fork_meta_snapshot_generation
+ * cutover) can retire the original colliding event once a later promoted
+ * event makes it unreachable, and a restart then loses it from memory
+ * entirely -- so a stale mutation reusing that same original lsn, admitted
+ * after such compaction, finds no event at that lsn either and stays
+ * unpromoted, below the still-durable promoted event it should sort after.
+ * A prototype fix floored *lsn_inout at fork_newest_visible_lsn_through()
+ * whenever the original lsn fell below the durable forkmeta snapshot
+ * cutoff (fork_meta_snapshot_cutoff_lsn), on the theory that exact-match
+ * evidence can only be lost below that cutoff.  Testing falsified it two
+ * ways at once, both against this same mechanism (fork_meta_persist()'s own
+ * "kind <= FEV_DEAD && !fork_meta_mutation_future(lsn, admission_seq)"
+ * check, which independently rejects any EXPLICIT mutation whose (possibly
+ * promoted) position still lands below that cutoff):
+ *   - it broke "arrival order is not version order" for keys whose OWN
+ *     definitive history straddles the cutoff (run_prune_relation_lifecycle_suite's
+ *     "create before delayed unlink" and run_branches_suite's "delayed
+ *     older truncate" cases: a genuinely honest, non-colliding, merely
+ *     late-processed mutation below the key's current newest position was
+ *     wrongly floored up to it and reordered after it);
+ *   - promoting to fork_newest_visible_lsn_through() lands at or above the
+ *     cutoff by construction (a surviving event is never below it), which
+ *     means the floor ALSO rescues a mutation that legitimately targets a
+ *     position below the cutoff for a key with no real history there at
+ *     all (pagestore_forkmeta_cutover_test's "fork mutation below selected
+ *     cutoff is rejected": a bare CREATE at 300, comfortably above a 200
+ *     cutoff, is indistinguishable in every respect from Codex's pruned
+ *     CREATE@1000 once only its own newest position is visible).
+ * Both are the SAME underlying problem: without persisted provenance
+ * (explicitly rejected as too large a change surface -- see this fix's
+ * revision history, which also rejected the more precise but heavier
+ * branch_seq/two-dimensional-fence design for the same reason), "this lsn
+ * once collided with something now pruned" and "this lsn never had any
+ * history at all" are the same observation from current state.  Closing
+ * this narrow gap needs either persisted provenance or a durable
+ * placeholder/tombstone at any position forkmeta compaction retires after a
+ * promotion (mirroring the relation-page path's bound markers, which exist
+ * for exactly this reason -- see append_page_impl()'s ordered-record
+ * comments) -- both real, if smaller, design changes, so left for a
+ * follow-up rather than forced in here.  What DOES already help: a real
+ * fork_meta_snapshot_generation cutover's OWN fork_meta_mutation_future()
+ * check independently rejects (fails closed) any stale mutation whose
+ * ORIGINAL lsn falls below that cutover's cutoff, so this gap is reachable
+ * only when compaction prunes the colliding event before any such cutover
+ * has ever been established for the timeline.
+ *
+ * Returns 1 on success (possibly bumping *lsn_inout), 0 on an internal
+ * failure the caller should surface as PS_STATUS_ERROR.
+ */
+static int
+fork_meta_lsn_promote(uint32_t timeline, const PsKey *key,
+					  uint64_t orig_req_lsn, uint64_t admission_seq,
+					  uint64_t *lsn_inout)
+{
+	if (admission_seq == 0 || *lsn_inout == 0 || *lsn_inout == UINT64_MAX)
+		return 1;
+	if (orig_req_lsn != 0 &&
+		!fork_event_exists_at_ancestry(timeline, key, *lsn_inout))
+		return 1;
+	return fence_promote_lsn(timeline, key, admission_seq, lsn_inout) == 0;
+}
+
 /* Caller holds map_lock for writing and the global admission write lock. */
 static int
 timeline_has_live_descendant(uint32_t ancestor)
@@ -20446,7 +21341,94 @@ ps_handle_meta(PsChannel *ch)
 					if (live)
 						break;
 				}
+				/*
+				 * Codex review finding 4097536220: check CREATE-retry
+				 * idempotence at 'lsn' BEFORE any promotion decision.
+				 * fork_meta_lsn_promote() can bump lsn past a live
+				 * descendant's fence or retention pin; checking
+				 * fork_has_create_at() only AFTER that bump looks for the
+				 * retry's own record at the promoted position instead of
+				 * where the original CREATE actually landed, so the
+				 * duplicate goes undetected and a fresh zero-block FEV_SET
+				 * gets persisted on top of it, hiding every page already
+				 * admitted under the original CREATE.
+				 *
+				 * A plain fork_has_create_at(e, lsn) is not by itself
+				 * enough, though: it only asks whether the last SET/DEAD
+				 * recorded AT THIS EXACT LSN is a zero-block SET, not
+				 * whether this is genuinely the LAST thing that happened to
+				 * the fork.  Once other fork-meta mutations sharing this
+				 * same requested lsn can themselves be promoted elsewhere
+				 * (a live descendant or retention pin fencing a LATER
+				 * mutation but not this earlier CREATE, e.g. a
+				 * create/extend/truncate/unlink/recreate sequence that all
+				 * requested the same lsn), the ORIGINAL CREATE's own record
+				 * can be left behind, orphaned, at 'lsn' while the fork's
+				 * true current state has moved on past it (unlinked, then
+				 * promoted elsewhere) -- fork_has_create_at(e, lsn) alone
+				 * would then misidentify a brand-new, later, unrelated
+				 * CREATE as a retry of the ORIGINAL one purely because they
+				 * share a requested lsn, and wrongly skip it instead of
+				 * recording the fork's real new state.  Require the
+				 * zero-block SET at 'lsn' to also be the fork's newest
+				 * DEFINITIVE (SET/DEAD) event -- e->def_idx tracks only
+				 * those, skipping ordinary FEV_GROW page-growth bookkeeping
+				 * (an untouched CREATE retry legitimately has pages written
+				 * after it, e.g. the very pages this retry must not hide;
+				 * that growth must not by itself defeat idempotence).  Only
+				 * a LATER definitive event -- a real TRUNCATE/UNLINK/
+				 * another CREATE, something that actually changed the
+				 * fork's lifecycle state since -- makes this not a pure
+				 * retry.
+				 *
+				 * Codex review finding 4098831601: 'e' alone is not enough
+				 * either, once fork_meta_lsn_promote() became ancestry-aware
+				 * (page_has_version_at_ancestry()/fork_event_exists_at_ancestry(),
+				 * this file).  A CREATE retry on a non-root timeline whose
+				 * ORIGINAL CREATE is only INHERITED -- never stored locally
+				 * on 'tl' -- has e->ndef == 0 here regardless, so a
+				 * local-only check never finds it; promotion, however, DOES
+				 * now find the inherited CREATE through ancestry and can
+				 * bump the retry's lsn past a descendant fence or the key's
+				 * newest inherited page, and the local-only check then also
+				 * misses the duplicate at the promoted position, persisting
+				 * a fresh zero-block FEV_SET that hides every inherited
+				 * page.  fork_newest_definitive_event_through() applies the
+				 * same "newest DEFINITIVE event, skipping GROW" rule through
+				 * the same ancestry tl_walk() promotion itself now uses.
+				 */
+				{
+					uint64_t	def_lsn;
+					uint8_t		def_kind;
+					uint32_t	def_nblocks;
+					int			def_found;
+
+					fork_newest_definitive_event_through(tl, &ch->key,
+														 &def_lsn, &def_kind,
+														 &def_nblocks,
+														 &def_found);
+					if (def_found && def_lsn == lsn &&
+						def_kind == FEV_SET && def_nblocks == 0)
+						break;
+				}
+
 				seq = admission_seq_alloc();
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
+				/*
+				 * Codex review finding 4098831579: validate the caller's
+				 * ORIGINAL (req_lsn, seq) tuple against the forkmeta
+				 * snapshot cutover before trusting the (possibly promoted)
+				 * 'lsn' -- promotion can push an explicit, below-cutoff
+				 * mutation above a live descendant/pin fence, after which
+				 * fork_meta_persist() below would see only the promoted lsn
+				 * and accept a tuple the cutover requires rejecting.  Same
+				 * check the nearby ZEROEXTEND case already applies to
+				 * ch->req_lsn before fork_grow_with_seq().
+				 */
+				if (seq != 0 && ch->req_lsn != 0 &&
+					!fork_meta_mutation_future(ch->req_lsn, seq))
+					seq = 0;
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
@@ -20532,7 +21514,18 @@ ps_handle_meta(PsChannel *ch)
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
-				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
+				int			delayed;
+
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
+				/* Codex review finding 4098831579: validate the ORIGINAL
+				 * (req_lsn, seq) tuple against the forkmeta snapshot
+				 * cutover before trusting the possibly-promoted 'lsn' --
+				 * see the identical check in the CREATE case above. */
+				if (seq != 0 && ch->req_lsn != 0 &&
+					!fork_meta_mutation_future(ch->req_lsn, seq))
+					seq = 0;
+				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
 				{
@@ -20597,7 +21590,18 @@ ps_handle_meta(PsChannel *ch)
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
-				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
+				int			delayed;
+
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
+				/* Codex review finding 4098831579: validate the ORIGINAL
+				 * (req_lsn, seq) tuple against the forkmeta snapshot
+				 * cutover before trusting the possibly-promoted 'lsn' --
+				 * see the identical check in the CREATE case above. */
+				if (seq != 0 && ch->req_lsn != 0 &&
+					!fork_meta_mutation_future(ch->req_lsn, seq))
+					seq = 0;
+				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
 				{
@@ -20629,6 +21633,8 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	seq = admission_seq_alloc();
 				uint32_t	to = ch->blocknum + ch->nblocks;
 
+				if (seq != 0 && !fork_meta_lsn_promote(tl, &ch->key, ch->req_lsn, seq, &lsn))
+					seq = 0;
 				/* Validate the caller's explicit tuple before fork_grow_with_seq()
 				 * can clamp its effective LSN to a newer definitive event. */
 				if (seq == 0 ||

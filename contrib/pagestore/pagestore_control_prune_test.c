@@ -116,6 +116,25 @@ write_note(uint32_t timeline, uint64_t version, uint64_t redo)
 	return rc == 0 && ps_storage->sync() == 0;
 }
 
+/* The control image alone, colliding with an existing same-version pair's
+ * image without necessarily re-shipping its note: reproduces a same-version
+ * retry that only re-sends block 0 (Codex review finding 4099084954's
+ * split-write scenario). */
+static int
+write_image(uint32_t timeline, uint64_t version)
+{
+	PsKey key = control_key();
+	unsigned char page[8192];
+	int rc;
+
+	ps_lock_shard_wr(ps_shard_of(&key));
+	memset(page, 0xC3, sizeof(page));
+	memcpy(page, &version, sizeof(version));
+	rc = append_page(timeline, &key, PS_CONTROL_IMAGE_BLOCK, page, version, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
 /* A note whose trailer names another format: the floor cannot be derived. */
 static int
 write_foreign_note(uint32_t timeline, uint64_t version, uint64_t redo)
@@ -783,6 +802,70 @@ test_failed_artifact_append_releases_its_fence(void)
 	remove_tree(store);
 }
 
+/*
+ * Codex round-4 review finding 4099084954: ps_control_drain() always ships
+ * a control image (block 0) and its floor note (block 1) at one shared
+ * version, but the admission-time control-collision promotion decided each
+ * block's promoted position independently.  A same-version retry of the
+ * note collides with the pair's original checkpoint while no artifact
+ * fence exists yet, so it stays unpromoted at L; an artifact fence then
+ * registers above L; a same-version retry of the image collides too, but
+ * now DOES see the fence and is promoted to V' > L.  The pair is now split
+ * across two versions -- note only at L, image only at V' -- which
+ * control_images_covered() sees as an image with no matching note,
+ * collapsing wal_retain_floor() to "retain everything" even though the
+ * pair's honest redo (1800) is still fully known from the original,
+ * complete checkpoint.  The fix chases the promotion: whichever half of a
+ * control pair is admitted second and promoted republishes a copy of the
+ * other half at the same promoted version, so the pair stays together and
+ * the floor keeps tracking the real redo instead of collapsing.
+ */
+static void
+test_promoted_control_collision_follows_its_pair(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-pair-XXXXXX";
+	PsKey key = control_key();
+	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
+	unsigned char page[8192];
+	uint64_t image_ver = 0;
+	uint64_t note_ver = 0;
+	uint64_t note_redo = 0;
+	int rc;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the promoted-pair test");
+	check(write_control(0, 2000, 1800),
+		  "write the pair's original, complete checkpoint (note then image) at L=2000");
+	check(write_note(0, 2000, 1800),
+		  "retry the note alone at L=2000: no artifact fence exists yet, so it collides but stays at L");
+
+	memset(page, 0x77, sizeof(page));
+	ps_lock_shard_wr(ps_shard_of(&seed));
+	rc = append_page(0, &seed, 0, page, 2500, NULL);
+	ps_unlock_shard(ps_shard_of(&seed));
+	check(rc == 0 && ps_test_artifact_fence_count(0) == 1,
+		  "an SLRU seed shipped at L=2500 registers an artifact fence");
+
+	check(write_image(0, 2000),
+		  "retry the image alone at L=2000: it collides and is promoted above the new fence");
+
+	check(read_resolve(0, &key, PS_CONTROL_IMAGE_BLOCK, 3000, 0, page,
+					   &image_ver) == 1 && image_ver > 2500,
+		  "the retried image was promoted strictly above the artifact fence");
+	check(read_resolve(0, &key, PS_REDO_NOTE_BLOCK, image_ver, 0, page,
+					   &note_ver) == 1 && note_ver == image_ver,
+		  "the note follows the image to its promoted version, keeping the pair together");
+	memcpy(&note_redo, page, sizeof(note_redo));
+	check(note_redo == 1800,
+		  "the follow-promoted note carries the pair's honest redo");
+	check(wal_floor(0) == 1800,
+		  "wal_retain_floor() does not collapse: the promoted pair is complete at its shared version");
+
+	close_store();
+	remove_tree(store);
+}
+
 /* A materializer pins WAL and the WAL index but no page history, at the redo
  * of its last durable restartpoint.  That pin is the operational page-history
  * cutoff: relation history and control checkpoints below it are retired with
@@ -1134,6 +1217,7 @@ main(void)
 	test_slru_seed_keeps_its_control_image();
 	test_late_artifact_below_frontier_is_refused();
 	test_failed_artifact_append_releases_its_fence();
+	test_promoted_control_collision_follows_its_pair();
 	test_materializer_pin_is_the_page_cutoff();
 	test_checkpoint_note_is_the_page_cutoff();
 	test_stale_artifacts_are_retired();
