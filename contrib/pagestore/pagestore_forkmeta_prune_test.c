@@ -237,78 +237,78 @@ int
 main(void)
 {
 	PsForkMetaEvent lifecycle[] = {
-		{10, 1, 5, PS_FORKMETA_GROW},
-		{20, 2, 8, PS_FORKMETA_SET},
-		{20, 3, 12, PS_FORKMETA_GROW},
-		{30, 4, 20, PS_FORKMETA_GROW},
-		{40, 5, 4, PS_FORKMETA_SET}
+		{10, 1, 5, PS_FORKMETA_GROW, 0},
+		{20, 2, 8, PS_FORKMETA_SET, 0},
+		{20, 3, 12, PS_FORKMETA_GROW, 0},
+		{30, 4, 20, PS_FORKMETA_GROW, 0},
+		{40, 5, 4, PS_FORKMETA_SET, 0}
 	};
 	PsForkMetaEvent sparse[] = {
-		{10, 1, 2, PS_FORKMETA_GROW},
-		{20, 2, 7, PS_FORKMETA_SET},
-		{30, 3, 9, PS_FORKMETA_GROW},
-		{50, 4, 0, PS_FORKMETA_DEAD},
-		{60, 5, 3, PS_FORKMETA_SET}
+		{10, 1, 2, PS_FORKMETA_GROW, 0},
+		{20, 2, 7, PS_FORKMETA_SET, 0},
+		{30, 3, 9, PS_FORKMETA_GROW, 0},
+		{50, 4, 0, PS_FORKMETA_DEAD, 0},
+		{60, 5, 3, PS_FORKMETA_SET, 0}
 	};
 	PsForkMetaEvent generations[] = {
-		{10, 1, 2, PS_FORKMETA_SET},
-		{20, 2, 8, PS_FORKMETA_GROW},
-		{30, 3, 0, PS_FORKMETA_DEAD},
-		{40, 4, 5, PS_FORKMETA_SET},
-		{50, 5, 11, PS_FORKMETA_GROW},
-		{60, 6, 0, PS_FORKMETA_DEAD},
-		{70, 7, 13, PS_FORKMETA_GROW}
+		{10, 1, 2, PS_FORKMETA_SET, 0},
+		{20, 2, 8, PS_FORKMETA_GROW, 0},
+		{30, 3, 0, PS_FORKMETA_DEAD, 0},
+		{40, 4, 5, PS_FORKMETA_SET, 0},
+		{50, 5, 11, PS_FORKMETA_GROW, 0},
+		{60, 6, 0, PS_FORKMETA_DEAD, 0},
+		{70, 7, 13, PS_FORKMETA_GROW, 0}
 	};
 	PsForkMetaEvent same_lsn[] = {
-		{20, 0, 9, PS_FORKMETA_GROW},
-		{20, 2, 3, PS_FORKMETA_SET},
-		{20, 3, 8, PS_FORKMETA_GROW},
-		{30, 4, 12, PS_FORKMETA_GROW}
+		{20, 0, 9, PS_FORKMETA_GROW, 0},
+		{20, 2, 3, PS_FORKMETA_SET, 0},
+		{20, 3, 8, PS_FORKMETA_GROW, 0},
+		{30, 4, 12, PS_FORKMETA_GROW, 0}
 	};
 	PsForkMetaEvent growth[] = {
-		{10, 1, 3, PS_FORKMETA_GROW},
-		{20, 2, 8, PS_FORKMETA_GROW},
-		{30, 3, 8, PS_FORKMETA_GROW},
-		{40, 4, 6, PS_FORKMETA_GROW}
+		{10, 1, 3, PS_FORKMETA_GROW, 0},
+		{20, 2, 8, PS_FORKMETA_GROW, 0},
+		{30, 3, 8, PS_FORKMETA_GROW, 0},
+		{40, 4, 6, PS_FORKMETA_GROW, 0}
 	};
 	PsForkMetaEvent set_grow_set[] = {
-		{10, 1, 5, PS_FORKMETA_SET},
-		{20, 2, 20, PS_FORKMETA_GROW},
-		{30, 3, 15, PS_FORKMETA_SET}
+		{10, 1, 5, PS_FORKMETA_SET, 0},
+		{20, 2, 20, PS_FORKMETA_GROW, 0},
+		{30, 3, 15, PS_FORKMETA_SET, 0}
 	};
 	PsForkMetaEvent based_growth[] = {
-		{10, 1, 0, PS_FORKMETA_SET},
-		{20, 2, 3, PS_FORKMETA_GROW},
-		{30, 3, 20, PS_FORKMETA_GROW},
-		{40, 4, 7, PS_FORKMETA_GROW},
-		{50, 5, 20, PS_FORKMETA_GROW},
-		{60, 6, 1, PS_FORKMETA_GROW}
+		{10, 1, 0, PS_FORKMETA_SET, 0},
+		{20, 2, 3, PS_FORKMETA_GROW, 0},
+		{30, 3, 20, PS_FORKMETA_GROW, 0},
+		{40, 4, 7, PS_FORKMETA_GROW, 0},
+		{50, 5, 20, PS_FORKMETA_GROW, 0},
+		{60, 6, 1, PS_FORKMETA_GROW, 0}
 	};
-	PsForkMetaEvent bad_lsn[] = {{20, 1, 1, PS_FORKMETA_GROW},
-		{10, 2, 2, PS_FORKMETA_GROW}};
-	PsForkMetaEvent bad_seq[] = {{20, 3, 1, PS_FORKMETA_GROW},
-		{20, 2, 2, PS_FORKMETA_GROW}};
-	PsForkMetaEvent legacy_order[] = {{20, 4, 1, PS_FORKMETA_GROW},
-		{20, 0, 2, PS_FORKMETA_GROW},
-		{20, 5, 3, PS_FORKMETA_GROW}};
+	PsForkMetaEvent bad_lsn[] = {{20, 1, 1, PS_FORKMETA_GROW, 0},
+		{10, 2, 2, PS_FORKMETA_GROW, 0}};
+	PsForkMetaEvent bad_seq[] = {{20, 3, 1, PS_FORKMETA_GROW, 0},
+		{20, 2, 2, PS_FORKMETA_GROW, 0}};
+	PsForkMetaEvent legacy_order[] = {{20, 4, 1, PS_FORKMETA_GROW, 0},
+		{20, 0, 2, PS_FORKMETA_GROW, 0},
+		{20, 5, 3, PS_FORKMETA_GROW, 0}};
 	PsForkMetaEvent hidden_seq_regression[] = {
-		{20, 2, 1, PS_FORKMETA_GROW},
-		{20, 0, 2, PS_FORKMETA_GROW},
-		{20, 1, 3, PS_FORKMETA_GROW}
+		{20, 2, 1, PS_FORKMETA_GROW, 0},
+		{20, 0, 2, PS_FORKMETA_GROW, 0},
+		{20, 1, 3, PS_FORKMETA_GROW, 0}
 	};
 	PsForkMetaEvent dead_then_grow[] = {
-		{10, 1, 9, PS_FORKMETA_SET},
-		{20, 2, 0, PS_FORKMETA_DEAD},
-		{30, 3, 5, PS_FORKMETA_GROW}
+		{10, 1, 9, PS_FORKMETA_SET, 0},
+		{20, 2, 0, PS_FORKMETA_DEAD, 0},
+		{30, 3, 5, PS_FORKMETA_GROW, 0}
 	};
 	PsForkMetaEvent wildcard_fence[] = {
-		{10, 1, 1, PS_FORKMETA_SET},
-		{20, 2, 3, PS_FORKMETA_SET},
-		{20, 3, 8, PS_FORKMETA_GROW},
-		{30, 4, 4, PS_FORKMETA_SET}
+		{10, 1, 1, PS_FORKMETA_SET, 0},
+		{20, 2, 3, PS_FORKMETA_SET, 0},
+		{20, 3, 8, PS_FORKMETA_GROW, 0},
+		{30, 4, 4, PS_FORKMETA_SET, 0}
 	};
-	PsForkMetaEvent bad_kind[] = {{20, 1, 1, 9}};
-	PsForkMetaEvent bad_dead[] = {{20, 1, 1, PS_FORKMETA_DEAD}};
+	PsForkMetaEvent bad_kind[] = {{20, 1, 1, 9, 0}};
+	PsForkMetaEvent bad_dead[] = {{20, 1, 1, PS_FORKMETA_DEAD, 0}};
 	unsigned char mask[8];
 
 	check(ps_forkmeta_prune_plan(NULL, 0, (PsForkMetaFence) {1, 1},
@@ -421,14 +421,14 @@ main(void)
 		/* Repeated truncate/regrow churn keeps one base, one fence, and one
 		 * growth per horizon instead of every boundary. */
 		PsForkMetaEvent churn[] = {
-			{10, 1, 0, PS_FORKMETA_SET},
-			{20, 2, 8, PS_FORKMETA_GROW},
-			{30, 3, 2, PS_FORKMETA_SET},
-			{40, 4, 9, PS_FORKMETA_GROW},
-			{50, 5, 3, PS_FORKMETA_SET},
-			{60, 6, 7, PS_FORKMETA_GROW},
-			{70, 7, 1, PS_FORKMETA_SET},
-			{80, 8, 6, PS_FORKMETA_GROW}
+			{10, 1, 0, PS_FORKMETA_SET, 0},
+			{20, 2, 8, PS_FORKMETA_GROW, 0},
+			{30, 3, 2, PS_FORKMETA_SET, 0},
+			{40, 4, 9, PS_FORKMETA_GROW, 0},
+			{50, 5, 3, PS_FORKMETA_SET, 0},
+			{60, 6, 7, PS_FORKMETA_GROW, 0},
+			{70, 7, 1, PS_FORKMETA_SET, 0},
+			{80, 8, 6, PS_FORKMETA_GROW, 0}
 		};
 		unsigned char required[8] = {0};
 
