@@ -222,6 +222,16 @@ extern int ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured);
 /* Test-only: count of walidx_snapshot_publish_one() aborts caused
  * specifically by a plan-epoch mismatch. */
 extern uint64_t ps_test_walidx_plan_epoch_aborts(void);
+/* P2 S3.7(7) rev 2: lsn-range plan guard test hooks.  ps_test_walidx_plan_
+ * guard_note() simulates the admission-path dirty marking a real
+ * fork_event_add()/fork_event_add_seg_marker() call would do (a test
+ * cannot safely call those for real from the plan hook, which fires while
+ * walidx_snapshot_publish_one() still holds map-rd); pass lsn == 0 to mark
+ * dirty regardless of the plan's horizon, or a large lsn (e.g. UINT64_MAX)
+ * to guarantee it stays clean.  ps_test_walidx_plan_guard_skips() counts
+ * rounds walidx_snapshot_publish_one() skipped because of a dirty guard. */
+extern void ps_test_walidx_plan_guard_note(uint32_t timeline, uint64_t lsn);
+extern uint64_t ps_test_walidx_plan_guard_skips(void);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);

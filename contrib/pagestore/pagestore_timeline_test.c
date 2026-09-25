@@ -2953,65 +2953,80 @@ test_deleting_timeline_wal_cleanup(void)
  * P2 (BRANCH_SNAPSHOT_SEQ_CAP.md S3.7(7)) plan-epoch detection for the
  * WAL-index snapshot publish switch.  Deterministic, single-threaded races
  * injected via ps_test_set_walidx_publish_plan_hook(), which fires inside
- * walidx_snapshot_publish_one() right after the plan epoch is captured and
- * every shard lock it held is released -- the same point a genuine
- * concurrent admission could land at in production.
+ * walidx_snapshot_publish_one() right after walidx_plan_guard_begin() fixes
+ * the plan's horizon H (= end_lsn) and opens the guard -- the same point a
+ * genuine concurrent admission could land at in production.
  *
- * Amendment: a racing admission is *detected* here (fork_event_plan_epoch_
- * validate() against the real counter, exercised through the real
- * production call sites) but production does not currently abort and
- * re-plan on it -- see walidx_snapshot_publish_one()'s comment for why a
- * hard gate on this (necessarily per-timeline, not lsn-scoped) counter was
- * found to livelock walidx publication under sustained concurrent writers
- * and was reverted after a real pagestore_soak regression.
+ * S3.7(7) rev 2 (design-review amendment, replacing the earlier per-
+ * timeline plan-epoch gate reverted above): the guard is now lsn-scoped.
+ * walidx_plan_guard_note(tl, lsn) -- called for real from fork_event_add()/
+ * fork_event_add_seg_marker() -- marks the plan dirty only when
+ * lsn <= H, not for every admission on the timeline.  A test cannot call
+ * those for real from the hook (it fires while walidx_snapshot_publish_
+ * one() still holds map-rd, and append_page_impl() needs map-wr -- the
+ * same thread reentering for map-wr while holding map-rd would self-
+ * deadlock; a genuine racing admission in production is a different
+ * thread/connection with no such conflict), so
+ * ps_test_walidx_plan_guard_note() calls the identical production logic
+ * directly.
  */
-typedef struct WalidxPlanRaceCtx
+typedef struct WalidxPlanGuardCtx
 {
 	uint32_t	timeline;
-	uint32_t	block;
+	uint64_t	note_lsn;		/* 0 = below any horizon (dirty); UINT64_MAX
+								 * = above any horizon (stays clean) */
 	int			fired;
-} WalidxPlanRaceCtx;
+} WalidxPlanGuardCtx;
 
 static void
-walidx_plan_race_hook(uint32_t timeline, void *arg)
+walidx_plan_guard_hook(uint32_t timeline, void *arg)
 {
-	WalidxPlanRaceCtx *ctx = arg;
+	WalidxPlanGuardCtx *ctx = arg;
 
 	if (ctx->fired || timeline != ctx->timeline)
 		return;
 	ctx->fired = 1;
-	/*
-	 * Force the epoch forward, exactly as a real fork_event_add()/
-	 * fork_event_add_seg_marker() admission would (both call
-	 * fork_event_admit_seq_bump(), which this test hook reaches through
-	 * the same test-only primitive pagestore_viewcap_test.c's plan-epoch
-	 * checks already exercise against the real counter).  A *real* write
-	 * cannot be issued from here: this hook runs while
-	 * walidx_snapshot_publish_one() still holds map-rd (released only at
-	 * its publish_done:), and append_page_impl() needs map-wr -- the same
-	 * thread reentering for map-wr while it holds map-rd would self-
-	 * deadlock.  In production the racing admission is a genuinely
-	 * different thread/connection, which has no such conflict.  Only
-	 * once: a race injected on every retry would never let the epoch
-	 * stabilize.
-	 */
-	ps_test_plan_epoch_bump(ctx->timeline, ps_test_plan_epoch(ctx->timeline) + 1);
+	/* Only once: injecting this on every retry would never let a dirty
+	 * plan settle. */
+	ps_test_walidx_plan_guard_note(ctx->timeline, ctx->note_lsn);
 }
 
+/*
+ * The dirty case (S8.2/checklist item 3's deterministic race): a late
+ * admission at lsn <= H must make walidx_snapshot_publish_one() skip the
+ * whole attempt -- design doc S3.7(7) rev 2's control-flow guarantee is
+ * that the skip (walidx_plan_guard_dirty() true) happens *before*
+ * ps_walidx_snapshot_prepare()/walidx_frontier_advance()/ps_walidx_
+ * snapshot_commit()/walidx_prune_memory() are ever reached for that
+ * attempt (see the goto publish_done at that check, and the amendment
+ * comment beside it), which a code reviewer can confirm directly and this
+ * test corroborates behaviourally: no plan-epoch abort side effect to
+ * inspect, so the observable proof is that (a) walidx_plan_guard_skips()
+ * advances by exactly one, (b) the timeline is not left broken (an
+ * unrelated write still succeeds and reads back, including after a
+ * clean reopen -- the reopen/recovery-adjacent check checklist item 3
+ * asks for; a real crash between the switch and persist cannot occur in
+ * this design because nothing durable is written when dirty, so this
+ * exercises the same "prepared intent, frontier never advanced" recovery
+ * path a real crash there would also hit, see the amendment comment),
+ * and (c) the very next round -- now clean, since the hook only fires
+ * once -- replans from the post-race state and publishes normally (no
+ * further skip).
+ */
 static void
-test_walidx_publish_plan_epoch_abort_and_replan(void)
+test_walidx_publish_lsn_at_or_below_horizon_skips_and_replans(void)
 {
-	char		store[] = "/tmp/pagestore-walidx-plan-epoch-race-XXXXXX";
+	char		store[] = "/tmp/pagestore-walidx-plan-guard-dirty-XXXXXX";
 	PsChannel	channel;
-	WalidxPlanRaceCtx ctx = {501, 5, 0};
-	uint64_t	aborts_before;
-	uint64_t	aborts_after_fire = 0;
+	WalidxPlanGuardCtx ctx = {501, 0, 0};	/* note_lsn 0: at/below any H */
+	uint64_t	skips_before;
+	uint64_t	skips_after_fire = 0;
 	int			settled = 0;
 
-	check(mkdtemp(store) != NULL, "create walidx plan-epoch race store");
+	check(mkdtemp(store) != NULL, "create walidx plan-guard dirty store");
 	configure_timeline_core();
 	check(ps_core_open(store) == 0 && create_branch(ctx.timeline, 0, 100),
-		  "open store for the walidx plan-epoch race");
+		  "open store for the walidx plan-guard dirty case");
 	/* Force the geometric snapshot trigger down to one byte so a single
 	 * small walidx-log tail is immediately over threshold. A timeline
 	 * number not reused by any earlier test in this binary avoids stale
@@ -3033,53 +3048,116 @@ test_walidx_publish_plan_epoch_abort_and_replan(void)
 	channel.req_lsn = 100;
 	channel.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
 	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
-		  "append a WAL-index tail entry to make the race timeline due");
+		  "append a WAL-index tail entry to make the target timeline due");
 	check(ps_backpressure_configure_all(0, 0, 0, 0, 1, 0) == 0,
 		  "configure a minimal walidx reclaim high-water mark");
 	ps_backpressure_refresh();
 	check(ps_test_walidx_force_due(ctx.timeline) != 0,
-		  "tail-only debt marks the race timeline force-eligible");
+		  "tail-only debt marks the target timeline force-eligible");
 
-	aborts_before = ps_test_walidx_plan_epoch_aborts();
-	ps_test_set_walidx_publish_plan_hook(walidx_plan_race_hook, &ctx);
+	skips_before = ps_test_walidx_plan_guard_skips();
+	ps_test_set_walidx_publish_plan_hook(walidx_plan_guard_hook, &ctx);
 	for (int i = 0; i < 16 && !ctx.fired; i++)
 	{
 		ps_backpressure_refresh();
 		(void) ps_core_maintenance();
 	}
 	ps_test_set_walidx_publish_plan_hook(NULL, NULL);
-	check(ctx.fired, "the race hook fired exactly once on the target timeline's plan");
-	check(ps_test_walidx_plan_epoch_aborts() == aborts_before + 1,
-		  "the racing admission was detected as a plan-epoch mismatch "
-		  "exactly once (checklist item 4's deterministic race case). "
-		  "Amendment: this is currently an *observation*, not a hard "
-		  "gate -- see walidx_snapshot_publish_one()'s comment at both "
-		  "call sites for why a per-timeline (not lsn-scoped) gate was "
-		  "found to livelock walidx publication under sustained "
-		  "concurrent writers (a real pagestore_soak regression) and was "
-		  "reverted; publication proceeds regardless of this detection.");
+	check(ctx.fired, "the guard hook fired exactly once on the target timeline's plan");
+	check(ps_test_walidx_plan_guard_skips() == skips_before + 1,
+		  "a late admission at lsn <= H made the plan dirty and "
+		  "walidx_snapshot_publish_one() skipped the whole attempt "
+		  "exactly once (checklist item 3's below-horizon race case)");
 
-	/* Detection never spuriously repeats: once the racing admission has
-	 * been observed for this plan, no further tick re-detects the same
-	 * event (each new plan captures a fresh epoch). */
-	aborts_after_fire = ps_test_walidx_plan_epoch_aborts();
+	/* Reopen after the dirty skip: nothing durable was written for the
+	 * skipped attempt (see the amendment comment at the skip site), so
+	 * this exercises the ordinary "no pending intent" reopen path -- the
+	 * store must come back exactly as it was, not stuck or corrupted. */
+	close_store();
+	check(ps_core_open(store) == 0,
+		  "reopen cleanly after a dirty skip (checklist item 3's "
+		  "reopen-consistency check)");
+
+	/* Self-heal: the hook only fires once, so every later tick is clean
+	 * and the next round publishes normally, including the event that
+	 * made the previous round dirty (walidx_plan_bases_build() et al.
+	 * re-run from the current, post-race state). */
+	skips_after_fire = ps_test_walidx_plan_guard_skips();
 	for (int i = 0; i < 16 && !settled; i++)
 	{
 		ps_backpressure_refresh();
 		(void) ps_core_maintenance();
-		settled = ps_test_walidx_plan_epoch_aborts() == aborts_after_fire;
+		settled = ps_test_walidx_plan_guard_skips() == skips_after_fire;
 	}
-	check(ps_test_walidx_plan_epoch_aborts() == aborts_before + 1,
-		  "detection settles at exactly one -- no further spurious "
-		  "plan-epoch mismatches on later ticks");
+	check(ps_test_walidx_plan_guard_skips() == skips_before + 1,
+		  "no further skip on later ticks -- the replan settles");
 	check(ps_backpressure_configure_all(0, 0, 0, 0, 0, 0) == 0,
 		  "clear the reclaim high-water mark before the health-check write");
-	check(write_timeline_layer(ctx.timeline, ctx.block, 900) == 0 &&
-		  read_test_page(ctx.timeline, ctx.block, (unsigned char[8192]) {0}) == 1,
-		  "the timeline is fully healthy after the race: a fresh write "
-		  "(now safely outside walidx_snapshot_publish_one()) still "
-		  "succeeds and reads back");
+	check(write_timeline_layer(ctx.timeline, 5, 900) == 0 &&
+		  read_test_page(ctx.timeline, 5, (unsigned char[8192]) {0}) == 1,
+		  "the timeline is fully healthy after the dirty skip and reopen: "
+		  "a fresh write still succeeds and reads back");
 
+	walidx_snapshot_trigger_option_bytes = 0;
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * The clean case (checklist item 3's liveness-regression proof): a late
+ * admission at lsn > H must leave the plan clean, so publication proceeds
+ * exactly as pagestore_soak's sustained-writer workload needs it to --
+ * this is the scenario the reverted per-timeline (not lsn-scoped) gate
+ * got wrong.
+ */
+static void
+test_walidx_publish_lsn_above_horizon_publishes(void)
+{
+	char		store[] = "/tmp/pagestore-walidx-plan-guard-clean-XXXXXX";
+	PsChannel	channel;
+	WalidxPlanGuardCtx ctx = {502, UINT64_MAX, 0};	/* above any H */
+	uint64_t	skips_before;
+
+	check(mkdtemp(store) != NULL, "create walidx plan-guard clean store");
+	configure_timeline_core();
+	check(ps_core_open(store) == 0 && create_branch(ctx.timeline, 0, 100),
+		  "open store for the walidx plan-guard clean case");
+	walidx_snapshot_trigger_option_bytes = 1;
+
+	check(append_wal(ctx.timeline, 100,
+					 (const unsigned char[4]) {0x11, 0x22, 0x33, 0x44}, 4),
+		  "append real WAL bytes so wal_log_start() is defined");
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = ctx.timeline;
+	channel.opcode = PS_OP_WAL_INDEX_ADD;
+	channel.blocknum = 1;
+	channel.req_lsn = 100;
+	channel.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+		  "append a WAL-index tail entry to make the target timeline due");
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 1, 0) == 0,
+		  "configure a minimal walidx reclaim high-water mark");
+	ps_backpressure_refresh();
+	check(ps_test_walidx_force_due(ctx.timeline) != 0,
+		  "tail-only debt marks the target timeline force-eligible");
+
+	skips_before = ps_test_walidx_plan_guard_skips();
+	ps_test_set_walidx_publish_plan_hook(walidx_plan_guard_hook, &ctx);
+	for (int i = 0; i < 16 && !ctx.fired; i++)
+	{
+		ps_backpressure_refresh();
+		(void) ps_core_maintenance();
+	}
+	ps_test_set_walidx_publish_plan_hook(NULL, NULL);
+	check(ctx.fired, "the guard hook fired exactly once on the target timeline's plan");
+	check(ps_test_walidx_plan_guard_skips() == skips_before,
+		  "an admission strictly above H never marks the plan dirty -- "
+		  "publication is not skipped (the liveness fix: unrelated-"
+		  "position writes under sustained load must never block a "
+		  "timeline's walidx snapshot from advancing)");
+
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 0, 0) == 0,
+		  "clear the reclaim high-water mark before the next test");
 	walidx_snapshot_trigger_option_bytes = 0;
 	close_store();
 	remove_tree(store);
@@ -3090,8 +3168,9 @@ test_walidx_publish_no_race_publishes_once(void)
 {
 	char		store[] = "/tmp/pagestore-walidx-plan-epoch-norace-XXXXXX";
 	PsChannel	channel;
-	uint32_t	timeline = 502;
+	uint32_t	timeline = 503;
 	uint64_t	aborts_before;
+	uint64_t	skips_before;
 
 	check(mkdtemp(store) != NULL, "create walidx plan-epoch no-race store");
 	configure_timeline_core();
@@ -3121,13 +3200,17 @@ test_walidx_publish_no_race_publishes_once(void)
 	 * -- every attempted publication succeeds on its first try
 	 * (checklist item 4's "no concurrent admission -> publishes once"). */
 	aborts_before = ps_test_walidx_plan_epoch_aborts();
+	skips_before = ps_test_walidx_plan_guard_skips();
 	for (int i = 0; i < 16; i++)
 	{
 		ps_backpressure_refresh();
 		(void) ps_core_maintenance();
 	}
 	check(ps_test_walidx_plan_epoch_aborts() == aborts_before,
-		  "no plan-epoch abort ever fires without a racing admission");
+		  "no plan-epoch mismatch statistic ever fires without a racing "
+		  "admission");
+	check(ps_test_walidx_plan_guard_skips() == skips_before,
+		  "no plan-guard skip ever fires without a racing admission");
 
 	check(ps_backpressure_configure_all(0, 0, 0, 0, 0, 0) == 0,
 		  "clear the reclaim high-water mark before the next test");
@@ -4511,7 +4594,8 @@ main(void)
 	test_legacy_migration_and_parser_fail_closed();
 	test_delete_discards_unflushed_memtable();
 	test_deleting_timeline_wal_cleanup();
-	test_walidx_publish_plan_epoch_abort_and_replan();
+	test_walidx_publish_lsn_at_or_below_horizon_skips_and_replans();
+	test_walidx_publish_lsn_above_horizon_publishes();
 	test_walidx_publish_no_race_publishes_once();
 	test_deletion_requires_durable_forkmeta();
 	test_deletion_state_append_failure();
