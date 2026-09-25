@@ -1,6 +1,7 @@
 # Branch snapshot seq cap: a read-side same-position freeze for Bug B
 
 **Status:** **Design frozen for implementation (2026-09-25), revision 9.** Changes made during implementation are recorded as amendments in the phase PRs. Items that code review must confirm are listed in §10.
+- Amendment 2026-09-25 (§3.7(7) rev 3, a P3b prerequisite): WAL-index publication versus fork admissions is resolved by monotone bases instead of a plan-epoch gate.
 - Rev 9 (final) addresses round 7 (4101392015/4101392022/4101392030/4101392035/4101392043/4101392050); adds §10 and the detailed P1 scope (§9.3).
 - Rev 2 addressed PR #297 Codex round 1 and PR #296 comment 4100769750.
 - Rev 3 addresses round 2: 4100994214/4100994220/4100994223/4100994229/4100994233/4100994236.
@@ -397,19 +398,90 @@ Closure depends on the *current* fence set, which is inherent to fence-driven re
 4. **Fence filter** (`:9990-9998`): keep positional fences at `cutoff_lsn`.
 5. **Derived fences.** Add `(cutoff_lsn, S, strict = cutoff_seq)` for every view with `L ≥ cutoff_lsn` and `S < cutoff_seq`.
 6. **WAL-index horizons** become ViewCaps.
-7. **Plan-epoch validation (U3), moved into P2 as a prerequisite of any activation.**
-   - Keep a per-timeline `fork_event_admit_seq`: the max seq of any fork event or PAGE GROW admitted at `lsn ≤` the plan's max horizon. It is updated under the key's shard lock on admission.
-   - The planner records the value at plan time.
-   - **Final comparison and switch run under admission-wr** (rev 8; 4101315045). `walidx_publish` alone does not exclude fork or PAGE-GROW admissions, which hold only admission-rd plus a shard lock.
-   - **WAL-index snapshot publication is split into three phases:**
-     - **(A) Prepare, without admission.** Plan, under `walidx_prune_lock` (rd) and map (rd) as today. Write the new generation's payload and its manifest as *pending* (not yet referenced) files, fsync them, **and fsync the directory**, so every newly created name is durable before the switch (round 7, 4101392050). These are the heavy writes.
-     - **(B) Switch, under admission-wr.** Take `admission-wr → walidx_publish (wr)`. This follows the global order admission → shard → page_prune → walidx_prune → map → walidx_publish → wal_lock → walidx_meta; no shard or prune locks are needed in (B). Compare `fork_event_admit_seq` with the plan's value. On mismatch, release both locks, discard the pending files and re-plan. On a match, `rename()` the pending manifest over the current one and switch the in-memory generation. Release.
-       - (B) contains no fsync, only one `rename` plus pointer updates, so all admissions stall for microseconds. This is comparable to the existing barrier.
-     - **(C) Durability, after (B).** fsync the directory to make the rename durable, then publish the WAL-index frontier and retire the sources in the existing order. Source retirement waits for (C).
-       - A **process** crash after the rename sees the new manifest, since the rename is visible immediately. A **power loss** before the directory fsync may see either manifest.
-       - Recovery therefore **accepts and validates either** manifest. Both are complete and durable because of (A), and the sources are still intact because retirement waits for (C).
-       - The plan-epoch check is not needed at recovery. If the new generation won, it was switched under admission-wr with a matching epoch; if the old one won, it is the pre-switch state.
-   - **Forkmeta cutover.** It already takes admission-wr for `freeze_seq` (`:10575`). Its epoch comparison moves inside that same section, immediately before its switch. The same prepare/switch split applies if its switch currently fsyncs under admission-wr.
+7. **WAL-index publication versus concurrent fork admissions: §3.7(7) rev 3 (amendment, 2026-09-25; a P3b prerequisite).** This replaces the rev 8/9 plan-epoch gate, which PR #300 (P2) showed cannot work.
+
+   **7.1 Fact check: are admissions at `lsn ≤ H` routine? Yes, in every topology.**
+
+   `H = walidx_progress[tl]`. It is advanced by the **writer-side** `pagestore WAL index worker` (`pagestore.auto_wal_index`, `pagestore.c:14333-14555`; the loop at `:1600-1720` reads `walidx_progress` and the shipped end, indexes, then commits progress). It indexes *shipped* WAL, independently of any redo. The sources of fork-state admissions and their LSNs:
+
+   | Source | LSN | Relative to H |
+   |---|---|---|
+   | Materializer redo: CREATE/TRUNCATE/UNLINK (`is_redo`) | The replayed record's LSN (`ls_op_lsn`: `GetCurrentReplayRecPtr` in the startup process) | **Routinely ≤ H.** Replay lags indexing, since both consume the same shipped WAL but indexing is lighter. |
+   | Materializer page flushes, which produce PAGE GROWs (always recorded since P3a) | The page's `pd_lsn` (≤ the replay position) | **Routinely ≤ H.** These are the "idempotent GROWs" that starved rev 2. |
+   | Writer (route_all) page evictions | `pd_lsn`, which may be arbitrarily old | Routinely ≤ H for pages modified long ago. |
+   | Writer CREATE/TRUNCATE with its own WAL | `XactLastRecEnd` | Usually > H, because shipping is segment-granular. Not guaranteed. |
+   | Writer UNLINK at transaction end | The commit or abort end | Usually > H; can be ≤ H with slow pending deletes. |
+   | P0 `+1` / P4 `req_floor_lsn` (WAL-less ops) | insert + 1 | > H: insert + 1 exceeds any shipped and indexed LSN. |
+   | Unstamped placement without a floor (legacy clients) | `newest_visible + 1` | Can be ≤ H. |
+
+   Admissions at `lsn ≤ H` after a plan are therefore normal traffic:
+   - skipping publication on them starves it (soak 1178);
+   - blocking them risks deadlock, since the admitter holds shard-wr;
+   - refusing them fails user transactions.
+
+   Any "close the window" design must accept them.
+
+   **7.2 Options.**
+
+   - **(a) Fork-stable horizon.** Plan at `H* = min(H, F)`, where F is an LSN below which no fork-state admission can still arrive.
+     - The materializer floor could be its durable restartpoint marker (control block 3), because redo after a restart resumes there.
+     - Writer page evictions have **no finite floor**: any dirty buffer can carry an old `pd_lsn` until the next checkpoint completes. At best F = the last completed checkpoint's redo, and only if every source registers.
+     - Unregistered sources (old clients, IPC tests, the unstamped `newest+1` placement) make F undefined, so they would have to fail closed.
+     - The cost is that WAL-index compaction trails the slowest of materializer replay and checkpoint cadence, which weakens the reclaim-lag controller.
+     - **Rejected:** heavy protocol, still needs the checkpoint bound, and harms liveness.
+   - **(b) Handshake.** The publisher excludes admissions at `≤ H` while comparing and switching.
+     - The only deadlock-free order is `admission-wr → walidx_publish-wr`, taken **without** holding walidx_publish from planning. That forces a re-plan whenever an admission lands in between, and admissions at `≤ H` are routine (7.1).
+     - It is correct but **starves** under load, as rev 1 and rev 2 did, and stalls all writes during each attempt.
+     - **Rejected.**
+   - **(c) Recommended: make the WAL-index plan insensitive to late fork admissions (monotone bases), and remove the gate.** The plan does not need a stable fork state. It needs its retained chain to stay sufficient for every reader, and late admissions can only make readers need *less*.
+
+   **7.3 Invariant and proof for (c).**
+
+   **What the WAL-index plan decides.** For each `(key, block)` and horizon `h` (the progress horizon, WAL_INDEX pins, and descendant caps, each with its §1.3 ViewCap), `walidx_plan_bases_build` (`:15205-15420`) retains the records after the newest **base** `≤ h`. A base is one of:
+   - (i) a retained durable page version (`walidx_base_version_durable`), or
+   - (ii) a **death**: a visible definitive event (DEAD, or SET with `nblocks ≤ block`) at or below `h` (`:15276-15300`, `:15354-15360`).
+
+   Fork *size* is used only to recognise deaths, never to drop records for blocks outside the relation.
+
+   **What a reader does.** The single-page redo reader (`pagestore.c:2600-2650`, and likewise `:2924`) takes the newest image at or below `lsn` as the base, asks `ps_redo_block_death()` (`PS_OP_BLOCK_DEATH` → `fork_block_death_through`) for the newest visible death, and uses whichever is newer (`ps_death_supersedes`). It then replays the records after that base.
+
+   **Monotonicity lemma.** For a fixed view V, a later admission can only **add** members to V's visible set:
+   - A new event or version e has a seq greater than every existing entry, so it never changes another entry's `s_min` or `META_FIRST` status.
+   - Visibility of an existing entry under V depends only on `(its seq, S_V, X_V, s_min of its position, B_k)`, all of which are fixed once that entry exists.
+   - e itself is either visible or hidden.
+
+   **Consequences:**
+   1. Visible deaths at or below h form a superset over time, and so do visible images, since page admissions only add versions; removals are prune's business (below). Hence the reader's base at h, `max(death, image)`, is **non-decreasing** over time.
+   2. The plan retained every record after `base_plan(h)`. At any later time `base_now(h) ≥ base_plan(h)`, so the records the reader needs, those after `base_now(h)`, are a subset of those retained. ∎
+   3. **Late PAGE GROWs, ZEROEXTENDs, and SETs that do not cover the block** never create deaths. They can only change the zero-page-versus-absent decision (`ps_redo_nblocks_asof`), which needs no WAL record.
+   4. **Hidden late events** (post-S at occupied or inherited positions) do not affect V at all.
+
+   **Side conditions** that must hold in code (they become §10 items):
+   - **(S1)** The planner's deaths and images per horizon use the horizon's ViewCap, the same `fork_event_hidden` / `page_select` as the reader. That is §3.4, plus closure §3.5/§3.7 so that retention never *removes* a visible base the plan relied on.
+   - **(S2)** The reader always combines as `max(death, image)`. Never "death if present, else image".
+   - **(S3)** The planner never drops a record on the grounds that a block is beyond `nblocks` at `h`.
+   - **(S4)** Page prune retains every page version the WAL-index plan counted as a base, until the next WAL-index publication stops relying on it. This is the existing cross-planner contract (`walidx_base_version_durable`); re-verify it under closure.
+
+   **The forkmeta cutover is unaffected.** It already holds the maintenance controller's admission/shard/page/WAL-index/map locks across freeze, build and publish (`pagestore_core.c:10562-10566` and the call site). Its summaries are *not* insertion-stable (the fold is order-dependent), so it keeps full exclusion and needs no epoch gate. Below-cutoff admissions after publication stay refused by `fork_meta_mutation_future`, as today. The cutoff is at or below every owner's page frontier, so those admissions are rare, and they are already refused today.
+
+   **7.4 Changes from the rev 8/9 text:**
+   - **Removed:** the `fork_event_admit_seq` watermark, the plan-epoch comparison, and the "(B) switch under admission-wr" requirement for the WAL-index publish.
+   - **Kept:** the WAL-index publish stays under its existing locks (`walidx_prune_lock` / map / `walidx_publish` as today, **no admission lock**), with the rev 9 durability fixes: phase (A) fsyncs the pending files and the directory; after the rename, recovery accepts either manifest; sources are retired only after the directory fsync.
+   - The §10 checklist rows for the WAL-index publish switch, the forkmeta epoch comparison and `fork_event_admit_seq` (rows 4–6) are superseded by S1–S4 (below).
+   - U3 in §7 is resolved **by construction** (monotone bases), with no protocol.
+
+   **7.5 Code touch points (P2 redo, on top of PR #300's detect-only state):**
+   - `walidx_plan_bases_build`: per-horizon ViewCap for deaths and images (S1). Confirm there is no size-based record drop (S3).
+   - `ps_death_supersedes` and the two redo reader sites (`pagestore.c:~2629`, `~2924`): assert and comment S2.
+   - Remove the rev 1/rev 2 gate code (the active/horizon/dirty guard) from PR #300. Keep the detect-only instrumentation as a debug counter of "admissions at `lsn ≤ H` after plan", for the soak report.
+   - Page prune / `walidx_base_version_durable`: an S4 assertion in debug builds.
+
+   **7.6 Tests:**
+   - **Property test "WAL-index plan monotone"** (`pagestore_walidx_prune_test.c`), a merge blocker. Build a random history and ViewCaps; plan; then apply K random late admissions (definitive events at `≤ H`, fresh and occupied positions, PAGE GROWs, page versions at `≤ H`, and hidden or visible under each view). For every horizon and block, assert that `base_now ≥ base_plan` and that every record after `base_now` is retained. Reconstruct through the real reader combination against a full-WAL reference.
+   - **Deterministic cases:** a late TRUNCATE at `d` with `base_plan < d ≤ h` (the reader zero-bases at d; records kept); a late UNLINK below `base_plan` (ignored by max); a late image newer or older than the base; a late GROW on a dead block (zero page, no records needed).
+   - **Integration:** materializer replay lagging the index worker by several segments while compaction publishes. Reads at horizons equal those from an uncompacted index.
+   - **Soak:** remove the gate and re-run the PR #300 soak. Liveness returns to the pre-P2 baseline (no publication starvation), with 0 failures and no admission stalls, because the publish takes no admission lock. The debug counter shows the routine-late rate for the record.
+
 8. **Restart.** `META_FIRST`, `max_meta_seq` and `max_inherited_page_seq` are recomputed from the retained events. Closure makes `META_FIRST` identical, and the other two are functions of the present set.
 
 ### 3.8 Persistence of admission_seq
@@ -544,7 +616,7 @@ Page segments, image layers, frontier files, the retention log, artifact formats
 | V1, V2/V3, V4, V5, V6, V7, G1, G2 | By construction (no promotion; local inherited range; untouched parent order; closure preserves first-status). |
 | U1 | Needs work (P5): WAL-index caps and planner. |
 | U2 | By construction, with a semantic change: pins are positional below R, and at R `seq ≤ X` with the escape kept. |
-| U3 | Plan-epoch validation, **in P2** (§3.7(7)). |
+| U3 | **By construction** (§3.7(7) rev 3): WAL-index bases are monotone under late admissions; the forkmeta cutover is already fully excluded. No plan-epoch protocol. |
 | U4 | By construction (§2.1). |
 | U5 | Out of scope, guarded by an assert. |
 | Stale/synthetic label at a fresh position | P0 `+1`, then P4 (§5.2); other sources in §5.3. |
@@ -758,7 +830,7 @@ HINT:   Delete it with pagestore_delete_branch after confirming no manifest refe
   - control-note closure;
   - forkmeta closure;
   - GROW retention under hiding masks;
-  - **plan-epoch abort**: an admission between plan and publish forces a re-plan.
+  - **WAL-index plan monotone** (§3.7(7) rev 3): after a plan, late admissions never make a reader need a dropped record.
 
 ### 8.3 Crash / restart
 
@@ -809,7 +881,7 @@ HINT:   Delete it with pagestore_delete_branch after confirming no manifest refe
 - **Legacy strict reads:** a pre-activation exact-R read without a pin still returns today's result, including the §1d tuple fence at R (a post-pin rewrite at R stays hidden) and is not gated. A post-activation unpinned strict read gets -2.
 - **Unproven retry:** an exact retry of a finite branch without the magic is refused (`PS_BRANCH_REFUSE_UNPROVEN_RETRY`). A retry after a crash between CREATE_BRANCH and readiness redoes the WAL scan before writing readiness; with the writer restored in between, it fails into `r2_cleanup`.
 - **Atomic pins (§2.3):** a barrier with `PS_BARRIER_REGISTER` leaves a `CHECKPOINT_FENCE` pin. Hand-off PIN_SET at its `(R, S)` succeeds. An explicit-seq SET with no identical live registration gets `PS_RETENTION_NOT_REGISTERED`. A prune racing the hand-off (fault hook between them) cannot drop the pre-S version. Fence pins beyond the newest two are released.
-- **WAL-index publish:** an admission injected between (A) and (B) forces a re-plan. A crash between the rename and the directory fsync recovers either generation (both validated), with sources intact. Tests accept both outcomes. An admission-latency measurement for (B) is recorded in the PR.
+- **WAL-index publish:** late admissions at `lsn ≤ H` between plan and publish do not block or fail publication, and reads stay correct (monotone bases). A crash between the rename and the directory fsync recovers either generation (both validated), with sources intact. Tests accept both outcomes. The publish takes no admission lock, so there is no admission stall.
 - **Mixed versions (P3b):** a new client with an old daemon (capability bit clear) refuses with the error. An old client with a new daemon (no magic) gets ∞ and legacy behaviour. A stale `is_redo` value of 1 or 2 left in the channel does not count as `R2_PROVEN`.
 - **Activation epochs:** a pin, horizon or artifact fence created before activation still reads today's result after activation plus compaction; one created after activation is frozen. A branch created by a P3a binary stays ∞ after the upgrade to P3b. A P3a binary refuses a store that has a `CAP_ACTIVATION` record.
 - **R2-m:** a materializer marker below the fork is rejected.
@@ -831,7 +903,7 @@ HINT:   Delete it with pagestore_delete_branch after confirming no manifest refe
 |---|---|---|
 | **P0** | `ls_op_lsn()` `+1` fallback (PR #296) | ~60 + 0 |
 | **P1** | Refactor, no behaviour change. ViewCap and composition (STRICT-exact), `TlWalk` + `B_k`, `page_select`, identity lookups, ForkEvent flags and indexes, the fold slow path, I-ALLOC/U5 asserts. All caps ∞. | ~750 + ~600 (detail in §9.3) |
-| **P2** | Planner. `PsViewFence`, positional/STRICT modes, closure (page/control/forkmeta), the invalidation exception, masks, derived fences, the LSN-strict ordered bump, **U3 plan-epoch validation, with the WAL-index publish split into prepare / switch-under-admission-wr / durable (§3.7(7))**, property tests. | ~900 + ~900 |
+| **P2** | Planner. `PsViewFence`, positional/STRICT modes, closure (page/control/forkmeta), the invalidation exception, masks, derived fences, the LSN-strict ordered bump, **WAL-index plan monotonicity (§3.7(7) rev 3: S1–S4, no admission lock), with the durable publish (fsync pending files and directory; recovery accepts either manifest)**, property tests. | ~900 + ~900 |
 | **P3a** | Formats, no activation. `TimelineRecEventV3` (**writes `branch_seq = ∞`**; the `CAP_ACTIVATION` kind is defined and fail-closed); forkmeta V4 / FMS v2 (META/UNSTAMPED flags written); WIPG v2 / WISD v4 (**writes `S_H = ∞`**); `req_floor_lsn` + UNSTAMPED persistence on the daemon side, **with the `PS_SHM_VERSION` bump for the `PsChannel` change**; PAGE GROW dedup removal and in-memory GROW compaction; `admission_seq_observe_finite` and the sentinel guard (§3.8); the retention owner kind `CHECKPOINT_FENCE` (retention identity bump); identities and fixtures. | ~750 + ~600, plus fixtures |
 | **P3b** | Activate branches **together with G3 enforcement, atomically**: write `CAP_ACTIVATION{BRANCH}` and finite `branch_seq`. Branch edges use `branch_seq` in reads, fences, gates and projection in one commit; the registration gate for branch levels; the kept child-first CREATE idempotence. **R2** in `pagestore_prepare_branch_from_control`: the shutdown-checkpoint check via `ps_checkpoint_record_end` info, `pagestore_branch_window_open` + the journaled snapshot, the post-CREATE WAL scan (R2-x), the `r2_cleanup` journal states, the materializer-marker check. `PS_FRONTEND_CAP_BRANCH_SEQ` + the `R2_PROVEN` magic (mixed-version gating); the `ch->result` NEW/FINITE bits; refusal of ∞ results on the safe path; refusal of an unproven retry of a finite branch; readiness written only after a passing post-check and the retry/delete rules. **Direct entry points gated** by `pagestore.allow_unsafe_branch_cut`. Test migrations (§7 table). Ports `run_bugb_suite` and the ancestry suite. | ~900 + ~1050 |
 | **P4** | Activate client unstamped. `req_lsn = 0` + `req_floor_lsn`; removes P0's `+1` and `ls_zeroextend`'s stamp; no version bump (it landed in P3a). | ~150 + ~200 |
@@ -955,9 +1027,9 @@ Each item must be confirmed against real code in the named phase PR. Deviations 
 | 1 | P1 | Every `seq_cap` site was converted. Grep for `read_seq : 0`, `seq_cap`, and `, 0, &nb` in fold calls. No 0-as-cap remains. |
 | 2 | P1 | The `snapshot_dropped` → flags conversion did not change the snapshot build/compaction semantics of bit0. |
 | 3 | P1 | Memtable/layer identity lookups return the same bytes as before (pgcache keys unchanged). |
-| 4 | P2 | Lock order for the WAL-index publish switch: `admission-wr → walidx_publish`, with no shard, prune or map lock taken inside (B). No fsync inside (B). Measure admission stall. |
-| 5 | P2 | The forkmeta cutover epoch comparison sits inside its existing admission-wr section and before its switch. Check whether that switch fsyncs under admission-wr; if it does, apply the prepare/switch split. |
-| 6 | P2 | `fork_event_admit_seq` is updated under the key's shard lock *before* the admission releases admission-rd. |
+| 4 | P2 | *(superseded by §3.7(7) rev 3)* The WAL-index publish takes no admission lock. Confirm S1 (per-horizon ViewCap for deaths and images in `walidx_plan_bases_build`) and S3 (no size-based record drop). |
+| 5 | P2 | *(superseded)* S2: every redo reader combines `max(death, image)` (`ps_death_supersedes`, `pagestore.c:~2629`, `~2924`). The forkmeta cutover still holds full maintenance exclusion across freeze, build and publish. |
+| 6 | P2 | *(superseded)* S4: page prune retains every WAL-index base the published plan relies on, under closure. The monotone property test and the lagging-materializer integration test are merge blockers. The PR #300 gate code is removed. |
 | 7 | P2 | The planner masks call the same `fork_event_hidden` / `page_select` as the read path, with no re-implementation. The §8.2 property tests are merge blockers. |
 | 8 | P2 | Closure: `prune_version_needed` never drops a closure-required version. `control_chain_keeps` keeps the min-seq note. |
 | 9 | P2 | The ordered-path fence bump is LSN-strict for positional fences. Audit every `UINT64_MAX`-as-bare-LSN consumer. |
