@@ -7910,7 +7910,10 @@ ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
 done:
 	/* Confirms the FEV_F_UNSTAMPED coverage above is not vacuous: over the
 	 * default seed at niter=4000 this reliably hits four figures. */
-	PS_ASSERT(rc != 0 || niter < 500 || viewcap_test_unstamped_hidden_hits > 0);
+	/* Non-vacuity: the UNSTAMPED-hidden branch must actually be exercised.
+	 * A runtime check (not PS_ASSERT) so it holds in non-assert builds too. */
+	if (rc == 0 && niter >= 500 && viewcap_test_unstamped_hidden_hits == 0)
+		rc = -1;
 	return rc;
 }
 
