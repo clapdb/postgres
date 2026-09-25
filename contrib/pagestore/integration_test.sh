@@ -2436,7 +2436,45 @@ assert "$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, '$asofR'::pg_lsn
 	"the pre-truncate horizon still sees the pre-truncate size (frozen view)"
 # WAL-less (unlogged) pages carry pd_lsn 0; their growth must order at the
 # create event's floor, not sort under it and leave the fork looking empty
+#
+# ls_op_lsn regression (split from #294): CREATE UNLOGGED has no WAL record
+# of its own (RelationCreateStorage skips log_smgrcreate for unlogged
+# relations), so it exercises ls_op_lsn's XactLastRecEnd==0 fallback.  $P
+# opens a brand-new backend per "-c" invocation, so a single-statement CREATE
+# here also starts with XactLastCommitEnd/XactLastAbortEnd at their
+# process-initial zero.  The old unconditional
+# Max(XactLastCommitEnd, XactLastAbortEnd) fallback would then stamp this
+# fork's create record at LSN 0 -- a stale position below any legitimate
+# fork/branch cut, letting a branch cut anywhere seemingly "admit" a relation
+# that on this timeline was actually created later (pagestore Bug B).  The
+# fix uses GetXLogInsertRecPtr()+1 instead, which is always strictly greater
+# than the insert position already observed by a concurrently-running
+# connection just before the CREATE executes.  Capture that position first
+# and confirm the fork does not yet exist as of it: the old code would report
+# it as existing already (stamped at LSN 0, which is <= any horizon).
+preUnloggedCreate=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "CREATE UNLOGGED TABLE unlogged_t(i int) TABLESPACE ts;" >/dev/null
+assert "$($P -c "SELECT pagestore_rel_exists_asof('unlogged_t', 0, '$preUnloggedCreate'::pg_lsn);")" "f" \
+	"a WAL-less create's stamped LSN is not a stale (zero) position below the pre-create horizon"
+# Quiet-cluster/idle-WAL variant (Codex review finding 4100769750 on PR #296):
+# on an idle cluster GetXLogInsertRecPtr() does not itself advance between
+# reads, so a horizon captured with the SAME function ls_op_lsn's fallback
+# calls -- pg_current_wal_insert_lsn() maps directly to GetXLogInsertRecPtr(),
+# unlike pg_current_wal_lsn()'s GetXLogWriteRecPtr() -- can come back exactly
+# equal to the create's own stamped LSN rather than merely less than it. The
+# fork/ancestry admission check (fork_asof_hop with seq_cap==0, the ancestry
+# case: `e->ev[mid].lsn <= cap`) treats an event lsn == cap as still inside
+# the parent's history, so an exact tie at the create's own stamp would leak
+# a post-cut relation into a branch cut there -- this is the case the +1
+# specifically exists to break.  This assertion is the tightest black-box
+# proxy for that tie this test can construct without new daemon
+# instrumentation to read the stamp back directly: it reads the identical
+# insert-position function ls_op_lsn() itself calls, immediately before the
+# CREATE, with nothing else run on this connection in between.
+preInsertLsn=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "CREATE UNLOGGED TABLE lsnfix_quiet_t(i int) TABLESPACE ts;" >/dev/null
+assert "$($P -c "SELECT pagestore_rel_exists_asof('lsnfix_quiet_t', 0, '$preInsertLsn'::pg_lsn);")" "f" \
+	"a WAL-less create's stamped LSN is strictly greater than the insert position read immediately beforehand (idle-WAL tie case)"
 $P -q -c "INSERT INTO unlogged_t SELECT generate_series(1, 100);" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_rel_nblocks_asof('unlogged_t', 0, pg_current_wal_lsn()) > 0;")" "t" \
