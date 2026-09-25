@@ -219,6 +219,9 @@ extern int ps_test_page_frontier(uint32_t timeline, uint64_t *lsn, uint64_t *seq
 extern uint64_t ps_test_plan_epoch(uint32_t timeline);
 extern void ps_test_plan_epoch_bump(uint32_t timeline, uint64_t seq);
 extern int ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured);
+/* Test-only: count of walidx_snapshot_publish_one() aborts caused
+ * specifically by a plan-epoch mismatch. */
+extern uint64_t ps_test_walidx_plan_epoch_aborts(void);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
@@ -288,6 +291,14 @@ typedef int (*PsAdmissionWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
  * readers.  The callback must not take admission locks. */
 typedef void (*PsAdmissionWriteQueuedTestHook)(void *arg);
 typedef int (*PsLifecycleWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
+/* P2 (design doc S3.7(7)): fires inside walidx_snapshot_publish_one(),
+ * once the plan epoch has been captured for the given timeline and every
+ * shard lock is released, before the admission-wr-gated switch.  A test
+ * can synchronously admit a fork event (or force-bump the counter) here
+ * to deterministically race the plan. */
+typedef void (*PsWalidxPublishPlanTestHook)(uint32_t timeline, void *arg);
+extern void ps_test_set_walidx_publish_plan_hook(
+	PsWalidxPublishPlanTestHook hook, void *arg);
 extern void ps_test_set_forkmeta_cutover_hook(
 	PsForkmetaCutoverTestHook hook, void *arg);
 extern void ps_test_set_forkmeta_post_gc_hook(

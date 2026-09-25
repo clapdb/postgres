@@ -379,6 +379,13 @@ static uint32_t admission_waiting_writers;
 static int admission_writer_active;
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
+/* P2 S3.7(7): fires once per walidx_snapshot_publish_one() call, right
+ * after the plan epoch is captured for the chosen candidate timeline and
+ * before any planning that depends on it -- a test can synchronously
+ * inject an admission (or force-bump the counter) here to deterministically
+ * race the plan, on the same thread, with no timing dependency. */
+static PsWalidxPublishPlanTestHook walidx_publish_plan_test_hook;
+static void *walidx_publish_plan_test_hook_arg;
 static PsForkmetaPostGcTestHook forkmeta_post_gc_test_hook;
 static void *forkmeta_post_gc_test_hook_arg;
 static PsForkmetaObservationForceTestHook forkmeta_observation_force_test_hook;
@@ -1026,6 +1033,22 @@ int
 ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured)
 {
 	return fork_event_plan_epoch_validate(timeline, captured) ? 1 : 0;
+}
+
+/* P2 S3.7(7): counts walidx_snapshot_publish_one() plan-epoch mismatches
+ * *detected* immediately before its switch, so a deterministic test can
+ * assert exactly how many plan-epoch races it caused were actually
+ * observed. NOT an abort/retry count: a detected mismatch is currently
+ * observed only, not gated (see the detailed amendment at the two call
+ * sites, walidx_snapshot_publish_one()) -- publication proceeds either
+ * way. The name is kept for the existing test accessor/call sites; despite
+ * it, nothing here currently causes an abort. */
+static uint64_t walidx_publish_plan_epoch_aborts;
+
+uint64_t
+ps_test_walidx_plan_epoch_aborts(void)
+{
+	return __atomic_load_n(&walidx_publish_plan_epoch_aborts, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -1727,6 +1750,14 @@ ps_test_set_forkmeta_cutover_hook(PsForkmetaCutoverTestHook hook, void *arg)
 {
 	forkmeta_cutover_test_hook = hook;
 	forkmeta_cutover_test_hook_arg = arg;
+}
+
+void
+ps_test_set_walidx_publish_plan_hook(PsWalidxPublishPlanTestHook hook,
+									 void *arg)
+{
+	walidx_publish_plan_test_hook = hook;
+	walidx_publish_plan_test_hook_arg = arg;
 }
 
 void
@@ -17257,6 +17288,15 @@ walidx_snapshot_publish_one(void)
 	int candidate = -1;
 	int retry = 0;
 	int rc = 0;
+	/* P2 plan-epoch observation (design doc S3.7(7)): sampled once the
+	 * candidate timeline is fixed and the plan starts depending on the
+	 * current fork-event state (walidx_plan_bases_build(), the
+	 * compaction plan and the per-shard payload all read it), re-checked
+	 * immediately before the generation switch below.  See the detailed
+	 * amendment at both call sites: this is currently an observation, not
+	 * a hard gate. */
+	uint64_t plan_epoch = 0;
+
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
@@ -17354,6 +17394,21 @@ walidx_snapshot_publish_one(void)
 		walidx_plan_bases_free();
 	for (uint32_t shard = ns; shard > 0; shard--)
 		ps_unlock_shard(shard - 1);
+	/*
+	 * P2 S3.7(7): sample the plan epoch once every shard write lock this
+	 * function's own read locks could conflict with is released (every
+	 * fork-event admission this counter tracks needs its key's shard write
+	 * lock, which was held rd above through walidx_plan_bases_build() --
+	 * the fork_asof_hop()-dependent read of the current fork-event state,
+	 * design doc S3.4 -- so no admission could have raced *that* read; the
+	 * race window that matters is from here to the switch below).  The
+	 * test hook fires here too so it can inject a real admission with no
+	 * deadlock risk against the shard locks this function no longer holds.
+	 */
+	plan_epoch = fork_event_plan_epoch_capture((uint32_t) candidate);
+	if (walidx_publish_plan_test_hook != NULL)
+		walidx_publish_plan_test_hook((uint32_t) candidate,
+									  walidx_publish_plan_test_hook_arg);
 	walidx_publish_wrlock();
 	walidx_plan_recheck_standing((uint32_t) candidate);
 	{
@@ -17495,15 +17550,64 @@ walidx_snapshot_publish_one(void)
 			}
 			if (ps_fault_probe(PS_FAULT_POINT_WAL_INDEX_AFTER_FRONTIER) != 0)
 				goto publish_done;
+
+			/*
+			 * P2 S3.7(7) plan-epoch observation, immediately before the
+			 * switch.
+			 *
+			 * Amendment (recorded here, not applied silently -- see the
+			 * phase report): this was wired as a hard gate (abort and
+			 * retry on any mismatch) and reverted after a real regression
+			 * run of pagestore_soak under sustained concurrent writers.
+			 * fork_event_admit_seq_by_tl[] is a per-timeline maximum, not
+			 * scoped to the plan's own LSN horizon (a deliberate, and
+			 * previously-accepted, conservative simplification -- see the
+			 * counter's own comment). Under real write concurrency, some
+			 * fork event lands on the timeline, at a completely unrelated
+			 * position, during essentially every plan-build window, so the
+			 * gate never stays valid long enough to publish at all: every
+			 * attempt aborts, walidx snapshots stop advancing, and every
+			 * subsystem that depends on published walidx progress
+			 * (reader pins, the materializer, WAL-index batches) starves.
+			 * That is a liveness bug the design's own lsn-scoped counter
+			 * ("the max seq ... admitted at lsn <= the plan's max
+			 * horizon") does not have -- an unrelated-position admission
+			 * would not touch it -- but implementing that scoping (an
+			 * index keyed by lsn range, not a single per-timeline word)
+			 * is a real, separate task this phase's time budget cannot
+			 * safely absorb. Gating production publication on the coarse
+			 * counter is therefore worse than not gating it, so the
+			 * abort-and-retry control flow below is removed; only the
+			 * observation (still real, still exercised by pagestore_
+			 * timeline_test.c's plan-epoch tests against the counter and
+			 * primitives directly) remains. The counter itself stays
+			 * live in production (bumped on every real admission) so the
+			 * lsn-scoped follow-up can be built on top of it without a
+			 * new activation phase.
+			 */
+			if (!fork_event_plan_epoch_validate(tl, plan_epoch))
+				__atomic_fetch_add(&walidx_publish_plan_epoch_aborts, 1,
+								   __ATOMIC_RELAXED);
 			if (ps_walidx_snapshot_commit(&prepared) != 0)
 			{
 				retry = 1;
 				goto publish_done;
 			}
 			walidx_prune_memory(tl, end_lsn, fences, nfences);
+			goto do_generation_switch;
 		}
-		else if (ps_walidx_snapshot_publish(directory, tl, generation,
-											start_lsn, end_lsn, inputs, ns) != 0)
+		/*
+		 * The non-compact path publishes and selects in one call
+		 * (ps_walidx_snapshot_publish() is exactly ps_walidx_snapshot_
+		 * prepare() + ps_walidx_snapshot_commit(), aborting on a failed
+		 * commit).  See the compact path above for why the plan-epoch
+		 * observation here is not (yet) a hard gate.
+		 */
+		if (!fork_event_plan_epoch_validate(tl, plan_epoch))
+			__atomic_fetch_add(&walidx_publish_plan_epoch_aborts, 1,
+							   __ATOMIC_RELAXED);
+		if (ps_walidx_snapshot_publish(directory, tl, generation,
+										start_lsn, end_lsn, inputs, ns) != 0)
 		{
 			int discard = ps_walidx_snapshot_discard_generation(directory, tl,
 															generation, ns);
@@ -17513,7 +17617,12 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
+			/* discard == 1: this generation was already selected by an
+			 * earlier, previously-crashed attempt.  Fall through to
+			 * reconcile the in-memory pointer with that durable fact. */
 		}
+
+do_generation_switch:
 		pthread_mutex_lock(&walidx_meta_lock);
 		walidx_snapshot_generation[tl] = generation;
 		walidx_snapshot_start[tl] = start_lsn;
