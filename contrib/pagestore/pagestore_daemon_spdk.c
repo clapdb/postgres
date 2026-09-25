@@ -506,6 +506,33 @@ active_fence_epoch(void)
 	return epoch;
 }
 
+/*
+ * Which shard's lock (if any single one) guards this request.  Mirrors the
+ * POSIX frontend's derivation in run_request_admitted() (pagestore_daemon.c):
+ * most ops are keyed by ch->key, but the shipped-WAL byte ops (WAL_APPEND/
+ * WAL_SIZE/WAL_READ) touch a per-timeline log rather than per-key page state
+ * and are not reliably keyed by the caller, so they serialize on shard 0; the
+ * floor queries scan the fixed control object, so their shard is derived from
+ * a synthetic control key rather than trusting ch->key to be pre-filled.
+ */
+static uint32_t
+request_shard(const PsChannel *ch)
+{
+	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+		return 0;
+	if (op == PS_OP_WAL_RETAIN_FLOOR || op == PS_OP_RETENTION_FLOOR)
+	{
+		PsKey		ctlkey;
+
+		memset(&ctlkey, 0, sizeof(ctlkey));
+		ctlkey.klass = PS_KLASS_CONTROL;
+		return ps_shard_of(&ctlkey);
+	}
+	return ps_shard_of(&ch->key);
+}
+
 static int
 run_request(uint32_t i, PsChannel *ch)
 {
@@ -594,19 +621,75 @@ run_request(uint32_t i, PsChannel *ch)
 		pthread_rwlock_rdlock(&core_rwlock);
 	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
 		op == PS_OP_REQUIRE_BRANCH)
+	{
+		/*
+		 * CREATE_BRANCH/CHECK_BRANCH/REQUIRE_BRANCH mutate only timelines[]
+		 * under map_wr, not any shard's page/fork state -- unlike the POSIX
+		 * frontend's CREATE_BRANCH, which additionally takes every shard's
+		 * write lock to purge per-shard incarnation-local indexes/caches
+		 * when *reusing* a deleted timeline's incarnation.  That reuse path
+		 * (timeline_reset_reuse_runtime(), driven by an incarnation > 1
+		 * request) is already refused above, before this point, for both
+		 * ops in this SPDK frontend, so it can never run here and no shard
+		 * lock is needed.
+		 */
 		ps_lock_map_wr();
-	/* WAL-index inserts complete synchronously in ps_handle_meta().  Match the
-	 * POSIX frontend's shard exclusion so snapshot/prune maintenance and a
-	 * future retained-base publisher cannot race the batch admission or its
-	 * in-memory insertion.  Do not extend this lock across async page I/O. */
-	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
-		ps_lock_shard_wr(ps_shard_of(&ch->key));
-	begin(i, ch, inspection_completion_required(op));
-	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
-		ps_unlock_shard(ps_shard_of(&ch->key));
-	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
-		op == PS_OP_REQUIRE_BRANCH)
+		begin(i, ch, inspection_completion_required(op));
 		ps_unlock_map();
+	}
+	else if (op == PS_OP_IMMEDSYNC)
+	{
+		/*
+		 * storage_spdk's sync() flushes every shard's in-memory curbuf --
+		 * state a concurrent shard write or maintenance() prune/flush
+		 * mutates -- so no single shard's write lock excludes that the way
+		 * it does for every other write op below.  Match the POSIX
+		 * frontend's SPDK-storage branch (pagestore_daemon.c,
+		 * ps_storage->sync_needs_write_lock) and take every shard's write
+		 * lock, ascending: the shard lock order already used throughout
+		 * this file (see maintenance_worker()/core's own multi-shard ops).
+		 */
+		uint32_t	s;
+
+		for (s = 0; s < ps_nshards; s++)
+			ps_lock_shard_wr(s);
+		begin(i, ch, inspection_completion_required(op));
+		for (s = ps_nshards; s-- > 0;)
+			ps_unlock_shard(s);
+	}
+	else
+	{
+		/*
+		 * Every other op that reaches ps_handle_meta()/append_page() through
+		 * begin() touches this shard's state (page/fork version chains,
+		 * WAL-index entries, or the append cursor s->cur_off) with no
+		 * locking of its own -- append_page_impl() documents holding this
+		 * lock as its caller's responsibility, and walidx_add()/
+		 * walidx_add_batch_locked() (WAL_INDEX_ADD[_BATCH]) rely on it the
+		 * same way.  maintenance_worker() below takes each shard's write
+		 * lock for prune/flush without going through core_rwlock, so
+		 * without this lock it can run concurrently with an insert on the
+		 * same shard and race its version chain and cur_off.  Reads walk
+		 * that same chain in read_through_checked() with no locking of
+		 * their own either, so they need the same exclusion while
+		 * resolving it (page_find()/page_visible(), and dereferencing a
+		 * version's seg/off -- see begin()'s header comment).  Match the
+		 * POSIX frontend's shard exclusion (pagestore_daemon.c's
+		 * request_is_write branch) with shard-wr for writes, shard-rd for
+		 * reads.  Dropped at the same point core_rwlock is below, before
+		 * any asynchronous device I/O begin() may have queued: identical
+		 * scope to what core_rwlock already had, so this adds no new
+		 * across-the-async-wait exposure.
+		 */
+		uint32_t	shard = request_shard(ch);
+
+		if (is_write)
+			ps_lock_shard_wr(shard);
+		else
+			ps_lock_shard_rd(shard);
+		begin(i, ch, inspection_completion_required(op));
+		ps_unlock_shard(shard);
+	}
 	if (is_write)
 		ps_admission_read_unlock();
 	pthread_rwlock_unlock(&core_rwlock);
