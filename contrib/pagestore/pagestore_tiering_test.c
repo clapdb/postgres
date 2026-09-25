@@ -26,6 +26,9 @@
 static int run = 0,
 			failed = 0;
 static void check(int cond, const char *msg);
+static int append_page_locked(uint32_t timeline, const PsKey *key,
+							  uint32_t block, const unsigned char *page,
+							  uint64_t version, uint64_t *out_admission_seq);
 
 typedef struct BlockingGate
 {
@@ -155,7 +158,7 @@ test_core_provider_lifecycle(void)
 
 	ps_storage = &PsStoragePosix;
 	check(ps_core_open(dir) == 0, "POSIX core reopens after caller teardown");
-	check(append_page(0, &key, 0, page, 1, NULL) == 0,
+	check(append_page_locked(0, &key, 0, page, 1, NULL) == 0,
 		  "buffer a parent page before fork");
 	pid = fork();
 	if (pid == 0)
@@ -188,7 +191,7 @@ test_core_provider_lifecycle(void)
 	check(pid > 0 && waitpid(pid, &status, 0) == pid &&
 		  WIFEXITED(status) && WEXITSTATUS(status) == 0,
 		  "forked core cannot flush, mutate, or reopen inherited state");
-	check(append_page(0, &key, 1, page, 2, NULL) == 0,
+	check(append_page_locked(0, &key, 1, page, 2, NULL) == 0,
 		  "parent remains writable after child rejects inherited core");
 	ps_core_close();
 	ps_core_close();
@@ -233,7 +236,7 @@ test_legacy_local_uri_reopen(void)
 	memset(page, 0x5a, sizeof(page));
 	flush_pages = 1;
 	check(ps_core_open(store) == 0 &&
-		  append_page(0, &key, 0, page, 1, NULL) == 0,
+		  append_page_locked(0, &key, 0, page, 1, NULL) == 0,
 		  "persist a page for legacy path upgrade");
 	ps_core_close();
 	check(symlink("store", "alias") == 0, "create legacy store alias");
@@ -493,6 +496,29 @@ check(int cond, const char *msg)
 		failed++;
 		fprintf(stderr, "  FAIL: %s\n", msg);
 	}
+}
+
+/*
+ * append_page() and other core entry points assume the caller holds the
+ * key's shard write lock and admission-rd, exactly as pagestore_daemon.c's
+ * run_request()/run_request_admitted() do for a live client before
+ * dispatching to handle_request() (I-ALLOC, BRANCH_SNAPSHOT_SEQ_CAP.md
+ * S2).  This test drives append_page() directly, bypassing the daemon's
+ * own request loop, so it takes both locks itself, in the daemon's order.
+ */
+static int
+append_page_locked(uint32_t timeline, const PsKey *key, uint32_t block,
+				   const unsigned char *page, uint64_t version,
+				   uint64_t *out_admission_seq)
+{
+	int			rc;
+
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = append_page(timeline, key, block, page, version, out_admission_seq);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
 }
 
 /* finish_upload() publishes descriptor fields under map-wr.  Copy the

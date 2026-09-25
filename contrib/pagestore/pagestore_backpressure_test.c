@@ -31,6 +31,7 @@ static int append_test_walidx_identity(uint32_t timeline);
 static int test_path_suffix(char *path, size_t path_size, const char *base,
 						const char *suffix);
 static void wait_flag(volatile int *flag);
+static int ps_handle_meta_locked(PsChannel *ch);
 
 typedef struct WalIdxObservationRetryTest
 {
@@ -152,9 +153,15 @@ forkmeta_proof_race_worker(void *arg)
 	race->channel.opcode = PS_OP_CREATE;
 	race->channel.key = race->key;
 	race->channel.req_lsn = 1050;
+	/* ps_handle_meta(PS_OP_CREATE) indexes a fork event; this test drives it
+	 * directly instead of through pagestore_daemon.c's run_request(), so it
+	 * takes the key's shard write lock itself, in the daemon's order
+	 * (I-ALLOC, BRANCH_SNAPSHOT_SEQ_CAP.md S2). */
+	ps_lock_shard_wr(ps_shard_of(&race->key));
 	if (ps_handle_meta(&race->channel) != 1 ||
 		race->channel.status != PS_STATUS_OK)
 		race->failed = 1;
+	ps_unlock_shard(ps_shard_of(&race->key));
 	ps_admission_read_unlock();
 	return NULL;
 }
@@ -265,6 +272,27 @@ check(int ok, const char *name)
 		fprintf(stderr, "FAIL: %s\n", name);
 		failed++;
 	}
+}
+
+/*
+ * ps_handle_meta() assumes the caller holds the request key's shard write
+ * lock and admission-rd, exactly as pagestore_daemon.c's run_request()/
+ * run_request_admitted() do for a live client before dispatching to
+ * handle_request() (I-ALLOC, BRANCH_SNAPSHOT_SEQ_CAP.md S2).  This test
+ * drives ps_handle_meta() directly, bypassing the daemon's own request
+ * loop, so it takes both locks itself, in the daemon's order.
+ */
+static int
+ps_handle_meta_locked(PsChannel *ch)
+{
+	int			rc;
+
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&ch->key));
+	rc = ps_handle_meta(ch);
+	ps_unlock_shard(ps_shard_of(&ch->key));
+	ps_admission_read_unlock();
+	return rc;
 }
 
 typedef struct TestWalIdxWatermark
@@ -1097,7 +1125,7 @@ test_forkmeta_runtime_enable_and_symlink_root(void)
 		channel.timeline = 0;
 		channel.key = (PsKey) {77, 77, 77, 0, PS_KLASS_RELATION};
 		channel.req_lsn = 100;
-		check(ps_handle_meta(&channel) == 1 &&
+		check(ps_handle_meta_locked(&channel) == 1 &&
 				channel.status == PS_STATUS_OK && stat(source_a, &after) == 0 &&
 				after.st_size > before.st_size && access(source_b, F_OK) != 0,
 				"backend and core stay on the opened target after symlink replacement");
@@ -1173,24 +1201,24 @@ test_forkmeta_backpressure_observer(void)
 	channel.timeline = 0;
 	channel.key = (PsKey) {11, 11, 11, 0, PS_KLASS_RELATION};
 	channel.req_lsn = 100;
-		check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK &&
+		check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK &&
 			stat(source, &after) == 0,
 			"append a forkmeta growth event after the baseline");
 	channel.opcode = PS_OP_CREATE;
 	channel.key = (PsKey) {12, 12, 12, 0, PS_KLASS_RELATION};
 	channel.req_lsn = 150;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+	check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"metadata-only create churn is admitted without a frontier");
 	channel.opcode = PS_OP_ZEROEXTEND;
 	channel.blocknum = 0;
 	channel.nblocks = 1;
 	channel.req_lsn = 200;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+	check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"metadata-only zero-extend churn is admitted without a frontier");
 	channel.opcode = PS_OP_UNLINK;
 	channel.key = (PsKey) {11, 11, 11, 0, PS_KLASS_RELATION};
 	channel.req_lsn = 300;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+	check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"metadata-only unlink churn is admitted without a frontier");
 	ps_backpressure_refresh();
 	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
@@ -1349,7 +1377,7 @@ test_forkmeta_backpressure_observer(void)
 			channel.key = (PsKey) {100 + i, 100 + i, 100 + i, 0,
 				PS_KLASS_RELATION};
 			channel.req_lsn = 400 + i;
-			if (ps_handle_meta(&channel) != 1 ||
+			if (ps_handle_meta_locked(&channel) != 1 ||
 				channel.status != PS_STATUS_OK)
 				churn_ok = 0;
 		}
@@ -1470,7 +1498,7 @@ test_forkmeta_self_recovery(void)
 	channel.timeline = 0;
 	channel.key = key;
 	channel.req_lsn = 100;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+	check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"seed forkmeta lifecycle history after a safe page frontier exists");
 	ps_backpressure_refresh();
 	check(stat(source, &source_after) == 0 &&
@@ -1529,17 +1557,17 @@ test_forkmeta_self_recovery(void)
 	channel.opcode = PS_OP_CREATE;
 	channel.key = key;
 	channel.req_lsn = 1100;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+	check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"append CREATE metadata on the new timeline without a frontier");
 	channel.opcode = PS_OP_ZEROEXTEND;
 	channel.blocknum = 0;
 	channel.nblocks = 1;
 	channel.req_lsn = 1150;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+	check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"append ZEROEXTEND metadata on the new timeline without a frontier");
 	channel.opcode = PS_OP_UNLINK;
 	channel.req_lsn = 1200;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+	check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"append UNLINK metadata on the new timeline without a frontier");
 	ps_backpressure_refresh();
 	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
@@ -2369,7 +2397,7 @@ test_forkmeta_self_recovery(void)
 		channel.timeline = 2;
 		channel.key = delete_key;
 		channel.req_lsn = 3000;
-		check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK &&
+		check(ps_handle_meta_locked(&channel) == 1 && channel.status == PS_STATUS_OK &&
 			  begin_delete_test(2),
 			  "put the forkmeta owner into durable deletion");
 		check(snprintf(temporary, sizeof(temporary),

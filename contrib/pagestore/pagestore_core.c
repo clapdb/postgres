@@ -2073,53 +2073,70 @@ account_page_gc_coverage(Shard *s, uint32_t old_boundary,
 static pthread_rwlock_t shard_locks[MAX_SHARDS];
 static pthread_rwlock_t map_lock = PTHREAD_RWLOCK_INITIALIZER;
 /* Which shard locks this thread holds, so a reader of another shard's index
- * can tell an already-held lock from one it must still take. */
+ * can tell an already-held lock from one it must still take.  Also backs
+ * I-ALLOC (below): PS_SHARD_HELD_RD/WR distinguish the mode, since I-ALLOC
+ * specifically requires the write mode. */
+#define PS_SHARD_HELD_NONE	0
+#define PS_SHARD_HELD_RD	1
+#define PS_SHARD_HELD_WR	2
 static __thread unsigned char shard_held_by_thread[MAX_SHARDS];
+
+/*
+ * Set only across ps_core_open_impl()'s single-threaded recovery section
+ * (from fork_meta_snapshot_load()/load_fork_meta() through
+ * recover_layer_prefix()/recover()/replay_page_record()/
+ * fork_grow_replay()), before any worker or maintenance thread exists and
+ * so before any shard lock could meaningfully be contended.  I-ALLOC
+ * exempts this window instead of requiring recovery to take shard-wr on
+ * every record it replays.
+ */
+static int core_open_exclusive;
 
 void
 ps_lock_shard_rd(uint32_t shard)
 {
 	pthread_rwlock_rdlock(&shard_locks[shard]);
-	shard_held_by_thread[shard] = 1;
+	shard_held_by_thread[shard] = PS_SHARD_HELD_RD;
 }
 
 void
 ps_lock_shard_wr(uint32_t shard)
 {
 	pthread_rwlock_wrlock(&shard_locks[shard]);
-	shard_held_by_thread[shard] = 1;
+	shard_held_by_thread[shard] = PS_SHARD_HELD_WR;
 }
 
 void
 ps_unlock_shard(uint32_t shard)
 {
-	shard_held_by_thread[shard] = 0;
+	shard_held_by_thread[shard] = PS_SHARD_HELD_NONE;
 	pthread_rwlock_unlock(&shard_locks[shard]);
 }
 
 /*
  * I-ALLOC (BRANCH_SNAPSHOT_SEQ_CAP.md S2): every admission_seq that ends up
  * indexed is allocated and published within one hold of that key's shard
- * write lock, under admission-rd.  This helper checks that against the
- * existing shard_held_by_thread[] bookkeeping.
+ * write lock, under admission-rd.  Checked against shard_held_by_thread[]
+ * (must be the write mode specifically) with a single exemption for
+ * ps_core_open_impl()'s single-threaded recovery window
+ * (core_open_exclusive).
  *
- * P1 amendment: an initial version called this from page_add_version()'s
- * and fork_event_add()'s live (non-recovery) call sites.  It fired on
- * pagestore_backpressure_test and pagestore_tiering_test, which reach the
- * daemon's CREATE/append opcode handling through a deferred/retry path
- * that does not hold the shard lock at that exact point -- a live path
- * whose locking this design doc excerpt does not describe in enough detail
- * to re-derive safely within P1's scope, so the assertion is left
- * unwired (defined but uncalled) rather than risk a false positive on a
- * legitimate path; see the P1 report for the full note.  Wiring it
- * correctly needs an audit of every admission_seq_alloc() call site's
- * lock discipline, deferred to a follow-up.
+ * Wired in by an investigation (see the P2 report) that traced every
+ * page_add_version()/fork_event_add()/fork_event_add_seg_marker() call
+ * site reachable in the POSIX daemon and its tests: every live (non-
+ * recovery, non-test-harness) path already holds the key's shard write
+ * lock here. The test binaries that called these functions directly,
+ * bypassing the daemon's own opcode dispatch (and so its locking), now
+ * either take the lock themselves or go through an _unchecked() test-only
+ * variant (self-tests building a throwaway ForkEnt that was never
+ * inserted into any shard's index).
  */
 static inline void
 ps_assert_shard_held_for_key(const PsKey *key)
 {
 #ifdef PAGESTORE_ASSERT_CHECKING
-	PS_ASSERT(shard_held_by_thread[ps_shard_of(key)]);
+	PS_ASSERT(shard_held_by_thread[ps_shard_of(key)] == PS_SHARD_HELD_WR ||
+			  core_open_exclusive);
 #else
 	(void) key;
 #endif
@@ -2142,7 +2159,7 @@ shard_try_scan_lock(uint32_t shard)
 	{
 		if (pthread_rwlock_tryrdlock(&shard_locks[shard]) == 0)
 		{
-			shard_held_by_thread[shard] = 1;
+			shard_held_by_thread[shard] = PS_SHARD_HELD_RD;
 			return 1;
 		}
 		sched_yield();
@@ -5655,6 +5672,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	PageEnt    *e = page_find(timeline, key, block);
 	ForkEnt    *fork = fork_get_or_create(timeline, key);
 
+	ps_assert_shard_held_for_key(key);
 	timeline_mark_used(timeline);
 	if (!e)
 	{
@@ -6601,8 +6619,14 @@ fork_event_recompute_meta_first(ForkEnt *e)
 	}
 }
 
+/*
+ * Test-only escape hatch (I-ALLOC, BRANCH_SNAPSHOT_SEQ_CAP.md S2): the
+ * self-tests build a throwaway ForkEnt on the stack that is never inserted
+ * into any shard's index, so no shard lock is meaningful for it.
+ * fork_event_add() itself asserts I-ALLOC and calls this.
+ */
 static void
-fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
+fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind, bool meta)
 {
 	uint32_t	i;
@@ -6686,13 +6710,23 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 		e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
 }
 
+static void
+fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
+			   uint32_t nblocks, uint8_t kind, bool meta)
+{
+	ps_assert_shard_held_for_key(&e->key);
+	fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta);
+}
+
 /*
  * Preserve a segment growth's position among equal-LSN fork-meta events without
  * making the marker itself a size event.  Recovery activates the placeholder
  * only after validating the matching segment header and complete page body.
+ * fork_event_add_seg_marker_unchecked() is the I-ALLOC escape hatch for the
+ * self-tests, exactly like fork_event_add_unchecked() above.
  */
 static void
-fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+fork_event_add_seg_marker_unchecked(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 						  uint8_t kind, uint64_t order_id,
 						  uint64_t admission_seq)
 {
@@ -6721,6 +6755,16 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	fork_def_index_insert(e, i, 0);
 	fork_late_meta_shift(e, i);
 	fork_event_cache_from(e, i);
+}
+
+static void
+fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+						  uint8_t kind, uint64_t order_id,
+						  uint64_t admission_seq)
+{
+	ps_assert_shard_held_for_key(&e->key);
+	fork_event_add_seg_marker_unchecked(e, lsn, nblocks, kind, order_id,
+										admission_seq);
 }
 
 static int
@@ -7180,7 +7224,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			uint32_t	nblocks = (uint32_t) (fork_event_selftest_rand(&rngstate) % 9);
 
 			kind = roll == 0 ? FEV_SET : roll == 1 ? FEV_DEAD : FEV_GROW;
-			fork_event_add(&fe, lsn, admission_seq, nblocks, kind, false);
+			fork_event_add_unchecked(&fe, lsn, admission_seq, nblocks, kind, false);
 			/* A GROW that does not raise the size at (lsn, admission_seq) is
 			 * deduped (fork_event_add() returns early, nev unchanged); the
 			 * slot promise has nothing to check in that case. */
@@ -7198,7 +7242,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rngstate) % 8);
 			uint64_t	order_id = 1 + fork_event_selftest_rand(&rngstate) % UINT32_MAX;
 
-			fork_event_add_seg_marker(&fe, lsn, nblocks, kind, order_id,
+			fork_event_add_seg_marker_unchecked(&fe, lsn, nblocks, kind, order_id,
 									  admission_seq);
 			FEV_ST_CHECK(fe.nev == old_nev + 1);
 			FEV_ST_CHECK(fe.ev[expected_slot].lsn == lsn &&
@@ -7242,7 +7286,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		}
 		else if (i % 3 == 1 && m->kind == FEV_SEG_COMMIT_BOUND)
 		{
-			fork_event_add(&fe, m->lsn, m->admission_seq, 100, FEV_GROW, false);
+			fork_event_add_unchecked(&fe, m->lsn, m->admission_seq, 100, FEV_GROW, false);
 			FEV_ST_CHECK(fork_event_check_order(&fe));
 		}
 	}
@@ -7422,10 +7466,10 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			uint64_t	order_id = 1 + fork_event_selftest_rand(&rng2) % UINT32_MAX;
 
 			if (i % 3 == 0)
-				fork_event_add_seg_marker(&fe2, lsn, nblocks,
+				fork_event_add_seg_marker_unchecked(&fe2, lsn, nblocks,
 										  FEV_SEG_COMMIT_BOUND, order_id, 0);
 			else
-				fork_event_add_seg_marker(&fe2, lsn, nblocks,
+				fork_event_add_seg_marker_unchecked(&fe2, lsn, nblocks,
 										  FEV_SEG_COMMIT_BOUND, order_id,
 										  100 + i);
 		}
@@ -7753,7 +7797,7 @@ ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
 			bool		meta = kind == FEV_GROW &&
 				(fork_event_selftest_rand(&rng) % 2) == 0;
 
-			fork_event_add(&fe, lsn, seq, nblocks, kind, meta);
+			fork_event_add_unchecked(&fe, lsn, seq, nblocks, kind, meta);
 		}
 
 		/*
@@ -23488,6 +23532,13 @@ open_step_failed(const char *step)
 {
 	int			saved_errno = errno;
 
+	/* Every ps_core_open_impl() failure return goes through here (see the
+	 * OPEN_STEP macro), including every one inside the single-threaded
+	 * recovery window that sets core_open_exclusive: unconditionally clear
+	 * it so a failed open never leaves I-ALLOC permanently exempted on this
+	 * thread. */
+	core_open_exclusive = 0;
+
 	/* A callee that fails without setting errno must not leave the daemon's
 	 * perror() (or this diagnostic, on a second failed step) reporting
 	 * whatever unrelated syscall last touched errno. */
@@ -23922,6 +23973,16 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 				admission_seq_observe(pin.admission_seq);
 		}
 	}
+	/*
+	 * From here through the recover() loop below, this process is still
+	 * single-threaded (no worker or maintenance thread exists yet), so no
+	 * shard lock is meaningfully contended; I-ALLOC (ps_assert_shard_held_
+	 * for_key()) is exempted for this window instead of requiring recovery
+	 * to take shard-wr on every record it replays.  Cleared unconditionally
+	 * by open_step_failed() on any error return in this function, and
+	 * explicitly right after the recover() loop on the success path.
+	 */
+	core_open_exclusive = 1;
 	/* Reconcile the snapshot intent before loading either source epoch.  Only a
 	 * selected manifest transfers ownership away from the old source epoch. */
 	{
@@ -24027,6 +24088,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		if (recover(sh) != 0)
 			return OPEN_STEP("recover shard");
 	}
+	/* End of the single-threaded recovery window (see the comment above). */
+	core_open_exclusive = 0;
 	errno = 0;
 	if (artifact_validate_recovery() != 0)
 		return OPEN_STEP("validate artifact recovery");
