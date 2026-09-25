@@ -201,7 +201,14 @@ artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 					break;
 				}
 		}
-		state = fork ? fork_asof_hop(fork, lsn, cap, &nb) : FORK_HOP_NONE;
+		if (fork)
+		{
+			ViewCap		fc = viewcap_lsn_seq(lsn, cap);
+
+			state = fork_asof_hop(fork, &fc, 0, false, &nb);
+		}
+		else
+			state = FORK_HOP_NONE;
 		if (state == FORK_HOP_DEAD)
 			break;
 		if (state != FORK_HOP_NONE)

@@ -195,6 +195,12 @@ extern int ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 /* Test-only: total scan/bisection steps taken by the fork-event index and
  * its fallback loops on this thread since the process started. */
 extern uint64_t ps_test_fork_event_scan_steps(void);
+/* Phase P1 (BRANCH_SNAPSHOT_SEQ_CAP.md S9.3) differential test: random page
+ * versions and fork-event histories, checked against frozen pre-P1
+ * references at PS_SEQ_UNBOUNDED (must be bit-identical) and against an
+ * independent literal-S1.3/S3.2-rule brute force with finite caps.  Returns
+ * 0 on success or the 1-based number of the first failed check. */
+extern int ps_test_viewcap_differential(uint64_t seed, uint32_t niter);
 /* Test-only: event counts for one fork (0 if not found).  nmarkers counts
  * marker_kind != 0, ninert counts kind > FEV_DEAD (never activated). */
 extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
