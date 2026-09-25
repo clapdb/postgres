@@ -581,6 +581,19 @@ test('pagestore_prune',
   timeout: 30,
 )
 
+# P2: ps_page_prune_plan_capped() property tests (design doc S3.5/S8.2,
+# merge blockers) -- differential against a frozen pre-P2 reference, and
+# read/prune consistency over random histories/views/rounds.
+pagestore_prune_capped_test = executable('pagestore_prune_capped_test',
+  files('pagestore_prune_capped_test.c', 'pagestore_prune.c'),
+  install: false,
+)
+test('pagestore_prune_capped',
+  pagestore_prune_capped_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Pure replacement-base chain selection for WAL-index compaction.
 pagestore_walidx_prune_test = executable('pagestore_walidx_prune_test',
   files('pagestore_walidx_prune_test.c', 'pagestore_walidx_prune.c'),
@@ -601,6 +614,18 @@ test('pagestore_forkmeta_prune',
   pagestore_forkmeta_prune_test,
   suite: ['pagestore'],
   timeout: 30,
+)
+
+# P2: ps_forkmeta_prune_plan_capped() property tests (design doc S3.7/S8.2,
+# merge blockers).
+pagestore_forkmeta_prune_capped_test = executable('pagestore_forkmeta_prune_capped_test',
+  files('pagestore_forkmeta_prune_capped_test.c', 'pagestore_forkmeta_prune.c'),
+  install: false,
+)
+test('pagestore_forkmeta_prune_capped',
+  pagestore_forkmeta_prune_capped_test,
+  suite: ['pagestore'],
+  timeout: 60,
 )
 
 # Persisted immutable shipped-WAL segment header and checksum contract.
