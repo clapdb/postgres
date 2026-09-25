@@ -442,6 +442,17 @@ static const char *g_weak_oracle_ops[] = {
 	"fork's own last written page lsn -- a value this model does not track "
 	"separately from max_begin_lsn -- or BEGIN_NEWER/OLDER_GENERATION "
 	"otherwise); see act_artifact_begin/drop()'s comments.",
+	"ARTIFACT_BEGIN/WRITE(EXTEND)/COMMIT/DROP's *legal* (non-adversarial) "
+	"path: PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF is accepted alongside OK (see "
+	"artifact_growth_refusal_ok()) -- ARTIFACT_LIFECYCLE.md documents this "
+	"as a legitimate, non-poisoning, retryable admission refusal any "
+	"artifact growth append can hit, independent of and not preventable by "
+	"BEGIN's own up-front fencing, whenever the daemon's forkmeta cutover "
+	"(this stage runs it aggressively) advances past a generation's lsn "
+	"while its attempt is still open; found via a real, reproducible "
+	"integration-run failure (seed 2542129034, ~/pagestore-fuzz/failures/"
+	"20260925T115625-w2-seed2542129034) triaged as a fuzzer-model gap, not "
+	"a product bug -- see the report.",
 };
 #define FZ_NWEAK ((int) (sizeof(g_weak_oracle_ops) / sizeof(g_weak_oracle_ops[0])))
 
@@ -2513,6 +2524,35 @@ enum
 	FZ_ART_DROPPED = 3,
 };
 
+/*
+ * PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF ("growth not future of the forkmeta
+ * snapshot cutoff") is documented (ARTIFACT_LIFECYCLE.md) as a legitimate,
+ * non-poisoning admission refusal that ANY artifact-protocol growth append
+ * can hit -- not only BEGIN's up-front artifact_lsn_fenced() check, but
+ * WRITE's and COMMIT's own record/page appends too (both route through the
+ * same append_page_raw_outcome() -> fork_meta_mutation_future() growth-
+ * ordering check as BEGIN's).  The daemon's forkmeta cutover advances in
+ * the background independent of how long an attempt has been open, so an
+ * attempt whose BEGIN succeeded can still have its *own* WRITE/COMMIT
+ * refused this way later if the cutover overtakes its generation lsn in
+ * the meantime -- this stage's deliberately aggressive forkmeta thresholds
+ * (FZ_FORKMETA_HIGH_WATER/CATCH_UP) make that common, not rare.  Per the
+ * same doc, this is explicitly retryable and non-destructive ("a refused
+ * COMMIT leaves the attempt open for a retry with the same token or a
+ * fresh BEGIN; a refused WRITE leaves the attempt open and the same block
+ * retriable"), i.e. exactly "no model mutation", which is already what
+ * act_artifact_begin/write/commit()'s status==OK-gated mutation blocks do
+ * on any refusal -- so tolerating this one reason here needs no extra
+ * bookkeeping, only a weaker assertion than a hard OK.
+ */
+static int
+artifact_growth_refusal_ok(int status, uint32_t reason)
+{
+	return status == PS_STATUS_OK ||
+		(status == PS_STATUS_ERROR &&
+		 reason == PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF);
+}
+
 static void
 act_artifact_begin(void)
 {
@@ -2685,9 +2725,9 @@ act_artifact_begin(void)
 
 		ring_note("ARTIFACT_BEGIN tl=%u akind=%u rel=%u lsn=%llu", tl, akind,
 				  rel, (unsigned long long) lsn);
-		ck(status == PS_STATUS_OK, "ARTIFACT_BEGIN tl=%u akind=%u rel=%u "
-		   "lsn=%llu (status %d reason %u)", tl, akind, rel,
-		   (unsigned long long) lsn, status, reason);
+		ck(artifact_growth_refusal_ok(status, reason), "ARTIFACT_BEGIN "
+		   "tl=%u akind=%u rel=%u lsn=%llu (status %d reason %u)", tl, akind,
+		   rel, (unsigned long long) lsn, status, reason);
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		if (status == PS_STATUS_OK)
 		{
@@ -2823,10 +2863,18 @@ act_artifact_write(void)
 				 * (ARTIFACT_LIFECYCLE.md's T7 / PS_ARTIFACT_REFUSE_UNFENCED
 				 * "not poisoning, retryable"), not a bug -- so UNFENCED is
 				 * accepted here as a legal alternative outcome; anything
-				 * else is still a hard failure.
+				 * else is still a hard failure.  FORKMETA_CUTOFF is the
+				 * same class of TOCTOU (see artifact_growth_refusal_ok()'s
+				 * comment: it is a *separate*, "defence in depth" check
+				 * the fence re-derivation above does not cover, reachable
+				 * the same way -- an open attempt sitting through many
+				 * steps while this stage's aggressive forkmeta thresholds
+				 * advance the cutover past its lsn), so it is accepted
+				 * here too.
 				 */
 				int			weak = probe == 3 && status != PS_STATUS_OK &&
-					reason == PS_ARTIFACT_REFUSE_UNFENCED;
+					(reason == PS_ARTIFACT_REFUSE_UNFENCED ||
+					 reason == PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF);
 
 				ck(weak || status == PS_STATUS_OK, "ARTIFACT_WRITE tl=%u "
 				   "akind=%u rel=%u block=%u (status %d reason %u)", tl,
@@ -2937,9 +2985,18 @@ act_artifact_commit(void)
 					  akind, rel, probe);
 			if (expect_ok)
 			{
-				ck(status == PS_STATUS_OK, "ARTIFACT_COMMIT tl=%u akind=%u "
-				   "rel=%u lsn=%llu token=%llu count=%llu (status %d "
-				   "reason %u)", tl, akind, rel, (unsigned long long) use_lsn,
+				/* WEAK ORACLE (FORKMETA_CUTOFF only): see
+				 * artifact_growth_refusal_ok()'s comment -- the commit's
+				 * own COMMIT-block append can legitimately lose this race
+				 * against the daemon's background forkmeta cutover even
+				 * though BEGIN's own fencing succeeded earlier; documented
+				 * as non-poisoning and retryable ("leaves the attempt
+				 * open"), so no model mutation happens below, matching
+				 * that contract. */
+				ck(artifact_growth_refusal_ok(status, reason),
+				   "ARTIFACT_COMMIT tl=%u akind=%u rel=%u lsn=%llu "
+				   "token=%llu count=%llu (status %d reason %u)", tl, akind,
+				   rel, (unsigned long long) use_lsn,
 				   (unsigned long long) use_token,
 				   (unsigned long long) use_count, status, reason);
 				record_cov(PS_OP_ARTIFACT_COMMIT, (uint32_t) status, reason);
@@ -3196,9 +3253,12 @@ act_artifact_drop(void)
 
 		ring_note("ARTIFACT_DROP tl=%u akind=%u rel=%u lsn=%llu", tl, akind,
 				  rel, (unsigned long long) lsn);
-		ck(status == PS_STATUS_OK, "ARTIFACT_DROP tl=%u akind=%u rel=%u "
-		   "lsn=%llu (status %d reason %u)", tl, akind, rel,
-		   (unsigned long long) lsn, status, reason);
+		/* WEAK ORACLE (FORKMETA_CUTOFF only): DROP's own COMMIT-block
+		 * append goes through the same growth-ordering check as BEGIN/
+		 * COMMIT/WRITE -- see artifact_growth_refusal_ok(). */
+		ck(artifact_growth_refusal_ok(status, reason), "ARTIFACT_DROP "
+		   "tl=%u akind=%u rel=%u lsn=%llu (status %d reason %u)", tl, akind,
+		   rel, (unsigned long long) lsn, status, reason);
 		record_cov(PS_OP_ARTIFACT_DROP, (uint32_t) status, reason);
 		if (status == PS_STATUS_OK)
 		{
