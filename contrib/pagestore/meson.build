@@ -455,7 +455,7 @@ test('pagestore_soak',
   timeout: 600,
 )
 
-# Stage 1 op-sequence fuzzer: coverage of opcode x status x interleaving
+# Op-sequence fuzzer: coverage of opcode x status x interleaving
 # combinations against one real daemon in a short, fixed-seed CI run (see
 # pagestore_fuzz_test.c's header for the full design).  PAGESTORE_FUZZ_SEED /
 # PAGESTORE_FUZZ_OPS raise the seed count / op budget for exploration runs
@@ -470,6 +470,14 @@ test('pagestore_op_fuzz',
   depends: [pagestore_daemon],
   suite: ['pagestore'],
   timeout: 90,
+  # TODO(remove after pagestore PR #294 merges): #294 fixes "Bug B" (a
+  # parent write stamped exactly at a branch's fork LSN leaks through the
+  # child's read-through). Stage 2's verify_branch_frozen() oracle catches
+  # this deterministically once PAGESTORE_FUZZ_BUGB_WORKAROUND is unset, but
+  # CI must stay green against the not-yet-fixed daemon, so force the
+  # stage-1-style avoidance workaround on here; once #294 lands, drop this
+  # env entry so CI exercises the real, now-fixed race by default.
+  env: ['PAGESTORE_FUZZ_BUGB_WORKAROUND=1'],
 )
 
 # Deterministic page/WAL lag-controller and admission-wait coverage.

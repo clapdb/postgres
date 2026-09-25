@@ -635,6 +635,28 @@ psc_op_immedsync(void)
 	return psc_cl_exec()->status;
 }
 
+/* PS_OP_ADMISSION_BARRIER: global (no timeline/incarnation association --
+ * the daemon serves it before any per-timeline validation, see
+ * pagestore_daemon.c's dispatcher around PS_OP_BEGIN_DELETE/ADMISSION_BARRIER
+ * special-casing).  Out: req_seq, the admission sequence after every prior
+ * mutation this process has observed complete. */
+static int
+psc_op_admission_barrier(uint64_t *seq_out)
+{
+	PsChannel  *ch = psc_chan_ptr();
+
+	psc_setmeta(ch, 0, 0);
+	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	psc_cl_exec();
+	if (seq_out)
+		*seq_out = ch->req_seq;
+	return ch->status;
+}
+
+/* PS_OP_ARTIFACT_BEGIN/COMMIT/DROP wrappers live further down, near
+ * psc_op_write_control() -- see there for the field mapping and the
+ * supersedable-flag parameter. */
+
 /* ===================== op wrappers: WAL ================================= */
 
 static int
@@ -1076,6 +1098,78 @@ psc_op_write_control(uint32_t block, const unsigned char *page, uint64_t version
 	ch->req_lsn = version;
 	memcpy(ch->data, page, PSC_PAGE_SIZE);
 	return psc_cl_exec()->status;
+}
+
+/* ===================== op wrappers: artifact lifecycle =================== */
+/*
+ * PS_OP_ARTIFACT_BEGIN/COMMIT/DROP (see pagestore_artifact_lifecycle.inc's
+ * ps_artifact_begin/commit/drop and pagestore_daemon.c's handle_request()
+ * cases for the exact field mapping used here). The data itself is written
+ * through the *ordinary* PS_OP_EXTEND/PS_OP_WRITEV wrappers above with
+ * key.klass in {PS_KLASS_SLRU, PS_KLASS_READER_SNAPSHOT} and req_lsn/req_seq
+ * set to the open attempt's (lsn, token) -- there is no separate "write"
+ * opcode. klass/rel here follow the same (spc=1,db=1,rel=1000+rel,forkNum=0)
+ * convention as every other psc_op_* wrapper (artifact_data_key() requires
+ * forkNum==0, which psc_set_channel_key() already zeroes).
+ *
+ * On error, *reason_out carries PsArtifactRefuseReason (pagestore_artifact_
+ * format.h) from ch->result; 0 (PS_ARTIFACT_REFUSE_NONE) on success or when
+ * refused before reaching artifact-specific logic (the timeline/incarnation
+ * gate in ps_handle_meta, or the klass/opcode gate at the top of
+ * handle_request()).
+ */
+static int
+psc_op_artifact_begin(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
+					   uint64_t lsn, int supersedable, uint64_t *token_out,
+					   uint32_t *reason_out)
+{
+	PsChannel  *ch = psc_chan_ptr();
+
+	psc_set_channel_key(ch, tl, inc, klass, rel);
+	ch->opcode = PS_OP_ARTIFACT_BEGIN;
+	ch->req_lsn = lsn;
+	ch->parent_timeline = supersedable ? PS_ARTIFACT_REQ_SUPERSEDABLE : 0;
+	psc_cl_exec();
+	if (token_out)
+		*token_out = ch->req_seq;
+	if (reason_out)
+		*reason_out = ch->result;
+	return ch->status;
+}
+
+static int
+psc_op_artifact_commit(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
+						uint64_t lsn, uint64_t token, uint64_t count,
+						int supersedable, uint32_t *reason_out)
+{
+	PsChannel  *ch = psc_chan_ptr();
+
+	psc_set_channel_key(ch, tl, inc, klass, rel);
+	ch->opcode = PS_OP_ARTIFACT_COMMIT;
+	ch->req_lsn = lsn;
+	ch->req_seq = token;
+	ch->nblocks = (uint32_t) count;
+	ch->parent_timeline = supersedable ? PS_ARTIFACT_REQ_SUPERSEDABLE : 0;
+	psc_cl_exec();
+	if (reason_out)
+		*reason_out = ch->result;
+	return ch->status;
+}
+
+static int
+psc_op_artifact_drop(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
+					  uint64_t lsn, int supersedable, uint32_t *reason_out)
+{
+	PsChannel  *ch = psc_chan_ptr();
+
+	psc_set_channel_key(ch, tl, inc, klass, rel);
+	ch->opcode = PS_OP_ARTIFACT_DROP;
+	ch->req_lsn = lsn;
+	ch->parent_timeline = supersedable ? PS_ARTIFACT_REQ_SUPERSEDABLE : 0;
+	psc_cl_exec();
+	if (reason_out)
+		*reason_out = ch->result;
+	return ch->status;
 }
 
 #endif							/* PAGESTORE_TEST_CLIENT_H */
