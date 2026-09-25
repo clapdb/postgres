@@ -2098,6 +2098,34 @@ ps_unlock_shard(uint32_t shard)
 }
 
 /*
+ * I-ALLOC (BRANCH_SNAPSHOT_SEQ_CAP.md S2): every admission_seq that ends up
+ * indexed is allocated and published within one hold of that key's shard
+ * write lock, under admission-rd.  This helper checks that against the
+ * existing shard_held_by_thread[] bookkeeping.
+ *
+ * P1 amendment: an initial version called this from page_add_version()'s
+ * and fork_event_add()'s live (non-recovery) call sites.  It fired on
+ * pagestore_backpressure_test and pagestore_tiering_test, which reach the
+ * daemon's CREATE/append opcode handling through a deferred/retry path
+ * that does not hold the shard lock at that exact point -- a live path
+ * whose locking this design doc excerpt does not describe in enough detail
+ * to re-derive safely within P1's scope, so the assertion is left
+ * unwired (defined but uncalled) rather than risk a false positive on a
+ * legitimate path; see the P1 report for the full note.  Wiring it
+ * correctly needs an audit of every admission_seq_alloc() call site's
+ * lock discipline, deferred to a follow-up.
+ */
+static inline void
+ps_assert_shard_held_for_key(const PsKey *key)
+{
+#ifdef PAGESTORE_ASSERT_CHECKING
+	PS_ASSERT(shard_held_by_thread[ps_shard_of(key)]);
+#else
+	(void) key;
+#endif
+}
+
+/*
  * Take a read lock on a shard this thread does not hold, for a short scan of
  * that shard's index from a path that may already hold another shard's lock
  * and map-wr.  Blocking would invert the lock order against a writer of that
@@ -4002,6 +4030,77 @@ segment_hole_magic_for_header_size(uint64_t header_size)
 
 /* PageVer (one stored version's location) is defined in pagestore_core.h. */
 
+/*
+ * View caps (BRANCH_SNAPSHOT_SEQ_CAP.md S1.2/S1.3, phase P1).
+ *
+ * A ViewCap is the read-side admissibility window for one timeline level:
+ *   lsn         L  -- position cap (today's read_lsn)
+ *   seq         S  -- the "hides same-position rewrites admitted after the
+ *                      view froze" bound; PS_SEQ_UNBOUNDED (infinity) means
+ *                      no such bound -- every admission_seq passes.
+ *   strict_seq  X  -- an *extra* bound that applies only exactly at
+ *                      position == L (today's single read_seq parameter).
+ *   legacy         -- true while every constituent view predates its kind's
+ *                      cap activation (S2.2); P1 never gates on this, it is
+ *                      carried only so P2/P5 have a stable field to read.
+ *
+ * P1 introduces this machinery with every cap fixed at PS_SEQ_UNBOUNDED, so
+ * every call converges on today's page_visible()/fork_asof_hop() behaviour
+ * bit for bit (see the "Equivalence argument" in S9.3 of the design doc).
+ * Only P2 (the planner) and P3b/P5 (activation) ever construct a ViewCap
+ * with a finite seq or strict_seq in production; P1 exercises the finite
+ * case only from test code.
+ */
+#define PS_SEQ_UNBOUNDED	UINT64_MAX
+
+typedef struct ViewCap
+{
+	uint64_t	lsn;			/* L */
+	uint64_t	seq;			/* S; PS_SEQ_UNBOUNDED = infinity */
+	uint64_t	strict_seq;		/* X: extra bound exactly at position == L */
+	bool		legacy;			/* every constituent view predates activation */
+} ViewCap;
+
+/*
+ * Map today's request pair (read_lsn, read_seq) onto a ViewCap: uncapped by
+ * S, with read_seq (or infinity, for read_seq == 0) as the strict bound at
+ * L.  read_lsn == UINT64_MAX ("newest") falls out of the same formula,
+ * since PS_SEQ_UNBOUNDED == UINT64_MAX already means "no LSN bound" too.
+ * A ViewCap's seq/strict_seq are never constructed as literal 0 (see the
+ * PS_ASSERT in viewcap_compose()/here): "no cap" is always spelled
+ * PS_SEQ_UNBOUNDED, so a legacy record's admission_seq == 0 can never be
+ * confused with "no cap" (S3.8).
+ */
+static inline ViewCap
+viewcap_from_request(uint64_t read_lsn, uint64_t read_seq)
+{
+	ViewCap		c;
+
+	c.lsn = read_lsn;
+	c.seq = PS_SEQ_UNBOUNDED;
+	c.strict_seq = read_seq ? read_seq : PS_SEQ_UNBOUNDED;
+	c.legacy = true;
+	return c;
+}
+
+/*
+ * Compose a cap across one branch edge (L_e, S_e): the single function used
+ * by tl_walk_next(), the P2 planner's retention_project_cap(), the P2/P5
+ * registration gates and every fence builder (design doc S1.2).  Proved
+ * exact (the intersection of the constituents' admissible sets) in S1.2.
+ */
+static inline ViewCap
+viewcap_compose(ViewCap c, uint64_t edge_lsn, uint64_t edge_seq)
+{
+	ViewCap		r;
+
+	r.strict_seq = (edge_lsn < c.lsn) ? PS_SEQ_UNBOUNDED : c.strict_seq;
+	r.lsn = c.lsn < edge_lsn ? c.lsn : edge_lsn;
+	r.seq = c.seq < edge_seq ? c.seq : edge_seq;
+	r.legacy = c.legacy;
+	return r;
+}
+
 /* Hash entry: all versions of one (timeline, key, block), in arrival order. */
 typedef struct PageEnt
 {
@@ -4037,12 +4136,20 @@ typedef struct ForkEvent
 	uint8_t		kind;
 	uint8_t		marker_kind;	/* durable ordered marker kind, even after activation */
 	uint8_t		cached_state;
-	uint8_t		snapshot_dropped;	/* set by the last fork_meta_snapshot_build()
-									 * pass over this fork's events (1 iff this
-									 * event did not make it into the new
-									 * checkpoint/tail); consumed once, right
-									 * after a successful publish, by
-									 * fork_event_compact_dropped_markers(). */
+	uint8_t		flags;			/* FEV_F_* below; bit0 is the former
+								 * snapshot_dropped (set by the last
+								 * fork_meta_snapshot_build() pass over this
+								 * fork's events -- 1 iff this event did not
+								 * make it into the new checkpoint/tail;
+								 * consumed once, right after a successful
+								 * publish, by
+								 * fork_event_compact_dropped_markers()).
+								 * The other bits classify the event for the
+								 * BRANCH_SNAPSHOT_SEQ_CAP.md S1.1/S1.3 rule;
+								 * they are in-memory-only, recomputed on
+								 * load exactly like the flag they replace,
+								 * and have no effect while every ViewCap's
+								 * seq stays PS_SEQ_UNBOUNDED (P1). */
 } ForkEvent;
 
 /* In-memory only (never persisted); this just documents that the added
@@ -4061,6 +4168,12 @@ _Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 #define FEV_SEG_ID 9			/* second record carrying a bound marker's identity */
 #define FEV_SNAPSHOT_BASE 10	/* source-log epoch marker after snapshot cutover */
 
+/* ForkEvent.flags bits (design doc S3.2). */
+#define FEV_F_SNAPSHOT_DROPPED	0x01	/* former snapshot_dropped byte */
+#define FEV_F_META				0x02	/* SET/DEAD, or a ZEROEXTEND-origin GROW */
+#define FEV_F_META_FIRST		0x04	/* the min-seq META event at its own lsn */
+#define FEV_F_UNSTAMPED			0x08	/* a WAL-less (req_lsn == 0) op's event */
+
 typedef struct ForkEnt
 {
 	struct ForkEnt *next;		/* bucket chain */
@@ -4074,6 +4187,15 @@ typedef struct ForkEnt
 	uint32_t   *def_idx;		/* indexes of SET/DEAD events only */
 	uint32_t	ndef;
 	uint32_t	defcap;
+	uint32_t   *late_meta_idx;	/* indexes of non-FEV_F_META_FIRST META events */
+	uint32_t	nlate_meta;
+	uint32_t	late_meta_cap;
+	uint64_t	max_meta_seq;	/* max seq over the META/UNSTAMPED events
+								 * currently present (0 if none); a pure
+								 * function of the present set (S3.2/S9.3) */
+	uint64_t	max_inherited_page_seq;	/* max seq over PAGE-class GROWs
+								 * currently present at lsn <= this fork's
+								 * own branch_lsn (0 if none) */
 	PageEnt    *pages;			/* local pages belonging to this fork */
 	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
 	uint64_t	last_page_lsn;	/* newest durable local page tuple */
@@ -4119,6 +4241,7 @@ free_page_fork_indexes(void)
 
 				free(fork->ev);
 				free(fork->def_idx);
+				free(fork->late_meta_idx);
 				free(fork);
 				fork = next;
 			}
@@ -4149,6 +4272,39 @@ typedef struct TimelineMeta
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+
+/*
+ * branch_seq: the composition edge's S_e (design doc S1.2/S2/S9.3).  P1
+ * always returns PS_SEQ_UNBOUNDED here; P3b reads a persisted, activated
+ * field once branches carry one.  Keeping this indirection from P1 on means
+ * every ancestry walk already composes through it, so P3b only has to
+ * change this one function's body.
+ */
+static inline uint64_t
+timeline_branch_seq(uint32_t timeline)
+{
+	(void) timeline;
+	return PS_SEQ_UNBOUNDED;
+}
+
+/*
+ * B_k: the inherited-range boundary for timeline k (design doc S1.5) --
+ * this timeline's own branch_lsn, or "-infinity" (has_range = 0) for the
+ * root.  Do not encode the root's B_k as 0: LSN-0 positions must stay
+ * escape-eligible at the root.
+ */
+static inline uint64_t
+timeline_inherited_below(uint32_t tl, bool *has_range)
+{
+	if (timeline_has_parent(tl))
+	{
+		*has_range = true;
+		return timelines[tl].branch_lsn;
+	}
+	*has_range = false;
+	return 0;					/* unused by callers when *has_range is false */
+}
+
 /* A metadata append failure is ambiguous: the lower layer may have made the
  * record durable before reporting an error.  Refuse all timeline services
  * until the process reopens and replays the log. */
@@ -5539,25 +5695,83 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		fork->has_wal_less = 1;
 }
 
-/* Newest version on this entry with lsn <= read_lsn, or NULL if none. */
+/*
+ * Is v the minimum-admission_seq version at its own lsn within e?  Used
+ * only by page_select()'s escape path (v->admission_seq > c->seq), which is
+ * unreachable in production while every ViewCap stays PS_SEQ_UNBOUNDED
+ * (P1); legacy (admission_seq == 0) versions never need it (they always
+ * pass the plain seq <= S disjunct, since a ViewCap's seq is never a
+ * literal 0).  O(nver) worst case, same bound as page_select() itself.
+ */
+static bool
+page_select_is_smin(const PageEnt *e, const PageVer *v)
+{
+	for (int j = 0; j < e->nver; j++)
+		if (e->vers[j].lsn == v->lsn && e->vers[j].admission_seq < v->admission_seq)
+			return false;
+	return true;
+}
+
+/*
+ * The design doc's S1.3 admissibility rule for relation pages: the
+ * admissible version with the greatest (lsn, seq), where
+ *
+ *   admissible(v) <=> p <= L
+ *                   && (p < L || v.seq <= X)
+ *                   && (v.seq <= S || (p > B_k && v.seq == s_min(p)))
+ *
+ * B/has_B is B_k (design doc S1.5): has_B false means "-infinity" (the
+ * root), where the escape is always available.
+ *
+ * At c->seq == PS_SEQ_UNBOUNDED (the only case P1 ever reaches in
+ * production) the third conjunct is trivially true for every version, so
+ * this reduces, line for line, to the first two conjuncts plus the
+ * greatest-(lsn,seq) reduction -- exactly today's page_visible() body with
+ * read_lsn = c->lsn, read_seq = c->strict_seq.  See the "Equivalence
+ * argument" in the design doc's S9.3, and the differential tests in
+ * ps_test_viewcap_differential().
+ */
 static PageVer *
-page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
+page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 {
 	PageVer    *best = NULL;
 
 	for (int i = 0; i < e->nver; i++)
 	{
 		PageVer    *v = &e->vers[i];
+		uint64_t	vseq = v->admission_seq;
+		bool		ok;
 
-		if (v->lsn <= read_lsn &&
-			(v->lsn < read_lsn || read_seq == 0 || v->admission_seq == 0 ||
-			 v->admission_seq <= read_seq) &&
-			(!best || v->lsn > best->lsn ||
-			 (v->lsn == best->lsn &&
-			  v->admission_seq >= best->admission_seq)))
+		if (v->lsn > c->lsn)
+			continue;
+		if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
+			vseq != 0 && vseq > c->strict_seq)
+			continue;
+
+		if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
+			ok = true;
+		else if (!has_B || v->lsn > B)
+			ok = page_select_is_smin(e, v);
+		else
+			ok = false;
+
+		if (!ok)
+			continue;
+		if (!best || v->lsn > best->lsn ||
+			(v->lsn == best->lsn && vseq >= best->admission_seq))
 			best = v;
 	}
 	return best;
+}
+
+/* Newest version on this entry with lsn <= read_lsn, or NULL if none.  Kept
+ * as a thin wrapper for callers that have not adopted a ViewCap/TlWalk. */
+static PageVer *
+page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
+{
+	ViewCap		c = viewcap_from_request(read_lsn, read_seq);
+
+	return page_select(e, &c, 0, false);
 }
 
 uint32_t
@@ -5708,11 +5922,127 @@ fork_event_identity_range(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq
 	}
 }
 
+/* viewcap_from_request() under another name, for call sites that only have
+ * a bare (lsn, seq_cap) pair -- today's calling convention -- rather than a
+ * TlWalk-carried ViewCap: identical mapping (S = infinity, X = seq_cap or
+ * infinity for seq_cap == 0), spelled out separately here because these
+ * call sites are not "requests" in the read-path sense. */
+static inline ViewCap
+viewcap_lsn_seq(uint64_t lsn, uint64_t seq_cap)
+{
+	return viewcap_from_request(lsn, seq_cap);
+}
+
+/*
+ * The single hidden-event predicate (design doc S3.2), shared by the read
+ * path's slow-path fold here and, from P2 on, by the planner's retention
+ * masks -- requirement 2 of the P1 scope ("a single admissibility
+ * predicate").  Returns true iff event e->ev[i] is NOT admissible under cap
+ * c at this fork's inherited-range boundary B/has_B (design doc S1.5):
+ *
+ *   PAGE-class GROW: hidden <=> seq > S && lsn <= B_k
+ *   META (incl. ZEROEXTEND-origin GROW): hidden <=> seq > S && (!META_FIRST || lsn <= B_k)
+ *   UNSTAMPED: hidden <=> seq > S   (no escape at all, design doc S1.6)
+ *
+ * The boundary conjuncts (p <= L, and X at p == L) are shared by every
+ * class and checked first.  Only ever reached from the slow-path fold
+ * below, itself only reached when c->seq != PS_SEQ_UNBOUNDED -- i.e. never
+ * in P1 production, where every ViewCap stays unbounded.
+ */
+static bool
+fork_event_hidden(const ForkEnt *e, uint32_t i, const ViewCap *c,
+				  uint64_t B, bool has_B)
+{
+	const ForkEvent *v = &e->ev[i];
+	uint64_t	vseq = v->admission_seq;
+
+	if (v->lsn > c->lsn)
+		return true;
+	if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
+		vseq != 0 && vseq > c->strict_seq)
+		return true;
+
+	if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
+		return false;
+
+	/* vseq > S: only a class-appropriate escape can still admit it. */
+	if (v->flags & FEV_F_UNSTAMPED)
+		return true;
+	if (has_B && v->lsn <= B)
+		return true;			/* inherited range: no escape (S1.5) */
+	if (v->flags & FEV_F_META)
+		return !(v->flags & FEV_F_META_FIRST);
+	return false;				/* PAGE-class GROW: lsn > B_k is enough */
+}
+
+/*
+ * Slow-path fold: a full linear fold over every non-hidden GROW/SET/DEAD
+ * event at or below c->lsn (S1.3's X bound applies at lsn == c->lsn exactly
+ * as fork_event_cache_from()'s cached fold does).  Only ever reached with a
+ * finite c->seq, so it is exercised solely by the P1 test suite (production
+ * caps stay PS_SEQ_UNBOUNDED); correctness, not speed, is what matters
+ * here, so unlike the cached-prefix fast path this does not try to resume
+ * from a cached midpoint.
+ */
 static int
-fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
+fork_asof_hop_slow(const ForkEnt *e, const ViewCap *c, uint64_t B, bool has_B,
+					uint32_t *nb_out)
+{
+	uint8_t		state = FORK_HOP_NONE;
+	uint32_t	nb = 0;
+
+	*nb_out = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		const ForkEvent *v = &e->ev[i];
+
+		if (v->lsn > c->lsn)
+			break;
+		if (v->kind > FEV_DEAD)
+			continue;
+		if (fork_event_hidden(e, i, c, B, has_B))
+			continue;
+		if (v->kind == FEV_GROW)
+		{
+			if (v->nblocks > nb)
+				nb = v->nblocks;
+			state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+				FORK_HOP_GROW : FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_SET)
+		{
+			nb = v->nblocks;
+			state = FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_DEAD)
+		{
+			nb = 0;
+			state = FORK_HOP_DEAD;
+		}
+	}
+	*nb_out = nb;
+	return state;
+}
+
+/*
+ * Resolve one timeline hop's contribution to an as-of size/existence query
+ * under cap c (design doc S1.3/S3.2/S9.3).  The fast path below, taken
+ * whenever c->seq == PS_SEQ_UNBOUNDED or every event that could need the
+ * escape is already within S, is byte-for-byte today's fork_asof_hop() body
+ * (cap = c->lsn, seq_cap = c->strict_seq); see the "Equivalence argument"
+ * in the design doc's S9.3.  P1 never takes the slow path in production.
+ */
+static int
+fork_asof_hop(const ForkEnt *e, const ViewCap *c, uint64_t B, bool has_B,
 			  uint32_t *nb_out)
 {
+	uint64_t	cap = c->lsn;
+	uint64_t	seq_cap = c->strict_seq;
+
 	*nb_out = 0;
+	if (c->seq != PS_SEQ_UNBOUNDED &&
+		!(e->max_meta_seq <= c->seq && e->max_inherited_page_seq <= c->seq))
+		return fork_asof_hop_slow(e, c, B, has_B, nb_out);
 	if (seq_cap == 0)
 	{
 		uint32_t lo = 0;
@@ -5864,33 +6194,51 @@ fork_def_index_insert(ForkEnt *e, uint32_t event_idx, int definitive)
 	e->ndef++;
 }
 
-/* Size of e as of cap, hop-local (for the GROW-dedup below). */
+/* Size of e as of cap, hop-local (for the GROW-dedup below).  Not a
+ * read-path view: no S/escape notion existed here before P1, so it is
+ * wrapped with the same (S = infinity, X = seq_cap) mapping
+ * viewcap_from_request() uses, and B/has_B = 0/false, matching the absence
+ * of any inherited-range concept in the pre-P1 code this preserves. */
 static uint32_t
 fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
 {
+	ViewCap		c = viewcap_lsn_seq(cap, seq_cap);
 	uint32_t	nb;
 
-	(void) fork_asof_hop(e, cap, seq_cap, &nb);
+	(void) fork_asof_hop(e, &c, 0, false, &nb);
 	return nb;
 }
 
-/* A later truncate/drop invalidates old page bytes even if subsequent growth
+/*
+ * A later truncate/drop invalidates old page bytes even if subsequent growth
  * makes the block addressable again.  The current fast path avoids touching
- * event history unless a definitive event is newer than the selected page. */
+ * event history unless a definitive event is newer than the selected page.
+ * Only SET/DEAD (always META) events are ever consulted, so the slow-path
+ * gate only needs max_meta_seq.
+ */
 static int
 fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
-					  uint64_t cap, uint64_t seq_cap)
+					  const ViewCap *c, uint64_t B, bool has_B)
 {
+	bool		slow;
+
 	if (e == NULL || page == NULL || e->last_def_lsn < page->lsn)
 		return 0;
+	slow = c->seq != PS_SEQ_UNBOUNDED && e->max_meta_seq > c->seq;
 	for (int i = (int) e->ndef - 1; i >= 0; i--)
 	{
-		const ForkEvent *v = &e->ev[e->def_idx[i]];
+		uint32_t	idx = e->def_idx[i];
+		const ForkEvent *v = &e->ev[idx];
 
-		if (v->lsn > cap ||
-			(seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
-			 v->admission_seq > seq_cap) ||
-			(v->kind != FEV_SET && v->kind != FEV_DEAD))
+		if (v->lsn > c->lsn)
+			continue;
+		if (slow)
+		{
+			if (fork_event_hidden(e, idx, c, B, has_B))
+				continue;
+		}
+		else if (c->strict_seq != PS_SEQ_UNBOUNDED && v->lsn == c->lsn &&
+				 v->admission_seq != 0 && v->admission_seq > c->strict_seq)
 			continue;
 		/* Nonzero LSN is the primary order, including across legacy and
 		 * sequenced records.  WAL-less records have no LSN order, so retain
@@ -5911,12 +6259,39 @@ fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
 	return 0;
 }
 
+/* Same predicate family as fork_asof_hop(); only SET/DEAD events ever
+ * update cached_fence_nblocks (fork_event_cache_from()), so the slow-path
+ * gate here is max_meta_seq too. */
 static int
 fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
-						uint64_t cap, uint64_t seq_cap)
+						const ViewCap *c, uint64_t B, bool has_B)
 {
+	uint64_t	cap = c->lsn;
+	uint64_t	seq_cap = c->strict_seq;
+
 	if (e == NULL)
 		return 0;
+	if (c->seq != PS_SEQ_UNBOUNDED && e->max_meta_seq > c->seq)
+	{
+		uint32_t	fence = UINT32_MAX;
+
+		for (uint32_t i = 0; i < e->nev; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->lsn > cap)
+				break;
+			if (v->kind != FEV_SET && v->kind != FEV_DEAD)
+				continue;
+			if (fork_event_hidden(e, i, c, B, has_B))
+				continue;
+			if (v->kind == FEV_DEAD)
+				fence = 0;
+			else if (v->nblocks < fence)
+				fence = v->nblocks;
+		}
+		return fence != UINT32_MAX && block >= fence;
+	}
 	if (seq_cap == 0)
 	{
 		uint32_t lo = 0;
@@ -6067,7 +6442,63 @@ fork_event_check_order(const ForkEnt *e)
 			e->ev[i - 1].admission_seq > e->ev[i].admission_seq)
 			return 0;
 	}
-	return zero == e->nlegacy_seq;
+	if (zero != e->nlegacy_seq)
+		return 0;
+
+	/*
+	 * META_FIRST / late_meta_idx consistency (design doc S9.3): within each
+	 * lsn run, at most one META event carries META_FIRST, it must be the
+	 * minimum-admission_seq META event in that run, and late_meta_idx names
+	 * exactly the other META events, each exactly once.
+	 */
+	{
+		uint32_t	run_start = 0;
+		uint32_t	nlate_seen = 0;
+
+		for (uint32_t i = 0; i <= e->nev; i++)
+		{
+			if (i < e->nev && e->ev[i].lsn == e->ev[run_start].lsn &&
+				i != run_start)
+				continue;
+			if (i > run_start)
+			{
+				uint32_t	best = UINT32_MAX;
+
+				for (uint32_t j = run_start; j < i; j++)
+				{
+					if (!(e->ev[j].flags & FEV_F_META))
+						continue;
+					if (e->ev[j].flags & FEV_F_META_FIRST)
+					{
+						if (best != UINT32_MAX)
+							return 0;	/* two META_FIRSTs in one run */
+						best = j;
+					}
+				}
+				for (uint32_t j = run_start; j < i; j++)
+					if ((e->ev[j].flags & FEV_F_META) && best != UINT32_MAX &&
+						j != best &&
+						e->ev[j].admission_seq < e->ev[best].admission_seq)
+						return 0;	/* best is not the minimum */
+			}
+			run_start = i;
+		}
+		for (uint32_t i = 0; i < e->nev; i++)
+			if ((e->ev[i].flags & FEV_F_META) &&
+				!(e->ev[i].flags & FEV_F_META_FIRST))
+				nlate_seen++;
+		if (nlate_seen != e->nlate_meta)
+			return 0;
+		for (uint32_t k = 0; k < e->nlate_meta; k++)
+		{
+			uint32_t	idx = e->late_meta_idx[k];
+
+			if (idx >= e->nev || !(e->ev[idx].flags & FEV_F_META) ||
+				(e->ev[idx].flags & FEV_F_META_FIRST))
+				return 0;
+		}
+	}
+	return 1;
 }
 
 /*
@@ -6088,11 +6519,84 @@ fork_event_check_order(const ForkEnt *e)
 */
 static _Thread_local int fork_event_cache_defer = 0;
 
+/*
+ * Recompute FEV_F_META_FIRST and late_meta_idx from the present META set
+ * (design doc S3.2/S9.3: "recomputed exactly on load and after in-memory
+ * compaction; it is a pure function of the present set").  O(e->nev);
+ * called only when a META event is inserted, so it never runs on the
+ * PAGE-class GROW hot path.  The array is lsn-ordered (fork_event_add()'s
+ * own invariant), so same-lsn events are always contiguous: one linear
+ * pass buckets by lsn and, within each META run, marks the min-seq event
+ * (legacy seq 0 sorts first) as META_FIRST and every other one as late.
+ */
+/*
+ * late_meta_idx stores array indexes, exactly like def_idx; an insert at
+ * event_idx shifts every existing surviving event at or after it up by one
+ * slot (fork_event_insert_pos()), so any stored index >= event_idx must
+ * shift too.  Called on every insert that does NOT itself trigger
+ * fork_event_recompute_meta_first() (which instead rebuilds the whole
+ * array from the current, already-inserted state and so needs no prior
+ * shift).
+ */
+static void
+fork_late_meta_shift(ForkEnt *e, uint32_t event_idx)
+{
+	for (uint32_t k = 0; k < e->nlate_meta; k++)
+		if (e->late_meta_idx[k] >= event_idx)
+			e->late_meta_idx[k]++;
+}
+
+static void
+fork_event_recompute_meta_first(ForkEnt *e)
+{
+	uint32_t	run_start = 0;
+
+	e->nlate_meta = 0;
+	for (uint32_t i = 0; i <= e->nev; i++)
+	{
+		if (i < e->nev && e->ev[i].lsn == e->ev[run_start].lsn && i != run_start)
+			continue;
+		if (i > run_start)
+		{
+			uint32_t	best = UINT32_MAX;
+
+			for (uint32_t j = run_start; j < i; j++)
+			{
+				if (!(e->ev[j].flags & FEV_F_META))
+					continue;
+				e->ev[j].flags &= (uint8_t) ~FEV_F_META_FIRST;
+				if (best == UINT32_MAX ||
+					e->ev[j].admission_seq < e->ev[best].admission_seq)
+					best = j;
+			}
+			if (best != UINT32_MAX)
+			{
+				e->ev[best].flags |= FEV_F_META_FIRST;
+				for (uint32_t j = run_start; j < i; j++)
+				{
+					if (j == best || !(e->ev[j].flags & FEV_F_META))
+						continue;
+					if (e->nlate_meta == e->late_meta_cap)
+					{
+						e->late_meta_cap = e->late_meta_cap ?
+							e->late_meta_cap * 2 : 4;
+						e->late_meta_idx = realloc(e->late_meta_idx,
+							(size_t) e->late_meta_cap * sizeof(*e->late_meta_idx));
+					}
+					e->late_meta_idx[e->nlate_meta++] = j;
+				}
+			}
+		}
+		run_start = i;
+	}
+}
+
 static void
 fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
-			   uint32_t nblocks, uint8_t kind)
+			   uint32_t nblocks, uint8_t kind, bool meta)
 {
 	uint32_t	i;
+	bool		is_meta = (kind == FEV_SET || kind == FEV_DEAD) ? true : meta;
 
 	if (!fork_event_cache_defer && kind == FEV_GROW &&
 		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
@@ -6111,11 +6615,33 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = 0;
-	e->ev[i].snapshot_dropped = 0;
+	e->ev[i].flags = is_meta ? FEV_F_META : 0;
 	e->nev++;
 	if (admission_seq == 0)
 		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
+	if (kind == FEV_GROW)
+	{
+		if (is_meta)
+		{
+			if (admission_seq > e->max_meta_seq)
+				e->max_meta_seq = admission_seq;
+		}
+		else
+		{
+			bool		has_range;
+			uint64_t	B = timeline_inherited_below(e->timeline, &has_range);
+
+			if (has_range && lsn <= B && admission_seq > e->max_inherited_page_seq)
+				e->max_inherited_page_seq = admission_seq;
+		}
+	}
+	else if (admission_seq > e->max_meta_seq)
+		e->max_meta_seq = admission_seq;	/* SET/DEAD: always META */
+	if (is_meta)
+		fork_event_recompute_meta_first(e);
+	else
+		fork_late_meta_shift(e, i);
 	if (fork_event_cache_defer)
 		return;
 	fork_event_cache_from(e, i);
@@ -6174,11 +6700,16 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = kind;
-	e->ev[i].snapshot_dropped = 0;
+	/* Ordered/segment markers are always PAGE-class (S1.1): they mirror a
+	 * page append, never a ZEROEXTEND.  Not META, so no META_FIRST bit and
+	 * no recompute; a fresh assignment (not &=) since e->ev[i] can be a
+	 * reused, previously-populated slot. */
+	e->ev[i].flags = 0;
 	e->nev++;
 	if (admission_seq == 0)
 		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, 0);
+	fork_late_meta_shift(e, i);
 	fork_event_cache_from(e, i);
 }
 
@@ -6204,7 +6735,13 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 		{
 			if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_GROW_BOUND)
 			{
-				v->kind = FEV_GROW;
+				bool		has_range;
+				uint64_t	B = timeline_inherited_below(e->timeline, &has_range);
+
+				v->kind = FEV_GROW;	/* still PAGE-class: flags unchanged */
+				if (has_range && v->lsn <= B &&
+					v->admission_seq > e->max_inherited_page_seq)
+					e->max_inherited_page_seq = v->admission_seq;
 				fork_event_cache_from(e, i);
 				e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
 			}
@@ -6633,7 +7170,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			uint32_t	nblocks = (uint32_t) (fork_event_selftest_rand(&rngstate) % 9);
 
 			kind = roll == 0 ? FEV_SET : roll == 1 ? FEV_DEAD : FEV_GROW;
-			fork_event_add(&fe, lsn, admission_seq, nblocks, kind);
+			fork_event_add(&fe, lsn, admission_seq, nblocks, kind, false);
 			/* A GROW that does not raise the size at (lsn, admission_seq) is
 			 * deduped (fork_event_add() returns early, nev unchanged); the
 			 * slot promise has nothing to check in that case. */
@@ -6695,7 +7232,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		}
 		else if (i % 3 == 1 && m->kind == FEV_SEG_COMMIT_BOUND)
 		{
-			fork_event_add(&fe, m->lsn, m->admission_seq, 100, FEV_GROW);
+			fork_event_add(&fe, m->lsn, m->admission_seq, 100, FEV_GROW, false);
 			FEV_ST_CHECK(fork_event_check_order(&fe));
 		}
 	}
@@ -6722,16 +7259,18 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		}
 
 		{
+			ViewCap		qc = viewcap_lsn_seq(cap, seq_cap);
 			uint32_t	nb_fast = 0,
 						nb_ref = 0;
-			int			s_fast = fork_asof_hop(&fe, cap, seq_cap, &nb_fast);
+			int			s_fast = fork_asof_hop(&fe, &qc, 0, false, &nb_fast);
 			int			s_ref = fork_asof_hop_reference(&fe, cap, seq_cap, &nb_ref);
 
 			FEV_ST_CHECK(s_fast == s_ref && nb_fast == nb_ref);
 		}
 		{
+			ViewCap		qc = viewcap_lsn_seq(cap, seq_cap);
 			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rngstate) % 12);
-			int			f_fast = fork_inheritance_fenced(&fe, block, cap, seq_cap);
+			int			f_fast = fork_inheritance_fenced(&fe, block, &qc, 0, false);
 			int			f_ref = fork_inheritance_fenced_reference(&fe, block, cap,
 																	 seq_cap);
 
@@ -6808,7 +7347,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			if (fe.ev[i].kind > FEV_DEAD &&
 				(fork_event_selftest_rand(&rngstate) % 2) == 0)
 			{
-				fe.ev[i].snapshot_dropped = 1;
+				fe.ev[i].flags |= FEV_F_SNAPSHOT_DROPPED;
 				flagged[i] = 1;
 			}
 			else
@@ -6835,7 +7374,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 						 fe.ev[j].cached_nblocks == pre[i].cached_nblocks &&
 						 fe.ev[j].cached_fence_nblocks == pre[i].cached_fence_nblocks &&
 						 fe.ev[j].cached_state == pre[i].cached_state &&
-						 fe.ev[j].snapshot_dropped == 0);
+						 !(fe.ev[j].flags & FEV_F_SNAPSHOT_DROPPED));
 			if (fe.ev[j].kind == FEV_SET || fe.ev[j].kind == FEV_DEAD)
 			{
 				FEV_ST_CHECK(k < fe.ndef && fe.def_idx[k] == j);
@@ -6884,7 +7423,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		FEV_ST_CHECK(!fork_event_index_usable(&fe2, 1));
 		for (uint32_t i = 0; i < fe2.nev; i++)
 			if (fe2.ev[i].admission_seq == 0)
-				fe2.ev[i].snapshot_dropped = 1;
+				fe2.ev[i].flags |= FEV_F_SNAPSHOT_DROPPED;
 		fork_event_compact_entry(&fe2);
 		FEV_ST_CHECK(fe2.nlegacy_seq == 0 && fork_event_check_order(&fe2));
 		FEV_ST_CHECK(fork_event_index_usable(&fe2, 1));
@@ -6892,6 +7431,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			FEV_ST_CHECK(fe2.ev[i].admission_seq != 0);
 		free(fe2.ev);
 		free(fe2.def_idx);
+		free(fe2.late_meta_idx);
 	}
 
 #undef FEV_ST_CHECK
@@ -6969,7 +7509,7 @@ fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 		fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
 						  FEV_GROW) != 0)
 		return -1;			/* not durable: do not apply in memory */
-	fork_event_add(e, lsn, admission_seq, to_nblocks, FEV_GROW);
+	fork_event_add(e, lsn, admission_seq, to_nblocks, FEV_GROW, true);
 	return 0;
 }
 
@@ -6993,7 +7533,7 @@ fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				uint64_t lsn, uint64_t admission_seq)
 {
 	fork_event_add(fork_get_or_create(timeline, key), lsn, admission_seq, to_nblocks,
-				   FEV_GROW);
+				   FEV_GROW, false);
 }
 
 static int
@@ -7116,7 +7656,7 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 				}
 			if (!present)
 				fork_event_add(e, grows[i].lsn, grows[i].admission_seq,
-							   grows[i].nblocks, FEV_GROW);
+							   grows[i].nblocks, FEV_GROW, false);
 		}
 	}
 	fork_event_cache_defer--;
@@ -7141,7 +7681,7 @@ fork_grow_replay(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				 uint64_t lsn, uint64_t admission_seq)
 {
 	fork_event_add(fork_get_or_create(timeline, key), lsn, admission_seq, to_nblocks,
-				   FEV_GROW);
+				   FEV_GROW, false);
 }
 
 /* --- timeline metadata + read-through --- */
@@ -7346,26 +7886,62 @@ timeline_recovery_allowed(uint32_t timeline)
 typedef struct TlWalk
 {
 	uint32_t	tl;				/* current ancestry level */
-	uint64_t	lsn;			/* read_lsn capped to this level's fork point */
+	uint64_t	lsn;			/* cap.lsn mirror, for LSN-only callers */
+	ViewCap		cap;			/* full composed cap at this level (S1.2) */
+	uint64_t	inherited_below;	/* B_k for this level (S1.5) */
+	bool		has_inherited_below;	/* false at the root: B_k = -infinity */
 } TlWalk;
+
+static inline void
+tl_walk_set_level(TlWalk *w, uint32_t tl)
+{
+	w->tl = tl;
+	w->lsn = w->cap.lsn;
+	w->inherited_below = timeline_inherited_below(tl, &w->has_inherited_below);
+}
+
+static inline TlWalk
+tl_walk_first_cap(uint32_t timeline, ViewCap cap)
+{
+	TlWalk		w;
+
+	w.cap = cap;
+	tl_walk_set_level(&w, timeline);
+	return w;
+}
 
 static inline TlWalk
 tl_walk_first(uint32_t timeline, uint64_t read_lsn)
 {
-	TlWalk		w = {timeline, read_lsn};
-
-	return w;
+	/* read_seq = 0: uncapped by X too, matching every pre-P1 LSN-only
+	 * walk's total absence of a seq concept.  Callers that need a real
+	 * request seq use tl_walk_first_cap(timeline, viewcap_from_request(...))
+	 * instead. */
+	return tl_walk_first_cap(timeline, viewcap_from_request(read_lsn, 0));
 }
 
-/* Advance to the parent, capping lsn at the branch point; 0 at the root. */
+/*
+ * Advance to the parent, composing the cap across the branch edge (S1.2)
+ * and recomputing this level's B_k; 0 at the root.  At edge_seq ==
+ * PS_SEQ_UNBOUNDED (timeline_branch_seq()'s only return value in P1),
+ * viewcap_compose() reduces lsn/strict_seq exactly as the pre-P1 body did
+ * ("if branch_lsn < w->lsn, cap lsn there"), so every existing LSN-only or
+ * (lsn, seq) walk is unaffected.
+ */
 static inline int
 tl_walk_next(TlWalk *w)
 {
+	uint64_t	edge_lsn;
+	uint64_t	edge_seq;
+	uint32_t	parent;
+
 	if (!timeline_has_parent(w->tl))
 		return 0;
-	if (timelines[w->tl].branch_lsn < w->lsn)
-		w->lsn = timelines[w->tl].branch_lsn;
-	w->tl = (uint32_t) timelines[w->tl].parent;
+	edge_lsn = timelines[w->tl].branch_lsn;
+	edge_seq = timeline_branch_seq(w->tl);
+	w->cap = viewcap_compose(w->cap, edge_lsn, edge_seq);
+	parent = (uint32_t) timelines[w->tl].parent;
+	tl_walk_set_level(w, parent);
 	return 1;
 }
 
@@ -7376,11 +7952,13 @@ static int
 page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
 						  uint64_t read_seq)
 {
-	TlWalk		w = tl_walk_first(reader_timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(reader_timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	for (;;)
 	{
-		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+		uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
+			0 : w.cap.strict_seq;
 
 		if (!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
 			return 0;
@@ -7642,16 +8220,19 @@ read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
 	*out = NULL;
 	if (!core_process_valid())
 		return -1;
-	w = tl_walk_first(timeline, read_lsn);
+	w = tl_walk_first_cap(timeline, viewcap_from_request(read_lsn, read_seq));
 	do
 	{
 		ForkEnt    *fe = fork_find(w.tl, key);
-		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+		uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
+			0 : w.cap.strict_seq;
 		uint32_t	nb = 0;
-		int			fork_state = fe ? fork_asof_hop(fe, w.lsn, seq_cap, &nb) :
+		int			fork_state = fe ? fork_asof_hop(fe, &w.cap, w.inherited_below,
+											w.has_inherited_below, &nb) :
 			FORK_HOP_NONE;
 		PageEnt    *e = page_find(w.tl, key, block);
-		PageVer    *v = e ? page_visible(e, w.lsn, seq_cap) : NULL;
+		PageVer    *v = e ? page_select(e, &w.cap, w.inherited_below,
+										w.has_inherited_below) : NULL;
 		if (artifact_data_key(key))
 		{
 			int state = artifact_visible(w.tl, key, block, w.lsn, seq_cap, &v, 1);
@@ -7663,7 +8244,8 @@ read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (v)
 		{
-			if (fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
+			if (fork_page_invalidated(fe, block, v, &w.cap, w.inherited_below,
+									  w.has_inherited_below))
 				return 0;
 			/* LSN-0 bytes have no historical visibility proof.  This also
 			 * applies when a newest read becomes capped through ancestry. */
@@ -7677,7 +8259,8 @@ read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
 			(fork_state == FORK_HOP_DEF && block >= nb))
 			return 0;
 		if (fork_state == FORK_HOP_DEF &&
-			fork_inheritance_fenced(fe, block, w.lsn, seq_cap))
+			fork_inheritance_fenced(fe, block, &w.cap, w.inherited_below,
+									w.has_inherited_below))
 			return 0;
 	} while (tl_walk_next(&w));
 	return 0;
@@ -7710,7 +8293,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 					 uint64_t read_seq)
 {
 	uint32_t	maxnb = 0;
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	do
 	{
@@ -7719,8 +8303,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
-			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
+			int			r = fork_asof_hop(e, &w.cap, w.inherited_below,
+										  w.has_inherited_below, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return maxnb;
@@ -7770,7 +8354,8 @@ fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,
 						 uint64_t *seq_out)
 {
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	*seq_out = 0;
 	do
@@ -7779,15 +8364,26 @@ fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (e != NULL)
 		{
-			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+			bool		slow = w.cap.seq != PS_SEQ_UNBOUNDED &&
+				e->max_meta_seq > w.cap.seq;
+			uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
+				0 : w.cap.strict_seq;
 
 			for (uint32_t i = e->nev; i > 0; i--)
 			{
-				const ForkEvent *v = &e->ev[i - 1];
+				uint32_t	idx = i - 1;
+				const ForkEvent *v = &e->ev[idx];
 
-				if (v->kind > FEV_DEAD || v->lsn == 0 || v->lsn > w.lsn ||
-					(v->lsn == w.lsn && seq_cap != 0 &&
-					 v->admission_seq != 0 && v->admission_seq > seq_cap))
+				if (v->kind > FEV_DEAD || v->lsn == 0 || v->lsn > w.lsn)
+					continue;
+				if (slow)
+				{
+					if (fork_event_hidden(e, idx, &w.cap, w.inherited_below,
+										  w.has_inherited_below))
+						continue;
+				}
+				else if (v->lsn == w.lsn && seq_cap != 0 &&
+						 v->admission_seq != 0 && v->admission_seq > seq_cap)
 					continue;
 				if (v->kind == FEV_DEAD ||
 					(v->kind == FEV_SET && v->nblocks <= block))
@@ -7806,7 +8402,8 @@ static int
 fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 					uint64_t read_seq)
 {
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	do
 	{
@@ -7815,8 +8412,8 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
-			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
+			int			r = fork_asof_hop(e, &w.cap, w.inherited_below,
+										  w.has_inherited_below, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return 0;
@@ -8945,9 +9542,12 @@ fork_meta_snapshot_load(const char *directory)
 					records[i].lsn, records[i].nblocks, records[i].kind,
 					records[i].order_id, records[i].admission_seq);
 			else
+				/* Legacy V2/V3 forkmeta carries no META/PAGE distinction
+				 * (design doc S4.2): SET/DEAD are always META regardless of
+				 * this argument, and a plain FEV_GROW is PAGE-class here. */
 				fork_event_add(fork_get_or_create(records[i].timeline, &records[i].key),
 							   records[i].lsn, records[i].admission_seq,
-							   records[i].nblocks, records[i].kind);
+							   records[i].nblocks, records[i].kind, false);
 		}
 	}
 	fork_meta_snapshot_generation = snapshot.generation;
@@ -9296,8 +9896,11 @@ load_fork_meta(void)
 				rec.admission_seq);
 		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
+			/* Legacy record: same S4.2 mapping as the snapshot-payload path
+			 * above. */
 			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
-						   rec.lsn, rec.admission_seq, rec.nblocks, rec.kind);
+						   rec.lsn, rec.admission_seq, rec.nblocks, rec.kind,
+						   false);
 		}
 		else
 			fprintf(stderr, "pagestore: skipping invalid fork-meta record "
@@ -9933,7 +10536,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					 * from a fork this generation is supposed to leave
 					 * untouched.  Clear it here instead. */
 					for (uint32_t i = 0; i < e->nev; i++)
-						e->ev[i].snapshot_dropped = 0;
+						e->ev[i].flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					continue;
 				}
 
@@ -10063,7 +10666,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						kind = event->marker_kind != 0 ? event->marker_kind :
 							event->kind;
 						order_id = event->marker_kind != 0 ? event->order_id : 0;
-						event->snapshot_dropped = 0;
+						event->flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					}
 					else if (event->marker_kind != 0 &&
 						(future || fork_meta_snapshot_marker_page_retained(
@@ -10072,13 +10675,13 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					{
 						kind = event->marker_kind;
 						order_id = event->order_id;
-						event->snapshot_dropped = 0;
+						event->flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					}
 					else if (event->kind <= FEV_DEAD && keep[i])
 					{
 						kind = event->kind;
 						order_id = 0;
-						event->snapshot_dropped = 0;
+						event->flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					}
 					else
 					{
@@ -10094,7 +10697,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						 * acts on kind > FEV_DEAD): those stay bounded by
 						 * distinct sizes already, per the header comment
 						 * above fork_event_add(). */
-						event->snapshot_dropped = 1;
+						event->flags |= FEV_F_SNAPSHOT_DROPPED;
 						continue;
 					}
 
@@ -10208,7 +10811,7 @@ fork_event_compact_entry(ForkEnt *e)
 
 	for (uint32_t i = 0; i < e->nev; i++)
 	{
-		if (e->ev[i].snapshot_dropped && e->ev[i].kind > FEV_DEAD)
+		if ((e->ev[i].flags & FEV_F_SNAPSHOT_DROPPED) && e->ev[i].kind > FEV_DEAD)
 		{
 			if (e->ev[i].admission_seq == 0)
 				e->nlegacy_seq--;
@@ -10216,7 +10819,7 @@ fork_event_compact_entry(ForkEnt *e)
 		}
 		if (w != i)
 			e->ev[w] = e->ev[i];
-		e->ev[w].snapshot_dropped = 0;
+		e->ev[w].flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 		w++;
 	}
 	if (w == e->nev)
@@ -10226,6 +10829,23 @@ fork_event_compact_entry(ForkEnt *e)
 	for (uint32_t i = 0; i < e->nev; i++)
 		if (e->ev[i].kind == FEV_SET || e->ev[i].kind == FEV_DEAD)
 			e->def_idx[e->ndef++] = i;
+	/* late_meta_idx stores array indexes too; META_FIRST itself travelled
+	 * with each surviving event above, so only the index list needs
+	 * rebuilding (kind <= FEV_DEAD events, which is every META event, are
+	 * never dropped by this pass, so no event's META_FIRST status changes
+	 * -- only its slot). */
+	e->nlate_meta = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if ((e->ev[i].flags & FEV_F_META) && !(e->ev[i].flags & FEV_F_META_FIRST))
+		{
+			if (e->nlate_meta == e->late_meta_cap)
+			{
+				e->late_meta_cap = e->late_meta_cap ? e->late_meta_cap * 2 : 4;
+				e->late_meta_idx = realloc(e->late_meta_idx,
+					(size_t) e->late_meta_cap * sizeof(*e->late_meta_idx));
+			}
+			e->late_meta_idx[e->nlate_meta++] = i;
+		}
 	PS_ASSERT(fork_event_check_order(e));
 }
 
@@ -15292,8 +15912,9 @@ walidx_plan_bases_build(uint32_t tl)
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
+						ViewCap		hc = viewcap_lsn_seq(horizons[i], 0);
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
-						fork_asof_hop(f, horizons[i], 0, &nb);
+						fork_asof_hop(f, &hc, 0, false, &nb);
 
 						if (state == FORK_HOP_DEAD ||
 							(state == FORK_HOP_DEF && nb <= e->block))
@@ -15359,8 +15980,9 @@ walidx_plan_bases_build(uint32_t tl)
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
+						ViewCap		hc = viewcap_lsn_seq(horizons[i], 0);
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
-						fork_asof_hop(f, horizons[i], 0, &nb);
+						fork_asof_hop(f, &hc, 0, false, &nb);
 
 						if (state == FORK_HOP_DEAD ||
 							(state == FORK_HOP_DEF && nb <= e->block))
@@ -17575,7 +18197,7 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (!core_process_valid())
 		return -1;
 	s = shard_for(key);
-	w = tl_walk_first(timeline, read_lsn);
+	w = tl_walk_first_cap(timeline, viewcap_from_request(read_lsn, read_seq));
 	/*
 	 * A durable compaction frontier makes older page history unavailable even
 	 * while a crash-recovery pass still has its source layers to clean up.
@@ -17609,7 +18231,9 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		{
 			uint32_t	tl = w.tl;
 			uint64_t	rl = w.lsn;
-			uint64_t	seq_cap = rl == read_lsn ? read_seq : 0;
+			uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
+				0 : w.cap.strict_seq;
+			ViewCap		cur = w.cap;
 			ForkEnt    *fe;
 			uint32_t	nb = 0;
 			int			fork_state;
@@ -17631,10 +18255,12 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 					return -2;
 			}
 			fe = fork_find(tl, key);
-			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
+			fork_state = fe ? fork_asof_hop(fe, &cur, w.inherited_below,
+										  w.has_inherited_below, &nb) :
 				FORK_HOP_NONE;
 			e = page_find(tl, key, block);
-			pv = e ? page_visible(e, rl, seq_cap) : NULL;
+			pv = e ? page_select(e, &cur, w.inherited_below,
+								 w.has_inherited_below) : NULL;
 			if (artifact_data_key(key))
 			{
 				int state = artifact_visible(tl, key, block, rl, seq_cap, &pv, 0);
@@ -17649,6 +18275,9 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			{
 				rl = pv->lsn;
 				seq_cap = pv->admission_seq;
+				cur.lsn = pv->lsn;
+				cur.strict_seq = pv->admission_seq ? pv->admission_seq :
+					PS_SEQ_UNBOUNDED;
 			}
 
 		if (pv)
@@ -17658,7 +18287,8 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			int			served;
 			int			poisoned;
 
-			if (fork_page_invalidated(fe, block, pv, rl, seq_cap))
+			if (fork_page_invalidated(fe, block, pv, &cur, w.inherited_below,
+									  w.has_inherited_below))
 				return 0;
 
 			/* Frontends reject explicit capped reads of WAL-less bytes.  A
@@ -17730,7 +18360,8 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			(fork_state == FORK_HOP_DEF && block >= nb))
 			return 0;
 		if (fork_state == FORK_HOP_DEF &&
-			fork_inheritance_fenced(fe, block, rl, seq_cap))
+			fork_inheritance_fenced(fe, block, &cur, w.inherited_below,
+									w.has_inherited_below))
 			return 0;
 		}
 	}
@@ -18453,9 +19084,12 @@ prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
 		memset(&pv, 0, sizeof(pv));
 		pv.lsn = versions[idx].lsn;
 		pv.admission_seq = versions[idx].admission_seq;
-		if (!fork_page_invalidated(fe, block, &pv, horizon.lsn,
-								   horizon.admission_seq))
-			return 1;
+		{
+			ViewCap		hc = viewcap_lsn_seq(horizon.lsn, horizon.admission_seq);
+
+			if (!fork_page_invalidated(fe, block, &pv, &hc, 0, false))
+				return 1;
+		}
 	}
 	return 0;
 }
@@ -19620,7 +20254,7 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 				fork_meta_persist(timeline, key, l, admission_seq,
 							  block + 1, FEV_GROW) != 0)
 				fork_meta_migrate_failed = 1;
-			fork_event_add(fe, l, admission_seq, block + 1, FEV_GROW);
+			fork_event_add(fe, l, admission_seq, block + 1, FEV_GROW, false);
 		}
 	}
 	else if (!ordered && wal_less)
@@ -20460,7 +21094,7 @@ ps_handle_meta(PsChannel *ch)
 						ch->status = PS_STATUS_ERROR;
 					else
 					{
-						fork_event_add(e, lsn, seq, 0, FEV_SET);
+						fork_event_add(e, lsn, seq, 0, FEV_SET, true);
 						if (delayed)
 							fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 						ch->req_seq = seq;
@@ -20543,7 +21177,7 @@ ps_handle_meta(PsChannel *ch)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
-					fork_event_add(e, lsn, seq, 0, FEV_DEAD);
+					fork_event_add(e, lsn, seq, 0, FEV_DEAD, true);
 					if (delayed)
 						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
@@ -20609,7 +21243,7 @@ ps_handle_meta(PsChannel *ch)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
-					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET);
+					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET, true);
 					if (delayed)
 						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
