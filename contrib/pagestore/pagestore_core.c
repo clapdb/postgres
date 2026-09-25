@@ -4172,7 +4172,17 @@ _Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 #define FEV_F_SNAPSHOT_DROPPED	0x01	/* former snapshot_dropped byte */
 #define FEV_F_META				0x02	/* SET/DEAD, or a ZEROEXTEND-origin GROW */
 #define FEV_F_META_FIRST		0x04	/* the min-seq META event at its own lsn */
-#define FEV_F_UNSTAMPED			0x08	/* a WAL-less (req_lsn == 0) op's event */
+#define FEV_F_UNSTAMPED			0x08	/* a WAL-less (req_lsn == 0) op's event.
+										 * No setter yet in P1: the classifier
+										 * (fork_event_hidden()) and tests
+										 * already handle it, but nothing sets
+										 * it in memory ahead of persisting it,
+										 * to avoid a memory/disk disagreement
+										 * across a restart.  The setter lands
+										 * in P4 together with the persisted
+										 * flag and the client's req_lsn == 0 +
+										 * req_floor_lsn switch (design doc
+										 * S5). */
 
 typedef struct ForkEnt
 {
@@ -7640,6 +7650,7 @@ ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
 	uint64_t	rng = seed ? seed : 1;
 	int			checkno = 0;
 	int			rc = 0;
+	uint32_t	viewcap_test_unstamped_hidden_hits = 0;
 
 #define VC_CHECK(cond) \
 	do { \
@@ -7744,6 +7755,33 @@ ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
 
 			fork_event_add(&fe, lsn, seq, nblocks, kind, meta);
 		}
+
+		/*
+		 * Mix in FEV_F_UNSTAMPED coverage (Codex round, 4102106012): no live
+		 * path sets this flag yet (the setter lands in P4 together with the
+		 * persisted flag, design doc S5), but fork_event_hidden()/
+		 * brute_fork_asof_hop() already implement its S1.6 rule ("no
+		 * first-arrival escape, ever", checked ahead of the META escape), so
+		 * flip it on a test-only random subset of the events just inserted,
+		 * including META ones (a META event can also be flagged UNSTAMPED;
+		 * the predicate's priority order is exactly what this exercises).
+		 * max_meta_seq is defined as the max seq over the "META/UNSTAMPED
+		 * events currently present" (see its field comment): bump it here
+		 * too, exactly what a real P4 setter would have to do, so
+		 * fork_asof_hop()'s fast-path gate stays correct for these
+		 * test-only events.
+		 */
+		for (uint32_t i = 0; i < fe.nev; i++)
+		{
+			if (fe.ev[i].kind > FEV_DEAD)
+				continue;		/* only GROW/SET/DEAD are ever folded */
+			if ((fork_event_selftest_rand(&rng) % 3) == 0)
+			{
+				fe.ev[i].flags |= FEV_F_UNSTAMPED;
+				if (fe.ev[i].admission_seq > fe.max_meta_seq)
+					fe.max_meta_seq = fe.ev[i].admission_seq;
+			}
+		}
 		VC_CHECK(fork_event_check_order(&fe));
 
 		/* (a) infinity: must equal the pre-index oracles exactly. */
@@ -7812,6 +7850,10 @@ ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
 			s_got = fork_asof_hop(&fe, &c, B, has_B, &nb_got);
 			s_want = brute_fork_asof_hop(&fe, &c, B, has_B, &nb_want);
 			VC_CHECK(s_got == s_want && nb_got == nb_want);
+			for (uint32_t i = 0; i < fe.nev; i++)
+				if ((fe.ev[i].flags & FEV_F_UNSTAMPED) &&
+					fe.ev[i].admission_seq > S && fe.ev[i].lsn <= L)
+					viewcap_test_unstamped_hidden_hits++;
 		}
 
 		free(fe.ev);
@@ -7822,6 +7864,9 @@ ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
 
 #undef VC_CHECK
 done:
+	/* Confirms the FEV_F_UNSTAMPED coverage above is not vacuous: over the
+	 * default seed at niter=4000 this reliably hits four figures. */
+	PS_ASSERT(rc != 0 || niter < 500 || viewcap_test_unstamped_hidden_hits > 0);
 	return rc;
 }
 
