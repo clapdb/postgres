@@ -2436,7 +2436,26 @@ assert "$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, '$asofR'::pg_lsn
 	"the pre-truncate horizon still sees the pre-truncate size (frozen view)"
 # WAL-less (unlogged) pages carry pd_lsn 0; their growth must order at the
 # create event's floor, not sort under it and leave the fork looking empty
+#
+# ls_op_lsn regression (split from #294): CREATE UNLOGGED has no WAL record
+# of its own (RelationCreateStorage skips log_smgrcreate for unlogged
+# relations), so it exercises ls_op_lsn's XactLastRecEnd==0 fallback.  $P
+# opens a brand-new backend per "-c" invocation, so a single-statement CREATE
+# here also starts with XactLastCommitEnd/XactLastAbortEnd at their
+# process-initial zero.  The old unconditional
+# Max(XactLastCommitEnd, XactLastAbortEnd) fallback would then stamp this
+# fork's create record at LSN 0 -- a stale position below any legitimate
+# fork/branch cut, letting a branch cut anywhere seemingly "admit" a relation
+# that on this timeline was actually created later (pagestore Bug B).  The
+# fix uses GetXLogInsertRecPtr() instead, which can only be >= the insert
+# position already observed by a concurrently-running connection just before
+# the CREATE executes.  Capture that position first and confirm the fork does
+# not yet exist as of it: the old code would report it as existing already
+# (stamped at LSN 0, which is <= any horizon).
+preUnloggedCreate=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "CREATE UNLOGGED TABLE unlogged_t(i int) TABLESPACE ts;" >/dev/null
+assert "$($P -c "SELECT pagestore_rel_exists_asof('unlogged_t', 0, '$preUnloggedCreate'::pg_lsn);")" "f" \
+	"a WAL-less create's stamped LSN is not a stale (zero) position below the pre-create horizon"
 $P -q -c "INSERT INTO unlogged_t SELECT generate_series(1, 100);" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_rel_nblocks_asof('unlogged_t', 0, pg_current_wal_lsn()) > 0;")" "t" \

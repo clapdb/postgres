@@ -714,25 +714,60 @@ ls_pinned_read_seq(void)
  * (GetCurrentReplayRecPtr; the last-REPLAYED pointer only advances after
  * rm_redo returns, i.e. it names the PREVIOUS record).
  *
- * End-of-transaction unlinks are the subtle case: smgrDoPendingDeletes()
- * runs after RecordTransactionCommit()/RecordTransactionAbort(), both of
- * which RESET XactLastRecEnd -- but the commit record's end survives in
- * XactLastCommitEnd and the abort record's in XactLastAbortEnd, and
- * whichever this backend produced LAST is the record that decided the
- * cleanup (a commit for a DROP, an abort for a created-then-rolled-back
- * relation; stamping the older one would sort the unlink below the
- * relation's own CREATE and resurrect it).  WAL-less mutations (unlogged
- * relations) can leave all of these at older records; their content is
- * not LSN-ordered to begin with.
+ * XactLastRecEnd == 0 falls back to one of two answers, and the two
+ * fallback callers are NOT interchangeable (Codex review finding
+ * 4097536209 on PR #294):
+ *
+ * - CREATE and TRUNCATE reach this fallback when they have no fresh WAL
+ *   record of their own for THIS operation yet (e.g. a route_all compute
+ *   issuing the op with no preceding log_smgrcreate/SMGR_TRUNCATE record in
+ *   this backend since its last commit/abort).  For them, the old
+ *   unconditional Max(XactLastCommitEnd, XactLastAbortEnd) fallback could
+ *   hand back a stale position -- possibly this session's last, unrelated
+ *   commit, or even 0 -- left over from long before some branch was forked
+ *   off the same timeline since.  Stamping that stale, too-low position let
+ *   the mutation sort at or below the branch's cap and leak into it
+ *   (pagestore Bug B: a branch observing parent post-fork metadata
+ *   changes).  GetXLogInsertRecPtr() is the honest fix: it can only be >=
+ *   anything this backend has produced, so it cannot sort a related
+ *   mutation before a record it must follow, and it cannot understate "now"
+ *   the way a leftover session value can.  A non-startup backend in
+ *   recovery (hot standby) never inserts WAL itself, so it uses the last
+ *   replayed position instead -- the same horizon ls_read_lsn() uses for
+ *   its own recovery case, just below.
+ *
+ * - UNLINK's non-redo path runs from smgrDoPendingDeletes() at
+ *   end-of-transaction cleanup, AFTER RecordTransactionCommit()/
+ *   RecordTransactionAbort() have already reset XactLastRecEnd -- that IS
+ *   the documented XactLastCommitEnd/XactLastAbortEnd case above, not a
+ *   caller with no WAL record of its own: the commit/abort record it must
+ *   sort after already happened, and whichever this backend produced LAST
+ *   is the record that decided the cleanup (a commit for a DROP, an abort
+ *   for a created-then-rolled-back relation; stamping the older one would
+ *   sort the unlink below the relation's own CREATE and resurrect it).
+ *   GetXLogInsertRecPtr() is NOT a safe stand-in here: unrelated concurrent
+ *   WAL insertion can push the global pointer arbitrarily far past that
+ *   commit/abort record, and a branch cut between the real transaction end
+ *   and that inflated position would then miss the unlink -- exposing a
+ *   dropped relation, or a relation created by an aborted transaction, to
+ *   the branch.  UNLINK therefore keeps the original
+ *   Max(XactLastCommitEnd, XactLastAbortEnd) fallback.
+ *
+ * WAL-less mutations (unlogged relations) can leave all of these at older
+ * records; their content is not LSN-ordered to begin with.
  */
 static uint64
-ls_op_lsn(void)
+ls_op_lsn(bool is_unlink)
 {
 	if (AmStartupProcess())
 		return (uint64) GetCurrentReplayRecPtr(NULL);
 	if (XactLastRecEnd != 0)
 		return (uint64) XactLastRecEnd;
-	return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+	if (is_unlink)
+		return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+	if (RecoveryInProgress())
+		return (uint64) GetXLogReplayRecPtr(NULL);
+	return (uint64) GetXLogInsertRecPtr();
 }
 
 /* A materializer is writable, not a pinned reader, but during recovery it
@@ -780,7 +815,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
 
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedoEnsure ? 2 : (isRedo ? 1 : 0);
-	ch->req_lsn = ls_op_lsn();
+	ch->req_lsn = ls_op_lsn(false);
 	ls_exec(ch);
 }
 
@@ -810,7 +845,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 
 	ch->opcode = PS_OP_UNLINK;
 	ch->is_redo = isRedo ? 1 : 0;
-	ch->req_lsn = ls_op_lsn();
+	ch->req_lsn = ls_op_lsn(true);
 
 	/* WAL redo must fail if its durable DEAD event cannot be recorded. */
 	if (isRedo)
@@ -863,7 +898,7 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
 	ch->nblocks = nblocks;
-	ch->req_lsn = ls_op_lsn();
+	ch->req_lsn = ls_op_lsn(false);
 	ls_exec(ch);
 }
 
