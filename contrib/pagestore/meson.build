@@ -350,6 +350,30 @@ test('pagestore_timeline',
   timeout: 60,
 )
 
+# Focused POSIX-only unit test for the Bug B read-side seq-cap machinery
+# (BRANCH_SNAPSHOT_SEQ_CAP.md), phase P1: ViewCap/page_select/fork_asof_hop
+# differential tests against frozen pre-P1 references and an independent
+# literal-rule brute force.  Links the shared core directly; no daemon.
+pagestore_viewcap_test = executable('pagestore_viewcap_test',
+  files('pagestore_viewcap_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_RETENTION_TEST', '-DPAGESTORE_RELATION_INSPECTION_TEST']
+          + pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_viewcap',
+  pagestore_viewcap_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Focused shared-core tests for the conservative POSIX WAL reclaim policy.
 pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
   files('pagestore_wal_reclaim_core_test.c', 'pagestore_core.c',

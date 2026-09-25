@@ -7440,6 +7440,388 @@ done:
 	free(markers);
 	free(fe.ev);
 	free(fe.def_idx);
+	free(fe.late_meta_idx);
+	return rc;
+}
+
+/*
+ * ============================================================================
+ * Phase P1 differential tests (BRANCH_SNAPSHOT_SEQ_CAP.md S9.3).
+ *
+ * ref_page_visible() below is today's (pre-P1) page_visible() body, copied
+ * verbatim; fork_asof_hop_reference()/fork_inheritance_fenced_reference()
+ * above already are that same kind of frozen pre-index oracle for the fork
+ * fold, so they are reused rather than duplicated.  ref_fork_page_invalidated()
+ * is a verbatim copy of the pre-P1 fork_page_invalidated() body.
+ *
+ * ps_test_viewcap_differential() checks, over random histories:
+ *  (a) at PS_SEQ_UNBOUNDED (every production cap in P1), the new
+ *      page_select()/fork_asof_hop()/fork_inheritance_fenced()/
+ *      fork_page_invalidated() are bit-for-bit identical to these frozen
+ *      references -- the "no behaviour change" requirement;
+ *  (b) with finite random caps, page_select() agrees with a brute-force
+ *      admissibility check written directly from the design doc's S1.3
+ *      rule text (independent of page_select()'s own code), and
+ *      fork_asof_hop()'s slow path agrees with an independent brute-force
+ *      fold over the S3.2 hidden-event predicate, written directly from
+ *      the rule text rather than by calling fork_event_hidden().  Finite
+ *      caps are exercised only here: no production path constructs one in
+ *      P1.
+ * ============================================================================
+ */
+
+/* Verbatim copy of today's (pre-P1) page_visible() body. */
+static PageVer *
+ref_page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
+{
+	PageVer    *best = NULL;
+
+	for (int i = 0; i < e->nver; i++)
+	{
+		PageVer    *v = &e->vers[i];
+
+		if (v->lsn <= read_lsn &&
+			(v->lsn < read_lsn || read_seq == 0 || v->admission_seq == 0 ||
+			 v->admission_seq <= read_seq) &&
+			(!best || v->lsn > best->lsn ||
+			 (v->lsn == best->lsn &&
+			  v->admission_seq >= best->admission_seq)))
+			best = v;
+	}
+	return best;
+}
+
+/* Verbatim copy of today's (pre-P1) fork_page_invalidated() body. */
+static int
+ref_fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
+						  uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL || page == NULL || e->last_def_lsn < page->lsn)
+		return 0;
+	for (int i = (int) e->ndef - 1; i >= 0; i--)
+	{
+		const ForkEvent *v = &e->ev[e->def_idx[i]];
+
+		if (v->lsn > cap ||
+			(seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
+			 v->admission_seq > seq_cap) ||
+			(v->kind != FEV_SET && v->kind != FEV_DEAD))
+			continue;
+		if (v->lsn != 0 && page->lsn != 0)
+		{
+			if (v->lsn < page->lsn)
+				break;
+			if (v->lsn == page->lsn &&
+				v->admission_seq <= page->admission_seq)
+				continue;
+		}
+		else if (v->admission_seq <= page->admission_seq)
+			continue;
+		if (v->kind == FEV_DEAD || block >= v->nblocks)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Brute-force page admissibility, written directly from S1.3's rule text,
+ * independent of page_select()'s own code:
+ *   admissible(v) <=> p <= L && (p < L || v.seq <= X)
+ *                   && (v.seq <= S || (p > B_k && v.seq == s_min(p)))
+ * then the admissible version with the greatest (lsn, seq).
+ */
+static PageVer *
+brute_page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
+{
+	PageVer    *best = NULL;
+
+	for (int i = 0; i < e->nver; i++)
+	{
+		PageVer    *v = &e->vers[i];
+		uint64_t	vseq = v->admission_seq;
+		bool		p_le_L = v->lsn <= c->lsn;
+		bool		strict_ok = v->lsn < c->lsn || vseq == 0 ||
+			c->strict_seq == PS_SEQ_UNBOUNDED || vseq <= c->strict_seq;
+		bool		seq_ok = vseq == 0 || c->seq == PS_SEQ_UNBOUNDED ||
+			vseq <= c->seq;
+
+		if (!seq_ok)
+		{
+			bool		eligible = !has_B || v->lsn > B;
+
+			if (eligible)
+			{
+				uint64_t	smin = UINT64_MAX;
+
+				for (int j = 0; j < e->nver; j++)
+					if (e->vers[j].lsn == v->lsn &&
+						e->vers[j].admission_seq < smin)
+						smin = e->vers[j].admission_seq;
+				seq_ok = (vseq == smin);
+			}
+		}
+		if (p_le_L && strict_ok && seq_ok &&
+			(!best || v->lsn > best->lsn ||
+			 (v->lsn == best->lsn && vseq >= best->admission_seq)))
+			best = v;
+	}
+	return best;
+}
+
+/*
+ * Brute-force fork-size fold, written directly from S1.3/S3.2's rule text
+ * (an event is hidden, and skipped, exactly when the H-set membership test
+ * below holds), independent of fork_event_hidden()/fork_asof_hop_slow()'s
+ * own code.  Only GROW/SET/DEAD (kind <= FEV_DEAD) events are ever folded,
+ * exactly as fork_event_cache_from() folds them.
+ */
+static int
+brute_fork_asof_hop(const ForkEnt *e, const ViewCap *c, uint64_t B, bool has_B,
+					uint32_t *nb_out)
+{
+	uint8_t		state = FORK_HOP_NONE;
+	uint32_t	nb = 0;
+
+	*nb_out = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		const ForkEvent *v = &e->ev[i];
+		uint64_t	vseq = v->admission_seq;
+		bool		hidden;
+
+		if (v->kind > FEV_DEAD)
+			continue;
+		if (v->lsn > c->lsn)
+			break;
+		if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
+			vseq != 0 && vseq > c->strict_seq)
+			continue;			/* fails the boundary conjunct: not in scope */
+		if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
+			hidden = false;
+		else if (v->flags & FEV_F_UNSTAMPED)
+			hidden = true;
+		else if (has_B && v->lsn <= B)
+			hidden = true;
+		else if (v->flags & FEV_F_META)
+			hidden = !(v->flags & FEV_F_META_FIRST);
+		else
+			hidden = false;		/* PAGE-class GROW, lsn > B_k: escapes */
+		if (hidden)
+			continue;
+		if (v->kind == FEV_GROW)
+		{
+			if (v->nblocks > nb)
+				nb = v->nblocks;
+			state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+				FORK_HOP_GROW : FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_SET)
+		{
+			nb = v->nblocks;
+			state = FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_DEAD)
+		{
+			nb = 0;
+			state = FORK_HOP_DEAD;
+		}
+	}
+	*nb_out = nb;
+	return state;
+}
+
+/*
+ * Randomized differential test (design doc S9.3).  Returns 0 on success, or
+ * the 1-based index of the first failed check.
+ */
+int
+ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
+{
+	uint64_t	rng = seed ? seed : 1;
+	int			checkno = 0;
+	int			rc = 0;
+
+#define VC_CHECK(cond) \
+	do { \
+		checkno++; \
+		if (!(cond)) \
+		{ \
+			rc = checkno; \
+			goto done; \
+		} \
+	} while (0)
+
+	for (uint32_t iter = 0; iter < niter; iter++)
+	{
+		PageEnt		e;
+		PageVer		vers[16];
+		int			nver = 1 + (int) (fork_event_selftest_rand(&rng) % 16);
+
+		memset(&e, 0, sizeof(e));
+		e.vers = vers;
+		e.nver = nver;
+		for (int i = 0; i < nver; i++)
+		{
+			vers[i].lsn = fork_event_selftest_rand(&rng) % 12;
+			vers[i].admission_seq = (fork_event_selftest_rand(&rng) % 5 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 20;
+			vers[i].seg = -1;
+			vers[i].off = 0;
+			vers[i].shard = 0;
+		}
+
+		/* (a) infinity: must equal today's page_visible() exactly. */
+		{
+			uint64_t	read_lsn = fork_event_selftest_rand(&rng) % 14;
+			uint64_t	read_seq = (fork_event_selftest_rand(&rng) % 4 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 22;
+			ViewCap		c = viewcap_from_request(read_lsn, read_seq);
+			PageVer    *got = page_select(&e, &c, 0, false);
+			PageVer    *want = ref_page_visible(&e, read_lsn, read_seq);
+			PageVer    *want2 = page_visible(&e, read_lsn, read_seq);
+
+			VC_CHECK((got == NULL) == (want == NULL));
+			VC_CHECK(got == want2);	/* page_visible() is page_select()'s wrapper */
+			if (got && want)
+				VC_CHECK(got->lsn == want->lsn &&
+						 got->admission_seq == want->admission_seq);
+		}
+
+		/* (b) finite caps: must equal the literal-rule brute force. */
+		{
+			uint64_t	L = fork_event_selftest_rand(&rng) % 14;
+			uint64_t	S = 1 + fork_event_selftest_rand(&rng) % 22;
+			uint64_t	X = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				PS_SEQ_UNBOUNDED : 1 + fork_event_selftest_rand(&rng) % 22;
+			bool		has_B = (fork_event_selftest_rand(&rng) % 2) != 0;
+			uint64_t	B = has_B ? fork_event_selftest_rand(&rng) % 10 : 0;
+			ViewCap		c;
+			PageVer    *got;
+			PageVer    *want;
+
+			c.lsn = L;
+			c.seq = S;
+			c.strict_seq = X;
+			c.legacy = false;
+			got = page_select(&e, &c, B, has_B);
+			want = brute_page_select(&e, &c, B, has_B);
+			VC_CHECK((got == NULL) == (want == NULL));
+			if (got && want)
+				VC_CHECK(got->lsn == want->lsn &&
+						 got->admission_seq == want->admission_seq);
+		}
+	}
+
+	for (uint32_t iter = 0; iter < niter; iter++)
+	{
+		/* A scratch timeline slot, reconfigured every iteration: fork_event_add()
+		 * maintains max_inherited_page_seq against e->timeline's *real* ancestry
+		 * (timeline_inherited_below(), exactly as production does through
+		 * TlWalk), so this test's own B/has_B must be the ancestry it actually
+		 * inserted the events under, not an independent draw made afterwards. */
+		const uint32_t viewcap_test_tl = MAX_TIMELINES - 1;
+		ForkEnt		fe;
+		uint32_t	nevents = 1 + (uint32_t) (fork_event_selftest_rand(&rng) % 12);
+		bool		has_B = (fork_event_selftest_rand(&rng) % 2) != 0;
+		uint64_t	B = has_B ? fork_event_selftest_rand(&rng) % 8 : 0;
+
+		timelines[viewcap_test_tl].defined = 1;
+		timelines[viewcap_test_tl].parent = has_B ? 0 : -1;
+		timelines[viewcap_test_tl].branch_lsn = B;
+
+		memset(&fe, 0, sizeof(fe));
+		fe.timeline = viewcap_test_tl;
+		for (uint32_t i = 0; i < nevents; i++)
+		{
+			uint64_t	lsn = fork_event_selftest_rand(&rng) % 10;
+			uint64_t	seq = (fork_event_selftest_rand(&rng) % 5 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 30;
+			uint32_t	roll = (uint32_t) (fork_event_selftest_rand(&rng) % 10);
+			uint8_t		kind = roll < 6 ? FEV_GROW : roll < 8 ? FEV_SET : FEV_DEAD;
+			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rng) % 8);
+			bool		meta = kind == FEV_GROW &&
+				(fork_event_selftest_rand(&rng) % 2) == 0;
+
+			fork_event_add(&fe, lsn, seq, nblocks, kind, meta);
+		}
+		VC_CHECK(fork_event_check_order(&fe));
+
+		/* (a) infinity: must equal the pre-index oracles exactly. */
+		{
+			uint64_t	cap = fork_event_selftest_rand(&rng) % 12;
+			uint64_t	seq_cap = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 32;
+			ViewCap		c = viewcap_lsn_seq(cap, seq_cap);
+			uint32_t	nb_got = 0,
+						nb_want = 0;
+			int			s_got = fork_asof_hop(&fe, &c, 0, false, &nb_got);
+			int			s_want = fork_asof_hop_reference(&fe, cap, seq_cap,
+														  &nb_want);
+			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rng) % 10);
+			int			f_got = fork_inheritance_fenced(&fe, block, &c, 0, false);
+			int			f_want = fork_inheritance_fenced_reference(&fe, block,
+																	cap, seq_cap);
+
+			VC_CHECK(s_got == s_want && nb_got == nb_want);
+			VC_CHECK((f_got != 0) == (f_want != 0));
+		}
+
+		/* fork_page_invalidated(), at infinity, against its own pre-P1
+		 * verbatim copy. */
+		{
+			PageVer		pv;
+			uint64_t	cap = fork_event_selftest_rand(&rng) % 12;
+			uint64_t	seq_cap = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 32;
+			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rng) % 10);
+			ViewCap		c = viewcap_lsn_seq(cap, seq_cap);
+			int			got;
+			int			want;
+
+			pv.lsn = fork_event_selftest_rand(&rng) % 12;
+			pv.admission_seq = (fork_event_selftest_rand(&rng) % 4 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 30;
+			pv.seg = -1;
+			pv.off = 0;
+			pv.shard = 0;
+			got = fork_page_invalidated(&fe, block, &pv, &c, 0, false);
+			want = ref_fork_page_invalidated(&fe, block, &pv, cap, seq_cap);
+			VC_CHECK((got != 0) == (want != 0));
+		}
+
+		/* (b) finite caps: fork_asof_hop()'s slow path against the
+		 * independent literal-rule brute force fold.  Reuses this
+		 * iteration's own B/has_B -- the ancestry the events above were
+		 * actually inserted under (see the comment at the top of this
+		 * loop) -- with a fresh random L/S/X. */
+		{
+			uint64_t	L = fork_event_selftest_rand(&rng) % 10;
+			uint64_t	S = 1 + fork_event_selftest_rand(&rng) % 34;
+			uint64_t	X = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				PS_SEQ_UNBOUNDED : 1 + fork_event_selftest_rand(&rng) % 34;
+			ViewCap		c;
+			uint32_t	nb_got = 0,
+						nb_want = 0;
+			int			s_got;
+			int			s_want;
+
+			c.lsn = L;
+			c.seq = S;
+			c.strict_seq = X;
+			c.legacy = false;
+			s_got = fork_asof_hop(&fe, &c, B, has_B, &nb_got);
+			s_want = brute_fork_asof_hop(&fe, &c, B, has_B, &nb_want);
+			VC_CHECK(s_got == s_want && nb_got == nb_want);
+		}
+
+		free(fe.ev);
+		free(fe.def_idx);
+		free(fe.late_meta_idx);
+		timelines[viewcap_test_tl].defined = 0;
+	}
+
+#undef VC_CHECK
+done:
 	return rc;
 }
 
