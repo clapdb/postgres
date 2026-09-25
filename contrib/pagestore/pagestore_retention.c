@@ -13,9 +13,34 @@
  * uncommitted append and is truncated during recovery; a full corrupt record
  * fails startup.  Losing a valid DROP would only retain too much, but losing a
  * valid SET could reclaim live history, so recovery never guesses.
- * A durable pending marker is installed before every mutation.  It is removed
- * only after the log and its independently checksummed committed-prefix state
- * are durable, so an uncertain append or rewrite fails closed across restart.
+ *
+ * A durable pending marker (retention.pending) is installed before every
+ * mutation (an in-place log append, or a full compaction/migration rewrite).
+ * Unlike a bare guard file, it carries the mutation's *intent*: the record
+ * count and rolling hash the log/state pair had before the mutation started
+ * (old_nrecords/old_hash) and the count/hash it is meant to reach
+ * (new_nrecords/new_hash), CRC-protected.  A process death anywhere in the
+ * window between installing that marker and removing it again leaves no
+ * ambiguity: the next open reads the surviving intent, compares it against
+ * whatever bytes retention.meta actually has, and deterministically rolls the
+ * mutation back (if the log still looks like "old", tolerating a torn or
+ * complete trailing append record) or forward (if it already looks like
+ * "new"), then clears the marker and continues the ordinary replay path.
+ * Every step of that reconciliation is itself crash-safe: replaying it twice
+ * after a second crash mid-recovery reaches the same fixed point.  A pending
+ * marker with unrecognized or truncated content (the previous format's
+ * zero-byte guard, or disk corruption) cannot be reconciled and still fails
+ * closed, exactly as before.
+ *
+ * That automatic reconciliation is only safe for genuine process death: it
+ * assumes nobody was ever told whether the mutation succeeded.  A handful of
+ * failures happen instead in a *live* process — an fsync, rename, or unlink
+ * step reports an error while the daemon keeps running and keeps answering
+ * (rejecting) requests.  Those durably install retention.failed, a permanent
+ * marker predating the intent format (see the legacy guard this file already
+ * honored) that open() refuses to look past even after retention.pending is
+ * gone, so a later restart can never silently resurrect a mutation whose
+ * failure the process already observed and may have acted on.
  *
  *-------------------------------------------------------------------------
  */
@@ -30,6 +55,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_fault.h"
 #include "pagestore_retention.h"
 #include "pagestore_format.h"
 
@@ -38,6 +64,40 @@
 #define PS_RETENTION_VERSION_V1 1
 #define PS_RETENTION_FNV_INIT	2166136261u
 #define PS_RETENTION_STATE_MAGIC 0x53544552	/* "RETS" */
+#define PS_RETENTION_PENDING_MAGIC 0x444e5052	/* "RPND" */
+#define PS_RETENTION_PENDING_VERSION 1
+
+/* What a durable retention.pending marker is in the middle of doing: extend
+ * the log in place by one record, replace it wholesale (compaction, and the
+ * identical v1 -> v2 migration rewrite), or install retention.state for the
+ * first time over an unchanged log (the one-time bootstrap of a v2-format
+ * store that predates the committed-prefix state file).  Bootstrap is not
+ * an APPEND: it never grows the log (new_nrecords == old_nrecords), which
+ * would otherwise be indistinguishable from a truncated/corrupt intent
+ * under APPEND's "always grows by exactly one" rule. */
+typedef enum PsRetentionPendingOp
+{
+	PS_RETENTION_PENDING_APPEND = 1,
+	PS_RETENTION_PENDING_COMPACT = 2,
+	PS_RETENTION_PENDING_BOOTSTRAP_STATE = 3,
+} PsRetentionPendingOp;
+
+/* The intent behind an in-flight mutation: the committed (nrecords, hash)
+ * pair before and after.  Recovery classifies whatever is actually on disk
+ * against these two fixed points instead of guessing. */
+typedef struct PsRetentionPending
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	op;
+	uint32_t	pad;
+	uint64_t	old_nrecords;
+	uint32_t	old_hash;
+	uint32_t	pad2;
+	uint64_t	new_nrecords;
+	uint32_t	new_hash;
+	uint32_t	crc;
+} PsRetentionPending;
 
 typedef enum PsRetentionRecordType
 {
@@ -93,7 +153,9 @@ typedef struct PsRetentionState
 static char retention_path[4096];
 static char retention_marker_path[4096];
 static char retention_pending_path[4096];
+static char retention_pending_tmp_path[4096];
 static char retention_state_path[4096];
+static char retention_failed_path[4096];
 static char retention_dir[2048];
 static PsRetentionPin *retention_pins;
 static uint32_t retention_npins;
@@ -139,6 +201,7 @@ retention_new_incarnation(uint64_t *epoch)
 /* Standalone-test fault injection; ordinary deployments leave these zero. */
 static int test_fail_append_after_write;
 static int test_fail_rollback;
+static int test_fail_clear_pending_dir_fsync;
 
 static int retention_identity_matches(const struct stat *st);
 
@@ -445,40 +508,170 @@ retention_mark_initialized(void)
 	return rc;
 }
 
-/* Caller holds retention_lock.  No log byte may change until this guard and
- * its directory entry are durable. */
-static int
-retention_begin_pending(void)
+static uint32_t
+retention_pending_crc(const PsRetentionPending *pending)
 {
+	return retention_fnv1a(PS_RETENTION_FNV_INIT, pending,
+						   offsetof(PsRetentionPending, crc));
+}
+
+/* Caller holds retention_lock.  No log byte may change until this guard and
+ * its directory entry are durable.  The marker carries the mutation's
+ * intent (the committed (nrecords, hash) before and after) so a later open
+ * can reconcile an interrupted mutation instead of refusing to start.
+ *
+ * Published atomically -- write a private retention.pending.tmp, fsync it,
+ * rename(2) it into place, fsync the directory -- rather than written in
+ * place.  An in-place O_CREAT|O_EXCL write of the intent record left a
+ * window where a crash between the create and the write produced a
+ * retention.pending that existed but did not yet hold a complete, valid
+ * record: retention_read_pending()'s size/CRC checks correctly refused to
+ * trust it, but that meant every future open was permanently refused even
+ * though no log byte had actually changed yet.  (That in-place-write
+ * implementation was itself only ever an intermediate state of this
+ * feature on this branch -- it never shipped -- but the op-sequence fuzzer
+ * still caught it: a SIGKILL landing exactly in that window left a 0-byte
+ * retention.pending in a captured failure store.)  With rename(2) atomic
+ * on every filesystem this backend supports, retention_pending_path can
+ * now only ever be observed either absent or holding the complete bytes
+ * that were durable before the rename, so this format's own writer can no
+ * longer produce a short retention.pending at all.  A leftover
+ * retention.pending.tmp from a crash during this function is inert:
+ * ps_retention_open() below removes it unconditionally before ever looking
+ * at retention_pending_path, because no log byte can have changed while
+ * only the tmp file existed.
+ *
+ * A short retention.pending can still be found, though: it is exactly the
+ * shape of the *previous* format's retention.pending, an intentionally
+ * empty guard whose presence alone cannot prove whether the crash that
+ * left it landed before or after the mutation it guarded (see the
+ * short-file branch in ps_retention_open()).  That is genuinely
+ * unreconcilable, not merely inconvenient, so it fails closed rather than
+ * being discarded. */
+static int
+retention_begin_pending(uint32_t op, uint64_t old_nrecords, uint32_t old_hash,
+						uint64_t new_nrecords, uint32_t new_hash)
+{
+	PsRetentionPending pending;
 	int fd;
 	int rc = 0;
 
-	fd = open(retention_pending_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	memset(&pending, 0, sizeof(pending));
+	pending.magic = PS_RETENTION_PENDING_MAGIC;
+	pending.version = PS_RETENTION_PENDING_VERSION;
+	pending.op = op;
+	pending.old_nrecords = old_nrecords;
+	pending.old_hash = old_hash;
+	pending.new_nrecords = new_nrecords;
+	pending.new_hash = new_hash;
+	pending.crc = retention_pending_crc(&pending);
+
+	fd = open(retention_pending_tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd < 0)
 		return -1;
-	if (fsync(fd) != 0)
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_PENDING_AFTER_CREATE) != 0)
+		rc = -1;
+	if (rc == 0 &&
+		write(fd, &pending, sizeof(pending)) != (ssize_t) sizeof(pending))
+		rc = -1;
+	if (rc == 0 && fsync(fd) != 0)
 		rc = -1;
 	if (close(fd) != 0)
+		rc = -1;
+	if (rc == 0 &&
+		ps_fault_probe(PS_FAULT_POINT_RETENTION_PENDING_AFTER_TMP_SYNC) != 0)
+		rc = -1;
+	if (rc == 0 &&
+		rename(retention_pending_tmp_path, retention_pending_path) != 0)
 		rc = -1;
 	if (rc == 0 && retention_fsync_dir() != 0)
 		rc = -1;
 	if (rc != 0)
 	{
+		unlink(retention_pending_tmp_path);
 		unlink(retention_pending_path);
 		(void) retention_fsync_dir();
 	}
 	return rc;
 }
 
-/* Once unlink succeeds, either the guard removal reaches disk or recovery
- * sees the still-durable guard and fails closed.  Directory fsync is still
- * attempted, but its failure cannot make the committed state unsafe. */
+/* Caller holds retention_lock (or is the single-threaded ps_retention_open
+ * path).  Permanently refuses every future open: installed only when a
+ * *live* process could not prove whether a mutation committed (an fsync,
+ * rename, or unlink step failed) and may already have reported that failure
+ * or acted on it.  Unlike retention.pending, this marker survives even after
+ * the bytes it guards are gone, so automatic reconciliation can never
+ * silently resurrect what a running process already gave up on.  Best
+ * effort: the caller is already on a failure path and has no better option
+ * than to log and keep the in-memory poison bit either way.
+ *
+ * Deliberately NOT published via retention.pending's tmp+rename pattern:
+ * this marker carries no payload (it is pure existence -- ps_retention_open()
+ * only ever does access(retention_failed_path, F_OK), never parses its
+ * bytes), so it cannot end up "torn" the way an in-place-written
+ * retention.pending could -- there is nothing to tear.  A rename-based
+ * publish would instead make this guard *weaker*: a crash between deciding
+ * to refuse forever and completing the rename would leave the live process's
+ * decision undone, letting a later restart silently proceed as if nothing
+ * had gone wrong -- exactly what this marker exists to prevent.  The
+ * in-place O_CREAT|O_EXCL create is the safer choice here: it maximizes the
+ * chance that even a partially-durable creation still leaves a trace (the
+ * directory entry) after a crash, and every step (fsync, close, directory
+ * fsync) is still attempted and logged even after an earlier one fails,
+ * unlike the fail-fast chains elsewhere in this file. */
+static void
+retention_mark_failed(void)
+{
+	int fd;
+
+	fd = open(retention_failed_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+	{
+		if (errno != EEXIST)
+			fprintf(stderr,
+					"pagestore_retention: could not install %s: %s\n",
+					retention_failed_path, strerror(errno));
+		return;
+	}
+	if (fsync(fd) != 0)
+		fprintf(stderr, "pagestore_retention: could not fsync %s: %s\n",
+				retention_failed_path, strerror(errno));
+	if (close(fd) != 0)
+		fprintf(stderr, "pagestore_retention: could not close %s: %s\n",
+				retention_failed_path, strerror(errno));
+	if (retention_fsync_dir() != 0)
+		fprintf(stderr, "pagestore_retention: could not fsync %s: %s\n",
+				retention_dir, strerror(errno));
+}
+
+/* The mutation the marker guarded is about to be acknowledged as committed
+ * to a caller outside this process, so its removal must be durable, not
+ * merely attempted: if the directory fsync fails and the marker's directory
+ * entry later reappears after a machine crash (unlink() without a durable
+ * directory is not itself durable), the next open would reconcile against a
+ * pending intent whose mutation the caller was already told succeeded --
+ * rolling back or otherwise second-guessing an acknowledged commit.  Every
+ * caller that clears a marker on its success path must therefore treat a
+ * nonzero return here exactly like a failed rename/write: install
+ * retention.failed and refuse to acknowledge success.
+ *
+ * PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC lets the standalone tests
+ * simulate a directory fsync that fails after a real, successful unlink --
+ * the exact window this function exists to make safe -- without requiring a
+ * genuinely faulty filesystem. */
 static int
 retention_clear_pending(void)
 {
 	if (unlink(retention_pending_path) != 0)
 		return -1;
-	(void) retention_fsync_dir();
+	if (retention_fsync_dir() != 0)
+		return -1;
+	if (test_fail_clear_pending_dir_fsync > 0 &&
+		--test_fail_clear_pending_dir_fsync == 0)
+	{
+		errno = EIO;
+		return -1;
+	}
 	return 0;
 }
 
@@ -596,9 +789,23 @@ static int
 retention_abort_append(int fd, off_t old_size, int created)
 {
 	if (retention_rollback(fd, old_size, created) != 0)
+	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
+	}
 	else
+	{
+		/* This is the abort path: the caller always gets -1 here, never an
+		 * acknowledged commit, so a clear_pending() failure cannot let a
+		 * resurrected marker roll back something already promised durable.
+		 * The rollback above already put the log back to old_nrecords/
+		 * old_hash, so even if the marker survives (unlink failed) or
+		 * reappears after a crash (the directory fsync failed), the next
+		 * open's reconciliation finds the log already matching "old" and
+		 * performs a safe no-op rollback.  Best effort is enough; nothing
+		 * downstream depends on this call succeeding. */
 		(void) retention_clear_pending();
+	}
 	return -1;
 }
 
@@ -609,10 +816,19 @@ retention_append(const PsRetentionRecord *rec)
 	int			fd;
 	int			created;
 	off_t		old_size;
+	uint64_t	old_nrecords;
+	uint32_t	old_hash;
+	uint32_t	new_hash;
 
 	if (retention_is_poisoned)
 		return -1;
-	if (retention_begin_pending() != 0)
+	old_nrecords = retention_nrecords;
+	old_hash = retention_log_hash;
+	new_hash = retention_fnv1a(retention_log_hash, rec, sizeof(*rec));
+	if (retention_begin_pending(PS_RETENTION_PENDING_APPEND, old_nrecords,
+								old_hash, old_nrecords + 1, new_hash) != 0)
+		return -1;
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_APPEND_AFTER_PENDING) != 0)
 		return -1;
 	created = 0;
 	fd = open(retention_path, O_WRONLY | O_APPEND);
@@ -624,6 +840,11 @@ retention_append(const PsRetentionRecord *rec)
 	}
 	if (fd < 0)
 	{
+		/* No log byte has been touched yet, so the pending intent's "old"
+		 * state is still exactly what is on disk: a resurrected marker
+		 * reconciles to a safe no-op rollback regardless of whether this
+		 * clear succeeds, and this function always reports the append as
+		 * failed either way.  Best effort is enough here. */
 		(void) retention_clear_pending();
 		return -1;
 	}
@@ -631,6 +852,7 @@ retention_append(const PsRetentionRecord *rec)
 	if (old_size < 0)
 	{
 		close(fd);
+		/* Same reasoning as above: nothing has been written yet. */
 		(void) retention_clear_pending();
 		return -1;
 	}
@@ -646,6 +868,7 @@ retention_append(const PsRetentionRecord *rec)
 			errno = EILSEQ;
 			(void) retention_abort_append(fd, old_size, created);
 			retention_is_poisoned = 1;
+			retention_mark_failed();
 			return -1;
 		}
 		if (created)
@@ -664,35 +887,38 @@ retention_append(const PsRetentionRecord *rec)
 	}
 	if (fsync(fd) != 0)
 		return retention_abort_append(fd, old_size, created);
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_APPEND_AFTER_WRITE) != 0)
+		return -1;
 	if (close(fd) != 0)
 	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
 		return -1;
 	}
 	if (created && retention_fsync_dir() != 0)
 	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
 		return -1;
 	}
 	if (created && retention_mark_initialized() != 0)
 	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
 		return -1;
 	}
+	if (retention_write_state(old_nrecords + 1, new_hash) != 0)
 	{
-		uint32_t new_hash = retention_fnv1a(retention_log_hash, rec, sizeof(*rec));
-
-		if (retention_write_state(retention_nrecords + 1, new_hash) != 0)
-		{
-			retention_is_poisoned = 1;
-			return -1;
-		}
-		retention_log_hash = new_hash;
+		retention_is_poisoned = 1;
+		retention_mark_failed();
+		return -1;
 	}
+	retention_log_hash = new_hash;
 	retention_nrecords++;
 	if (retention_clear_pending() != 0)
 	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
 		return -1;
 	}
 	return 0;
@@ -711,11 +937,47 @@ retention_make_record(PsRetentionRecord *rec, uint32_t type,
 	rec->crc = retention_record_crc(rec);
 }
 
-/* Caller holds retention_lock.  This is also the fail-safe v1 -> v2 upgrade:
- * publish the new log before its v2 committed-prefix state, with the durable
- * pending marker making every interrupted ordering fail closed. */
+/* Caller holds retention_lock.  Shared by ps_retention_compact() and the
+ * fail-safe v1 -> v2 upgrade (retention_rewrite_current()): both replace the
+ * entire log with one record per live pin/tombstone plus, if any, the
+ * admission-reservation high-water record.  Publish the new log before its
+ * v2 committed-prefix state, with the durable pending marker making every
+ * interrupted ordering -- including a second crash during recovery itself --
+ * fail closed until ps_retention_open() can reconcile it. */
+/* The hash the rewritten log will have, computed purely from in-memory state
+ * (no I/O) so the pending intent can carry the true post-compaction hash
+ * instead of a placeholder.  Caller holds retention_lock, so retention_pins
+ * and retention_admission_highwater cannot change between this call and the
+ * write loop that reproduces the identical sequence of records below. */
+static uint32_t
+retention_republish_hash(void)
+{
+	uint32_t	hash = PS_RETENTION_FNV_INIT;
+
+	for (uint32_t i = 0; i < retention_npins; i++)
+	{
+		PsRetentionRecord rec;
+
+		retention_make_record(&rec,
+						  retention_pin_active(&retention_pins[i]) ?
+						  PS_RETENTION_SET : PS_RETENTION_DROP,
+						  &retention_pins[i]);
+		hash = retention_fnv1a(hash, &rec, sizeof(rec));
+	}
+	if (retention_admission_highwater != 0)
+	{
+		PsRetentionPin pin = {0};
+		PsRetentionRecord rec;
+
+		pin.admission_seq = retention_admission_highwater;
+		retention_make_record(&rec, PS_RETENTION_ADMISSION_RESERVE, &pin);
+		hash = retention_fnv1a(hash, &rec, sizeof(rec));
+	}
+	return hash;
+}
+
 static int
-retention_rewrite_current(void)
+retention_republish(void)
 {
 	char		tmp[4096] = {0};
 	int			fd = -1;
@@ -723,19 +985,30 @@ retention_rewrite_current(void)
 	int			n;
 	int			pending = 0;
 	int			published = 0;
-	uint32_t	new_hash = PS_RETENTION_FNV_INIT;
+	uint64_t	old_nrecords = retention_nrecords;
+	uint32_t	old_hash = retention_log_hash;
+	uint32_t	new_hash = retention_republish_hash();
+	uint64_t	new_nrecords = retention_npins +
+		(retention_admission_highwater != 0);
 
 	if (retention_is_poisoned)
 		goto done;
-	if (retention_begin_pending() != 0)
+	if (retention_begin_pending(PS_RETENTION_PENDING_COMPACT, old_nrecords,
+								old_hash, new_nrecords, new_hash) != 0)
 		goto done;
 	pending = 1;
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_COMPACT_AFTER_PENDING) != 0)
+		goto done;
 	n = snprintf(tmp, sizeof(tmp), "%s.tmp", retention_path);
 	if (n < 0 || (size_t) n >= sizeof(tmp))
 		goto done;
 	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0)
 		goto done;
+	/* retention_npins/retention_admission_highwater cannot change while
+	 * retention_lock is held, so this reproduces exactly the sequence of
+	 * records retention_republish_hash() already hashed for begin_pending()
+	 * above; new_hash/new_nrecords are not recomputed here. */
 	for (uint32_t i = 0; i < retention_npins; i++)
 	{
 		PsRetentionRecord rec;
@@ -746,7 +1019,6 @@ retention_rewrite_current(void)
 						  &retention_pins[i]);
 		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
 			goto done;
-		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
 	}
 	if (retention_admission_highwater != 0)
 	{
@@ -757,9 +1029,10 @@ retention_rewrite_current(void)
 		retention_make_record(&rec, PS_RETENTION_ADMISSION_RESERVE, &pin);
 		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
 			goto done;
-		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
 	}
 	if (fsync(fd) != 0)
+		goto done;
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_COMPACT_AFTER_TMP_SYNC) != 0)
 		goto done;
 	if (close(fd) != 0)
 	{
@@ -770,9 +1043,12 @@ retention_rewrite_current(void)
 	if (rename(tmp, retention_path) != 0)
 		goto done;
 	published = 1;
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_COMPACT_AFTER_RENAME) != 0)
+		goto done;
 	if (retention_fsync_dir() != 0)
 	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
 		goto done;
 	}
 	{
@@ -781,23 +1057,26 @@ retention_rewrite_current(void)
 		if (stat(retention_path, &st) != 0)
 		{
 			retention_is_poisoned = 1;
+			retention_mark_failed();
 			goto done;
 		}
 		retention_dev = st.st_dev;
 		retention_ino = st.st_ino;
 	}
-	if (retention_write_state(retention_npins +
-			(retention_admission_highwater != 0), new_hash) != 0)
+	if (retention_write_state(new_nrecords, new_hash) != 0)
 	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
 		goto done;
 	}
-	retention_nrecords = retention_npins +
-		(retention_admission_highwater != 0);
+	retention_nrecords = new_nrecords;
 	retention_log_hash = new_hash;
+	if (ps_fault_probe(PS_FAULT_POINT_RETENTION_COMPACT_AFTER_STATE) != 0)
+		goto done;
 	if (retention_clear_pending() != 0)
 	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
 		goto done;
 	}
 	pending = 0;
@@ -809,12 +1088,463 @@ done:
 	if (rc != 0 && tmp[0] != '\0')
 		unlink(tmp);
 	if (rc != 0 && pending && !published)
+		/* The rename into place never happened, so retention.meta (if it
+		 * even exists) is still exactly the pre-mutation "old" state, and
+		 * this function is already about to report failure (rc != 0) to
+		 * its own caller: nobody was told the compaction committed.  A
+		 * resurrected marker reconciles to a safe no-op rollback either
+		 * way, so best effort is enough here too. */
 		(void) retention_clear_pending();
 	if (rc != 0 && pending && published)
+	{
 		retention_is_poisoned = 1;
+		retention_mark_failed();
+	}
 	if (rc != 0 && !retention_is_poisoned)
 		retention_defer_compact();
 	return rc;
+}
+
+static int
+retention_rewrite_current(void)
+{
+	return retention_republish();
+}
+
+/* Read and validate a durable pending intent.  A file of the wrong size
+ * (short, or carrying trailing bytes past the fixed-size record -- fstat
+ * catches what an exact-sized read alone cannot), bad magic/version, bad
+ * CRC, or an internally inconsistent op is exactly what the pre-intent
+ * format's empty guard file (or disk corruption) looks like: reject it the
+ * same way that format always failed closed. */
+static int
+retention_read_pending(PsRetentionPending *out)
+{
+	int			fd;
+	ssize_t		r;
+	struct stat	st;
+
+	fd = open(retention_pending_path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &st) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	r = read(fd, out, sizeof(*out));
+	if (close(fd) != 0)
+		return -1;
+	if (st.st_size != (off_t) sizeof(*out) ||
+		r != (ssize_t) sizeof(*out) ||
+		out->magic != PS_RETENTION_PENDING_MAGIC ||
+		out->version != PS_RETENTION_PENDING_VERSION ||
+		retention_pending_crc(out) != out->crc ||
+		(out->op != PS_RETENTION_PENDING_APPEND &&
+		 out->op != PS_RETENTION_PENDING_COMPACT &&
+		 out->op != PS_RETENTION_PENDING_BOOTSTRAP_STATE) ||
+		/* An append always grows the log by exactly one record; a
+		 * compaction (or the identical v1 -> v2 migration rewrite) rewrites
+		 * the whole log down to one record per live pin/tombstone plus an
+		 * optional admission record, so new_nrecords is typically *smaller*
+		 * than old_nrecords and neither direction is a corruption signal;
+		 * a bootstrap never touches the log at all (new_nrecords ==
+		 * old_nrecords), so it must be told apart from both. */
+		(out->op == PS_RETENTION_PENDING_APPEND &&
+		 out->new_nrecords != out->old_nrecords + 1) ||
+		(out->op == PS_RETENTION_PENDING_BOOTSTRAP_STATE &&
+		 out->new_nrecords != out->old_nrecords))
+	{
+		errno = EILSEQ;
+		return -1;
+	}
+	return 0;
+}
+
+/* Does retention.meta currently carry the legacy v1 header?  Only ever
+ * meaningful for a PS_RETENTION_PENDING_COMPACT intent recorded by the v1 ->
+ * v2 migration rewrite: a v1 header proves the migration's rename never
+ * happened, so the pre-image is untouched and needs no further inspection to
+ * roll back to. */
+static int
+retention_meta_is_legacy_header(int *is_legacy)
+{
+	int			fd;
+	off_t		size;
+	uint32_t	header[4];
+
+	*is_legacy = 0;
+	fd = open(retention_path, O_RDONLY);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	size = lseek(fd, 0, SEEK_END);
+	if (size < 0)
+	{
+		close(fd);
+		return -1;
+	}
+	if (size >= (off_t) sizeof(header))
+	{
+		if (pread(fd, header, sizeof(header), 0) != (ssize_t) sizeof(header))
+		{
+			close(fd);
+			return -1;
+		}
+		*is_legacy = header[0] == PS_RETENTION_MAGIC &&
+			header[1] == PS_RETENTION_VERSION_V1 &&
+			header[3] == sizeof(PsRetentionRecordV1);
+	}
+	return close(fd) == 0 ? 0 : -1;
+}
+
+/* Validate that the first n on-disk v2 records of retention.meta reproduce
+ * hash exactly, and report the file's current total size.  A missing file
+ * reads as zero records, matching an interrupted append/compaction that
+ * crashed before retention.meta was ever created.  Read-only: never mutates
+ * the live registry.  Returns 1 (prefix matches), 0 (it does not), or -1 on
+ * an I/O error unrelated to the comparison itself. */
+static int
+retention_verify_v2_prefix(uint64_t n, uint32_t hash, off_t *size_out)
+{
+	int			fd;
+	off_t		size;
+	uint32_t	rolling = PS_RETENTION_FNV_INIT;
+
+	fd = open(retention_path, O_RDONLY);
+	if (fd < 0)
+	{
+		if (errno != ENOENT)
+			return -1;
+		*size_out = 0;
+		return (n == 0 && hash == PS_RETENTION_FNV_INIT) ? 1 : 0;
+	}
+	size = lseek(fd, 0, SEEK_END);
+	if (size < 0)
+	{
+		close(fd);
+		return -1;
+	}
+	*size_out = size;
+	if (size < (off_t) (n * sizeof(PsRetentionRecord)))
+	{
+		close(fd);
+		return 0;
+	}
+	for (uint64_t i = 0; i < n; i++)
+	{
+		PsRetentionRecord rec;
+
+		if (pread(fd, &rec, sizeof(rec), (off_t) (i * sizeof(rec))) !=
+			(ssize_t) sizeof(rec) || !retention_record_valid(&rec))
+		{
+			close(fd);
+			return 0;
+		}
+		rolling = retention_fnv1a(rolling, &rec, sizeof(rec));
+	}
+	if (close(fd) != 0)
+		return -1;
+	return rolling == hash ? 1 : 0;
+}
+
+/* Caller holds retention_lock and has already populated every retention_*
+ * path global; retention.pending is known to exist.  Reconciles a durable
+ * pending intent left behind by a crash during retention_append(),
+ * retention_republish(), or the one-time PS_RETENTION_PENDING_BOOTSTRAP_STATE
+ * install in ps_retention_open(): classifies whatever retention.meta actually holds
+ * against the intent's recorded pre- and post-mutation (nrecords, hash), and
+ * either rolls the mutation back, rolls it forward, or fails closed.  Every
+ * step below is safe to redo verbatim after a second crash mid-recovery: it
+ * always recomputes the classification from what is currently on disk rather
+ * than trusting in-memory progress, so replaying it converges to the same
+ * fixed point.  On success, retention.meta and retention.state agree and
+ * retention.pending is gone, and the caller's ordinary replay path below
+ * proceeds exactly as if nothing had been interrupted. */
+static int
+retention_recover_pending(void)
+{
+	PsRetentionPending pending;
+	char		tmp_path[4096];
+	int			n;
+	int			is_legacy = 0;
+	int			old_ok = 0;
+	int			new_ok = 0;
+	off_t		size = 0;
+
+	if (retention_read_pending(&pending) != 0)
+	{
+		fprintf(stderr,
+				"pagestore_retention: %s present: interrupted mutation could "
+				"not be reconciled (unreadable or unrecognized intent)\n",
+				retention_pending_path);
+		errno = EILSEQ;
+		return -1;
+	}
+	n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", retention_path);
+	if (n < 0 || (size_t) n >= sizeof(tmp_path))
+		return -1;
+	if (unlink(tmp_path) != 0 && errno != ENOENT)
+	{
+		fprintf(stderr, "pagestore_retention: could not remove %s: %s\n",
+				tmp_path, strerror(errno));
+		return -1;
+	}
+
+	if (pending.op == PS_RETENTION_PENDING_COMPACT)
+	{
+		if (retention_meta_is_legacy_header(&is_legacy) != 0)
+		{
+			fprintf(stderr, "pagestore_retention: %s: %s\n", retention_path,
+					strerror(errno));
+			return -1;
+		}
+		if (is_legacy)
+			old_ok = 1;
+		else
+		{
+			new_ok = retention_verify_v2_prefix(pending.new_nrecords,
+												pending.new_hash, &size);
+			if (new_ok < 0)
+			{
+				fprintf(stderr, "pagestore_retention: %s: %s\n",
+						retention_path, strerror(errno));
+				return -1;
+			}
+			new_ok = new_ok && size ==
+				(off_t) (pending.new_nrecords * sizeof(PsRetentionRecord));
+			if (!new_ok)
+			{
+				old_ok = retention_verify_v2_prefix(pending.old_nrecords,
+													pending.old_hash, &size);
+				if (old_ok < 0)
+				{
+					fprintf(stderr, "pagestore_retention: %s: %s\n",
+							retention_path, strerror(errno));
+					return -1;
+				}
+				old_ok = old_ok && size == (off_t) (pending.old_nrecords *
+													 sizeof(PsRetentionRecord));
+			}
+		}
+	}
+	else if (pending.op == PS_RETENTION_PENDING_BOOTSTRAP_STATE)
+	{
+		off_t		min_size = (off_t) (pending.old_nrecords *
+										sizeof(PsRetentionRecord));
+		off_t		max_size = min_size + (off_t) sizeof(PsRetentionRecord);
+		int			prefix_ok;
+
+		/* Bootstrap never touches the log (new_nrecords == old_nrecords): it
+		 * only installs retention.state for the first time over an
+		 * unchanged log.  There is no separate "old" to roll back to --
+		 * either the log's valid prefix on disk still matches the exact
+		 * (nrecords, hash) the intent recorded, in which case the
+		 * roll-forward branch below finishes installing the state (after
+		 * durably discarding any torn tail past that prefix -- the log
+		 * this bootstrap is installing state for predates crash-safe
+		 * mutation and can carry the same kind of harmless incomplete
+		 * final record ps_retention_open()'s ordinary committed-prefix
+		 * replay has always discarded; see the "short final record is
+		 * recoverable" contract) -- or it does not, in which case
+		 * something changed the log out from under an in-flight bootstrap
+		 * and recovery fails closed rather than guess.  A *complete*
+		 * trailing record is not given this pass: it is not part of what
+		 * this intent recorded, and only an APPEND intent's own in-flight
+		 * record gets that benefit of the doubt. */
+		prefix_ok = retention_verify_v2_prefix(pending.old_nrecords,
+											   pending.old_hash, &size);
+		if (prefix_ok < 0)
+		{
+			fprintf(stderr, "pagestore_retention: %s: %s\n", retention_path,
+					strerror(errno));
+			return -1;
+		}
+		new_ok = prefix_ok && size >= min_size && size < max_size;
+	}
+	else
+	{
+		off_t		min_size = (off_t) (pending.old_nrecords *
+										sizeof(PsRetentionRecord));
+		off_t		max_size = min_size + (off_t) sizeof(PsRetentionRecord);
+		int			prefix_ok;
+
+		/* An in-place append never rolls forward: whatever retention_append()
+		 * returns to its caller, nobody outside this process could have been
+		 * told the mutation succeeded before the crash, so dropping a
+		 * complete-but-unacknowledged trailing record is always safe and
+		 * strictly simpler than trying to prove it was never observed. */
+		prefix_ok = retention_verify_v2_prefix(pending.old_nrecords,
+											   pending.old_hash, &size);
+		if (prefix_ok < 0)
+		{
+			fprintf(stderr, "pagestore_retention: %s: %s\n", retention_path,
+					strerror(errno));
+			return -1;
+		}
+		old_ok = prefix_ok && size >= min_size && size <= max_size;
+	}
+
+	if (new_ok)
+	{
+		int			skip_state = 0;
+
+		if (pending.op == PS_RETENTION_PENDING_COMPACT &&
+			pending.old_nrecords == 0 && pending.new_nrecords == 0)
+		{
+			struct stat mst;
+
+			if (stat(retention_path, &mst) != 0)
+			{
+				if (errno != ENOENT)
+				{
+					fprintf(stderr, "pagestore_retention: %s: %s\n",
+							retention_path, strerror(errno));
+					return -1;
+				}
+				/* Compacting an already-empty registry down to zero records
+				 * is a no-op that retention_republish() still tries to
+				 * publish (an empty tmp file renamed into place); a crash
+				 * after the intent but before that rename can leave
+				 * retention.meta genuinely absent, exactly as if the store
+				 * had never been mutated at all (retention_verify_v2_prefix
+				 * reports a missing file as a trivial match for zero
+				 * records, which is what routed this case here).  Writing
+				 * retention.state now would leave a store with state but no
+				 * meta, which the ordinary open path below permanently
+				 * refuses.  Treat it exactly like a store that was never
+				 * durably created: no state, no meta, just clear the
+				 * pending marker below. */
+				skip_state = 1;
+			}
+		}
+		else if (pending.op == PS_RETENTION_PENDING_BOOTSTRAP_STATE &&
+				 size != (off_t) (pending.old_nrecords *
+								  sizeof(PsRetentionRecord)))
+		{
+			/* A torn tail matched the classification above (old_nrecords
+			 * records plus a partial final one); durably discard it before
+			 * installing state, exactly like the APPEND op's own trailing-
+			 * record truncation below, and exactly what the non-crashed
+			 * bootstrap path in ps_retention_open() already does.  Every
+			 * future open's committed-prefix check requires
+			 * retention.meta's size to match nrecords precisely, so the
+			 * torn bytes cannot survive past this point. */
+			int			fd = open(retention_path, O_WRONLY);
+			int			ok = fd >= 0 &&
+				ftruncate(fd, (off_t) (pending.old_nrecords *
+										sizeof(PsRetentionRecord))) == 0 &&
+				fsync(fd) == 0;
+
+			if (fd >= 0 && close(fd) != 0)
+				ok = 0;
+			if (!ok || retention_fsync_dir() != 0)
+			{
+				fprintf(stderr,
+						"pagestore_retention: could not truncate %s back to "
+						"%llu record(s) while reconciling %s\n",
+						retention_path,
+						(unsigned long long) pending.old_nrecords,
+						retention_pending_path);
+				return -1;
+			}
+		}
+		if (!skip_state &&
+			(retention_fsync_dir() != 0 ||
+			 retention_write_state(pending.new_nrecords, pending.new_hash) != 0))
+		{
+			fprintf(stderr,
+					"pagestore_retention: could not roll %s forward to the "
+					"post-compaction state (nrecords=%llu) while "
+					"reconciling %s\n", retention_path,
+					(unsigned long long) pending.new_nrecords,
+					retention_pending_path);
+			return -1;
+		}
+	}
+	else if (old_ok)
+	{
+		struct stat mst;
+		int			meta_exists = stat(retention_path, &mst) == 0;
+
+		if (!meta_exists && errno != ENOENT)
+		{
+			fprintf(stderr, "pagestore_retention: %s: %s\n", retention_path,
+					strerror(errno));
+			return -1;
+		}
+		if (pending.op == PS_RETENTION_PENDING_APPEND &&
+			pending.old_nrecords == 0 && !meta_exists)
+		{
+			/* Nothing was ever durably created for this store (the crash
+			 * landed before its very first record's file was made): leave
+			 * it exactly as a never-initialized registry so the ordinary
+			 * open path below takes the fresh-store branch instead of
+			 * installing a state file with no log to match it. */
+		}
+		else
+		{
+			if (pending.op == PS_RETENTION_PENDING_APPEND &&
+				size != (off_t) (pending.old_nrecords *
+								 sizeof(PsRetentionRecord)))
+			{
+				int			fd = open(retention_path, O_WRONLY);
+				int			ok = fd >= 0 &&
+					ftruncate(fd, (off_t) (pending.old_nrecords *
+											sizeof(PsRetentionRecord))) == 0 &&
+					fsync(fd) == 0;
+
+				if (fd >= 0 && close(fd) != 0)
+					ok = 0;
+				if (!ok || retention_fsync_dir() != 0)
+				{
+					fprintf(stderr,
+							"pagestore_retention: could not truncate %s back "
+							"to %llu record(s) while reconciling %s\n",
+							retention_path,
+							(unsigned long long) pending.old_nrecords,
+							retention_pending_path);
+					return -1;
+				}
+			}
+			if (!is_legacy &&
+				retention_write_state(pending.old_nrecords,
+									  pending.old_hash) != 0)
+			{
+				fprintf(stderr,
+						"pagestore_retention: could not roll %s back to the "
+						"pre-mutation state (nrecords=%llu) while "
+						"reconciling %s\n", retention_path,
+						(unsigned long long) pending.old_nrecords,
+						retention_pending_path);
+				return -1;
+			}
+		}
+	}
+	else
+	{
+		fprintf(stderr,
+				"pagestore_retention: %s present but %s (size=%lld bytes) "
+				"matches neither the recorded pre-mutation (nrecords=%llu) "
+				"nor post-mutation (nrecords=%llu) state: interrupted %s "
+				"could not be reconciled\n", retention_pending_path,
+				retention_path, (long long) size,
+				(unsigned long long) pending.old_nrecords,
+				(unsigned long long) pending.new_nrecords,
+				pending.op == PS_RETENTION_PENDING_APPEND ? "append" :
+				pending.op == PS_RETENTION_PENDING_BOOTSTRAP_STATE ?
+				"state bootstrap" : "compaction");
+		errno = EILSEQ;
+		return -1;
+	}
+	if (retention_clear_pending() != 0)
+	{
+		fprintf(stderr,
+				"pagestore_retention: reconciled %s but could not remove "
+				"%s: %s\n", retention_path, retention_pending_path,
+				strerror(errno));
+		return -1;
+	}
+	return 0;
 }
 
 int
@@ -826,7 +1556,6 @@ ps_retention_open(const char *store_dir)
 	int			state_rc;
 	struct stat st;
 	PsRetentionState committed;
-	char		legacy_failed_path[4096];
 	off_t		off = 0;
 	int			legacy_format = 0;
 
@@ -844,50 +1573,180 @@ ps_retention_open(const char *store_dir)
 	retention_ino = 0;
 	test_fail_append_after_write = 0;
 	test_fail_rollback = 0;
+	test_fail_clear_pending_dir_fsync = 0;
 	n = snprintf(retention_dir, sizeof(retention_dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_dir))
+	{
+		fprintf(stderr, "pagestore_retention: store path too long: %s\n",
+				store_dir);
+		errno = ENAMETOOLONG;
 		goto done;
+	}
 	n = snprintf(retention_path, sizeof(retention_path), "%s/retention.meta",
 				 store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_path))
+	{
+		errno = ENAMETOOLONG;
 		goto done;
+	}
 	n = snprintf(retention_marker_path, sizeof(retention_marker_path),
 				 "%s/retention.initialized", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_marker_path))
+	{
+		errno = ENAMETOOLONG;
 		goto done;
+	}
 	n = snprintf(retention_pending_path, sizeof(retention_pending_path),
 				 "%s/retention.pending", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_pending_path))
+	{
+		errno = ENAMETOOLONG;
 		goto done;
+	}
+	n = snprintf(retention_pending_tmp_path, sizeof(retention_pending_tmp_path),
+				 "%s/retention.pending.tmp", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(retention_pending_tmp_path))
+	{
+		errno = ENAMETOOLONG;
+		goto done;
+	}
 	n = snprintf(retention_state_path, sizeof(retention_state_path),
 				 "%s/retention.state", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_state_path))
-		goto done;
-	n = snprintf(legacy_failed_path, sizeof(legacy_failed_path),
-				 "%s/retention.failed", store_dir);
-	if (n < 0 || (size_t) n >= sizeof(legacy_failed_path))
-		goto done;
-	if (access(retention_pending_path, F_OK) == 0 || errno != ENOENT)
 	{
+		errno = ENAMETOOLONG;
+		goto done;
+	}
+	n = snprintf(retention_failed_path, sizeof(retention_failed_path),
+				 "%s/retention.failed", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(retention_failed_path))
+	{
+		errno = ENAMETOOLONG;
+		goto done;
+	}
+	/* This durable marker -- written both by the immediately preceding
+	 * format after an uncertain rollback, and by this format whenever a
+	 * *live* process could not prove a mutation committed -- is never
+	 * migrated or replayed past.  It is checked before retention.pending so
+	 * that a live-process failure can never be silently reconciled away by
+	 * the automatic recovery below just because the crash-only guard also
+	 * happens to still be present. */
+	if (access(retention_failed_path, F_OK) == 0)
+	{
+		fprintf(stderr,
+				"pagestore_retention: %s present: a prior mutation could not "
+				"be proven safe and startup is permanently refused\n",
+				retention_failed_path);
 		errno = EILSEQ;
 		goto done;
 	}
-	/* The immediately preceding format wrote this permanent guard after an
-	 * uncertain rollback.  Never migrate/replay past that evidence. */
-	if (access(legacy_failed_path, F_OK) == 0 || errno != ENOENT)
+	if (errno != ENOENT)
 	{
-		errno = EILSEQ;
+		fprintf(stderr, "pagestore_retention: %s: %s\n", retention_failed_path,
+				strerror(errno));
+		goto done;
+	}
+	/* retention_begin_pending() publishes retention.pending by renaming a
+	 * private retention.pending.tmp into place.  A crash during that
+	 * publish can leave the tmp file behind; no log byte, nor
+	 * retention.pending itself, can have changed while only the tmp
+	 * existed, so it is always safe to remove and is never itself a
+	 * reason to refuse to open. */
+	if (access(retention_pending_tmp_path, F_OK) == 0)
+	{
+		fprintf(stderr,
+				"pagestore_retention: removing incomplete %s left behind by "
+				"an interrupted pending-marker publish\n",
+				retention_pending_tmp_path);
+		if (unlink(retention_pending_tmp_path) != 0 ||
+			retention_fsync_dir() != 0)
+		{
+			fprintf(stderr, "pagestore_retention: could not remove %s: %s\n",
+					retention_pending_tmp_path, strerror(errno));
+			goto done;
+		}
+	}
+	else if (errno != ENOENT)
+	{
+		fprintf(stderr, "pagestore_retention: %s: %s\n",
+				retention_pending_tmp_path, strerror(errno));
+		goto done;
+	}
+	if (access(retention_pending_path, F_OK) == 0)
+	{
+		struct stat pending_st;
+
+		if (stat(retention_pending_path, &pending_st) != 0)
+		{
+			fprintf(stderr, "pagestore_retention: %s: %s\n",
+					retention_pending_path, strerror(errno));
+			goto done;
+		}
+		if (pending_st.st_size < (off_t) sizeof(PsRetentionPending))
+		{
+			/* Strictly shorter than one complete record: this is exactly
+			 * the shape of the *previous* format's retention.pending, an
+			 * intentionally empty guard created and fsynced before every
+			 * mutation and removed only after the mutation (meta and, for
+			 * a DROP, state) was fully durable.  Unlike this format's own
+			 * intent record, that guard's presence does not say *where* in
+			 * the mutation a crash landed: a crash could have landed
+			 * before the mutation ever touched the log (safe to ignore),
+			 * but it could equally have landed after retention.meta and
+			 * retention.state were both made durable and consistent with
+			 * each other, immediately before the guard's own removal --
+			 * in which case the mutation (e.g. a DROP) was never
+			 * acknowledged to its caller, and silently letting it stand
+			 * because meta/state happen to agree could reclaim
+			 * still-needed history.  Ordinary meta/state validation
+			 * cannot tell these two cases apart, because in both cases
+			 * meta and state are internally consistent.  There is
+			 * therefore no safe automatic recovery: fail closed, exactly
+			 * as the previous format always did, and require a human to
+			 * inspect retention.meta/retention.state and confirm no
+			 * unacknowledged mutation is present before removing the
+			 * marker by hand.  (The atomic tmp+rename publish this format
+			 * uses -- see retention_begin_pending() -- means retention.pending
+			 * itself can no longer end up short this way; a torn write is
+			 * now confined to retention.pending.tmp, which is never the
+			 * formal marker and is always safely removed above.) */
+			fprintf(stderr,
+					"pagestore_retention: %s is %lld bytes: an interrupted "
+					"mutation from an earlier version (or a torn marker) "
+					"cannot be reconciled automatically; inspect "
+					"retention.meta/retention.state and remove the marker "
+					"manually only after confirming no unacknowledged "
+					"mutation is present\n",
+					retention_pending_path, (long long) pending_st.st_size);
+			errno = EILSEQ;
+			goto done;
+		}
+		else if (retention_recover_pending() != 0)
+			goto done;			/* diagnostic already printed */
+	}
+	else if (errno != ENOENT)
+	{
+		fprintf(stderr, "pagestore_retention: %s: %s\n",
+				retention_pending_path, strerror(errno));
 		goto done;
 	}
 	state_rc = retention_read_state(&committed);
 	if (state_rc < 0)
+	{
+		fprintf(stderr, "pagestore_retention: %s: %s\n", retention_state_path,
+				strerror(errno));
 		goto done;
+	}
 	{
 		const char *fail_append = getenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE");
 		const char *fail_rollback = getenv("PS_TEST_FAIL_RETENTION_ROLLBACK");
+		const char *fail_clear_dir_fsync =
+			getenv("PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC");
 
 		test_fail_append_after_write = fail_append ? atoi(fail_append) : 0;
 		test_fail_rollback = fail_rollback ? atoi(fail_rollback) : 0;
+		test_fail_clear_pending_dir_fsync =
+			fail_clear_dir_fsync ? atoi(fail_clear_dir_fsync) : 0;
 	}
 	fd = open(retention_path, O_RDWR);
 	if (fd < 0)
@@ -895,10 +1754,17 @@ ps_retention_open(const char *store_dir)
 		if (errno == ENOENT && access(retention_marker_path, F_OK) != 0 &&
 			errno == ENOENT && state_rc == 0)
 			rc = 0;
+		else
+			fprintf(stderr, "pagestore_retention: %s: %s\n", retention_path,
+					strerror(errno));
 		goto done;
 	}
 	if (fstat(fd, &st) != 0)
+	{
+		fprintf(stderr, "pagestore_retention: fstat %s: %s\n", retention_path,
+				strerror(errno));
 		goto done;
+	}
 	retention_dev = st.st_dev;
 	retention_ino = st.st_ino;
 	if (st.st_size >= (off_t) (4 * sizeof(uint32_t)))
@@ -908,6 +1774,9 @@ ps_retention_open(const char *store_dir)
 		if (pread(fd, header, sizeof(header), 0) != (ssize_t) sizeof(header) ||
 			header[0] != PS_RETENTION_MAGIC)
 		{
+			fprintf(stderr,
+					"pagestore_retention: %s: bad header magic\n",
+					retention_path);
 			errno = EILSEQ;
 			goto done;
 		}
@@ -917,6 +1786,10 @@ ps_retention_open(const char *store_dir)
 		else if (header[1] != PS_RETENTION_VERSION ||
 				 header[3] != sizeof(PsRetentionRecord))
 		{
+			fprintf(stderr,
+					"pagestore_retention: %s: unrecognized version %u "
+					"record size %u\n", retention_path,
+					(unsigned) header[1], (unsigned) header[3]);
 			errno = EILSEQ;
 			goto done;
 		}
@@ -926,6 +1799,9 @@ ps_retention_open(const char *store_dir)
 	if (state_rc > 0 &&
 		(committed.version == PS_RETENTION_VERSION_V1) != legacy_format)
 	{
+		fprintf(stderr,
+				"pagestore_retention: %s legacy-format flag disagrees with "
+				"%s\n", retention_state_path, retention_path);
 		errno = EILSEQ;
 		goto done;
 	}
@@ -941,6 +1817,9 @@ ps_retention_open(const char *store_dir)
 			if (pread(fd, &old, sizeof(old), off) != (ssize_t) sizeof(old) ||
 				retention_record_v1_convert(&old, &rec) != 0)
 			{
+				fprintf(stderr,
+						"pagestore_retention: %s: invalid legacy record at "
+						"offset %lld\n", retention_path, (long long) off);
 				errno = EILSEQ;
 				goto done;
 			}
@@ -951,11 +1830,19 @@ ps_retention_open(const char *store_dir)
 		else if (pread(fd, &rec, sizeof(rec), off) != (ssize_t) sizeof(rec) ||
 				 !retention_record_valid(&rec))
 		{
+			fprintf(stderr,
+					"pagestore_retention: %s: invalid record at offset "
+					"%lld\n", retention_path, (long long) off);
 			errno = EILSEQ;
 			goto done;			/* a full corrupt record is never discarded */
 		}
 		if (retention_apply(&rec) != 0)
+		{
+			fprintf(stderr,
+					"pagestore_retention: %s: record at offset %lld could "
+					"not be applied\n", retention_path, (long long) off);
 			goto done;
+		}
 		if (!legacy_format)
 		{
 			retention_log_hash = retention_fnv1a(retention_log_hash,
@@ -969,6 +1856,11 @@ ps_retention_open(const char *store_dir)
 		if (committed.nrecords != retention_nrecords ||
 			committed.log_hash != retention_log_hash)
 		{
+			fprintf(stderr,
+					"pagestore_retention: state nrecords %llu != log %llu "
+					"(or hash mismatch)\n",
+					(unsigned long long) committed.nrecords,
+					(unsigned long long) retention_nrecords);
 			errno = EILSEQ;
 			goto done;
 		}
@@ -976,25 +1868,64 @@ ps_retention_open(const char *store_dir)
 		 * outside the acknowledged log and can be discarded safely. */
 		if (off != st.st_size &&
 			(ftruncate(fd, off) != 0 || fsync(fd) != 0))
+		{
+			fprintf(stderr,
+					"pagestore_retention: could not truncate %s to its "
+					"committed prefix: %s\n", retention_path,
+					strerror(errno));
 			goto done;
+		}
 	}
 	else if (!legacy_format)
 	{
-		/* One-time migration from the pre-committed-prefix format. */
-		if (retention_begin_pending() != 0)
+		/* One-time migration from the pre-committed-prefix format: no log
+		 * content changes (old == new), only retention.state is installed
+		 * for the first time.  This is PS_RETENTION_PENDING_BOOTSTRAP_STATE,
+		 * not an APPEND: an APPEND intent always requires new_nrecords ==
+		 * old_nrecords + 1 (see retention_read_pending()), so recording this
+		 * old-equals-new mutation as an APPEND would make an interrupted
+		 * bootstrap permanently unrecoverable -- the very next open would
+		 * read back its own pending marker and reject it as corrupt. */
+		if (retention_begin_pending(PS_RETENTION_PENDING_BOOTSTRAP_STATE,
+									retention_nrecords, retention_log_hash,
+									retention_nrecords,
+									retention_log_hash) != 0)
+		{
+			fprintf(stderr,
+					"pagestore_retention: could not install %s while "
+					"installing the initial %s: %s\n",
+					retention_pending_path, retention_state_path,
+					strerror(errno));
+			goto done;
+		}
+		if (ps_fault_probe(PS_FAULT_POINT_RETENTION_BOOTSTRAP_AFTER_PENDING) != 0)
 			goto done;
 		if ((off != st.st_size &&
 			 (ftruncate(fd, off) != 0 || fsync(fd) != 0)) ||
 			retention_write_state(retention_nrecords, retention_log_hash) != 0 ||
 			retention_clear_pending() != 0)
+		{
+			fprintf(stderr,
+					"pagestore_retention: could not install the initial %s: "
+					"%s\n", retention_state_path, strerror(errno));
 			goto done;
+		}
 	}
 	/* Rewrite all live pins and tombstones only after validating the complete
 	 * committed v1 prefix.  The rewrite also installs the v2 state atomically. */
 	if (legacy_format && retention_rewrite_current() != 0)
+	{
+		fprintf(stderr,
+				"pagestore_retention: could not migrate %s to the current "
+				"format: %s\n", retention_path, strerror(errno));
 		goto done;
+	}
 	if (retention_mark_initialized() != 0)
+	{
+		fprintf(stderr, "pagestore_retention: could not install %s: %s\n",
+				retention_marker_path, strerror(errno));
 		goto done;
+	}
 	rc = 0;
 done:
 	if (fd >= 0)
@@ -1031,6 +1962,7 @@ ps_retention_close(void)
 	retention_path[0] = '\0';
 	retention_marker_path[0] = '\0';
 	retention_pending_path[0] = '\0';
+	retention_pending_tmp_path[0] = '\0';
 	retention_state_path[0] = '\0';
 	retention_dir[0] = '\0';
 	retention_dev = 0;
@@ -1520,111 +2452,10 @@ ps_retention_should_compact(void)
 int
 ps_retention_compact(void)
 {
-	char		tmp[4096] = {0};
-	int			fd = -1;
-	int			rc = -1;
-	int			n;
-	int			pending = 0;
-	int			published = 0;
-	uint32_t	new_hash = PS_RETENTION_FNV_INIT;
+	int			rc;
 
 	pthread_mutex_lock(&retention_lock);
-	if (retention_is_poisoned)
-		goto done;
-	if (retention_begin_pending() != 0)
-		goto done;
-	pending = 1;
-	n = snprintf(tmp, sizeof(tmp), "%s.tmp", retention_path);
-	if (n < 0 || (size_t) n >= sizeof(tmp))
-		goto done;
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0)
-		goto done;
-	for (uint32_t i = 0; i < retention_npins; i++)
-	{
-		PsRetentionRecord rec;
-
-		retention_make_record(&rec,
-						  retention_pin_active(&retention_pins[i]) ?
-						  PS_RETENTION_SET : PS_RETENTION_DROP,
-						  &retention_pins[i]);
-		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
-			goto done;
-		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
-	}
-	if (retention_admission_highwater != 0)
-	{
-		PsRetentionPin pin = {0};
-		PsRetentionRecord rec;
-
-		pin.admission_seq = retention_admission_highwater;
-		retention_make_record(&rec, PS_RETENTION_ADMISSION_RESERVE, &pin);
-		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
-			goto done;
-		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
-	}
-	if (fsync(fd) != 0)
-	{
-		close(fd);
-		fd = -1;
-		goto done;
-	}
-	if (close(fd) != 0)
-	{
-		fd = -1;
-		goto done;
-	}
-	fd = -1;
-	if (rename(tmp, retention_path) != 0)
-		goto done;
-	published = 1;
-	/* Once rename publishes the new inode, a failed directory fsync means its
-	 * durability is unknown.  Do not continue from an in-memory state that a
-	 * crash may roll back. */
-	if (retention_fsync_dir() != 0)
-	{
-		retention_is_poisoned = 1;
-		goto done;
-	}
-	{
-		struct stat st;
-
-		if (stat(retention_path, &st) != 0)
-		{
-			retention_is_poisoned = 1;
-			goto done;
-		}
-		retention_dev = st.st_dev;
-		retention_ino = st.st_ino;
-	}
-	if (retention_write_state(retention_npins +
-			(retention_admission_highwater != 0), new_hash) != 0)
-	{
-		retention_is_poisoned = 1;
-		goto done;
-	}
-	retention_nrecords = retention_npins +
-		(retention_admission_highwater != 0);
-	retention_log_hash = new_hash;
-	if (retention_clear_pending() != 0)
-	{
-		retention_is_poisoned = 1;
-		goto done;
-	}
-	pending = 0;
-	memset(&retention_compact_retry_at, 0, sizeof(retention_compact_retry_at));
-	rc = 0;
-done:
-	if (fd >= 0)
-		close(fd);
-	if (rc != 0 && tmp[0] != '\0')
-		unlink(tmp);
-	if (rc != 0 && pending && !published)
-		(void) retention_clear_pending();
-	if (rc != 0 && pending && published)
-		retention_is_poisoned = 1;
-	if (rc != 0 && !retention_is_poisoned)
-		retention_defer_compact();
+	rc = retention_republish();
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }

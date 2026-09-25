@@ -77,6 +77,19 @@ mock_layer_failed_open(const char *path)
 	return -1;
 }
 
+/* Bug finding #3: models a callee that fails without setting errno at all,
+ * exactly what OPEN_STEP()'s errno=0-before-each-step reset exists to make
+ * safe -- without it, whatever unrelated errno was last left lying around
+ * (here, a prior op's ENOSPC) would be reported as if it explained this
+ * failure. */
+static int
+mock_storage_failed_open_no_errno(const char *path, uint64_t size)
+{
+	(void) path;
+	(void) size;
+	return -1;
+}
+
 static void
 test_core_provider_lifecycle(void)
 {
@@ -123,6 +136,16 @@ test_core_provider_lifecycle(void)
 	ps_core_close();
 	check(mock_close_calls == 1, "close after late startup failure does not close again");
 	ps_layer_store = &PsLayerStoreLocal;
+	mock.open = mock_storage_failed_open_no_errno;
+	ps_storage = &mock;
+	errno = ENOSPC;				/* a stale, unrelated errno from a prior op */
+	rc = ps_core_open(dir);
+	check(rc != 0 && errno == EIO,
+		  "a storage-open failure that never sets errno is reported as EIO, "
+		  "not whatever unrelated errno happened to be lying around");
+	ps_core_close();
+	ps_core_close();
+	mock.open = PsStoragePosix.open;
 	mock_close_calls = 0;
 	check(ps_core_open(dir) == 0, "reopen after failed provider initialization");
 	ps_core_close();

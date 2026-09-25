@@ -55,3 +55,30 @@ PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_MAPS, "branch_install.after_maps", "b
 PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_SLRU_REMOVE, "branch_install.after_slru_remove", "branch", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(BRANCH_INSTALL_BEFORE_MANIFEST, "branch_install.before_manifest", "branch", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_MANIFEST, "branch_install.after_manifest", "branch", "process_abort", "crash", 1, 1)
+// Retention-log compaction/migration probes bracket the atomic rewrite of
+// retention.meta under retention_lock: after the durable pending intent is
+// installed and before its temp file is touched, after the temp file is
+// fsync'd and before the rename, after the rename and before the directory
+// fsync, and after the post-rename committed-prefix state is durable and
+// before the pending marker is cleared.
+PAGESTORE_FAULT_POINT(RETENTION_COMPACT_AFTER_PENDING, "retention_compact.after_pending", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(RETENTION_COMPACT_AFTER_TMP_SYNC, "retention_compact.after_tmp_sync", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(RETENTION_COMPACT_AFTER_RENAME, "retention_compact.after_rename", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(RETENTION_COMPACT_AFTER_STATE, "retention_compact.after_state", "store", "process_abort", "crash", 1, 1)
+// Retention-log in-place append probes: after the durable pending intent is
+// installed and before the record is written, and after the appended record
+// is fsync'd and before the committed-prefix state is updated.
+PAGESTORE_FAULT_POINT(RETENTION_APPEND_AFTER_PENDING, "retention_append.after_pending", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(RETENTION_APPEND_AFTER_WRITE, "retention_append.after_write", "store", "process_abort", "crash", 1, 1)
+// One-time PS_RETENTION_PENDING_BOOTSTRAP_STATE probe in ps_retention_open():
+// after the durable pending intent (old_nrecords == new_nrecords) is
+// installed and before retention.state is written for the first time.
+PAGESTORE_FAULT_POINT(RETENTION_BOOTSTRAP_AFTER_PENDING, "retention_bootstrap.after_pending", "store", "process_abort", "crash", 1, 1)
+// retention_begin_pending()'s own atomic publish of retention.pending.tmp:
+// after the tmp file is created and before it is written (a crash here
+// leaves a 0-byte tmp), and after the tmp file is fully written and
+// fsync'd and before it is renamed into place (a crash here leaves a
+// complete but not-yet-visible tmp).  Neither window has touched
+// retention.pending or the log itself.
+PAGESTORE_FAULT_POINT(RETENTION_PENDING_AFTER_CREATE, "retention_pending.after_create", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(RETENTION_PENDING_AFTER_TMP_SYNC, "retention_pending.after_tmp_sync", "store", "process_abort", "crash", 1, 1)
